@@ -444,8 +444,8 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
 
         // --- the language pack set (M.24): Requests.cpp:8005-8073. The
         // local halves (custom packs, loaded strings, only_local target
-        // info) answer here; the server halves park behind the
-        // [blocked: net] langpack.* query seams ---
+        // info) answer here; the server halves dispatch over the
+        // langpack.* unauth net plane ---
         Function::getLocalizationTargetInfo(request) => {
             // Requests.cpp:8005-8009
             if !check_is_user(td, id) {
@@ -455,16 +455,19 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                 id,
                 Object::localizationTargetInfo,
             );
+            let net = td.langpack_net();
             let mut env = LanguagePackEnv {
                 options: td.option_manager.as_mut(),
                 updates: &mut td.language_pack_updates,
+                net,
+                pending: &mut td.langpack_pending,
             };
             td.language_pack_manager
                 .get_languages(&mut env, request.only_local, promise);
         }
         Function::getLanguagePackInfo(request) => {
-            // Requests.cpp:8011-8017; the net tail parks unanswered
-            // offline, like the C++ request without a network
+            // Requests.cpp:8011-8017; the net tail dispatches
+            // langpack.getLanguage
             if !check_is_user(td, id) {
                 return;
             }
@@ -474,16 +477,19 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             };
             let promise =
                 td.deferred_promise::<td_api::LanguagePackInfo, _>(id, Object::languagePackInfo);
+            let net = td.langpack_net();
             let mut env = LanguagePackEnv {
                 options: td.option_manager.as_mut(),
                 updates: &mut td.language_pack_updates,
+                net,
+                pending: &mut td.langpack_pending,
             };
             td.language_pack_manager
                 .search_language_info(&mut env, language_pack_id, promise);
         }
         Function::getLanguagePackStrings(request) => {
             // Requests.cpp:8019-8028; the loaded-pack halves answer, the
-            // rest parks on langpack.getLangPack/langpack.getStrings
+            // rest dispatches langpack.getLangPack/langpack.getStrings
             if !check_is_user(td, id) {
                 return;
             }
@@ -502,9 +508,12 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                 id,
                 Object::languagePackStrings,
             );
+            let net = td.langpack_net();
             let mut env = LanguagePackEnv {
                 options: td.option_manager.as_mut(),
                 updates: &mut td.language_pack_updates,
+                net,
+                pending: &mut td.langpack_pending,
             };
             td.language_pack_manager.get_language_pack_strings(
                 &mut env,
@@ -515,7 +524,7 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
         }
         Function::synchronizeLanguagePack(request) => {
             // Requests.cpp:8030-8036; custom codes answer ok locally, the
-            // server codes park behind langpack.getDifference
+            // server codes dispatch langpack.getDifference
             if !check_is_user(td, id) {
                 return;
             }
@@ -524,9 +533,12 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                 return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
             };
             let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let net = td.langpack_net();
             let mut env = LanguagePackEnv {
                 options: td.option_manager.as_mut(),
                 updates: &mut td.language_pack_updates,
+                net,
+                pending: &mut td.langpack_pending,
             };
             td.language_pack_manager
                 .synchronize_language_pack(&mut env, language_pack_id, promise);
@@ -550,9 +562,12 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let net = td.langpack_net();
             let mut env = LanguagePackEnv {
                 options: td.option_manager.as_mut(),
                 updates: &mut td.language_pack_updates,
+                net,
+                pending: &mut td.langpack_pending,
             };
             td.language_pack_manager.set_custom_language(
                 &mut env,
@@ -580,9 +595,12 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                 return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
             };
             let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let net = td.langpack_net();
             let mut env = LanguagePackEnv {
                 options: td.option_manager.as_mut(),
                 updates: &mut td.language_pack_updates,
+                net,
+                pending: &mut td.langpack_pending,
             };
             td.language_pack_manager.set_custom_language_string(
                 &mut env,
@@ -4433,9 +4451,9 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             }
         }
         // --- the AnimationsManager arm set (M.20): Requests.cpp:1793-1830.
-        // The saved-animations ring answers offline; the GetSavedGifsQuery/
-        // SaveGifQuery tails are the [blocked: net] env seams and park the
-        // promises exactly like the C++ request without a network ---
+        // The saved-animations ring answers over the animations net plane
+        // (net-drain 56): the GetSavedGifsQuery/SaveGifQuery send legs ride
+        // the manager-held AnimationsNetHandle ---
         Function::getSavedAnimations(_) => {
             // Requests.cpp:1793-1802; the two-step RequestActor collapses
             // into the manager's promise (it answers the Animations
@@ -6484,13 +6502,17 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             };
             let promise =
                 td.deferred_promise(id, |call_id: td_api::CallId| Object::callId(call_id));
+            // the collapsed G() dispatch surface of the actor send seams
+            let call_net = td.call_net();
             let mut env = CallEnv {
                 user_env: user_env!(td),
                 user_manager: &mut td.user_manager,
                 notification_manager: &mut td.notification_manager,
                 updates: &mut td.call_updates,
                 dh_config: &mut td.call_dh_config,
+                call_net,
             };
+
             td.call_manager.create_call(
                 &mut env,
                 UserId::new(request.user_id),
@@ -6508,13 +6530,17 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 return td.send_error_impl(id, 400, "Call protocol must be non-empty");
             };
             let promise = td.deferred_promise(id, |()| ok_object());
+            // the collapsed G() dispatch surface of the actor send seams
+            let call_net = td.call_net();
             let mut env = CallEnv {
                 user_env: user_env!(td),
                 user_manager: &mut td.user_manager,
                 notification_manager: &mut td.notification_manager,
                 updates: &mut td.call_updates,
                 dh_config: &mut td.call_dh_config,
+                call_net,
             };
+
             td.call_manager.accept_call(
                 &mut env,
                 CallId::new(request.call_id),
@@ -6528,13 +6554,17 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise(id, |()| ok_object());
+            // the collapsed G() dispatch surface of the actor send seams
+            let call_net = td.call_net();
             let mut env = CallEnv {
                 user_env: user_env!(td),
                 user_manager: &mut td.user_manager,
                 notification_manager: &mut td.notification_manager,
                 updates: &mut td.call_updates,
                 dh_config: &mut td.call_dh_config,
+                call_net,
             };
+
             td.call_manager.send_call_signaling_data(
                 &mut env,
                 CallId::new(request.call_id),
@@ -6552,13 +6582,17 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
             };
             let promise = td.deferred_promise(id, |()| ok_object());
+            // the collapsed G() dispatch surface of the actor send seams
+            let call_net = td.call_net();
             let mut env = CallEnv {
                 user_env: user_env!(td),
                 user_manager: &mut td.user_manager,
                 notification_manager: &mut td.notification_manager,
                 updates: &mut td.call_updates,
                 dh_config: &mut td.call_dh_config,
+                call_net,
             };
+
             td.call_manager.discard_call(
                 &mut env,
                 CallId::new(request.call_id),
@@ -6579,13 +6613,17 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
             };
             let promise = td.deferred_promise(id, |()| ok_object());
+            // the collapsed G() dispatch surface of the actor send seams
+            let call_net = td.call_net();
             let mut env = CallEnv {
                 user_env: user_env!(td),
                 user_manager: &mut td.user_manager,
                 notification_manager: &mut td.notification_manager,
                 updates: &mut td.call_updates,
                 dh_config: &mut td.call_dh_config,
+                call_net,
             };
+
             td.call_manager.rate_call(
                 &mut env,
                 &request.call_id,
@@ -6612,13 +6650,17 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 }
             };
             let promise = td.deferred_promise(id, |()| ok_object());
+            // the collapsed G() dispatch surface of the actor send seams
+            let call_net = td.call_net();
             let mut env = CallEnv {
                 user_env: user_env!(td),
                 user_manager: &mut td.user_manager,
                 notification_manager: &mut td.notification_manager,
                 updates: &mut td.call_updates,
                 dh_config: &mut td.call_dh_config,
+                call_net,
             };
+
             td.call_manager.send_call_debug_information(
                 &mut env,
                 call_id,
@@ -9317,6 +9359,7 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
                 file_load_manager: std::sync::Arc::clone(&td.file_load_manager),
                 file_reference_manager: &mut td.file_reference_manager,
                 documents_manager: &mut td.documents_manager,
+                animations: &mut td.animations_manager,
                 audios: &mut td.audios_manager,
                 videos: &mut td.videos_manager,
                 voice_notes: &mut td.voice_notes_manager,
@@ -11395,7 +11438,9 @@ fn run_bot_requests_46(td: &mut Td, id: u64, function: Function) {
 /// The M.50 SecretChatsManager arm group of the request dispatcher — see
 /// the frame note at the forward site in [`run_request`]. The arms route
 /// into `td_->secret_chats_manager_->...` (Requests.cpp:5082-5091,
-/// 7409-7415); the network tails are the [blocked: net] query seams.
+/// 7409-7415); the five wire families ride the manager-held
+/// `SecretNetKind` plane and the chat-object build parks with the
+/// dialog plane.
 #[allow(clippy::too_many_lines)]
 fn run_secret_chat_requests(td: &mut Td, id: u64, function: Function) {
     fn secret_chat_arm(
@@ -11425,20 +11470,51 @@ fn run_secret_chat_requests(td: &mut Td, id: u64, function: Function) {
 
     match function {
         // createNewSecretChat (Requests.cpp:5082-5091) — the C++ routes
-        // through user_manager_->create_new_secret_chat, which converts
-        // the created chat id to the chat object; both the net leg and
-        // the conversion park [blocked: net / the chat creation intake].
+        // through user_manager_->create_new_secret_chat, which resolves
+        // the plain `inputUser` peer (UserManager.cpp:9845-9854, the
+        // "Can't create secret chat with the user" band) and chains the
+        // chat-object build onto the create receipt (cpp:9864-9870);
+        // the object build itself parks with the dialog plane.
         Function::createNewSecretChat(request) => {
             if !check_is_user(td, id) {
                 return;
             }
-            let promise = td.deferred_promise::<td_api::Chat, _>(id, Object::chat);
+            let mut promise = td.deferred_promise::<td_api::Chat, _>(id, Object::chat);
+            let (user_id, user_access_hash) = {
+                let crate::td::Td {
+                    global,
+                    option_manager,
+                    auth_manager,
+                    user_manager,
+                    ..
+                } = td;
+                let user_env = crate::user_manager::UserEnv {
+                    global,
+                    options: option_manager.as_mut().expect("user environment"),
+                    auth_is_bot: auth_manager.is_bot(),
+                };
+                match user_manager
+                    .get_input_user(&user_env, crate::user_manager::UserId::new(request.user_id))
+                {
+                    Ok(tdmtproto::telegram_api::InputUser::inputUser(user)) => (
+                        crate::user_manager::UserId::new(user.user_id),
+                        user.access_hash,
+                    ),
+                    Ok(_) => {
+                        promise.set_error(Status::error(
+                            400,
+                            "Can't create secret chat with the user",
+                        ));
+                        return;
+                    }
+                    Err(status) => {
+                        promise.set_error(status);
+                        return;
+                    }
+                }
+            };
             secret_chat_arm(td, |env, manager| {
-                manager.create_chat_chat_object(
-                    env,
-                    crate::user_manager::UserId::new(request.user_id),
-                    promise,
-                );
+                manager.create_chat_chat_object(env, user_id, user_access_hash, promise);
             });
         }
 
@@ -17973,13 +18049,17 @@ fn run_misc_glue_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise(id, |()| ok_object());
+            // the collapsed G() dispatch surface of the actor send seams
+            let call_net = td.call_net();
             let mut env = CallEnv {
                 user_env: user_env!(td),
                 user_manager: &mut td.user_manager,
                 notification_manager: &mut td.notification_manager,
                 updates: &mut td.call_updates,
                 dh_config: &mut td.call_dh_config,
+                call_net,
             };
+
             td.call_manager
                 .send_call_log(&mut env, &request.call_id, request.log_file, promise);
         }

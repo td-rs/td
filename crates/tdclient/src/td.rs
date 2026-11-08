@@ -3362,6 +3362,11 @@ pub(crate) type GroupCallNetHandle = NetKindHandle<crate::group_call_manager::Gr
 /// answers drain through [`Td::on_call_net_answer`].
 pub(crate) type CallNetHandle = NetKindHandle<crate::call_manager::CallNetKind>;
 
+/// The cloned secret-chats dispatch surface the [`SecretChatsManager`]
+/// holds — the five wire families' answers drain through
+/// [`Td::on_secret_net_answer`].
+pub(crate) type SecretNetHandle = NetKindHandle<crate::secret_chats_manager::SecretNetKind>;
+
 /// The cloned message-import dispatch surface the
 /// [`MessageImportManagerEnv`] send legs use — the per-kind handle over
 /// the two head-query ResultHandler classes of
@@ -3510,6 +3515,32 @@ pub(crate) enum CountryNetKind {
 /// The cloned country dispatch surface the [`CountryEnv`] senders use —
 /// the answers drain through [`Td::on_country_net_answer`].
 type CountryNetHandle = NetKindHandle<CountryNetKind>;
+
+/// The LanguagePackManager in-flight query kinds — the C++ request
+/// lambdas of LanguagePackManager.cpp:433-458, 871-897 and 1128-1161
+/// (all five sends are `create_unauth` over the main DC). The payload
+/// is the index of the Td-side [`crate::language_pack_manager::
+/// PendingLangPackQuery`] slot (the kinds stay `Copy`; the params and
+/// the promises wait in the slot — the capture-exact pairing).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LangPackNetKind {
+    /// `GetLanguagesQuery` (cpp:871-878) — the localization-target rows.
+    Languages { pending_index: u32 },
+    /// `GetLanguageQuery` (cpp:887-897) — the searched info.
+    LanguageInfo { pending_index: u32 },
+    /// `GetLangPackQuery` (cpp:1128-1150) — the full pack (its promise
+    /// chain parks in the manager's query map).
+    LangPack { pending_index: u32 },
+    /// `GetStringsQuery` (cpp:1152-1161) — the keyed fetch.
+    Strings { pending_index: u32 },
+    /// `GetDifferenceQuery` (cpp:433-458) — the difference (its promises
+    /// park in the language's difference queue).
+    Difference { pending_index: u32 },
+}
+
+/// The cloned langpack dispatch surface the [`LanguagePackEnv`] senders
+/// use — the answers drain through [`Td::on_lang_pack_net_answer`].
+type LangPackNetHandle = NetKindHandle<LangPackNetKind>;
 
 /// The PromoDataManager in-flight query kinds — the C++ ResultHandler
 /// classes of PromoDataManager.cpp:31-86.
@@ -3789,6 +3820,15 @@ pub(crate) type BotRecommendationNetHandle =
 /// the manager over the env's file-plane reads.
 pub(crate) type StickersNetHandle = NetKindHandle<crate::stickers_manager::StickersNetKind>;
 
+/// The cloned animations dispatch surface the
+/// [`crate::animations_manager::AnimationsManager`] holds — the net-drain
+/// 56 families' send legs (the `GetSavedGifsQuery`/`SaveGifQuery`
+/// ResultHandler classes, AnimationsManager.cpp:39-124); the answers drain
+/// through [`Td::on_animations_net_answer`]. Manager-held (the game
+/// shape): the send legs run inside the manager over the env's file-plane
+/// reads.
+pub(crate) type AnimationsNetHandle = NetKindHandle<crate::animations_manager::AnimationsNetKind>;
+
 /// The cloned web-pages dispatch surface the
 /// [`crate::web_pages_manager::WebPagesManager`] holds — the
 /// net-drain 46 family's send leg (`GetWebPageQuery`, the by-URL
@@ -4040,6 +4080,62 @@ fn parse_wire_bool_value(data: &[u8]) -> Option<bool> {
     } else {
         None
     }
+}
+
+/// Take the [`crate::language_pack_manager::PendingLangPackQuery`] slot
+/// the net kind names — the capture-exact pairing (the slot stays `None`
+/// behind, so a stale or duplicated answer cannot double-answer).
+fn take_lang_pack_pending(
+    pending: &mut [Option<crate::language_pack_manager::PendingLangPackQuery>],
+    index: u32,
+) -> Option<crate::language_pack_manager::PendingLangPackQuery> {
+    let index = index as usize;
+    if index >= pending.len() {
+        return None;
+    }
+    pending[index].take()
+}
+
+/// Park one langpack pending entry, reusing a drained `None` slot when
+/// one exists (the vec stays bounded by the in-flight query count) —
+/// returns the slot index the `Copy` net kind carries.
+fn push_lang_pack_pending(
+    pending: &mut Vec<Option<crate::language_pack_manager::PendingLangPackQuery>>,
+    entry: crate::language_pack_manager::PendingLangPackQuery,
+) -> u32 {
+    if let Some(index) = pending.iter().position(|slot| slot.is_none()) {
+        pending[index] = Some(entry);
+        return index as u32;
+    }
+    pending.push(Some(entry));
+    (pending.len() - 1) as u32
+}
+
+/// The chained-`langpack.getLangPack` promise slot (the C++
+/// `PromiseCreator::lambda` one-hop catcher, cpp:1133-1139).
+type CaughtLanguagePackStrings =
+    Arc<Mutex<Option<tdutils::status::Result<td_api::LanguagePackStrings>>>>;
+
+/// The one-slot value catcher standing in for the C++
+/// `PromiseCreator::lambda` chain hop of `langpack.getLangPack`
+/// (cpp:1133-1139): the rebuilt strings ride the chained promise into
+/// the slot, then the intake feeds `on_get_all_language_pack_strings`
+/// with the caught result.
+fn catch_language_pack_strings() -> (
+    Promise<td_api::LanguagePackStrings>,
+    CaughtLanguagePackStrings,
+) {
+    struct Catch(CaughtLanguagePackStrings);
+    impl tdutils::promise::PromiseInterface<td_api::LanguagePackStrings> for Catch {
+        fn set_value(&mut self, value: td_api::LanguagePackStrings) {
+            *self.0.lock() = Some(tdutils::status::Result::Ok(value));
+        }
+        fn set_error(&mut self, error: Status) {
+            *self.0.lock() = Some(tdutils::status::Result::Err(error));
+        }
+    }
+    let slot: CaughtLanguagePackStrings = Arc::new(Mutex::new(None));
+    (Promise::from_interface(Catch(Arc::clone(&slot))), slot)
 }
 
 /// Pop the first parked [`PendingTranslationQuery`] matching the
@@ -6131,6 +6227,10 @@ pub struct Td {
     /// The call net completed queue (the `CallNetKind` answers park
     /// here; the drain routes them through `Td::on_call_net_answer`).
     call_net_completed: Arc<Mutex<Vec<(crate::call_manager::CallNetKind, NetQuery)>>>,
+    /// The secret-chats net completed queue (the `SecretNetKind`
+    /// answers park here; the drain routes them through
+    /// [`Td::on_secret_net_answer`]).
+    secret_net_completed: Arc<Mutex<Vec<(crate::secret_chats_manager::SecretNetKind, NetQuery)>>>,
     /// The message-import net completed queue (the
     /// `MessageImportNetKind` answers park here; the drain routes them
     /// through `Td::on_message_import_net_answer`).
@@ -6169,6 +6269,13 @@ pub struct Td {
     /// The parked TranslationManager promises (the C++ handlers' own
     /// promises) — popped by the answer drain.
     translation_promises: Vec<crate::translation_manager::PendingTranslationQuery>,
+    /// The callback-parked LanguagePackManager query answers, parked by
+    /// kind (the `Td::on_lang_pack_net_answer` drain).
+    langpack_net_completed: Arc<Mutex<Vec<(LangPackNetKind, NetQuery)>>>,
+    /// The parked LanguagePackManager query state (the C++ lambdas'
+    /// captured params + promises) — slot-indexed by the net kinds; the
+    /// intake leaves `None` behind so stale answers can't double-answer.
+    pub(crate) langpack_pending: Vec<Option<crate::language_pack_manager::PendingLangPackQuery>>,
     /// The callback-parked PrivacyManager query answers, parked by kind
     /// (the `Td::on_privacy_net_answer` drain).
     privacy_net_completed: Arc<Mutex<Vec<(PrivacyNetKind, NetQuery)>>>,
@@ -6415,6 +6522,11 @@ pub struct Td {
     /// net-drain 59 families) — the dispatcher callbacks park here, the
     /// actor pump routes them through [`Td::on_stickers_net_answer`].
     stickers_net_completed: Arc<Mutex<Vec<(crate::stickers_manager::StickersNetKind, NetQuery)>>>,
+    /// The animations net completed queue (the `AnimationsNetKind` tags;
+    /// the net-drain 56 families) — the dispatcher callbacks park here,
+    /// the actor pump routes them through [`Td::on_animations_net_answer`].
+    animations_net_completed:
+        Arc<Mutex<Vec<(crate::animations_manager::AnimationsNetKind, NetQuery)>>>,
     /// The `delete_forum_topic` continuation queue (the affected-history
     /// completion parking lot, the `FinishCreateCommunityChain`
     /// convention).
@@ -6892,6 +7004,7 @@ impl Td {
             pending_background_queries: PendingBackgroundQueries::default(),
             group_call_net_completed: Arc::new(Mutex::new(Vec::new())),
             call_net_completed: Arc::new(Mutex::new(Vec::new())),
+            secret_net_completed: Arc::new(Mutex::new(Vec::new())),
             message_import_net_completed: Arc::new(Mutex::new(Vec::new())),
             poll_net_completed: Arc::new(Mutex::new(Vec::new())),
             support_net_completed: Arc::new(Mutex::new(Vec::new())),
@@ -6902,6 +7015,8 @@ impl Td {
             sponsored_net_completed: Arc::new(Mutex::new(Vec::new())),
             translation_net_completed: Arc::new(Mutex::new(Vec::new())),
             translation_promises: Vec::new(),
+            langpack_net_completed: Arc::new(Mutex::new(Vec::new())),
+            langpack_pending: Vec::new(),
             privacy_net_completed: Arc::new(Mutex::new(Vec::new())),
             privacy_promises: Vec::new(),
             auto_download_net_completed: Arc::new(Mutex::new(Vec::new())),
@@ -6948,6 +7063,7 @@ impl Td {
             notification_net_completed: Arc::new(Mutex::new(Vec::new())),
             bot_recommendation_net_completed: Arc::new(Mutex::new(Vec::new())),
             stickers_net_completed: Arc::new(Mutex::new(Vec::new())),
+            animations_net_completed: Arc::new(Mutex::new(Vec::new())),
             forum_topic_delete_completions: Arc::new(Mutex::new(Vec::new())),
             message_query_net_pending: crate::message_query_manager::PendingNetQueries::default(),
             convert_gift_queue: Arc::new(Mutex::new(Vec::new())),
@@ -7438,6 +7554,7 @@ impl Td {
         self.notification_settings_manager.net = self.notification_settings_net();
         self.group_call_manager.net = self.group_call_net();
         self.call_manager.net = self.call_net();
+        self.secret_chats_manager.net = self.secret_net();
         self.forum_topic_manager.net = self.forum_topic_net();
         self.web_pages_manager.net = self.web_pages_net();
         self.attach_menu_manager.net = self.attach_menu_net();
@@ -7449,6 +7566,7 @@ impl Td {
         self.device_token_manager.net = self.device_token_net();
         self.notification_manager.net = self.notification_net();
         self.stickers_manager.net = self.stickers_net();
+        self.animations_manager.net = self.animations_net();
         // The SessionCallback::on_result hop (SessionProxy.cpp:80-85): the
         // session pool's finished queries re-enter the dispatcher head —
         // where live-server 303s (USER/PHONE/FILE_MIGRATE_) get fixed and
@@ -9242,11 +9360,13 @@ impl Td {
         self.dispatch_completed_background_net();
         self.dispatch_completed_group_call_net();
         self.dispatch_completed_call_net();
+        self.dispatch_completed_secret_net();
         self.dispatch_completed_message_import_net();
         self.dispatch_completed_poll_net();
         self.dispatch_completed_statistics_net();
         self.dispatch_completed_support_net();
         self.dispatch_completed_country_net();
+        self.dispatch_completed_lang_pack_net();
         self.dispatch_completed_promo_net();
         self.dispatch_completed_sponsored_net();
         self.dispatch_completed_translation_net();
@@ -9277,6 +9397,7 @@ impl Td {
         self.dispatch_completed_boost_net();
         self.dispatch_completed_callback_net();
         self.dispatch_completed_game_net();
+        self.dispatch_completed_animations_net();
         self.dispatch_completed_reaction_net();
         self.dispatch_completed_inline_message_net();
         self.dispatch_completed_top_dialog_net();
@@ -9401,6 +9522,17 @@ impl Td {
         })
     }
 
+    /// The cloned secret-chats dispatch surface the `SecretChatsManager`
+    /// holds — `None` keeps the net-inert posture (the pre-init windows
+    /// and the net-inert tests).
+    pub(crate) fn secret_net(&self) -> Option<SecretNetHandle> {
+        Some(SecretNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.secret_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
     /// The cloned message-import dispatch surface (the net-drain 58
     /// families' send legs — the whole-Td env reads it at the send).
     pub(crate) fn message_import_net(&self) -> Option<MessageImportNetHandle> {
@@ -9481,6 +9613,16 @@ impl Td {
         Some(TranslationNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.translation_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned langpack dispatch surface — the [`LanguagePackEnv`]
+    /// senders use it; `None` keeps the net-inert posture.
+    pub(crate) fn langpack_net(&self) -> Option<LangPackNetHandle> {
+        Some(LangPackNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.langpack_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -9861,6 +10003,18 @@ impl Td {
         })
     }
 
+    /// The cloned animations dispatch surface the
+    /// [`crate::animations_manager::AnimationsManager`] holds (the
+    /// net-drain 56 families' send legs) — `None` keeps the net-inert
+    /// posture.
+    pub(crate) fn animations_net(&self) -> Option<AnimationsNetHandle> {
+        Some(AnimationsNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.animations_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
     /// The cloned messages-plane dispatch surface (the M.10.19 ladder's
     /// `GetChannelDifferenceQuery` send leg). The handle is Td-held (not
     /// manager-held): the ladder runs over the split-context alias pair,
@@ -9980,6 +10134,7 @@ impl Td {
             file_manager,
             file_load_manager,
             documents_manager,
+            animations_manager,
             videos_manager,
             audios_manager,
             voice_notes_manager,
@@ -9997,6 +10152,7 @@ impl Td {
             file_manager: file_manager.clone(),
             file_load_manager: std::sync::Arc::clone(file_load_manager),
             documents: documents_manager,
+            animations: animations_manager,
             videos: videos_manager,
             audios: audios_manager,
             voice_notes: voice_notes_manager,
@@ -11135,6 +11291,17 @@ impl Td {
         self.drain_sink();
     }
 
+    /// Drain the callback-parked secret-chats answers — the C++
+    /// on_result_resendable halves of the five wire families
+    /// (SecretChatActor.cpp:105-135).
+    fn dispatch_completed_secret_net(&mut self) {
+        let completed = std::mem::take(&mut *self.secret_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_secret_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
     /// Drain the callback-parked message-import answers — the C++
     /// ResultHandler on_result/on_error halves of the net-drain 58
     /// head-query families (MessageImportManager.cpp:30-98).
@@ -11195,6 +11362,17 @@ impl Td {
         let completed = std::mem::take(&mut *self.country_net_completed.lock());
         for (kind, query) in completed {
             self.on_country_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Drain the callback-parked LanguagePackManager answers — the C++
+    /// request lambdas of LanguagePackManager.cpp:433-458, 871-897 and
+    /// 1128-1161 (the `create_unauth` band).
+    fn dispatch_completed_lang_pack_net(&mut self) {
+        let completed = std::mem::take(&mut *self.langpack_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_lang_pack_net_answer(kind, query);
         }
         self.drain_sink();
     }
@@ -18757,6 +18935,17 @@ impl Td {
         self.drain_sink();
     }
 
+    /// Drain the callback-parked animations answers — the C++
+    /// ResultHandler halves of the net-drain 56 families
+    /// (AnimationsManager.cpp:39-124).
+    fn dispatch_completed_animations_net(&mut self) {
+        let completed = std::mem::take(&mut *self.animations_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_animations_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
     /// Build the [`SecureEnv`] view over the split Td borrows and run the
     /// closure with it + the secure manager (the `secure_env!` shape —
     /// the net-answer drain's twin; the passport answers only run
@@ -20666,6 +20855,140 @@ impl Td {
                     }
                 }
                 self.game_manager = manager;
+            }
+        }
+    }
+
+    /// Route one animations net answer by kind — the ResultHandler
+    /// halves of the net-drain 56 families (AnimationsManager.cpp:39-124):
+    /// the wire answer parses here, the documents walk runs over the
+    /// split env, and the manager intakes run behind the take/drop
+    /// discipline (the game router shape). The parse failures run the
+    /// same on_error tails the C++ `fetch_result` failure would
+    /// (cpp:50-56/:88-94).
+    fn on_animations_net_answer(
+        &mut self,
+        kind: crate::animations_manager::AnimationsNetKind,
+        query: NetQuery,
+    ) {
+        use crate::animations_manager::AnimationsNetKind as K;
+        match kind {
+            // `GetSavedGifsQuery::on_result`/`on_error` (cpp:46-63) — the
+            // error head is the expected-error-gated LOG(ERROR), then the
+            // failed intake; the ok arm walks the documents over the
+            // split intake env (the `td_->documents_manager_->
+            // on_get_document` loop, cpp:584-586) before the manager
+            // finishes the state machine.
+            K::GetSavedGifs { is_repair } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::messages_SavedGifs::parse(query.ok()) {
+                        Ok(saved_gifs) => Ok(saved_gifs),
+                        Err(error) => {
+                            tdutils::log_error!("Can't parse messages.savedGifs: {error}");
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the messages_getSavedGifs answer",
+                            ))
+                        }
+                    }
+                };
+                match result {
+                    Err(status) => {
+                        if !self.global.is_expected_error(&status) {
+                            tdutils::log_error!("Receive error for get saved animations: {status}");
+                        }
+                        let mut manager = std::mem::take(&mut self.animations_manager);
+                        manager.on_get_saved_animations_failed(is_repair, status);
+                        self.animations_manager = manager;
+                    }
+                    Ok(saved_gifs) => {
+                        // the documents walk (cpp:575-604) — no manager
+                        // method is live here, so the intake env routes
+                        // the record dispatch
+                        let walk = {
+                            let (mut env, documents) = self.documents_env();
+                            crate::animations_manager::walk_saved_animations(
+                                documents, &mut env, saved_gifs,
+                            )
+                        };
+                        let mut manager = std::mem::take(&mut self.animations_manager);
+                        {
+                            let Td {
+                                global,
+                                option_manager,
+                                auth_manager,
+                                file_manager,
+                                file_reference_manager,
+                                animations_updates,
+                                ..
+                            } = self;
+                            let mut env = TdAnimationsEnv {
+                                global,
+                                options: option_manager.as_mut(),
+                                auth_is_bot: auth_manager.is_bot(),
+                                file_manager: std::sync::Arc::clone(file_manager),
+                                file_reference_manager,
+                                updates: animations_updates,
+                            };
+                            manager.on_get_saved_animations(&mut env, is_repair, walk);
+                        }
+                        self.animations_manager = manager;
+                        // the intake queued `updateSavedAnimations` —
+                        // flush the outbox with the answer (the C++
+                        // send_closures it from the manager)
+                        for update in std::mem::take(&mut self.animations_updates) {
+                            self.send_update(update.into());
+                        }
+                    }
+                }
+            }
+            // `SaveGifQuery::on_result`/`on_error` (cpp:86-123) — the
+            // Bool parses here, the bands (the ok=false reload, the
+            // degraded file-reference treatment, the verbatim error)
+            // run in the manager intake with the parked lot head.
+            K::SaveGif { file_id, unsave } => {
+                let result: tdutils::status::Result<bool> = if query.is_error() {
+                    tdutils::status::Result::Err(query.error().clone())
+                } else {
+                    match crate::td::parse_wire_bool_value(query.ok()) {
+                        Some(result) => tdutils::status::Result::Ok(result),
+                        None => {
+                            tdutils::log_error!("Can't parse messages.saveGif Bool answer");
+                            tdutils::status::Result::Err(Status::error(
+                                500,
+                                "Failed to parse the messages_saveGif answer",
+                            ))
+                        }
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.animations_manager);
+                let parked = manager.pop_save_gif_query();
+                {
+                    let Td {
+                        global,
+                        option_manager,
+                        auth_manager,
+                        file_manager,
+                        file_reference_manager,
+                        animations_updates,
+                        ..
+                    } = self;
+                    let mut env = TdAnimationsEnv {
+                        global,
+                        options: option_manager.as_mut(),
+                        auth_is_bot: auth_manager.is_bot(),
+                        file_manager: std::sync::Arc::clone(file_manager),
+                        file_reference_manager,
+                        updates: animations_updates,
+                    };
+                    manager.on_save_gif_result(&mut env, file_id, unsave, result, parked);
+                }
+                self.animations_manager = manager;
+                for update in std::mem::take(&mut self.animations_updates) {
+                    self.send_update(update.into());
+                }
             }
         }
     }
@@ -23031,6 +23354,7 @@ impl Td {
                 file_load_manager: std::sync::Arc::clone(&self.file_load_manager),
                 file_reference_manager: &mut self.file_reference_manager,
                 documents_manager: &mut self.documents_manager,
+                animations: &mut self.animations_manager,
                 audios: &mut self.audios_manager,
                 videos: &mut self.videos_manager,
                 voice_notes: &mut self.voice_notes_manager,
@@ -24141,6 +24465,309 @@ impl Td {
                         tdutils::log_error!("Receive error for sponsored chat hiding: {status}");
                     }
                 }
+            }
+        }
+    }
+
+    /// Route one langpack net answer by kind — the five C++ request
+    /// lambdas of LanguagePackManager.cpp:433-458, 871-897 and 1128-1161.
+    /// Every arm takes its pending slot (the capture-exact pairing) and
+    /// runs the landed manager response half through the production env
+    /// (the take-out keeps the borrows disjoint; the env carries the live
+    /// net so the version-changed re-fire chains keep dispatching, the
+    /// C++ `send_closure(actor_id, ...)` behavior).
+    fn on_lang_pack_net_answer(&mut self, kind: LangPackNetKind, query: NetQuery) {
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        let pending = match kind {
+            LangPackNetKind::Languages { pending_index }
+            | LangPackNetKind::LanguageInfo { pending_index }
+            | LangPackNetKind::LangPack { pending_index }
+            | LangPackNetKind::Strings { pending_index }
+            | LangPackNetKind::Difference { pending_index } => {
+                take_lang_pack_pending(&mut self.langpack_pending, pending_index)
+            }
+        };
+        let Some(pending) = pending else {
+            return;
+        };
+        match pending {
+            // `langpack.getLanguages` (cpp:871-876) — the answer re-enters
+            // `on_get_languages` (the merge + the server-info cache save).
+            crate::language_pack_manager::PendingLangPackQuery::Languages {
+                language_pack,
+                mut promise,
+            } => {
+                if query.is_error() {
+                    promise.set_error(query.error().clone());
+                    return;
+                }
+                let Some(languages) =
+                    parse_wire_vector(query.ok(), telegram_api::LangPackLanguage::read)
+                else {
+                    promise.set_error(parse_error("langpack_getLanguages"));
+                    return;
+                };
+                let mut manager = std::mem::take(&mut self.language_pack_manager);
+                let net = self.langpack_net();
+                let mut env = LanguagePackEnv {
+                    options: self.option_manager.as_mut(),
+                    updates: &mut self.language_pack_updates,
+                    net,
+                    pending: &mut self.langpack_pending,
+                };
+                manager.on_get_languages(&mut env, languages, language_pack, false, promise);
+                self.language_pack_manager = manager;
+            }
+            // `langpack.getLanguage` (cpp:887-894) — the answer re-enters
+            // `on_get_language` (the info build + the cache update).
+            crate::language_pack_manager::PendingLangPackQuery::LanguageInfo {
+                language_pack,
+                language_code,
+                mut promise,
+            } => {
+                if query.is_error() {
+                    promise.set_error(query.error().clone());
+                    return;
+                }
+                let Ok(language) = telegram_api::LangPackLanguage::parse(query.ok()) else {
+                    promise.set_error(parse_error("langpack_getLanguage"));
+                    return;
+                };
+                tdutils::log_info!("Receive {language:?}");
+                let mut manager = std::mem::take(&mut self.language_pack_manager);
+                let net = self.langpack_net();
+                let mut env = LanguagePackEnv {
+                    options: self.option_manager.as_mut(),
+                    updates: &mut self.language_pack_updates,
+                    net,
+                    pending: &mut self.langpack_pending,
+                };
+                manager.on_get_language(&mut env, language, language_pack, language_code, promise);
+                self.language_pack_manager = manager;
+            }
+            // `langpack.getLangPack` (cpp:1128-1150) — the chained hop:
+            // the fetch failure fails the parked get-all promises through
+            // the chained promise (cpp:1134-1136); the answer runs
+            // `on_get_language_pack_strings` first, the rebuilt strings
+            // then ride the catch-slot into `on_get_all_language_pack_strings`
+            // (the C++ promise-lambda chain, here a one-slot catcher).
+            crate::language_pack_manager::PendingLangPackQuery::LangPack {
+                language_pack,
+                language_code,
+            } => {
+                let difference = if query.is_error() {
+                    let status = query.error().clone();
+                    let mut manager = std::mem::take(&mut self.language_pack_manager);
+                    manager.on_get_all_language_pack_strings(
+                        language_pack,
+                        language_code,
+                        tdutils::status::Result::Err(status),
+                    );
+                    self.language_pack_manager = manager;
+                    return;
+                } else {
+                    match telegram_api::LangPackDifference::parse(query.ok()) {
+                        Ok(difference) => difference,
+                        Err(_) => {
+                            let status = parse_error("langpack_getLangPack");
+                            let mut manager = std::mem::take(&mut self.language_pack_manager);
+                            manager.on_get_all_language_pack_strings(
+                                language_pack,
+                                language_code,
+                                tdutils::status::Result::Err(status),
+                            );
+                            self.language_pack_manager = manager;
+                            return;
+                        }
+                    }
+                };
+                let wire_lang_code = difference.lang_code.to_ascii_lowercase();
+                tdutils::log_info!(
+                    "Receive language pack {} from version {} with version {} of size {}",
+                    wire_lang_code,
+                    difference.from_version,
+                    difference.version,
+                    difference.strings.len()
+                );
+                if wire_lang_code != language_code {
+                    tdutils::log_error!(
+                        "Receive strings for {} instead of {}",
+                        wire_lang_code,
+                        language_code
+                    );
+                }
+                if difference.from_version != 0 {
+                    tdutils::log_error!(
+                        "Receive language pack from version {}",
+                        difference.from_version
+                    );
+                }
+                let (chained, chained_slot) = catch_language_pack_strings();
+                let mut manager = std::mem::take(&mut self.language_pack_manager);
+                let net = self.langpack_net();
+                {
+                    let mut env = LanguagePackEnv {
+                        options: self.option_manager.as_mut(),
+                        updates: &mut self.language_pack_updates,
+                        net,
+                        pending: &mut self.langpack_pending,
+                    };
+                    manager.on_get_language_pack_strings(
+                        &mut env,
+                        language_pack.clone(),
+                        language_code.clone(),
+                        difference.version,
+                        false,
+                        Vec::new(),
+                        difference.strings,
+                        chained,
+                    );
+                }
+                let r_strings = chained_slot.lock().take().unwrap_or_else(|| {
+                    tdutils::status::Result::Err(Status::error(
+                        500,
+                        "Langpack answer chain lost the strings",
+                    ))
+                });
+                manager.on_get_all_language_pack_strings(language_pack, language_code, r_strings);
+                self.language_pack_manager = manager;
+            }
+            // `langpack.getStrings` (cpp:1152-1158) — the answer re-enters
+            // `on_get_language_pack_strings` with version −1 (the keyed
+            // fetch never bumps the pack version).
+            crate::language_pack_manager::PendingLangPackQuery::Strings {
+                language_pack,
+                language_code,
+                keys,
+                mut promise,
+            } => {
+                if query.is_error() {
+                    promise.set_error(query.error().clone());
+                    return;
+                }
+                let Some(strings) =
+                    parse_wire_vector(query.ok(), telegram_api::LangPackString::read)
+                else {
+                    promise.set_error(parse_error("langpack_getStrings"));
+                    return;
+                };
+                let mut manager = std::mem::take(&mut self.language_pack_manager);
+                let net = self.langpack_net();
+                let mut env = LanguagePackEnv {
+                    options: self.option_manager.as_mut(),
+                    updates: &mut self.language_pack_updates,
+                    net,
+                    pending: &mut self.langpack_pending,
+                };
+                manager.on_get_language_pack_strings(
+                    &mut env,
+                    language_pack,
+                    language_code,
+                    -1,
+                    false,
+                    keys,
+                    strings,
+                    promise,
+                );
+                self.language_pack_manager = manager;
+            }
+            // `langpack.getDifference` (cpp:433-455) — the failure half is
+            // `on_failed_get_difference` (the parked difference queue), the
+            // answer re-enters `on_get_language_pack_strings(..., is_diff =
+            // true)` with an empty promise (the difference queue is the
+            // answer surface, cpp:449-455).
+            crate::language_pack_manager::PendingLangPackQuery::Difference {
+                language_pack,
+                language_code,
+                from_version,
+            } => {
+                let difference = if query.is_error() {
+                    let status = query.error().clone();
+                    let mut manager = std::mem::take(&mut self.language_pack_manager);
+                    let net = self.langpack_net();
+                    let mut env = LanguagePackEnv {
+                        options: self.option_manager.as_mut(),
+                        updates: &mut self.language_pack_updates,
+                        net,
+                        pending: &mut self.langpack_pending,
+                    };
+                    crate::language_pack_manager::on_failed_get_difference(
+                        &mut manager,
+                        &mut env,
+                        &language_pack,
+                        &language_code,
+                        status,
+                    );
+                    self.language_pack_manager = manager;
+                    return;
+                } else {
+                    match telegram_api::LangPackDifference::parse(query.ok()) {
+                        Ok(difference) => difference,
+                        Err(_) => {
+                            let status = parse_error("langpack_getDifference");
+                            let mut manager = std::mem::take(&mut self.language_pack_manager);
+                            let net = self.langpack_net();
+                            let mut env = LanguagePackEnv {
+                                options: self.option_manager.as_mut(),
+                                updates: &mut self.language_pack_updates,
+                                net,
+                                pending: &mut self.langpack_pending,
+                            };
+                            crate::language_pack_manager::on_failed_get_difference(
+                                &mut manager,
+                                &mut env,
+                                &language_pack,
+                                &language_code,
+                                status,
+                            );
+                            self.language_pack_manager = manager;
+                            return;
+                        }
+                    }
+                };
+                let wire_lang_code = difference.lang_code.to_ascii_lowercase();
+                tdutils::log_info!(
+                    "Receive language pack difference for language pack {} from version {} with version {} of size {}",
+                    wire_lang_code,
+                    difference.from_version,
+                    difference.version,
+                    difference.strings.len()
+                );
+                if wire_lang_code != language_code {
+                    tdutils::log_error!(
+                        "Receive strings for {} instead of {}",
+                        wire_lang_code,
+                        language_code
+                    );
+                }
+                if difference.from_version != from_version {
+                    tdutils::log_error!(
+                        "Receive strings from {} instead of {}",
+                        difference.from_version,
+                        from_version
+                    );
+                }
+                let mut manager = std::mem::take(&mut self.language_pack_manager);
+                let net = self.langpack_net();
+                let mut env = LanguagePackEnv {
+                    options: self.option_manager.as_mut(),
+                    updates: &mut self.language_pack_updates,
+                    net,
+                    pending: &mut self.langpack_pending,
+                };
+                manager.on_get_language_pack_strings(
+                    &mut env,
+                    language_pack,
+                    language_code,
+                    difference.version,
+                    true,
+                    Vec::new(),
+                    difference.strings,
+                    Promise::default(),
+                );
+                self.language_pack_manager = manager;
             }
         }
     }
@@ -26369,6 +26996,9 @@ impl Td {
                 Some(queue.remove(0))
             }
         }
+        // The dispatch surface hoisted before the arms (the env literal's
+        // field borrows must not overlap a `&self` method call).
+        let call_net = self.call_net();
         // The manager-env split for the intakes (the `CallEnv` field
         // borrows stay disjoint from the manager borrow).
         macro_rules! call_env {
@@ -26386,6 +27016,7 @@ impl Td {
                     notification_manager: &mut self.notification_manager,
                     updates: &mut self.call_updates,
                     dh_config: &mut self.call_dh_config,
+                    call_net: call_net.clone(),
                 }
             };
         }
@@ -26453,6 +27084,281 @@ impl Td {
                             }
                             None => promise.set_error(parse_error("phone.saveCallLog")),
                         }
+                    }
+                }
+            }
+            // `GetDhConfigQuery` — the answer half of `do_load_dh_config`
+            // (CallActor.cpp:683-701): the fetch lambda builds the DhConfig,
+            // feeds the DRBG (`Random::add_seed`, cpp:690) and stores the
+            // full variant in the global config slot (cpp:691) — before
+            // the actor's good-prime check, exactly like the C++ — while
+            // the NotModified leg falls back to the stored config — the
+            // C++ captured it at send time, the store read is the
+            // equivalent — or takes the 500 band (cpp:701); the result
+            // rides `CallActor::on_dh_config` through the manager.
+            K::GetDhConfig { call_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::messages_DhConfig::parse(query.ok()) {
+                        Ok(telegram_api::messages_DhConfig::messages_dhConfig(dh)) => {
+                            tdutils::random::add_seed(&dh.random, 0.0);
+                            let config = DhConfig {
+                                version: dh.version,
+                                prime: dh.p,
+                                g: dh.g,
+                            };
+                            // the fetch lambda stores the config before
+                            // the actor's check runs (cpp:691)
+                            self.call_dh_config = Some(config.clone());
+                            Ok(config)
+                        }
+                        Ok(telegram_api::messages_DhConfig::messages_dhConfigNotModified(dh)) => {
+                            tdutils::random::add_seed(&dh.random, 0.0);
+                            // the stored-config read (the C++ captured the
+                            // old config at send time, cpp:699-701)
+                            self.call_dh_config
+                                .clone()
+                                .ok_or_else(|| Status::error(500, "Can't load DhConfig"))
+                        }
+                        Err(_) => Err(parse_error("messages.getDhConfig")),
+                    }
+                };
+                let mut env = call_env!();
+                self.call_manager
+                    .on_dh_config_net_answer(&mut env, call_id, result);
+            }
+            // `GetCallConfigQuery` — the `start_up` answer (CallActor.cpp:893-900):
+            // the dataJSON rides `call_state_.config` (the Ready flush
+            // waits for it, cpp:866-868).
+            K::GetCallConfig { call_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::DataJSON::parse(query.ok()) {
+                        Ok(data) => Ok(data.data),
+                        Err(_) => Err(parse_error("phone.getCallConfig")),
+                    }
+                };
+                let mut env = call_env!();
+                self.call_manager
+                    .on_call_config_net_answer(&mut env, call_id, result);
+            }
+            // The request/accept/confirm answers — the three
+            // `on_*_query_result` halves (CallActor.cpp:753-758/:784-789/
+            // :808-812) all ride `update_call_inner` on ok and `on_error`
+            // on the fetch error.
+            K::RequestCall { call_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::phone_PhoneCall::parse(query.ok())
+                        .map_err(|_| parse_error("phone.requestCall"))
+                };
+                let mut env = call_env!();
+                self.call_manager
+                    .on_phone_call_net_answer(&mut env, call_id, result);
+            }
+            K::AcceptCall { call_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::phone_PhoneCall::parse(query.ok())
+                        .map_err(|_| parse_error("phone.acceptCall"))
+                };
+                let mut env = call_env!();
+                self.call_manager
+                    .on_phone_call_net_answer(&mut env, call_id, result);
+            }
+            K::ConfirmCall { call_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::phone_PhoneCall::parse(query.ok())
+                        .map_err(|_| parse_error("phone.confirmCall"))
+                };
+                let mut env = call_env!();
+                self.call_manager
+                    .on_phone_call_net_answer(&mut env, call_id, result);
+            }
+            // `DiscardCallQuery` — the ok answer rides the Updates engine
+            // with an empty promise (CallActor.cpp:837-841, the
+            // SetCallRating shape minus the request promise); only the
+            // fetch error routes into the actor.
+            K::DiscardCall { call_id } => {
+                if query.is_error() {
+                    let result = Err(query.error().clone());
+                    let mut env = call_env!();
+                    self.call_manager
+                        .on_discard_call_net_answer(&mut env, call_id, result);
+                } else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => self.um_send(UmMessage::OnGetUpdates {
+                            updates: Box::new(updates),
+                            promise: Promise::default(),
+                        }),
+                        Err(_) => {
+                            let result = Err(parse_error("phone.discardCall"));
+                            let mut env = call_env!();
+                            self.call_manager
+                                .on_discard_call_net_answer(&mut env, call_id, result);
+                        }
+                    }
+                }
+            }
+            // `ReceivedCallQuery` — the ok answer is unused
+            // (CallActor.cpp:714-719), the fetch error routes into the
+            // actor.
+            K::ReceivedCall { call_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    parse_wire_bool(query.ok()).ok_or_else(|| parse_error("phone.receivedCall"))
+                };
+                let mut env = call_env!();
+                self.call_manager
+                    .on_received_call_net_answer(&mut env, call_id, result);
+            }
+            // `SendSignalingDataQuery` — the promise rides the FIFO family
+            // lot and settles in the router with no actor tail
+            // (CallActor.cpp:280-289); a false Bool is still an ok answer.
+            K::SendSignalingData { .. } => {
+                if let Some(mut promise) =
+                    pop_head(&mut self.call_manager.pending.send_signaling_data)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match parse_wire_bool_value(query.ok()) {
+                            Some(_) => promise.set_value(()),
+                            None => promise.set_error(parse_error("phone.sendSignalingData")),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Route one secret-chats net answer by kind — the C++
+    /// ResultHandler/on_result_resendable halves of the five wire
+    /// families (SecretChatActor.cpp:105-135). The manager holds the
+    /// per-family parking lots; the intakes run over the env split
+    /// (the `SecretChatsTdEnv` field borrows stay disjoint from the
+    /// manager borrow).
+    fn on_secret_net_answer(
+        &mut self,
+        kind: crate::secret_chats_manager::SecretNetKind,
+        query: NetQuery,
+    ) {
+        use crate::secret_chats_manager::SecretNetKind as K;
+        fn parse_error(what: &str) -> Status {
+            Status::error(500, &format!("Failed to parse the {what} answer"))
+        }
+        macro_rules! secret_env {
+            () => {
+                crate::td::SecretChatsTdEnv {
+                    global: &mut self.global,
+                    auth_is_authorized: self.auth_manager.is_authorized(),
+                    use_secret_chats: true,
+                    user_manager: &mut self.user_manager,
+                    updates: &mut self.notification_updates,
+                }
+            };
+        }
+        match kind {
+            // `on_update_chat(NetQueryPtr)` over the create entry
+            // (SecretChatActor.cpp:1805-1815); the wire error is the
+            // check_status fatal band (cpp:626-640).
+            K::RequestEncryption => {
+                if self.secret_chats_manager.pending.creates.is_empty() {
+                    tdutils::log_info!("Receive an unexpected messages.requestEncryption answer");
+                    return;
+                }
+                let pending = self.secret_chats_manager.pending.creates.remove(0);
+                let answer = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::EncryptedChat::parse(query.ok())
+                        .map_err(|_| parse_error("messages.requestEncryption"))
+                };
+                let mut env = secret_env!();
+                self.secret_chats_manager
+                    .on_secret_net_create_answer(&mut env, pending, answer);
+            }
+            // The SendAccept answer — the same union over the planted
+            // accept handshake (cpp:1769-1803).
+            K::AcceptEncryption { secret_chat_id } => {
+                let answer = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::EncryptedChat::parse(query.ok())
+                        .map_err(|_| parse_error("messages.acceptEncryption"))
+                };
+                let mut env = secret_env!();
+                self.secret_chats_manager.on_secret_net_accept_answer(
+                    &mut env,
+                    crate::secret_chat::SecretChatId::new(secret_chat_id),
+                    answer,
+                );
+            }
+            // The close receipt — the C++ close_flag_ branch settles
+            // `discard_encryption_promise_` on any outcome (cpp:113-117).
+            K::DiscardEncryption => {
+                if self.secret_chats_manager.pending.discards.is_empty() {
+                    tdutils::log_info!("Receive an unexpected messages.discardEncryption answer");
+                    return;
+                }
+                let mut promise = self.secret_chats_manager.pending.discards.remove(0);
+                promise.set_value(());
+            }
+            // The read receipt — the body is not parsed; the
+            // generation match settles the parked promise (cpp:1823-1828)
+            // and stale generations drop.
+            K::ReadHistory { generation } => {
+                let position = self
+                    .secret_chats_manager
+                    .pending
+                    .read_history
+                    .iter()
+                    .position(|(_, parked, _)| *parked == generation);
+                match position {
+                    Some(index) => {
+                        let (_, _, mut promise) =
+                            self.secret_chats_manager.pending.read_history.remove(index);
+                        promise.set_value(());
+                    }
+                    None => {
+                        tdutils::log_info!("Receive a stale messages.readEncryptedHistory answer");
+                    }
+                }
+            }
+            // The outbound send answer (on_outbound_send_message_result,
+            // cpp:1520-1600): the error forwards to the send receipt (the
+            // C++ routes it through MessagesManager on_send_message_error,
+            // unported); the `sentEncryptedMessage`/`sentEncryptedFile`
+            // ok leg settles `Unit` — the
+            // `MessageId(ServerMessageId(random_id))` routing rides
+            // MessagesManager too.
+            K::SendEncrypted { service } => {
+                if self.secret_chats_manager.pending.sends.is_empty() {
+                    tdutils::log_info!("Receive an unexpected messages.sendEncrypted answer");
+                    return;
+                }
+                // The §5 FIFO pairing — the family lot pops the head like
+                // the sibling lots (the C++ carries the promise on the
+                // query itself, so the answers pair in order).
+                let mut promise = self.secret_chats_manager.pending.sends.remove(0);
+                if query.is_error() {
+                    promise.set_error(query.error().clone());
+                } else {
+                    let what = if service {
+                        "messages.sendEncryptedService"
+                    } else {
+                        "messages.sendEncrypted"
+                    };
+                    match telegram_api::messages_SentEncryptedMessage::parse(query.ok()) {
+                        Ok(_) => promise.set_value(()),
+                        Err(_) => promise.set_error(parse_error(what)),
                     }
                 }
             }
@@ -29362,6 +30268,7 @@ impl Td {
             file_load_manager: std::sync::Arc::clone(&self.file_load_manager),
             file_reference_manager: &mut self.file_reference_manager,
             documents_manager: &mut self.documents_manager,
+            animations: &mut self.animations_manager,
             audios: &mut self.audios_manager,
             videos: &mut self.videos_manager,
             voice_notes: &mut self.voice_notes_manager,
@@ -29454,9 +30361,12 @@ impl Td {
     /// plus `start_up` (cpp:228-250) — the collapsed actor start reads the
     /// restored options and opens the language pack database (M.24).
     fn init_language_pack_manager(&mut self) {
+        let net = self.langpack_net();
         let mut env = LanguagePackEnv {
             options: self.option_manager.as_mut(),
             updates: &mut self.language_pack_updates,
+            net,
+            pending: &mut self.langpack_pending,
         };
         self.language_pack_manager.init(&mut env);
     }
@@ -31892,7 +32802,7 @@ impl FileManagerWorker for TdFileWorker {
 // The C++ AnimationsManager reads `G()` (options, close flag, the binlog
 // + sqlite pmcs, the FileManager) and sends its queries from the
 // collapsed actor's `create_handler`s; the env carries the same surfaces
-// and the `[blocked: net]` query seams.
+// (the two wire queries ride the manager-held net handle, net-drain 56).
 
 /// The per-call [`crate::animations_manager::AnimationsManagerEnv`] over
 /// the Td fields — built per call with the field-split borrows, never
@@ -32008,31 +32918,8 @@ impl crate::animations_manager::AnimationsManagerEnv for TdAnimationsEnv<'_> {
         }
     }
 
-    fn on_get_document_animation(&mut self, _document: telegram_api::document) -> Option<FileId> {
-        // `td_->documents_manager_->on_get_document` — the
-        // [blocked: M.28] intake seam; answers None until the document
-        // plane lands, which the caller handles like the C++
-        // non-animation case.
-        None
-    }
-
-    fn send_get_saved_gifs_query(&mut self, is_repair: bool, hash: i64) {
-        tdutils::log_info!(
-            "Send GetSavedGifsQuery(is_repair = {is_repair}, hash = {hash}) — [blocked: net]"
-        );
-    }
-
-    fn send_save_gif_query_net(
-        &mut self,
-        file_id: FileId,
-        unsave: bool,
-        _input_document: telegram_api::InputDocument,
-        _promise: Promise<()>,
-    ) {
-        tdutils::log_info!(
-            "Send SaveGifQuery(file_id = {}, unsave = {unsave}) — [blocked: net]",
-            file_id.get()
-        );
+    fn is_expected_error(&self, status: &tdutils::status::Status) -> bool {
+        self.global.is_expected_error(status)
     }
 }
 
@@ -32047,11 +32934,14 @@ impl crate::animations_manager::AnimationsManagerEnv for TdAnimationsEnv<'_> {
 
 /// The field-split [`crate::documents_manager::DocumentsManagerEnv`]
 /// of the `on_get_document` intake: the document manager itself plus
-/// the disjoint sibling records its `create_*` tails build.
+/// the disjoint sibling records its `create_*` tails build — the
+/// animations manager carries the record dispatch
+/// (`animations_manager_->create_animation`, DocumentsManager.cpp:552).
 pub(crate) struct TdDocumentsEnv<'a> {
     pub(crate) auth_is_bot: bool,
     pub(crate) file_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>>,
     pub(crate) file_load_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileLoadManager>>,
+    pub(crate) animations: &'a mut crate::animations_manager::AnimationsManager,
     pub(crate) audios: &'a mut crate::audios_manager::AudiosManager,
     pub(crate) videos: &'a mut crate::videos_manager::VideosManager,
     pub(crate) voice_notes: &'a mut crate::voice_notes_manager::VoiceNotesManager,
@@ -32088,22 +32978,33 @@ impl crate::documents_manager::DocumentsManagerEnv for TdDocumentsEnv<'_> {
 
     fn create_animation(
         &mut self,
-        _file_id: FileId,
-        _minithumbnail: String,
-        _thumbnail: crate::photo::PhotoSize,
-        _animated_thumbnail: crate::photo::AnimationSize,
-        _has_stickers: bool,
-        _file_name: String,
-        _mime_type: String,
-        _duration: i32,
-        _dimensions: crate::photo::Dimensions,
-        _replace: bool,
+        file_id: FileId,
+        minithumbnail: String,
+        thumbnail: crate::photo::PhotoSize,
+        animated_thumbnail: crate::photo::AnimationSize,
+        has_stickers: bool,
+        file_name: String,
+        mime_type: String,
+        duration: i32,
+        dimensions: crate::photo::Dimensions,
+        replace: bool,
     ) {
         // the C++ routes this to `animations_manager_->create_animation`
-        // (with the empty sticker-file-ids vector); the animation record
-        // dispatch rides the M.20 env construction at the message-content
-        // intake flip
-        tdutils::log_info!("create_animation — [blocked: M.20 record dispatch]");
+        // with the empty sticker-file-ids vector (DocumentsManager.cpp:552)
+        self.animations.create_animation(
+            self.auth_is_bot,
+            file_id,
+            minithumbnail,
+            thumbnail,
+            animated_thumbnail,
+            has_stickers,
+            Vec::new(),
+            file_name,
+            mime_type,
+            duration,
+            dimensions,
+            replace,
+        );
     }
 
     fn create_sticker(
@@ -32254,16 +33155,8 @@ impl crate::documents_manager::DocumentsManagerEnv for Td {
     ) {
         // the C++ DocumentsManager dispatch passes the empty
         // sticker-file-ids vector (DocumentsManager.cpp:552-554)
-        let mut env = TdAnimationsEnv {
-            global: &mut self.global,
-            options: self.option_manager.as_mut(),
-            auth_is_bot: self.auth_manager.is_bot(),
-            file_manager: std::sync::Arc::clone(&self.file_manager),
-            file_reference_manager: &mut self.file_reference_manager,
-            updates: &mut self.animations_updates,
-        };
         self.animations_manager.create_animation(
-            &mut env,
+            self.auth_manager.is_bot(),
             file_id,
             minithumbnail,
             thumbnail,
@@ -32411,6 +33304,7 @@ impl Td {
                 auth_is_bot: self.auth_manager.is_bot(),
                 file_manager: std::sync::Arc::clone(&self.file_manager),
                 file_load_manager: std::sync::Arc::clone(&self.file_load_manager),
+                animations: &mut self.animations_manager,
                 audios: &mut self.audios_manager,
                 videos: &mut self.videos_manager,
                 voice_notes: &mut self.voice_notes_manager,
@@ -35642,11 +36536,21 @@ impl crate::message_entity::UserManagerLike for TdTranslationEnv<'_> {
 /// [`Td::init_language_pack_manager`]). The `send_update`s buffer into
 /// [`Td::language_pack_updates`] and Td drains them — the collapsed
 /// `send_closure(G()->td(), &Td::send_update)` hop. The five net queries
-/// are the M.24 `[blocked: net]` seams: the C++ promises land in the
-/// query (or the manager's pending maps) and stay unanswered offline.
+/// ride the `LangPackNetKind` unauth band (the `create_unauth` shape,
+/// LanguagePackManager.cpp:456/877/896/1149/1159): the promises park in
+/// the pending slots the kinds name, and the answers drain through
+/// [`Td::on_lang_pack_net_answer`].
 pub(crate) struct LanguagePackEnv<'a> {
     pub(crate) options: Option<&'a mut OptionManager>,
     pub(crate) updates: &'a mut Vec<td_api::Update>,
+    /// The net-drain 60 dispatch surface (the five langpack.* wire
+    /// queries over the unauth band); `None` keeps the net-inert
+    /// posture (pre-init and in the net-inert tests).
+    pub(crate) net: Option<LangPackNetHandle>,
+    /// The parked query state (the C++ lambdas' captured params +
+    /// promises) — slot-indexed by the net kinds; the send legs push
+    /// `Some(...)` and carry the index.
+    pub(crate) pending: &'a mut Vec<Option<crate::language_pack_manager::PendingLangPackQuery>>,
 }
 
 impl crate::language_pack_manager::LanguagePackManagerEnv for LanguagePackEnv<'_> {
@@ -35673,59 +36577,159 @@ impl crate::language_pack_manager::LanguagePackManagerEnv for LanguagePackEnv<'_
         self.updates.push(update);
     }
 
-    /// `langpack_getLanguages` (LanguagePackManager.cpp:871-878).
+    /// `langpack_getLanguages` (LanguagePackManager.cpp:871-878) — the
+    /// unauth dispatch; the promise parks in the pending slot the kind
+    /// names (the capture-exact pairing).
     fn send_get_languages_query(
         &mut self,
         language_pack: String,
-        _promise: tdutils::promise::Promise<td_api::LocalizationTargetInfo>,
+        promise: tdutils::promise::Promise<td_api::LocalizationTargetInfo>,
     ) {
-        tdutils::log_info!(
-            "Send langpack.getLanguages for language pack {language_pack} — [blocked: net]"
+        let Some(net) = &self.net else {
+            tdutils::log_info!(
+                "Send langpack.getLanguages for language pack {language_pack} — [net-inert]"
+            );
+            return;
+        };
+        let pending_index = push_lang_pack_pending(
+            self.pending,
+            crate::language_pack_manager::PendingLangPackQuery::Languages {
+                language_pack: language_pack.clone(),
+                promise,
+            },
+        );
+        net.dispatch_unauth(
+            LangPackNetKind::Languages { pending_index },
+            telegram_api::Function::langpack_getLanguages(telegram_api::langpack_getLanguages {
+                lang_pack: language_pack,
+            }),
         );
     }
 
-    /// `langpack_getLanguage` (LanguagePackManager.cpp:887-897).
+    /// `langpack_getLanguage` (LanguagePackManager.cpp:887-897) — the
+    /// unauth dispatch over the parked slot.
     fn send_get_language_query(
         &mut self,
         language_pack: String,
         language_code: String,
-        _promise: tdutils::promise::Promise<td_api::LanguagePackInfo>,
+        promise: tdutils::promise::Promise<td_api::LanguagePackInfo>,
     ) {
-        tdutils::log_info!(
-            "Send langpack.getLanguage for language pack {language_pack}, language code {language_code} — [blocked: net]"
+        let Some(net) = &self.net else {
+            tdutils::log_info!(
+                "Send langpack.getLanguage for language pack {language_pack}, language code {language_code} — [net-inert]"
+            );
+            return;
+        };
+        let pending_index = push_lang_pack_pending(
+            self.pending,
+            crate::language_pack_manager::PendingLangPackQuery::LanguageInfo {
+                language_pack: language_pack.clone(),
+                language_code: language_code.clone(),
+                promise,
+            },
+        );
+        net.dispatch_unauth(
+            LangPackNetKind::LanguageInfo { pending_index },
+            telegram_api::Function::langpack_getLanguage(telegram_api::langpack_getLanguage {
+                lang_pack: language_pack,
+                lang_code: language_code,
+            }),
         );
     }
 
-    /// `langpack_getLangPack` (LanguagePackManager.cpp:1148-1150).
+    /// `langpack_getLangPack` (LanguagePackManager.cpp:1148-1150) — the
+    /// get-all promises park in the manager's query map, so the slot
+    /// carries only the params (the answer chain re-enters through
+    /// `Td::on_lang_pack_net_answer`).
     fn send_get_lang_pack_query(&mut self, language_pack: String, language_code: String) {
-        tdutils::log_info!(
-            "Send langpack.getLangPack for language pack {language_pack}, language code {language_code} — [blocked: net]"
+        let Some(net) = &self.net else {
+            tdutils::log_info!(
+                "Send langpack.getLangPack for language pack {language_pack}, language code {language_code} — [net-inert]"
+            );
+            return;
+        };
+        let pending_index = push_lang_pack_pending(
+            self.pending,
+            crate::language_pack_manager::PendingLangPackQuery::LangPack {
+                language_pack: language_pack.clone(),
+                language_code: language_code.clone(),
+            },
+        );
+        net.dispatch_unauth(
+            LangPackNetKind::LangPack { pending_index },
+            telegram_api::Function::langpack_getLangPack(telegram_api::langpack_getLangPack {
+                lang_pack: language_pack,
+                lang_code: language_code,
+            }),
         );
     }
 
-    /// `langpack_getStrings` (LanguagePackManager.cpp:1159-1161).
+    /// `langpack_getStrings` (LanguagePackManager.cpp:1159-1161) — the
+    /// keyed fetch over the parked slot.
     fn send_get_strings_query(
         &mut self,
         language_pack: String,
         language_code: String,
         keys: Vec<String>,
-        _promise: tdutils::promise::Promise<td_api::LanguagePackStrings>,
+        promise: tdutils::promise::Promise<td_api::LanguagePackStrings>,
     ) {
-        tdutils::log_info!(
-            "Send langpack.getStrings for language pack {language_pack}, language code {language_code}, {} keys — [blocked: net]",
-            keys.len()
+        let Some(net) = &self.net else {
+            tdutils::log_info!(
+                "Send langpack.getStrings for language pack {language_pack}, language code {language_code}, {} keys — [net-inert]",
+                keys.len()
+            );
+            return;
+        };
+        let pending_index = push_lang_pack_pending(
+            self.pending,
+            crate::language_pack_manager::PendingLangPackQuery::Strings {
+                language_pack: language_pack.clone(),
+                language_code: language_code.clone(),
+                keys: keys.clone(),
+                promise,
+            },
+        );
+        net.dispatch_unauth(
+            LangPackNetKind::Strings { pending_index },
+            telegram_api::Function::langpack_getStrings(telegram_api::langpack_getStrings {
+                lang_pack: language_pack,
+                lang_code: language_code,
+                keys,
+            }),
         );
     }
 
-    /// `langpack_getDifference` (LanguagePackManager.cpp:456-458).
+    /// `langpack_getDifference` (LanguagePackManager.cpp:456-458) — the
+    /// difference promises park in the language's difference queue, so
+    /// the slot carries only the params (the from_version rides along
+    /// for the C++ mismatch log, cpp:446-448).
     fn send_get_difference_query(
         &mut self,
         language_pack: String,
         language_code: String,
         from_version: i32,
     ) {
-        tdutils::log_info!(
-            "Send langpack.getDifference for language pack {language_pack}, language code {language_code}, from version {from_version} — [blocked: net]"
+        let Some(net) = &self.net else {
+            tdutils::log_info!(
+                "Send langpack.getDifference for language pack {language_pack}, language code {language_code}, from version {from_version} — [net-inert]"
+            );
+            return;
+        };
+        let pending_index = push_lang_pack_pending(
+            self.pending,
+            crate::language_pack_manager::PendingLangPackQuery::Difference {
+                language_pack: language_pack.clone(),
+                language_code: language_code.clone(),
+                from_version,
+            },
+        );
+        net.dispatch_unauth(
+            LangPackNetKind::Difference { pending_index },
+            telegram_api::Function::langpack_getDifference(telegram_api::langpack_getDifference {
+                lang_pack: language_pack,
+                lang_code: language_code,
+                from_version,
+            }),
         );
     }
 }
@@ -37598,6 +38602,10 @@ pub(crate) struct CallEnv<'a> {
     pub(crate) notification_manager: &'a mut NotificationManager,
     pub(crate) updates: &'a mut Vec<td_api::Update>,
     pub(crate) dh_config: &'a mut Option<DhConfig>,
+    /// The collapsed `G()` dispatch surface of the actor send seams (the
+    /// net-drain 61 second-handle precedent); `None` keeps the net-inert
+    /// posture (the pre-init windows and the net-inert tests).
+    pub(crate) call_net: Option<CallNetHandle>,
 }
 
 impl crate::dh_cache::DhCacheEnv for CallEnv<'_> {
@@ -37623,10 +38631,6 @@ impl crate::call_actor::CallActorEnv for CallEnv<'_> {
 
     fn get_dh_config(&self) -> Option<DhConfig> {
         self.dh_config.clone()
-    }
-
-    fn set_dh_config(&mut self, config: DhConfig) {
-        *self.dh_config = Some(config);
     }
 
     fn on_get_users(&mut self, users: Vec<tdmtproto::telegram_api::User>, source: &str) {
@@ -37669,6 +38673,125 @@ impl crate::call_actor::CallActorEnv for CallEnv<'_> {
 
     fn send_update(&mut self, update: td_api::Update) {
         self.updates.push(update);
+    }
+
+    fn send_get_call_config_query(
+        &mut self,
+        call_id: crate::call_id::CallId,
+        function: tdmtproto::telegram_api::Function,
+    ) {
+        dispatch_call_net(
+            &self.call_net,
+            crate::call_manager::CallNetKind::GetCallConfig { call_id },
+            function,
+            "phone.getCallConfig",
+        );
+    }
+
+    fn send_get_dh_config_query(
+        &mut self,
+        call_id: crate::call_id::CallId,
+        function: tdmtproto::telegram_api::Function,
+    ) {
+        dispatch_call_net(
+            &self.call_net,
+            crate::call_manager::CallNetKind::GetDhConfig { call_id },
+            function,
+            "messages.getDhConfig",
+        );
+    }
+
+    fn send_request_call_query(
+        &mut self,
+        call_id: crate::call_id::CallId,
+        function: tdmtproto::telegram_api::Function,
+    ) {
+        dispatch_call_net(
+            &self.call_net,
+            crate::call_manager::CallNetKind::RequestCall { call_id },
+            function,
+            "phone.requestCall",
+        );
+    }
+
+    fn send_accept_call_query(
+        &mut self,
+        call_id: crate::call_id::CallId,
+        function: tdmtproto::telegram_api::Function,
+    ) {
+        dispatch_call_net(
+            &self.call_net,
+            crate::call_manager::CallNetKind::AcceptCall { call_id },
+            function,
+            "phone.acceptCall",
+        );
+    }
+
+    fn send_confirm_call_query(
+        &mut self,
+        call_id: crate::call_id::CallId,
+        function: tdmtproto::telegram_api::Function,
+    ) {
+        dispatch_call_net(
+            &self.call_net,
+            crate::call_manager::CallNetKind::ConfirmCall { call_id },
+            function,
+            "phone.confirmCall",
+        );
+    }
+
+    fn send_discard_call_query(
+        &mut self,
+        call_id: crate::call_id::CallId,
+        function: tdmtproto::telegram_api::Function,
+    ) {
+        dispatch_call_net(
+            &self.call_net,
+            crate::call_manager::CallNetKind::DiscardCall { call_id },
+            function,
+            "phone.discardCall",
+        );
+    }
+
+    fn send_received_call_query(
+        &mut self,
+        call_id: crate::call_id::CallId,
+        function: tdmtproto::telegram_api::Function,
+    ) {
+        dispatch_call_net(
+            &self.call_net,
+            crate::call_manager::CallNetKind::ReceivedCall { call_id },
+            function,
+            "phone.receivedCall",
+        );
+    }
+
+    fn send_call_signaling_data_query(
+        &mut self,
+        call_id: crate::call_id::CallId,
+        function: tdmtproto::telegram_api::Function,
+    ) {
+        dispatch_call_net(
+            &self.call_net,
+            crate::call_manager::CallNetKind::SendSignalingData { call_id },
+            function,
+            "phone.sendSignalingData",
+        );
+    }
+}
+
+/// The collapsed `CallNetKind` dispatch the eight actor send seams share
+/// — the `Some(net) => net.dispatch(kind, function)` / net-inert log
+/// shape of the CallEnv overrides (the `NetKindHandle` plane).
+fn dispatch_call_net(
+    net: &Option<CallNetHandle>,
+    kind: crate::call_manager::CallNetKind,
+    function: tdmtproto::telegram_api::Function,
+    what: &str,
+) {
+    match net {
+        Some(net) => net.dispatch(kind, function),
+        None => tdutils::log_info!("Send {what} — [net-inert]"),
     }
 }
 
@@ -40412,6 +41535,36 @@ impl PremiumEnv for PremiumTdEnv<'_> {
         stickers_manager.get_premium_gift_sticker_object(&mut env, month_count, star_count)
     }
 
+    // Premium.cpp:371/377 — `animations_manager_->get_animation_object`
+    // over the animations record (the §6 flip, net-drain 56): the
+    // per-call animations env (the field-split shape — the answer drain
+    // builds the same view)
+    fn get_animation_object(&mut self, file_id: FileId) -> Option<td_api::Animation> {
+        let manager = std::mem::take(&mut self.td.animations_manager);
+        let object = {
+            let Td {
+                global,
+                option_manager,
+                auth_manager,
+                file_manager,
+                file_reference_manager,
+                animations_updates,
+                ..
+            } = self.td;
+            let env = TdAnimationsEnv {
+                global,
+                options: option_manager.as_mut(),
+                auth_is_bot: auth_manager.is_bot(),
+                file_manager: std::sync::Arc::clone(file_manager),
+                file_reference_manager,
+                updates: animations_updates,
+            };
+            manager.get_animation_object(&env, file_id)
+        };
+        self.td.animations_manager = manager;
+        object
+    }
+
     fn get_option_integer(&self, name: &str) -> i64 {
         self.td
             .option_manager
@@ -41718,9 +42871,12 @@ impl crate::country_info_manager::CountryInfoManagerEnv for CountryEnv<'_> {
     /// (CountryInfoManager.cpp:188-190) — the collapsed manager runs
     /// through its own env, like [`Td::init_language_pack_manager`].
     fn get_main_language_code(&mut self) -> String {
+        let net = self.td.langpack_net();
         let mut env = LanguagePackEnv {
             options: self.td.option_manager.as_mut(),
             updates: &mut self.td.language_pack_updates,
+            net,
+            pending: &mut self.td.langpack_pending,
         };
         self.td
             .language_pack_manager
@@ -42754,6 +43910,7 @@ pub(crate) struct ThemeEnv<'a> {
     pub(crate) file_load_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileLoadManager>>,
     pub(crate) file_reference_manager: &'a mut crate::files::FileReferenceManager,
     pub(crate) documents_manager: &'a mut crate::documents_manager::DocumentsManager,
+    pub(crate) animations: &'a mut crate::animations_manager::AnimationsManager,
     pub(crate) audios: &'a mut crate::audios_manager::AudiosManager,
     pub(crate) videos: &'a mut crate::videos_manager::VideosManager,
     pub(crate) voice_notes: &'a mut crate::voice_notes_manager::VoiceNotesManager,
@@ -42782,21 +43939,33 @@ impl crate::documents_manager::DocumentsManagerEnv for ThemeEnv<'_> {
 
     fn create_animation(
         &mut self,
-        _file_id: FileId,
-        _minithumbnail: String,
-        _thumbnail: crate::photo::PhotoSize,
-        _animated_thumbnail: crate::photo::AnimationSize,
-        _has_stickers: bool,
-        _file_name: String,
-        _mime_type: String,
-        _duration: i32,
-        _dimensions: crate::photo::Dimensions,
-        _replace: bool,
+        file_id: FileId,
+        minithumbnail: String,
+        thumbnail: crate::photo::PhotoSize,
+        animated_thumbnail: crate::photo::AnimationSize,
+        has_stickers: bool,
+        file_name: String,
+        mime_type: String,
+        duration: i32,
+        dimensions: crate::photo::Dimensions,
+        replace: bool,
     ) {
         // the C++ routes this to `animations_manager_->create_animation`
-        // (the TdDocumentsEnv collapse; the theme path never creates
-        // animation records)
-        tdutils::log_info!("create_animation — [blocked: M.20 record dispatch]");
+        // with the empty sticker-file-ids vector (DocumentsManager.cpp:552)
+        self.animations.create_animation(
+            self.auth_is_bot,
+            file_id,
+            minithumbnail,
+            thumbnail,
+            animated_thumbnail,
+            has_stickers,
+            Vec::new(),
+            file_name,
+            mime_type,
+            duration,
+            dimensions,
+            replace,
+        );
     }
 
     fn create_sticker(
@@ -42973,6 +44142,7 @@ impl crate::background_manager::BackgroundManagerEnv for ThemeEnv<'_> {
             auth_is_bot: self.auth_is_bot,
             file_manager: std::sync::Arc::clone(&self.file_manager),
             file_load_manager: std::sync::Arc::clone(&self.file_load_manager),
+            animations: self.animations,
             audios: self.audios,
             videos: self.videos,
             voice_notes: self.voice_notes,
@@ -43005,6 +44175,7 @@ impl crate::background_manager::BackgroundManagerEnv for ThemeEnv<'_> {
             auth_is_bot: self.auth_is_bot,
             file_manager: std::sync::Arc::clone(&self.file_manager),
             file_load_manager: std::sync::Arc::clone(&self.file_load_manager),
+            animations: self.animations,
             audios: self.audios,
             videos: self.videos,
             voice_notes: self.voice_notes,
@@ -43022,6 +44193,7 @@ impl crate::background_manager::BackgroundManagerEnv for ThemeEnv<'_> {
             auth_is_bot: self.auth_is_bot,
             file_manager: std::sync::Arc::clone(&self.file_manager),
             file_load_manager: std::sync::Arc::clone(&self.file_load_manager),
+            animations: self.animations,
             audios: self.audios,
             videos: self.videos,
             voice_notes: self.voice_notes,
@@ -46021,6 +47193,7 @@ pub(crate) struct StoryEnv<'a> {
     pub file_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>>,
     pub file_load_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileLoadManager>>,
     pub documents: &'a mut crate::documents_manager::DocumentsManager,
+    pub animations: &'a mut crate::animations_manager::AnimationsManager,
     pub videos: &'a mut crate::videos_manager::VideosManager,
     pub audios: &'a mut crate::audios_manager::AudiosManager,
     pub voice_notes: &'a mut crate::voice_notes_manager::VoiceNotesManager,
@@ -46458,10 +47631,12 @@ impl<'a> crate::story_manager::StoryManagerEnv for StoryEnv<'a> {
         // `DocumentsManager::on_get_document(..., Type::Video, Subtype::Story)`
         // (StoryContent.cpp:257-266)
         let documents = &mut *self.documents;
+        let animations = &mut *self.animations;
         let mut env = TdDocumentsEnv {
             auth_is_bot: self.auth_is_bot,
             file_manager: std::sync::Arc::clone(&self.file_manager),
             file_load_manager: std::sync::Arc::clone(&self.file_load_manager),
+            animations,
             audios: &mut *self.audios,
             videos: &mut *self.videos,
             voice_notes: &mut *self.voice_notes,
@@ -47926,6 +49101,7 @@ pub(crate) fn web_pages_env_split(
         file_load_manager,
         file_reference_manager,
         documents_manager,
+        animations_manager,
         audios_manager,
         videos_manager,
         voice_notes_manager,
@@ -47944,6 +49120,7 @@ pub(crate) fn web_pages_env_split(
             file_load_manager: std::sync::Arc::clone(file_load_manager),
             file_reference_manager,
             documents: documents_manager,
+            animations: animations_manager,
             audios: audios_manager,
             videos: videos_manager,
             voice_notes: voice_notes_manager,
@@ -47966,6 +49143,7 @@ pub(crate) struct TdWebPagesEnv<'a> {
     pub(crate) file_load_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileLoadManager>>,
     pub(crate) file_reference_manager: &'a mut crate::files::FileReferenceManager,
     pub(crate) documents: &'a mut crate::documents_manager::DocumentsManager,
+    pub(crate) animations: &'a mut crate::animations_manager::AnimationsManager,
     pub(crate) audios: &'a mut crate::audios_manager::AudiosManager,
     pub(crate) videos: &'a mut crate::videos_manager::VideosManager,
     pub(crate) voice_notes: &'a mut crate::voice_notes_manager::VoiceNotesManager,
@@ -48003,18 +49181,33 @@ impl crate::documents_manager::DocumentsManagerEnv for TdWebPagesEnv<'_> {
 
     fn create_animation(
         &mut self,
-        _file_id: FileId,
-        _minithumbnail: String,
-        _thumbnail: crate::photo::PhotoSize,
-        _animated_thumbnail: crate::photo::AnimationSize,
-        _has_stickers: bool,
-        _file_name: String,
-        _mime_type: String,
-        _duration: i32,
-        _dimensions: crate::photo::Dimensions,
-        _replace: bool,
+        file_id: FileId,
+        minithumbnail: String,
+        thumbnail: crate::photo::PhotoSize,
+        animated_thumbnail: crate::photo::AnimationSize,
+        has_stickers: bool,
+        file_name: String,
+        mime_type: String,
+        duration: i32,
+        dimensions: crate::photo::Dimensions,
+        replace: bool,
     ) {
-        tdutils::log_info!("create_animation — [blocked: M.20 record dispatch]");
+        // the C++ routes this to `animations_manager_->create_animation`
+        // with the empty sticker-file-ids vector (DocumentsManager.cpp:552)
+        self.animations.create_animation(
+            self.auth_is_bot,
+            file_id,
+            minithumbnail,
+            thumbnail,
+            animated_thumbnail,
+            has_stickers,
+            Vec::new(),
+            file_name,
+            mime_type,
+            duration,
+            dimensions,
+            replace,
+        );
     }
 
     fn create_sticker(
@@ -48433,10 +49626,12 @@ impl crate::web_pages_manager::WebPagesManagerEnv for TdWebPagesEnv<'_> {
             return None;
         };
         let documents = &mut *self.documents;
+        let animations = &mut *self.animations;
         let mut env = TdDocumentsEnv {
             auth_is_bot: self.auth_is_bot,
             file_manager: std::sync::Arc::clone(&self.file_manager),
             file_load_manager: std::sync::Arc::clone(&self.file_load_manager),
+            animations,
             audios: &mut *self.audios,
             videos: &mut *self.videos,
             voice_notes: &mut *self.voice_notes,
@@ -56153,6 +57348,7 @@ mod tests {
         }
         td.group_call_manager.net = td.group_call_net();
         td.call_manager.net = td.call_net();
+        td.secret_chats_manager.net = td.secret_net();
         td.statistics_manager.net = td.statistics_net();
         td.forum_topic_manager.net = td.forum_topic_net();
         td.web_pages_manager.net = td.web_pages_net();
@@ -56165,6 +57361,7 @@ mod tests {
         td.device_token_manager.net = td.device_token_net();
         td.notification_manager.net = td.notification_net();
         td.stickers_manager.net = td.stickers_net();
+        td.animations_manager.net = td.animations_net();
         (td, rec, callback)
     }
 
@@ -57336,6 +58533,26 @@ mod tests {
             "expected exactly one {constructor:#x} query"
         );
         matches.pop().unwrap()
+    }
+
+    /// Take the sent queries of two constructors sharing one flush (the
+    /// paired `start_up` + first-load sends), one each.
+    fn take_sent_pair(
+        rec: &std::sync::Arc<RecNetSession>,
+        first: i32,
+        second: i32,
+    ) -> (NetQuery, NetQuery) {
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        let (mut firsts, seconds): (Vec<_>, Vec<_>) = sent
+            .into_iter()
+            .partition(|query| query.tl_constructor() == first);
+        let mut seconds: Vec<_> = seconds
+            .into_iter()
+            .filter(|query| query.tl_constructor() == second)
+            .collect();
+        assert_eq!(firsts.len(), 1, "expected exactly one {first:#x} query");
+        assert_eq!(seconds.len(), 1, "expected exactly one {second:#x} query");
+        (firsts.pop().unwrap(), seconds.pop().unwrap())
     }
 
     /// The net-drain 36 band sweep — the remaining dispatcher families
@@ -62614,6 +63831,560 @@ mod tests {
         );
 
         assert!(td.country_net_completed.lock().is_empty(), "drained");
+    }
+
+    // ---- the langpack net slice: the five langpack.* queries ride the
+    // unauth dispatcher band (LanguagePackManager.cpp:433-458, 871-897,
+    // 1128-1161; the `create_unauth` shape). ----
+
+    type LocalizationTargetInfoSlot = std::sync::Arc<
+        std::sync::Mutex<Option<tdutils::status::Result<td_api::LocalizationTargetInfo>>>,
+    >;
+
+    fn record_localization_target_info() -> (
+        Promise<td_api::LocalizationTargetInfo>,
+        LocalizationTargetInfoSlot,
+    ) {
+        struct Rec(LocalizationTargetInfoSlot);
+        impl tdutils::promise::PromiseInterface<td_api::LocalizationTargetInfo> for Rec {
+            fn set_value(&mut self, value: td_api::LocalizationTargetInfo) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: LocalizationTargetInfoSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    type LanguagePackInfoSlot =
+        std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<td_api::LanguagePackInfo>>>>;
+
+    fn record_language_pack_info() -> (Promise<td_api::LanguagePackInfo>, LanguagePackInfoSlot) {
+        struct Rec(LanguagePackInfoSlot);
+        impl tdutils::promise::PromiseInterface<td_api::LanguagePackInfo> for Rec {
+            fn set_value(&mut self, value: td_api::LanguagePackInfo) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: LanguagePackInfoSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    type LanguagePackStringsSlot = std::sync::Arc<
+        std::sync::Mutex<Option<tdutils::status::Result<td_api::LanguagePackStrings>>>,
+    >;
+
+    fn record_language_pack_strings() -> (
+        Promise<td_api::LanguagePackStrings>,
+        LanguagePackStringsSlot,
+    ) {
+        struct Rec(LanguagePackStringsSlot);
+        impl tdutils::promise::PromiseInterface<td_api::LanguagePackStrings> for Rec {
+            fn set_value(&mut self, value: td_api::LanguagePackStrings) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: LanguagePackStringsSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    fn wire_lang_pack_language(lang_code: &str, name: &str) -> telegram_api::LangPackLanguage {
+        telegram_api::LangPackLanguage {
+            flags: 0,
+            official: true,
+            rtl: false,
+            beta: false,
+            name: name.to_owned(),
+            native_name: name.to_owned(),
+            lang_code: lang_code.to_owned(),
+            base_lang_code: String::new(),
+            plural_code: lang_code.to_owned(),
+            strings_count: 3,
+            translated_count: 2,
+            translations_url: "https://example.org".to_owned(),
+        }
+    }
+
+    /// the bare `Vector<LangPackLanguage>` answer body (the
+    /// `parse_wire_vector` counterpart shape).
+    fn wire_language_vector(languages: Vec<telegram_api::LangPackLanguage>) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&telegram_api::tl::VECTOR_ID.to_le_bytes());
+        out.extend_from_slice(&(languages.len() as i32).to_le_bytes());
+        for language in languages {
+            language.store_boxed(&mut out);
+        }
+        out
+    }
+
+    fn wire_lang_pack_string(key: &str, value: &str) -> telegram_api::LangPackString {
+        telegram_api::LangPackString::langPackString(telegram_api::langPackString {
+            key: key.to_owned(),
+            value: value.to_owned(),
+        })
+    }
+
+    /// the bare `Vector<LangPackString>` answer body.
+    fn wire_string_vector(strings: Vec<telegram_api::LangPackString>) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&telegram_api::tl::VECTOR_ID.to_le_bytes());
+        out.extend_from_slice(&(strings.len() as i32).to_le_bytes());
+        for string in strings {
+            // the enum store writes each variant boxed
+            string.store(&mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn langpack_queries_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(langpack_queries_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn langpack_queries_ride_the_dispatcher_impl() {
+        let (mut td, rec) = netted_td("netfix-langpack");
+        // the chosen language: the manager init reads the options (the
+        // C++ constructor + start_up). The production init runs before
+        // the dispatcher exists, so the re-init here models it with the
+        // net-less env (the bootstrap repair/load chains stay net-inert
+        // — the inert posture itself is scenario 9).
+        {
+            let options = td.option_manager.as_mut().expect("option manager set");
+            options.set_option_string("localization_target", "android");
+            options.set_option_string("language_pack_id", "en");
+        }
+        {
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+                net: None,
+                pending: &mut td.langpack_pending,
+            };
+            td.language_pack_manager.init(&mut env);
+        }
+
+        // 1. getLanguagePackStrings without keys — the get-all lot: two
+        //    callers park in the manager's query map, the
+        //    langpack.getLangPack query rides once, the answer fans out
+        //    through the chained on_get_language_pack_strings →
+        //    on_get_all_language_pack_strings hop and flushes the
+        //    updateLanguagePackStrings update.
+        let (promise_1, slot_1) = record_language_pack_strings();
+        let (promise_2, slot_2) = record_language_pack_strings();
+        {
+            let net = td.langpack_net();
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+                net,
+                pending: &mut td.langpack_pending,
+            };
+            td.language_pack_manager.get_language_pack_strings(
+                &mut env,
+                "de".to_owned(),
+                Vec::new(),
+                promise_1,
+            );
+            td.language_pack_manager.get_language_pack_strings(
+                &mut env,
+                "de".to_owned(),
+                Vec::new(),
+                promise_2,
+            );
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1, "the get-all query rides once");
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::langpack_getLangPack::ID
+        );
+        let mut answer = Vec::new();
+        telegram_api::LangPackDifference {
+            lang_code: "de".to_owned(),
+            from_version: 0,
+            version: 5,
+            strings: vec![
+                wire_lang_pack_string("key1", "value1"),
+                telegram_api::LangPackString::langPackStringPluralized(
+                    telegram_api::langPackStringPluralized {
+                        flags: 1 | (1 << 1) | (1 << 5),
+                        key: "key2".to_owned(),
+                        zero_value: "zero2".to_owned(),
+                        one_value: "one2".to_owned(),
+                        two_value: String::new(),
+                        few_value: String::new(),
+                        many_value: String::new(),
+                        other_value: "other2".to_owned(),
+                    },
+                ),
+                telegram_api::LangPackString::langPackStringDeleted(
+                    telegram_api::langPackStringDeleted {
+                        key: "key3".to_owned(),
+                    },
+                ),
+            ],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_lang_pack_net();
+        for (slot, label) in [(&slot_1, "first"), (&slot_2, "second")] {
+            match slot.lock().unwrap().take() {
+                Some(tdutils::status::Result::Ok(strings)) => {
+                    // the get-all rebuild lists the ordinary + pluralized
+                    // strings (the deleted keys ride only in the update
+                    // plane), in the storage-map order
+                    assert_eq!(strings.strings.len(), 2, "{label} fan-out entry");
+                    let by_key: std::collections::HashMap<&str, &_> = strings
+                        .strings
+                        .iter()
+                        .map(|s| (s.key.as_str(), &s.value))
+                        .collect();
+                    assert!(matches!(
+                        by_key["key1"].as_ref(),
+                        Some(td_api::LanguagePackStringValue::languagePackStringValueOrdinary(v))
+                            if v.value == "value1"
+                    ));
+                    assert!(matches!(
+                        by_key["key2"].as_ref(),
+                        Some(td_api::LanguagePackStringValue::languagePackStringValuePluralized(v))
+                            if v.other_value == "other2"
+                    ));
+                }
+                other => panic!("unexpected {label} get-all result: {other:?}"),
+            }
+        }
+        assert_eq!(
+            td.language_pack_updates.len(),
+            1,
+            "the first-full strings update flushed"
+        );
+        assert!(matches!(
+            &td.language_pack_updates[0],
+            td_api::Update::updateLanguagePackStrings(u) if u.language_pack_id == "de"
+        ));
+        td.language_pack_updates.clear();
+        assert!(
+            td.langpack_pending.iter().all(|slot| slot.is_none()),
+            "the pending slots drained"
+        );
+
+        // 2. getLanguagePackStrings with a key — the keyed fetch over a
+        //    not-yet-loaded language.
+        let (promise, slot) = record_language_pack_strings();
+        {
+            let net = td.langpack_net();
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+                net,
+                pending: &mut td.langpack_pending,
+            };
+            td.language_pack_manager.get_language_pack_strings(
+                &mut env,
+                "fr".to_owned(),
+                vec!["greeting".to_owned()],
+                promise,
+            );
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::langpack_getStrings::ID
+        );
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            wire_string_vector(vec![wire_lang_pack_string("greeting", "bonjour")]),
+        );
+        td.dispatch_completed_lang_pack_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(strings)) => {
+                assert_eq!(strings.strings.len(), 1);
+                assert_eq!(strings.strings[0].key, "greeting");
+            }
+            other => panic!("unexpected keyed strings result: {other:?}"),
+        }
+
+        // 3. the wire error band — the keyed fetch fails the promise
+        //    (an unloaded key, so the fetch stays on the wire).
+        let (promise, slot) = record_language_pack_strings();
+        {
+            let net = td.langpack_net();
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+                net,
+                pending: &mut td.langpack_pending,
+            };
+            td.language_pack_manager.get_language_pack_strings(
+                &mut env,
+                "fr".to_owned(),
+                vec!["farewell".to_owned()],
+                promise,
+            );
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        net_fail(
+            sent.into_iter().next().unwrap(),
+            400,
+            "LANGUAGE_PACK_INVALID",
+        );
+        td.dispatch_completed_lang_pack_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!(error.code(), 400);
+                assert_eq!(error.message(), "LANGUAGE_PACK_INVALID");
+            }
+            other => panic!("unexpected strings error result: {other:?}"),
+        }
+
+        // 4. the parse band — the garbage answer is the fetch_result 500.
+        let (promise, slot) = record_language_pack_strings();
+        {
+            let net = td.langpack_net();
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+                net,
+                pending: &mut td.langpack_pending,
+            };
+            td.language_pack_manager.get_language_pack_strings(
+                &mut env,
+                "fr".to_owned(),
+                vec!["farewell".to_owned()],
+                promise,
+            );
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        net_complete(sent.into_iter().next().unwrap(), vec![1, 2, 3, 4]);
+        td.dispatch_completed_lang_pack_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!(error.code(), 500);
+                assert_eq!(
+                    error.message(),
+                    "Failed to parse the langpack_getStrings answer"
+                );
+            }
+            other => panic!("unexpected strings parse result: {other:?}"),
+        }
+
+        // 5. getLocalizationTargetInfo — the localization rows merge into
+        //    the target info.
+        let (promise, slot) = record_localization_target_info();
+        {
+            let net = td.langpack_net();
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+                net,
+                pending: &mut td.langpack_pending,
+            };
+            td.language_pack_manager
+                .get_languages(&mut env, false, promise);
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::langpack_getLanguages::ID
+        );
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            wire_language_vector(vec![wire_lang_pack_language("it", "Italiano")]),
+        );
+        td.dispatch_completed_lang_pack_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(info)) => {
+                assert_eq!(info.language_packs.len(), 1);
+                assert_eq!(info.language_packs[0].id, "it");
+                assert_eq!(info.language_packs[0].name, "Italiano");
+                assert!(info.language_packs[0].is_official);
+            }
+            other => panic!("unexpected localization target info: {other:?}"),
+        }
+
+        // 6. getLanguagePackInfo — the searched info round-trip, plus the
+        //    unsupported-code band (the C++ get_language_info 500).
+        let (promise, slot) = record_language_pack_info();
+        {
+            let net = td.langpack_net();
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+                net,
+                pending: &mut td.langpack_pending,
+            };
+            td.language_pack_manager
+                .search_language_info(&mut env, "de".to_owned(), promise);
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::langpack_getLanguage::ID
+        );
+        let mut answer = Vec::new();
+        wire_lang_pack_language("de", "Deutsch").store_boxed(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_lang_pack_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Ok(info)) => {
+                assert_eq!(info.id, "de");
+                assert_eq!(info.name, "Deutsch");
+            }
+            other => panic!("unexpected language pack info: {other:?}"),
+        }
+        let (promise, slot) = record_language_pack_info();
+        {
+            let net = td.langpack_net();
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+                net,
+                pending: &mut td.langpack_pending,
+            };
+            td.language_pack_manager
+                .search_language_info(&mut env, "xx".to_owned(), promise);
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        let mut answer = Vec::new();
+        wire_lang_pack_language("", "Broken").store_boxed(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_lang_pack_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!(error.code(), 500);
+                assert_eq!(error.message(), "Unsupported language pack ID");
+            }
+            other => panic!("unexpected unsupported-code result: {other:?}"),
+        }
+
+        // 7. synchronizeLanguagePack — the difference query completes the
+        //    parked promise through the language's difference queue and
+        //    flushes the strings update.
+        let (promise, unit_slot) = record_translation_unit();
+        {
+            let net = td.langpack_net();
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+                net,
+                pending: &mut td.langpack_pending,
+            };
+            td.language_pack_manager
+                .synchronize_language_pack(&mut env, "en".to_owned(), promise);
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::langpack_getDifference::ID
+        );
+        let mut answer = Vec::new();
+        telegram_api::LangPackDifference {
+            lang_code: "en".to_owned(),
+            from_version: 0,
+            version: 7,
+            strings: vec![wire_lang_pack_string("en_key", "en_value")],
+        }
+        .store_boxed(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.language_pack_updates.clear();
+        td.dispatch_completed_lang_pack_net();
+        assert!(matches!(
+            unit_slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(
+            td.language_pack_updates
+                .iter()
+                .any(|update| matches!(update,
+                    td_api::Update::updateLanguagePackStrings(u) if u.language_pack_id == "en")),
+            "the difference strings update flushed"
+        );
+
+        // 8. the difference wire error band — on_failed_get_difference
+        //    fails the parked queue.
+        let (promise, unit_slot) = record_translation_unit();
+        {
+            let net = td.langpack_net();
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+                net,
+                pending: &mut td.langpack_pending,
+            };
+            td.language_pack_manager
+                .synchronize_language_pack(&mut env, "en".to_owned(), promise);
+        }
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        net_fail(
+            sent.into_iter().next().unwrap(),
+            500,
+            "Internal Server Error",
+        );
+        td.dispatch_completed_lang_pack_net();
+        match unit_slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!(error.code(), 500);
+            }
+            other => panic!("unexpected difference error result: {other:?}"),
+        }
+
+        // 9. the net-inert posture — a bare pre-init Td (no dispatcher):
+        //    the send arm logs and drops (the offline request stays
+        //    unanswered), the pending lot stays empty.
+        let inert_callback = CollectCallback::default();
+        let inert_td = Td::new(Box::new(CollectCallback {
+            responses: inert_callback.responses.clone(),
+            errors: inert_callback.errors.clone(),
+        }));
+        let net = inert_td.langpack_net();
+        assert!(net.is_none(), "no dispatcher — the inert posture");
+        let mut inert_updates = Vec::new();
+        let mut inert_pending: Vec<Option<crate::language_pack_manager::PendingLangPackQuery>> =
+            Vec::new();
+        let mut env = LanguagePackEnv {
+            options: None,
+            updates: &mut inert_updates,
+            net,
+            pending: &mut inert_pending,
+        };
+        let (promise, slot) = record_language_pack_strings();
+        use crate::language_pack_manager::LanguagePackManagerEnv as _;
+        env.send_get_strings_query(
+            "android".to_owned(),
+            "de".to_owned(),
+            vec!["key".to_owned()],
+            promise,
+        );
+        assert!(slot.lock().unwrap().is_none(), "the offline park");
+        assert!(inert_pending.is_empty());
+        assert!(
+            td.langpack_pending.iter().all(|slot| slot.is_none()),
+            "no stale slot survives"
+        );
+
+        assert!(td.langpack_net_completed.lock().is_empty(), "drained");
+        assert!(td.langpack_pending.iter().all(|slot| slot.is_none()));
     }
 
     // ---- the promo net slice: the promo-data queries ride the
@@ -73456,9 +75227,16 @@ mod tests {
                     state.animations[0].feature,
                     Some(td_api::PremiumFeature::premiumFeatureIncreasedLimits(_))
                 ));
+                // the §6 flip (net-drain 56): the promo answer builds the
+                // real animation object over the walked document record
+                // (the animations integration) — the whole-Td env leg;
+                // the trait default stays the miss band
+                let animation = state.animations[0].animation.as_ref().unwrap();
+                assert_eq!(animation.mime_type, "video/mp4");
+                assert!(animation.animation.as_ref().unwrap().id > 0);
                 assert!(
-                    state.animations[0].animation.is_none(),
-                    "the animation object parks at M.20"
+                    state.business_animations[0].animation.is_some(),
+                    "the business twin builds too"
                 );
                 assert_eq!(state.business_animations.len(), 1);
                 assert!(matches!(
@@ -73560,6 +75338,7 @@ mod tests {
                 file_load_manager: std::sync::Arc::clone(&td.file_load_manager),
                 file_reference_manager: &mut td.file_reference_manager,
                 documents_manager: &mut td.documents_manager,
+                animations: &mut td.animations_manager,
                 audios: &mut td.audios_manager,
                 videos: &mut td.videos_manager,
                 voice_notes: &mut td.voice_notes_manager,
@@ -73610,6 +75389,7 @@ mod tests {
                 file_load_manager: std::sync::Arc::clone(&td.file_load_manager),
                 file_reference_manager: &mut td.file_reference_manager,
                 documents_manager: &mut td.documents_manager,
+                animations: &mut td.animations_manager,
                 audios: &mut td.audios_manager,
                 videos: &mut td.videos_manager,
                 voice_notes: &mut td.voice_notes_manager,
@@ -73665,6 +75445,7 @@ mod tests {
                 file_load_manager: std::sync::Arc::clone(&td.file_load_manager),
                 file_reference_manager: &mut td.file_reference_manager,
                 documents_manager: &mut td.documents_manager,
+                animations: &mut td.animations_manager,
                 audios: &mut td.audios_manager,
                 videos: &mut td.videos_manager,
                 voice_notes: &mut td.voice_notes_manager,
@@ -84727,6 +86508,476 @@ kQIDAQAB\n\
         assert!(td.game_net_completed.lock().is_empty(), "drained");
     }
 
+    // ---- the net-drain 56 animation families: the two §3.9
+    // ---- AnimationsManager wire queries (AnimationsManager.cpp:39-124)
+    // ---- ride the AnimationsNetKind plane. ----
+
+    #[test]
+    fn animations_net_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(animations_net_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn animations_net_families_ride_the_dispatcher_impl() {
+        /// The `messages.savedGifsNotModified` wire answer (the enum
+        /// `store` writes the boxed constructor framing).
+        fn not_modified_answer() -> Vec<u8> {
+            let mut out = Vec::new();
+            telegram_api::messages_SavedGifs::messages_savedGifsNotModified(
+                telegram_api::messages_savedGifsNotModified,
+            )
+            .store(&mut out);
+            out
+        }
+        /// A `Promise<T>` slot (the game round-trip's record_slot shape).
+        type PromiseSlot<T> = std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<T>>>>;
+        fn record_slot<T: Send + 'static>() -> (Promise<T>, PromiseSlot<T>) {
+            let slot: PromiseSlot<T> = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let capture = std::sync::Arc::clone(&slot);
+            let promise = tdutils::promise::PromiseCreator::lambda_result(move |result| {
+                *capture.lock().unwrap() = Some(result);
+            });
+            (promise, slot)
+        }
+        /// The saved-animations wire answer over the animated test document.
+        fn saved_gifs_answer(hash: i64, documents: Vec<telegram_api::Document>) -> Vec<u8> {
+            let mut out = Vec::new();
+            telegram_api::messages_SavedGifs::messages_savedGifs(
+                telegram_api::messages_savedGifs {
+                    hash,
+                    gifs: documents,
+                },
+            )
+            .store(&mut out);
+            out
+        }
+        fn animated_wire_document(id: i64) -> telegram_api::Document {
+            animated_wire_document_with_reference(id, Vec::new())
+        }
+        /// The refreshed-reference form — the repair answer re-serves the
+        /// animation document with a new `file_reference`.
+        fn animated_wire_document_with_reference(
+            id: i64,
+            file_reference: Vec<u8>,
+        ) -> telegram_api::Document {
+            telegram_api::Document::document(telegram_api::document {
+                flags: 0,
+                id,
+                access_hash: 42,
+                file_reference,
+                date: 0,
+                mime_type: "video/mp4".to_owned(),
+                size: 1000,
+                thumbs: Vec::new(),
+                video_thumbs: Vec::new(),
+                dc_id: 2,
+                attributes: vec![telegram_api::DocumentAttribute::documentAttributeAnimated(
+                    telegram_api::documentAttributeAnimated,
+                )],
+            })
+        }
+
+        let (mut td, rec, callback) = netted_td_with_files("netdrain65-animations");
+        // user mode (the saved-animations arms CHECK !is_bot) — the
+        // netted harness defaults to it; the files database is on — the
+        // repair leg's refreshed-reference re-register flushes its file
+        // record (the FileDb events need the files key-value)
+        assert!(!td.auth_manager.is_bot());
+
+        // the pmc ring record reads back empty (the "ans" key), so the
+        // live getSavedAnimations arm loads from the server; the hash
+        // fold covers the two ring documents the load answer carries
+        let fold_hash = crate::misc::get_vector_hash(&[700, 701]);
+        // the fold over the ring after a save re-orders the added
+        // animation to the head (add_to_top_if, cpp:730)
+        let head_fold_hash = crate::misc::get_vector_hash(&[701, 700]);
+
+        // 1. the live getSavedAnimations arm rides the wire:
+        //    messages_getSavedGifs { hash: 0 } (the empty-ring fold)
+        td.request(
+            1,
+            Function::getSavedAnimations(td_api::getSavedAnimations {}),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut rec.sent.lock()),
+            telegram_api::messages_getSavedGifs::ID,
+        );
+        let body = telegram_api::messages_getSavedGifs::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.hash, 0);
+
+        // 2. the savedGifs answer walks the REAL documents intake: the
+        //    animation record lands (the create_animation dispatch), the
+        //    ring loads, updateSavedAnimations flushes, and the parked
+        //    request promise settles with the animations object
+        net_complete(
+            sent,
+            saved_gifs_answer(
+                fold_hash,
+                vec![
+                    telegram_api::Document::documentEmpty(telegram_api::documentEmpty { id: 1 }),
+                    animated_wire_document(700),
+                    animated_wire_document(701),
+                ],
+            ),
+        );
+        td.dispatch_completed_animations_net();
+        td.flush_deferred_results();
+        // the outbox flushed with the answer (updateSavedAnimations rode
+        // send_update; the empty lot proves the flush ran)
+        assert!(td.animations_updates.is_empty());
+        let responses = responses_of(&callback, 1);
+        let td_api::Object::animations(animations) = responses.first().unwrap() else {
+            panic!("the getSavedAnimations answer: {:?}", responses.first());
+        };
+        assert_eq!(animations.animations.len(), 2, "the empty document drops");
+        let animation = &animations.animations[0];
+        assert_eq!(animation.mime_type, "video/mp4");
+        assert_eq!(animation.file_name, "");
+        let animation_file_id = animation.animation.as_ref().unwrap().id;
+        let saved_animation_file_id = animations.animations[1].animation.as_ref().unwrap().id;
+        assert_ne!(saved_animation_file_id, animation_file_id);
+        // the walk's registered remote carries the wire document id
+        {
+            let files = td.file_manager.lock();
+            let full_remote = files
+                .get_file_view(crate::files::FileId::new(animation_file_id, 0))
+                .unwrap()
+                .get_full_remote_location()
+                .unwrap()
+                .clone();
+            assert!(full_remote.is_document());
+            assert_eq!(full_remote.get_id(), 700);
+        }
+
+        // 3. the addSavedAnimation arm rides the wire: the resolved input
+        //    document + unsave=false (SaveGifQuery::send, cpp:77-85). The
+        //    second animation is not the ring head, so the C++ fast path
+        //    (cpp:700-707) does not swallow the save
+        td.request(
+            2,
+            Function::addSavedAnimation(td_api::addSavedAnimation {
+                animation: Some(td_api::InputFile::inputFileId(td_api::inputFileId {
+                    id: saved_animation_file_id,
+                })),
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut rec.sent.lock()),
+            telegram_api::messages_saveGif::ID,
+        );
+        let body = telegram_api::messages_saveGif::parse(sent.query()).expect("the sent body");
+        assert!(!body.unsave);
+        let telegram_api::InputDocument::inputDocument(input_document) = body.id.as_ref().unwrap()
+        else {
+            panic!("the input document");
+        };
+        assert_eq!((input_document.id, input_document.access_hash), (701, 42));
+
+        // 4. the ok=false band: the server dropped the gif from the ring —
+        //    the reload fires a second getSavedGifs AND the promise settles
+        //    ok (cpp:92-98)
+        net_complete(sent, bool_answer(false));
+        td.dispatch_completed_animations_net();
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 2);
+        assert!(matches!(responses.first(), Some(td_api::Object::ok(_))));
+        let sent = take_sent(
+            std::mem::take(&mut rec.sent.lock()),
+            telegram_api::messages_getSavedGifs::ID,
+        );
+        let body = telegram_api::messages_getSavedGifs::parse(sent.query()).expect("the sent body");
+        assert_eq!(
+            body.hash, head_fold_hash,
+            "the reload carries the re-ordered ring fold"
+        );
+        // answer the reload with notModified (the plain no-op, cpp:566-573)
+        net_complete(sent, not_modified_answer());
+        td.dispatch_completed_animations_net();
+
+        // 5. the ok=true band: settles without a reload
+        td.request(
+            3,
+            Function::removeSavedAnimation(td_api::removeSavedAnimation {
+                animation: Some(td_api::InputFile::inputFileId(td_api::inputFileId {
+                    id: animation_file_id,
+                })),
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut rec.sent.lock()),
+            telegram_api::messages_saveGif::ID,
+        );
+        let body = telegram_api::messages_saveGif::parse(sent.query()).expect("the sent body");
+        assert!(body.unsave);
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_animations_net();
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 3);
+        assert!(matches!(responses.first(), Some(td_api::Object::ok(_))));
+        assert!(rec.sent.lock().is_empty(), "no reload after the ok=true");
+
+        // 6. the wire-error band: the verbatim error + the reload re-send
+        //    (the plain on_error band, cpp:118-122)
+        td.request(
+            4,
+            Function::addSavedAnimation(td_api::addSavedAnimation {
+                animation: Some(td_api::InputFile::inputFileId(td_api::inputFileId {
+                    id: animation_file_id,
+                })),
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut rec.sent.lock()),
+            telegram_api::messages_saveGif::ID,
+        );
+        net_fail(sent, 400, "ANIMATION_INVALID");
+        td.dispatch_completed_animations_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 4);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "ANIMATION_INVALID")
+        );
+        let sent = take_sent(
+            std::mem::take(&mut rec.sent.lock()),
+            telegram_api::messages_getSavedGifs::ID,
+        );
+        net_complete(sent, not_modified_answer());
+        td.dispatch_completed_animations_net();
+
+        // 7. the file-reference band (cpp:102-117): the reference
+        //    deletes, the saved-animations file source's repair closure
+        //    runs the is_repair form (FileReferenceManager.cpp:522-524),
+        //    and the repair answer re-sends the save query with the same
+        //    promise (the lambda's success arm, cpp:112-116)
+        td.request(
+            5,
+            Function::addSavedAnimation(td_api::addSavedAnimation {
+                animation: Some(td_api::InputFile::inputFileId(td_api::inputFileId {
+                    id: saved_animation_file_id,
+                })),
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut rec.sent.lock()),
+            telegram_api::messages_saveGif::ID,
+        );
+        net_fail(sent, 400, "FILE_REFERENCE_INVALID");
+        td.dispatch_completed_animations_net();
+        td.flush_deferred_results();
+        // the promise stays parked — the repair ladder owns it now
+        assert!(
+            responses_of(&callback, 5).is_empty(),
+            "the repair chain holds the promise"
+        );
+        let sent = take_sent(
+            std::mem::take(&mut rec.sent.lock()),
+            telegram_api::messages_getSavedGifs::ID,
+        );
+        let body = telegram_api::messages_getSavedGifs::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.hash, 0, "the repair form carries no fold");
+        // the repair answer re-serves the animation with a refreshed
+        // reference; the walked record updates the file view the re-send
+        // reads (cpp:112-116)
+        net_complete(
+            sent,
+            saved_gifs_answer(
+                0,
+                vec![animated_wire_document_with_reference(701, b"v2".to_vec())],
+            ),
+        );
+        td.dispatch_completed_animations_net();
+        let sent = take_sent(
+            std::mem::take(&mut rec.sent.lock()),
+            telegram_api::messages_saveGif::ID,
+        );
+        let body = telegram_api::messages_saveGif::parse(sent.query()).expect("the sent body");
+        assert!(!body.unsave);
+        let telegram_api::InputDocument::inputDocument(input_document) = body.id.as_ref().unwrap()
+        else {
+            panic!("the re-sent input document");
+        };
+        assert_eq!((input_document.id, input_document.access_hash), (701, 42));
+        assert_eq!(
+            input_document.file_reference,
+            b"v2".to_vec(),
+            "the re-send carries the refreshed reference"
+        );
+        net_complete(sent, bool_answer(true));
+        td.dispatch_completed_animations_net();
+        td.flush_deferred_results();
+        let responses = responses_of(&callback, 5);
+        assert!(matches!(responses.first(), Some(td_api::Object::ok(_))));
+
+        // 7b. the repair-failure band: the notModified repair answer
+        //     fails the repair lot (cpp:566-569) and the lambda's error
+        //     arm settles the parked promise with the C++ 400
+        //     (cpp:109-111)
+        td.request(
+            7,
+            Function::addSavedAnimation(td_api::addSavedAnimation {
+                animation: Some(td_api::InputFile::inputFileId(td_api::inputFileId {
+                    id: animation_file_id,
+                })),
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent(
+            std::mem::take(&mut rec.sent.lock()),
+            telegram_api::messages_saveGif::ID,
+        );
+        net_fail(sent, 400, "FILE_REFERENCE_INVALID");
+        td.dispatch_completed_animations_net();
+        let sent = take_sent(
+            std::mem::take(&mut rec.sent.lock()),
+            telegram_api::messages_getSavedGifs::ID,
+        );
+        net_complete(sent, not_modified_answer());
+        td.dispatch_completed_animations_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 7);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Failed to find the animation")
+        );
+
+        // 8. the repair form rides the wire with is_repair=true + hash 0;
+        //    the notModified answer fails the repair promise with the C++
+        //    500 (cpp:566-569)
+        let repair_file_id = {
+            let mut file_manager = td.file_manager.lock();
+            file_manager.register_remote(
+                crate::files::FullRemoteFileLocation::from_document(
+                    crate::files::FileType::Animation,
+                    701,
+                    42,
+                    crate::chat_manager::DcId::internal(2),
+                    String::new(),
+                ),
+                crate::files::FileLocationSource::FromServer,
+                crate::message_id::DialogId::default(),
+                1000,
+                0,
+                "repair.mp4".to_owned(),
+            )
+        };
+        let mut animations = std::mem::take(&mut td.animations_manager);
+        animations.create_animation(
+            td.auth_manager.is_bot(),
+            repair_file_id,
+            String::new(),
+            crate::photo::PhotoSize::default(),
+            crate::photo::AnimationSize::default(),
+            false,
+            Vec::new(),
+            "repair.mp4".to_owned(),
+            "video/mp4".to_owned(),
+            1,
+            crate::photo::get_dimensions(10, 10, "netdrain65 repair"),
+            true,
+        );
+        let (promise, slot) = record_slot::<()>();
+        {
+            let Td {
+                global,
+                option_manager,
+                auth_manager,
+                file_manager,
+                file_reference_manager,
+                animations_updates,
+                ..
+            } = &mut td;
+            let mut env = TdAnimationsEnv {
+                global,
+                options: option_manager.as_mut(),
+                auth_is_bot: auth_manager.is_bot(),
+                file_manager: std::sync::Arc::clone(file_manager),
+                file_reference_manager,
+                updates: animations_updates,
+            };
+            animations.repair_saved_animations(&mut env, promise);
+        }
+        td.animations_manager = animations;
+        let sent = take_sent(
+            std::mem::take(&mut rec.sent.lock()),
+            telegram_api::messages_getSavedGifs::ID,
+        );
+        let body = telegram_api::messages_getSavedGifs::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.hash, 0);
+        net_complete(sent, not_modified_answer());
+        td.dispatch_completed_animations_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(error)) => {
+                assert_eq!(
+                    (error.code(), error.message()),
+                    (500, "Failed to reload saved animations")
+                );
+            }
+            other => panic!("expected the repair band, got {other:?}"),
+        }
+
+        // 9. the net-inert posture — no dispatcher, both families park
+        //    like the C++ handlers hold them. The loaded ring answers
+        //    the get arm locally (the C++ cached read, cpp:495-504) with
+        //    the reload suppressed by the load clock — only the query
+        //    families park
+        td.net_query_dispatcher = None;
+        td.animations_manager.net = None;
+        td.request(
+            6,
+            Function::getSavedAnimations(td_api::getSavedAnimations {}),
+        );
+        td.flush_deferred_results();
+        assert!(rec.sent.lock().is_empty(), "nothing dispatched");
+        {
+            let responses = responses_of(&callback, 6);
+            let td_api::Object::animations(animations) = responses.first().unwrap() else {
+                panic!("the cached ring answer: {:?}", responses.first());
+            };
+            assert_eq!(animations.animations.len(), 2, "the cached ring");
+        }
+        let (promise, slot) = record_slot::<()>();
+        {
+            let mut animations = std::mem::take(&mut td.animations_manager);
+            let Td {
+                global,
+                option_manager,
+                auth_manager,
+                file_manager,
+                file_reference_manager,
+                animations_updates,
+                ..
+            } = &mut td;
+            let mut env = TdAnimationsEnv {
+                global,
+                options: option_manager.as_mut(),
+                auth_is_bot: auth_manager.is_bot(),
+                file_manager: std::sync::Arc::clone(file_manager),
+                file_reference_manager,
+                updates: animations_updates,
+            };
+            animations.send_save_gif_query(&mut env, repair_file_id, false, promise);
+            td.animations_manager = animations;
+        }
+        assert!(rec.sent.lock().is_empty(), "nothing dispatched");
+        assert!(slot.lock().unwrap().is_none(), "nothing settles offline");
+        assert!(
+            td.animations_manager.pop_save_gif_query().is_some(),
+            "the save promise parks like the C++ handler holds it"
+        );
+
+        // the drains ran clean — nothing parked, no strays
+        assert!(td.animations_net_completed.lock().is_empty(), "drained");
+    }
+
     #[test]
     fn callback_query_net_families_ride_the_dispatcher() {
         std::thread::Builder::new()
@@ -94877,6 +97128,8 @@ kQIDAQAB\n\
     }
 
     fn call_manager_families_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-call-manager");
+        let call_net = td.call_net();
         // The env exactly as the request arms build it — expanded at the
         // call site so the field borrows stay disjoint.
         macro_rules! call_env {
@@ -94891,10 +97144,10 @@ kQIDAQAB\n\
                     notification_manager: &mut $td.notification_manager,
                     updates: &mut $td.call_updates,
                     dh_config: &mut $td.call_dh_config,
+                    call_net: call_net.clone(),
                 }
             }};
         }
-        let (mut td, rec, callback) = netted_td_with_callback("netfix-call-manager");
 
         // A resolvable call: the requested update creates the actor and
         // binds the server id (CallId 1 ← server 100/7).
@@ -95141,6 +97394,869 @@ kQIDAQAB\n\
                 .map(|(_, error)| error.clone())
                 .expect("the empty-call band");
             assert_eq!(error.message, "Input call must be non-empty");
+        }
+    }
+
+    // ---- the net-drain 54 call-actor families: the §3.9 eight wire
+    // queries (CallActor.cpp send/answer bands) ride the `CallNetKind`
+    // plane; the DH peer is fabricated with a scratch `DhHandshake` over
+    // the built-in good prime (g = 3 passes the mod-4g check). ----
+
+    #[test]
+    fn call_actor_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(call_actor_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn call_actor_families_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-call-actor");
+        let call_net = td.call_net();
+        // The env exactly as the request arms build it — expanded at the
+        // call site so the field borrows stay disjoint.
+        macro_rules! call_env {
+            ($td:ident) => {{
+                CallEnv {
+                    user_env: UserEnv {
+                        global: &mut $td.global,
+                        options: $td.option_manager.as_mut().expect("option manager set"),
+                        auth_is_bot: $td.auth_manager.is_bot(),
+                    },
+                    user_manager: &mut $td.user_manager,
+                    notification_manager: &mut $td.notification_manager,
+                    updates: &mut $td.call_updates,
+                    dh_config: &mut $td.call_dh_config,
+                    call_net: call_net.clone(),
+                }
+            }};
+        }
+        let dh_prime = crate::dh_cache::BUILT_IN_GOOD_PRIME.to_vec();
+        let wire_protocol = telegram_api::PhoneCallProtocol {
+            flags: 0,
+            udp_p2p: true,
+            udp_reflector: false,
+            min_layer: 65,
+            max_layer: 92,
+            library_versions: vec!["4".to_string()],
+        };
+        let call_error_state = |td: &Td, code: i32, message: &str| match td.call_updates.last() {
+            Some(td_api::Update::updateCall(update)) => {
+                let call = update.call.as_ref().expect("the call");
+                match call.state.as_ref().expect("the call state") {
+                    td_api::CallState::callStateError(state) => {
+                        let error = state.error.as_ref().expect("the error");
+                        assert_eq!(
+                            (error.code, error.message.as_str()),
+                            (code, message),
+                            "the callStateError flush"
+                        );
+                    }
+                    other => panic!("expected the error state: {other:?}"),
+                }
+            }
+            other => panic!("expected updateCall: {other:?}"),
+        };
+
+        // The resolvable call peer (the `get_input_user` band).
+        with_user_manager(&mut td, |manager, env| {
+            manager.on_get_user(env, wire_user(5, "Peer"), "test");
+        });
+
+        // 1. getDhConfig, NotModified with no stored config — the fetch
+        //    lambda falls through to the 500 band (cpp:699-701), the
+        //    machine errors out and the call_id == 0 discard takes the
+        //    immediate-Missed fallback (cpp:815-825): no wire query.
+        {
+            td.request(
+                50,
+                Function::createCall(td_api::createCall {
+                    user_id: 5,
+                    protocol: Some(td_api::CallProtocol {
+                        udp_p2p: true,
+                        udp_reflector: true,
+                        min_layer: 65,
+                        max_layer: 92,
+                        library_versions: vec!["4".to_string()],
+                    }),
+                    is_video: false,
+                }),
+            );
+            td.flush_deferred_results();
+            let call_id = callback
+                .responses
+                .lock()
+                .iter()
+                .find(|(response_id, _)| *response_id == 50)
+                .map(|(_, object)| object.clone())
+                .expect("the createCall answer");
+            assert!(
+                matches!(call_id, Object::callId(_)),
+                "the local call id answer: {call_id:?}"
+            );
+            let (_config_sent, dh_sent) = take_sent_pair(
+                &rec,
+                telegram_api::phone_getCallConfig::ID,
+                telegram_api::messages_getDhConfig::ID,
+            );
+            let body = telegram_api::messages_getDhConfig::parse(dh_sent.query())
+                .expect("the getDhConfig body");
+            assert_eq!((body.version, body.random_length), (0, 0));
+            let mut not_modified = Vec::new();
+            telegram_api::messages_DhConfig::messages_dhConfigNotModified(
+                telegram_api::messages_dhConfigNotModified {
+                    random: b"seed".to_vec(),
+                },
+            )
+            .store(&mut not_modified);
+            net_complete(dh_sent, not_modified);
+            td.dispatch_completed_call_net();
+            call_error_state(&td, 500, "Can't load DhConfig");
+            let sent_after = std::mem::take(&mut *rec.sent.lock());
+            assert!(
+                sent_after
+                    .iter()
+                    .all(|q| q.tl_constructor() != telegram_api::phone_discardCall::ID),
+                "the unknown call id discards without a query"
+            );
+            assert!(
+                td.call_manager
+                    .get_call_actor(crate::call_id::CallId::new(1))
+                    .is_none()
+            );
+        }
+
+        // 2. getDhConfig, NotModified with a stored config — the
+        //    store-read fallback (the C++ captured old_dh_config,
+        //    cpp:699-701) proceeds to the request; the requestCall error
+        //    band (cpp:753-758 → on_error) repeats the call_id == 0
+        //    fallback with no query.
+        {
+            td.request(
+                51,
+                Function::createCall(td_api::createCall {
+                    user_id: 5,
+                    protocol: Some(td_api::CallProtocol {
+                        udp_p2p: true,
+                        udp_reflector: true,
+                        min_layer: 65,
+                        max_layer: 92,
+                        library_versions: vec!["4".to_string()],
+                    }),
+                    is_video: false,
+                }),
+            );
+            let (_config_sent, dh_sent) = take_sent_pair(
+                &rec,
+                telegram_api::phone_getCallConfig::ID,
+                telegram_api::messages_getDhConfig::ID,
+            );
+            // the store populates between the send and the answer
+            td.call_dh_config = Some(crate::dh_cache::DhConfig {
+                version: 7,
+                prime: dh_prime.clone(),
+                g: 3,
+            });
+            let mut not_modified = Vec::new();
+            telegram_api::messages_DhConfig::messages_dhConfigNotModified(
+                telegram_api::messages_dhConfigNotModified {
+                    random: b"seed".to_vec(),
+                },
+            )
+            .store(&mut not_modified);
+            net_complete(dh_sent, not_modified);
+            td.dispatch_completed_call_net();
+            let request_sent = take_sent_query(&rec, telegram_api::phone_requestCall::ID);
+            net_fail(request_sent, 400, "PARTICIPANT_CALL_DECLINED");
+            td.dispatch_completed_call_net();
+            call_error_state(&td, 400, "PARTICIPANT_CALL_DECLINED");
+            let sent_after = std::mem::take(&mut *rec.sent.lock());
+            assert!(
+                sent_after
+                    .iter()
+                    .all(|q| q.tl_constructor() != telegram_api::phone_discardCall::ID),
+                "the unknown call id discards without a query"
+            );
+            assert!(
+                td.call_manager
+                    .get_call_actor(crate::call_id::CallId::new(2))
+                    .is_none()
+            );
+        }
+
+        // 3. the outgoing happy chain — requestCall (the g_b hash + the
+        //    input user + the protocol ride, cpp:734-736), the waiting
+        //    answer round-trip, the accepted update (the DH key
+        //    generates), confirmCall (the g_b rides the g_a field,
+        //    cpp:797-799), the fingerprint-mismatch band (cpp:641-643 →
+        //    on_error → the cleanup discard), the discard round-trip with
+        //    the Updates answer (cpp:837-841), and the double-discard
+        //    band (cpp:293-295).
+        {
+            td.request(
+                52,
+                Function::createCall(td_api::createCall {
+                    user_id: 5,
+                    protocol: Some(td_api::CallProtocol {
+                        udp_p2p: true,
+                        udp_reflector: true,
+                        min_layer: 65,
+                        max_layer: 92,
+                        library_versions: vec!["4".to_string()],
+                    }),
+                    is_video: false,
+                }),
+            );
+            let (_config_sent, request_sent) = take_sent_pair(
+                &rec,
+                telegram_api::phone_getCallConfig::ID,
+                telegram_api::phone_requestCall::ID,
+            );
+            let body = telegram_api::phone_requestCall::parse(request_sent.query())
+                .expect("the requestCall body");
+            assert!(!body.video);
+            assert_eq!(body.g_a_hash.len(), 32, "the g_b hash rides");
+            assert!(body.random_id != 0, "the secure random id");
+            let protocol = body.protocol.as_ref().expect("the protocol");
+            assert_eq!(
+                (
+                    protocol.min_layer,
+                    protocol.max_layer,
+                    protocol.library_versions.as_slice()
+                ),
+                (65, 92, ["4".to_string()].as_slice())
+            );
+            match body.user_id.as_ref().expect("the input user") {
+                telegram_api::InputUser::inputUser(user) => {
+                    assert_eq!((user.user_id, user.access_hash), (5, 42));
+                }
+                other => panic!("the input user: {other:?}"),
+            }
+            let mut waiting = Vec::new();
+            telegram_api::phone_PhoneCall {
+                phone_call: Some(telegram_api::PhoneCall::phoneCallWaiting(
+                    telegram_api::phoneCallWaiting {
+                        flags: 0,
+                        video: false,
+                        id: 100,
+                        access_hash: 7,
+                        date: 0,
+                        admin_id: 5,
+                        participant_id: 5,
+                        protocol: None,
+                        receive_date: 0,
+                    },
+                )),
+                users: Vec::new(),
+            }
+            .store_boxed(&mut waiting);
+            net_complete(request_sent, waiting);
+            td.dispatch_completed_call_net();
+            assert!(
+                matches!(td.call_updates.last(), Some(td_api::Update::updateCall(_))),
+                "the Pending flush"
+            );
+
+            // the accepted update (the sink is parked — the manager is
+            // driven directly, the 44-test convention); the scratch
+            // handshake plays the peer.
+            let mut peer = tdmtproto::dh_handshake::DhHandshake::new();
+            peer.set_config(3, &dh_prime);
+            {
+                let mut env = call_env!(td);
+                td.call_manager.update_call(
+                    &mut env,
+                    telegram_api::updatePhoneCall {
+                        phone_call: Some(telegram_api::PhoneCall::phoneCallAccepted(
+                            telegram_api::phoneCallAccepted {
+                                flags: 0,
+                                video: false,
+                                id: 100,
+                                access_hash: 7,
+                                date: 0,
+                                admin_id: 5,
+                                participant_id: 5,
+                                g_b: peer.get_g_b(),
+                                protocol: None,
+                            },
+                        )),
+                    },
+                );
+            }
+            let confirm_sent = take_sent_query(&rec, telegram_api::phone_confirmCall::ID);
+            let body = telegram_api::phone_confirmCall::parse(confirm_sent.query())
+                .expect("the confirmCall body");
+            let confirm_peer = body.peer.as_ref().expect("the input phone call");
+            assert_eq!((confirm_peer.id, confirm_peer.access_hash), (100, 7));
+            assert!(
+                !body.g_a.is_empty(),
+                "the g_b rides the g_a field (cpp:797-798)"
+            );
+            assert!(body.key_fingerprint != 0, "the generated key id");
+            let mut ready_wrong = Vec::new();
+            telegram_api::phone_PhoneCall {
+                phone_call: Some(telegram_api::PhoneCall::phoneCall(
+                    telegram_api::phoneCall {
+                        flags: 0,
+                        p2p_allowed: false,
+                        video: false,
+                        conference_supported: false,
+                        id: 100,
+                        access_hash: 7,
+                        date: 0,
+                        admin_id: 5,
+                        participant_id: 5,
+                        g_a_or_b: b"unused-on-confirm".to_vec(),
+                        key_fingerprint: 999,
+                        protocol: Some(wire_protocol.clone()),
+                        connections: Vec::new(),
+                        start_date: 0,
+                        custom_parameters: None,
+                    },
+                )),
+                users: Vec::new(),
+            }
+            .store_boxed(&mut ready_wrong);
+            net_complete(confirm_sent, ready_wrong);
+            td.dispatch_completed_call_net();
+            call_error_state(&td, 400, "Key fingerprints mismatch");
+            let discard_sent = take_sent_query(&rec, telegram_api::phone_discardCall::ID);
+            let body = telegram_api::phone_discardCall::parse(discard_sent.query())
+                .expect("the discard body");
+            let discard_peer = body.peer.as_ref().expect("the input phone call");
+            assert_eq!((discard_peer.id, discard_peer.access_hash), (100, 7));
+            assert!(
+                matches!(
+                    body.reason,
+                    Some(telegram_api::PhoneCallDiscardReason::phoneCallDiscardReasonDisconnect(_))
+                ),
+                "the ExchangingKey error derives Disconnected"
+            );
+            net_complete(discard_sent, wire_empty_updates());
+            td.dispatch_completed_call_net();
+            // the double-discard band: the actor sits in
+            // WaitDiscardResult, the live arm settles without a query
+            td.request(
+                53,
+                Function::discardCall(td_api::discardCall {
+                    call_id: 3,
+                    is_disconnected: false,
+                    invite_link: String::new(),
+                    duration: 0,
+                    is_video: false,
+                    connection_id: 0,
+                }),
+            );
+            td.flush_deferred_results();
+            assert!(
+                callback
+                    .responses
+                    .lock()
+                    .iter()
+                    .any(|(response_id, _)| *response_id == 53),
+                "the double-discard settles"
+            );
+            let sent_after = std::mem::take(&mut *rec.sent.lock());
+            assert!(
+                sent_after
+                    .iter()
+                    .all(|q| q.tl_constructor() != telegram_api::phone_discardCall::ID),
+                "no second discard query"
+            );
+        }
+
+        // 4. the incoming chain, receivedCall band first — the requested
+        //    update creates the actor (start_up getCallConfig + the
+        //    received query, cpp:449-472), the receivedCall fetch error
+        //    routes into on_error (cpp:714-719) and the cleanup discard
+        //    fires with the Missed reason.
+        {
+            let mut env = call_env!(td);
+            td.call_manager.update_call(
+                &mut env,
+                telegram_api::updatePhoneCall {
+                    phone_call: Some(telegram_api::PhoneCall::phoneCallRequested(
+                        telegram_api::phoneCallRequested {
+                            flags: 0,
+                            video: false,
+                            id: 200,
+                            access_hash: 9,
+                            date: 0,
+                            admin_id: 5,
+                            participant_id: 6,
+                            g_a_hash: tdutils::crypto::sha256(b"peer-g-a").to_vec(),
+                            protocol: Some(wire_protocol.clone()),
+                        },
+                    )),
+                },
+            );
+            let (_config_sent, received_sent) = take_sent_pair(
+                &rec,
+                telegram_api::phone_getCallConfig::ID,
+                telegram_api::phone_receivedCall::ID,
+            );
+            let body = telegram_api::phone_receivedCall::parse(received_sent.query())
+                .expect("the receivedCall body");
+            let peer = body.peer.as_ref().expect("the input phone call");
+            assert_eq!((peer.id, peer.access_hash), (200, 9));
+            net_fail(received_sent, 400, "CALL_ALREADY_DECLINED");
+            td.dispatch_completed_call_net();
+            call_error_state(&td, 400, "CALL_ALREADY_DECLINED");
+            let discard_sent = take_sent_query(&rec, telegram_api::phone_discardCall::ID);
+            let body = telegram_api::phone_discardCall::parse(discard_sent.query())
+                .expect("the discard body");
+            let discard_peer = body.peer.as_ref().expect("the input phone call");
+            assert_eq!((discard_peer.id, discard_peer.access_hash), (200, 9));
+            assert!(matches!(
+                body.reason,
+                Some(telegram_api::PhoneCallDiscardReason::phoneCallDiscardReasonMissed(_))
+            ));
+        }
+
+        // 5. the incoming happy chain — receivedCall ok (the answer is
+        //    unused, cpp:714-719), acceptCall (the live arm; the g_b
+        //    rides, cpp:772-774), the ready answer with the fabricated
+        //    peer's g_a + the shared key fingerprint, the Ready flush
+        //    waiting for the getCallConfig answer (cpp:866-868) and then
+        //    carrying the key + config + emojis.
+        let shared_key = {
+            let mut peer = tdmtproto::dh_handshake::DhHandshake::new();
+            peer.set_config(3, &dh_prime);
+            let peer_g_a = peer.get_g_b();
+            {
+                let mut env = call_env!(td);
+                td.call_manager.update_call(
+                    &mut env,
+                    telegram_api::updatePhoneCall {
+                        phone_call: Some(telegram_api::PhoneCall::phoneCallRequested(
+                            telegram_api::phoneCallRequested {
+                                flags: 0,
+                                video: false,
+                                id: 300,
+                                access_hash: 11,
+                                date: 0,
+                                admin_id: 5,
+                                participant_id: 6,
+                                g_a_hash: tdutils::crypto::sha256(&peer_g_a).to_vec(),
+                                protocol: Some(wire_protocol.clone()),
+                            },
+                        )),
+                    },
+                );
+            }
+            let (config_sent, received_sent) = take_sent_pair(
+                &rec,
+                telegram_api::phone_getCallConfig::ID,
+                telegram_api::phone_receivedCall::ID,
+            );
+            net_complete(received_sent, bool_answer(true));
+            td.dispatch_completed_call_net();
+            td.request(
+                54,
+                Function::acceptCall(td_api::acceptCall {
+                    call_id: 5,
+                    protocol: Some(td_api::CallProtocol {
+                        udp_p2p: true,
+                        udp_reflector: true,
+                        min_layer: 65,
+                        max_layer: 92,
+                        library_versions: vec!["4".to_string()],
+                    }),
+                }),
+            );
+            let accept_sent = take_sent_query(&rec, telegram_api::phone_acceptCall::ID);
+            let body = telegram_api::phone_acceptCall::parse(accept_sent.query())
+                .expect("the acceptCall body");
+            let accept_peer = body.peer.as_ref().expect("the input phone call");
+            assert_eq!((accept_peer.id, accept_peer.access_hash), (300, 11));
+            let accept_protocol = body.protocol.as_ref().expect("the protocol");
+            assert_eq!(accept_protocol.max_layer, 92);
+            assert!(!body.g_b.is_empty(), "the local DH public rides");
+            // the peer processes the actor's public: the shared key and
+            // its id are computable from the scratch handshake
+            peer.set_g_a(&body.g_b);
+            let shared_key = peer.get_g_ab().to_binary(2048 / 8);
+            let fingerprint = tdmtproto::dh_handshake::DhHandshake::calc_key_id(&shared_key);
+            let updates_before = td.call_updates.len();
+            let mut ready = Vec::new();
+            telegram_api::phone_PhoneCall {
+                phone_call: Some(telegram_api::PhoneCall::phoneCall(
+                    telegram_api::phoneCall {
+                        flags: 0,
+                        p2p_allowed: true,
+                        video: false,
+                        conference_supported: false,
+                        id: 300,
+                        access_hash: 11,
+                        date: 0,
+                        admin_id: 5,
+                        participant_id: 6,
+                        g_a_or_b: peer_g_a,
+                        key_fingerprint: fingerprint,
+                        protocol: Some(wire_protocol.clone()),
+                        connections: vec![telegram_api::PhoneConnection::phoneConnection(
+                            telegram_api::phoneConnection {
+                                flags: 0,
+                                tcp: false,
+                                id: 7,
+                                ip: "1.2.3.4".to_string(),
+                                ipv6: "::1".to_string(),
+                                port: 443,
+                                peer_tag: b"tag".to_vec(),
+                            },
+                        )],
+                        start_date: 0,
+                        custom_parameters: None,
+                    },
+                )),
+                users: Vec::new(),
+            }
+            .store_boxed(&mut ready);
+            net_complete(accept_sent, ready);
+            td.dispatch_completed_call_net();
+            assert_eq!(
+                td.call_updates.len(),
+                updates_before,
+                "the Ready flush waits for the config (cpp:866-868)"
+            );
+            let mut data_json = Vec::new();
+            telegram_api::DataJSON {
+                data: "{\"cfg\":1}".to_string(),
+            }
+            .store_boxed(&mut data_json);
+            net_complete(config_sent, data_json);
+            td.dispatch_completed_call_net();
+            match td.call_updates.last() {
+                Some(td_api::Update::updateCall(update)) => {
+                    let call = update.call.as_ref().expect("the call");
+                    assert_eq!(call.id, 5);
+                    match call.state.as_ref().expect("the state") {
+                        td_api::CallState::callStateReady(state) => {
+                            assert_eq!(state.config.as_str(), "{\"cfg\":1}");
+                            assert_eq!(state.encryption_key, shared_key, "the DH key agrees");
+                            assert_eq!(state.emojis.len(), 4, "the emoji fingerprints");
+                            assert_eq!(state.servers.len(), 1);
+                            assert!(state.allow_p2p);
+                            let protocol = state.protocol.as_ref().expect("the protocol");
+                            assert_eq!((protocol.min_layer, protocol.max_layer), (65, 92));
+                        }
+                        other => panic!("expected the ready state: {other:?}"),
+                    }
+                }
+                other => panic!("expected updateCall: {other:?}"),
+            }
+            shared_key
+        };
+
+        // 6. sendSignalingData — the FIFO lot pairs the promises in the
+        //    dispatch order (cpp:280-289), a false Bool still settles,
+        //    the error forwards, and the not-active band errors before
+        //    anything parks (cpp:273-275).
+        {
+            td.request(
+                55,
+                Function::sendCallSignalingData(td_api::sendCallSignalingData {
+                    call_id: 5,
+                    data: b"sig1".to_vec(),
+                }),
+            );
+            td.request(
+                56,
+                Function::sendCallSignalingData(td_api::sendCallSignalingData {
+                    call_id: 5,
+                    data: b"sig2".to_vec(),
+                }),
+            );
+            let sent = std::mem::take(&mut *rec.sent.lock());
+            let mut sigs: Vec<_> = sent
+                .into_iter()
+                .filter(|query| query.tl_constructor() == telegram_api::phone_sendSignalingData::ID)
+                .collect();
+            assert_eq!(sigs.len(), 2, "the two signaling queries ride in order");
+            let sig2 = sigs.pop().unwrap();
+            let sig1 = sigs.pop().unwrap();
+            let body1 = telegram_api::phone_sendSignalingData::parse(sig1.query())
+                .expect("the signaling body");
+            let body2 = telegram_api::phone_sendSignalingData::parse(sig2.query())
+                .expect("the signaling body");
+            assert_eq!(&body1.data, b"sig1");
+            assert_eq!(&body2.data, b"sig2");
+            let peer1 = body1.peer.as_ref().expect("the input phone call");
+            assert_eq!((peer1.id, peer1.access_hash), (300, 11));
+            net_fail(sig1, 500, "Internal Server Error");
+            net_complete(sig2, bool_answer(false));
+            td.dispatch_completed_call_net();
+            td.flush_deferred_results();
+            let error = callback
+                .errors
+                .lock()
+                .iter()
+                .find(|(error_id, _)| *error_id == 55)
+                .map(|(_, error)| error.clone())
+                .expect("the first signal forwards the error");
+            assert_eq!(error.message, "Internal Server Error");
+            assert!(
+                callback
+                    .responses
+                    .lock()
+                    .iter()
+                    .any(|(response_id, _)| *response_id == 56),
+                "the false Bool still settles"
+            );
+            td.request(
+                57,
+                Function::sendCallSignalingData(td_api::sendCallSignalingData {
+                    call_id: 4,
+                    data: b"sig3".to_vec(),
+                }),
+            );
+            td.flush_deferred_results();
+            let error = callback
+                .errors
+                .lock()
+                .iter()
+                .find(|(error_id, _)| *error_id == 57)
+                .map(|(_, error)| error.clone())
+                .expect("the not-active band");
+            assert_eq!(error.message, "Call is not active");
+            let _ = shared_key;
+        }
+
+        // 7. getCallConfig's error band — the fetch error routes into
+        //    on_error (cpp:893-897) and the cleanup discard fires with
+        //    the Missed reason (the incoming Pending state).
+        {
+            let mut env = call_env!(td);
+            td.call_manager.update_call(
+                &mut env,
+                telegram_api::updatePhoneCall {
+                    phone_call: Some(telegram_api::PhoneCall::phoneCallRequested(
+                        telegram_api::phoneCallRequested {
+                            flags: 0,
+                            video: false,
+                            id: 400,
+                            access_hash: 13,
+                            date: 0,
+                            admin_id: 5,
+                            participant_id: 6,
+                            g_a_hash: tdutils::crypto::sha256(b"peer-g-a").to_vec(),
+                            protocol: Some(wire_protocol.clone()),
+                        },
+                    )),
+                },
+            );
+            let (config_sent, _received_sent) = take_sent_pair(
+                &rec,
+                telegram_api::phone_getCallConfig::ID,
+                telegram_api::phone_receivedCall::ID,
+            );
+            net_fail(config_sent, 420, "SLOWMODE_WAIT");
+            td.dispatch_completed_call_net();
+            call_error_state(&td, 420, "SLOWMODE_WAIT");
+            let discard_sent = take_sent_query(&rec, telegram_api::phone_discardCall::ID);
+            let body = telegram_api::phone_discardCall::parse(discard_sent.query())
+                .expect("the discard body");
+            let discard_peer = body.peer.as_ref().expect("the input phone call");
+            assert_eq!((discard_peer.id, discard_peer.access_hash), (400, 13));
+            assert!(matches!(
+                body.reason,
+                Some(telegram_api::PhoneCallDiscardReason::phoneCallDiscardReasonMissed(_))
+            ));
+            net_complete(discard_sent, wire_empty_updates());
+            td.dispatch_completed_call_net();
+            // the actor sits in WaitDiscardResult until the Updates
+            // engine routes the phoneCallDiscarded update back (the
+            // case-3 posture — the ok answer never reaches the actor,
+            // cpp:837-841)
+        }
+
+        // 8. getDhConfig's full variant, bad prime — the fetch lambda
+        //    stores the config before the actor's check runs
+        //    (cpp:691 vs the check at cpp:657-661), so the store
+        //    carries the bad config even though the call errors out;
+        //    the call_id == 0 discard stays local (no wire query).
+        {
+            td.call_dh_config = None;
+            td.request(
+                58,
+                Function::createCall(td_api::createCall {
+                    user_id: 5,
+                    protocol: Some(td_api::CallProtocol {
+                        udp_p2p: true,
+                        udp_reflector: true,
+                        min_layer: 65,
+                        max_layer: 92,
+                        library_versions: vec!["4".to_string()],
+                    }),
+                    is_video: false,
+                }),
+            );
+            let (_config_sent, dh_sent) = take_sent_pair(
+                &rec,
+                telegram_api::phone_getCallConfig::ID,
+                telegram_api::messages_getDhConfig::ID,
+            );
+            let mut full = Vec::new();
+            telegram_api::messages_DhConfig::messages_dhConfig(telegram_api::messages_dhConfig {
+                g: 3,
+                p: vec![0xff; 256],
+                version: 9,
+                random: b"seed".to_vec(),
+            })
+            .store(&mut full);
+            net_complete(dh_sent, full);
+            td.dispatch_completed_call_net();
+            // error_message carries code 0 (the C++ Status::Error(message))
+            call_error_state(&td, 0, "Bad prime mod 4g");
+            // the fetch-lambda store write (cpp:691) precedes the check
+            let stored = td
+                .call_dh_config
+                .clone()
+                .expect("the store write rides the fetch lambda");
+            assert_eq!((stored.version, stored.g, stored.prime.len()), (9, 3, 256));
+            let sent_after = std::mem::take(&mut *rec.sent.lock());
+            assert!(
+                sent_after
+                    .iter()
+                    .all(|q| q.tl_constructor() != telegram_api::phone_discardCall::ID),
+                "the unknown call id discards without a query"
+            );
+            assert!(
+                td.call_manager
+                    .get_call_actor(crate::call_id::CallId::new(7))
+                    .is_none()
+            );
+
+            // 8b. the stored BAD config fails the next call too — every
+            //     C++ actor validates the config through on_dh_config's
+            //     check (cpp:653-666); the port's cached store read (the
+            //     `load_dh_config` branch) mirrors the same gate: no
+            //     fresh getDhConfig query, no request leg, the error
+            //     state flushes and the unknown call id discards locally
+            {
+                td.request(
+                    61,
+                    Function::createCall(td_api::createCall {
+                        user_id: 5,
+                        protocol: Some(td_api::CallProtocol {
+                            udp_p2p: true,
+                            udp_reflector: true,
+                            min_layer: 65,
+                            max_layer: 92,
+                            library_versions: vec!["4".to_string()],
+                        }),
+                        is_video: false,
+                    }),
+                );
+                let sent_after = std::mem::take(&mut *rec.sent.lock());
+                assert!(
+                    sent_after
+                        .iter()
+                        .all(|q| q.tl_constructor() != telegram_api::messages_getDhConfig::ID),
+                    "the store serves the load — no fresh dh query"
+                );
+                assert!(
+                    sent_after
+                        .iter()
+                        .all(|q| q.tl_constructor() != telegram_api::phone_requestCall::ID),
+                    "the bad stored prime fails the load before the request leg"
+                );
+                assert!(
+                    sent_after
+                        .iter()
+                        .all(|q| q.tl_constructor() != telegram_api::phone_discardCall::ID),
+                    "the unknown call id discards without a query"
+                );
+                call_error_state(&td, 0, "Bad prime mod 4g");
+            }
+        }
+
+        // 9. getDhConfig's full variant, good prime — the fresh config
+        //    serves the request leg, and the next call reuses the store
+        //    without a fresh query (the `load_dh_config` read,
+        //    cpp:612-615).
+        {
+            td.call_dh_config = None;
+            td.request(
+                59,
+                Function::createCall(td_api::createCall {
+                    user_id: 5,
+                    protocol: Some(td_api::CallProtocol {
+                        udp_p2p: true,
+                        udp_reflector: true,
+                        min_layer: 65,
+                        max_layer: 92,
+                        library_versions: vec!["4".to_string()],
+                    }),
+                    is_video: false,
+                }),
+            );
+            let (_config_sent, dh_sent) = take_sent_pair(
+                &rec,
+                telegram_api::phone_getCallConfig::ID,
+                telegram_api::messages_getDhConfig::ID,
+            );
+            let mut full = Vec::new();
+            telegram_api::messages_DhConfig::messages_dhConfig(telegram_api::messages_dhConfig {
+                g: 3,
+                p: dh_prime.clone(),
+                version: 9,
+                random: b"seed".to_vec(),
+            })
+            .store(&mut full);
+            net_complete(dh_sent, full);
+            td.dispatch_completed_call_net();
+            let request_sent = take_sent_query(&rec, telegram_api::phone_requestCall::ID);
+            net_fail(request_sent, 400, "PARTICIPANT_CALL_DECLINED");
+            td.dispatch_completed_call_net();
+            let stored = td
+                .call_dh_config
+                .clone()
+                .expect("the store write rides the fetch lambda");
+            assert_eq!((stored.version, stored.g), (9, 3));
+            assert!(stored.prime == dh_prime, "the fresh prime is stored");
+
+            // the second call skips the dh query over the stored config
+            td.request(
+                60,
+                Function::createCall(td_api::createCall {
+                    user_id: 5,
+                    protocol: Some(td_api::CallProtocol {
+                        udp_p2p: true,
+                        udp_reflector: true,
+                        min_layer: 65,
+                        max_layer: 92,
+                        library_versions: vec!["4".to_string()],
+                    }),
+                    is_video: false,
+                }),
+            );
+            let sent = std::mem::take(&mut *rec.sent.lock());
+            assert!(
+                sent.iter()
+                    .all(|q| q.tl_constructor() != telegram_api::messages_getDhConfig::ID),
+                "the stored config serves the load"
+            );
+            assert_eq!(
+                sent.iter()
+                    .filter(|q| q.tl_constructor() == telegram_api::phone_requestCall::ID)
+                    .count(),
+                1,
+                "the request rides straight away"
+            );
+            let request_sent = sent
+                .into_iter()
+                .find(|q| q.tl_constructor() == telegram_api::phone_requestCall::ID)
+                .unwrap();
+            net_fail(request_sent, 400, "PARTICIPANT_CALL_DECLINED");
+            td.dispatch_completed_call_net();
+            assert!(
+                td.call_manager
+                    .get_call_actor(crate::call_id::CallId::new(9))
+                    .is_none()
+            );
         }
     }
 
@@ -97518,5 +100634,928 @@ kQIDAQAB\n\
             1,
             "the net-inert park"
         );
+    }
+
+    // ---- the secret-chats net slice: the five wire families ride the
+    // manager-held SecretNetKind plane over the ported DhHandshake
+    // machinery (SecretChatsManager.cpp:98-204, SecretChatActor.cpp:68-71,
+    // 507-529, 626-640, 692-722, 1769-1828). ----
+
+    /// The requests.rs `secret_chat_arm` shape for the tests — the
+    /// field-split env + manager borrows off one `&mut Td`.
+    fn test_secret_chat_arm(
+        td: &mut Td,
+        run: impl FnOnce(
+            &mut crate::td::SecretChatsTdEnv<'_>,
+            &mut crate::secret_chats_manager::SecretChatsManager,
+        ),
+    ) {
+        let crate::td::Td {
+            global,
+            auth_manager,
+            user_manager,
+            notification_updates,
+            secret_chats_manager,
+            ..
+        } = td;
+        let mut env = crate::td::SecretChatsTdEnv {
+            global,
+            auth_is_authorized: auth_manager.is_authorized(),
+            use_secret_chats: true,
+            user_manager,
+            updates: notification_updates,
+        };
+        run(&mut env, secret_chats_manager);
+    }
+
+    type SecretChatIdSlot = std::sync::Arc<
+        std::sync::Mutex<Option<tdutils::status::Result<crate::secret_chat::SecretChatId>>>,
+    >;
+
+    fn record_secret_chat_id() -> (Promise<crate::secret_chat::SecretChatId>, SecretChatIdSlot) {
+        struct Rec(SecretChatIdSlot);
+        impl tdutils::promise::PromiseInterface<crate::secret_chat::SecretChatId> for Rec {
+            fn set_value(&mut self, value: crate::secret_chat::SecretChatId) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: SecretChatIdSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    fn wire_encrypted_chat_waiting(id: i32, access_hash: i64) -> Vec<u8> {
+        let mut out = Vec::new();
+        telegram_api::encryptedChatWaiting {
+            id,
+            access_hash,
+            date: 1_700_000_000,
+            admin_id: 0,
+            participant_id: 0,
+        }
+        .store_boxed(&mut out);
+        out
+    }
+
+    fn wire_encrypted_chat(
+        id: i32,
+        access_hash: i64,
+        g_a_or_b: Vec<u8>,
+        key_fingerprint: i64,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        telegram_api::encryptedChat {
+            id,
+            access_hash,
+            date: 1_700_000_000,
+            admin_id: 0,
+            participant_id: 0,
+            g_a_or_b,
+            key_fingerprint,
+        }
+        .store_boxed(&mut out);
+        out
+    }
+
+    fn wire_encrypted_chat_discarded(id: i32) -> Vec<u8> {
+        let mut out = Vec::new();
+        telegram_api::encryptedChatDiscarded {
+            flags: 0,
+            history_deleted: false,
+            id,
+        }
+        .store_boxed(&mut out);
+        out
+    }
+
+    fn wire_sent_encrypted_message(date: i32) -> Vec<u8> {
+        let mut out = Vec::new();
+        telegram_api::messages_SentEncryptedMessage::messages_sentEncryptedMessage(
+            telegram_api::messages_sentEncryptedMessage { date },
+        )
+        .store(&mut out);
+        out
+    }
+
+    #[test]
+    fn secret_chat_create_request_encryption_round_trip() {
+        let (mut td, rec) = netted_td("secret_chat_create");
+
+        // 1. the create: the receipt settles at the dispatch with the
+        //    random_id the query carries (cpp:124), the handshake g_b
+        //    rides as the request g_a (SecretChatActor.cpp:507-516)
+        let (promise, slot) = record_secret_chat_id();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.create_chat(env, crate::user_manager::UserId::new(5), 42, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::messages_requestEncryption::ID
+        );
+        let random_id = match telegram_api::Function::parse(sent[0].query()).unwrap() {
+            telegram_api::Function::messages_requestEncryption(function) => {
+                match function.user_id.expect("the inputUser peer") {
+                    telegram_api::InputUser::inputUser(user) => {
+                        assert_eq!(user.user_id, 5);
+                        assert_eq!(user.access_hash, 42);
+                    }
+                    other => panic!("unexpected requestEncryption peer: {other:?}"),
+                }
+                assert!(!function.g_a.is_empty(), "the handshake g_b rides as g_a");
+                function.random_id
+            }
+            other => panic!("unexpected create query: {other:?}"),
+        };
+        assert!(matches!(
+            slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(id)) if id.get() == random_id
+        ));
+
+        // 2. the encryptedChatWaiting answer folds the registry record
+        //    (save_common_info + the state stays WaitRequestResponse,
+        //    cpp:1748-1755)
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            wire_encrypted_chat_waiting(7, 99),
+        );
+        td.dispatch_completed_secret_net();
+        let chat = td
+            .secret_chats_manager
+            .get_chat(crate::secret_chat::SecretChatId::new(7))
+            .expect("the folded record");
+        assert_eq!(chat.state, crate::secret_chat::SecretChatState::Waiting);
+        assert_eq!(chat.access_hash, 99);
+        assert_eq!(chat.user_id.get(), 5);
+        assert!(matches!(
+            td.notification_updates.last(),
+            Some(crate::td_api::Update::updateSecretChat(_))
+        ));
+
+        // 3. the encryptedChat answer with a real peer handshake runs
+        //    set_g_a + gen_key + the fingerprint check → Active
+        //    (cpp:1756-1798)
+        let (promise, _slot) = record_secret_chat_id();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.create_chat(env, crate::user_manager::UserId::new(5), 42, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        let manager_g_b = match telegram_api::Function::parse(sent[0].query()).unwrap() {
+            telegram_api::Function::messages_requestEncryption(function) => function.g_a,
+            other => panic!("unexpected create query: {other:?}"),
+        };
+        let seed = crate::dh_cache::DhCache::built_in_dh_config();
+        let mut peer = tdmtproto::dh_handshake::DhHandshake::new();
+        peer.set_config(seed.g, &seed.prime);
+        peer.set_g_a(&manager_g_b);
+        if peer
+            .run_checks(true, &crate::dh_cache::DhCache::instance())
+            .is_error()
+        {
+            panic!("the peer handshake checks");
+        }
+        let (peer_fingerprint, _peer_key) = peer.gen_key();
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            wire_encrypted_chat(8, 100, peer.get_g_b(), peer_fingerprint),
+        );
+        td.dispatch_completed_secret_net();
+        let chat = td
+            .secret_chats_manager
+            .get_chat(crate::secret_chat::SecretChatId::new(8))
+            .expect("the folded record");
+        assert_eq!(chat.state, crate::secret_chat::SecretChatState::Active);
+        assert_eq!(chat.access_hash, 100);
+
+        // 4. the band: the wire error is the C++ fatal (check_status →
+        //    cancel_chat, cpp:626-640) — the record plants Closed and
+        //    the discard tail fires for the receipt id
+        let (promise, _slot) = record_secret_chat_id();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.create_chat(env, crate::user_manager::UserId::new(5), 42, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        let failed_random_id = match telegram_api::Function::parse(sent[0].query()).unwrap() {
+            telegram_api::Function::messages_requestEncryption(function) => function.random_id,
+            other => panic!("unexpected create query: {other:?}"),
+        };
+        net_fail(sent.into_iter().next().unwrap(), 400, "CHAT_ID_INVALID");
+        td.dispatch_completed_secret_net();
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1, "the fatal fires the discard tail");
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::messages_discardEncryption::ID
+        );
+        match telegram_api::Function::parse(sent[0].query()).unwrap() {
+            telegram_api::Function::messages_discardEncryption(function) => {
+                assert_eq!(function.chat_id, failed_random_id);
+                assert_eq!(function.flags, 0);
+                assert!(!function.delete_history);
+            }
+            other => panic!("unexpected discard query: {other:?}"),
+        }
+        let chat = td
+            .secret_chats_manager
+            .get_chat(crate::secret_chat::SecretChatId::new(failed_random_id))
+            .expect("the planted closed record");
+        assert_eq!(chat.state, crate::secret_chat::SecretChatState::Closed);
+        assert!(
+            td.secret_chats_manager.pending.creates.is_empty(),
+            "drained"
+        );
+    }
+
+    #[test]
+    fn secret_chat_accept_encryption_round_trip() {
+        let (mut td, rec) = netted_td("secret_chat_accept");
+        let seed = crate::dh_cache::DhCache::built_in_dh_config();
+
+        // the peer request's g_a — a throwaway handshake's public
+        let mut requester = tdmtproto::dh_handshake::DhHandshake::new();
+        requester.set_config(seed.g, &seed.prime);
+        let request_g_a = requester.get_g_b();
+
+        // 1. the encryptedChatRequested intake folds Waiting and runs
+        //    the SendAccept tail (cpp:517-529, 1740-1760)
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.on_encrypted_chat_requested(
+                env,
+                crate::secret_chat::SecretChatId::new(7),
+                crate::user_manager::UserId::new(5),
+                99,
+                &request_g_a,
+            );
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::messages_acceptEncryption::ID
+        );
+        let manager_g_b = match telegram_api::Function::parse(sent[0].query()).unwrap() {
+            telegram_api::Function::messages_acceptEncryption(function) => {
+                let peer = function.peer.expect("the inputEncryptedChat peer");
+                assert_eq!(peer.chat_id, 7);
+                assert_eq!(peer.access_hash, 99);
+                assert!(!function.g_b.is_empty());
+                assert!(function.key_fingerprint != 0, "the gen_key fingerprint");
+                function.g_b
+            }
+            other => panic!("unexpected accept query: {other:?}"),
+        };
+
+        // 2. the test plays the peer on the requester's handshake — its
+        //    exponent is the peer half of the shared key, so the derived
+        //    fingerprint must agree with the manager's
+        requester.set_g_a(&manager_g_b);
+        if requester
+            .run_checks(true, &crate::dh_cache::DhCache::instance())
+            .is_error()
+        {
+            panic!("the peer handshake checks");
+        }
+        let (fingerprint, _key) = requester.gen_key();
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            wire_encrypted_chat(7, 99, requester.get_g_b(), fingerprint),
+        );
+        td.dispatch_completed_secret_net();
+        let chat = td
+            .secret_chats_manager
+            .get_chat(crate::secret_chat::SecretChatId::new(7))
+            .expect("the folded record");
+        assert_eq!(chat.state, crate::secret_chat::SecretChatState::Active);
+        assert_eq!(chat.access_hash, 99);
+
+        // 3. the fingerprint-mismatch band: the fatal closes the chat
+        //    and fires the discard tail (cpp:1777-1779, 626-640)
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.on_encrypted_chat_requested(
+                env,
+                crate::secret_chat::SecretChatId::new(9),
+                crate::user_manager::UserId::new(6),
+                98,
+                &request_g_a,
+            );
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            wire_encrypted_chat(9, 98, requester.get_g_b(), fingerprint ^ 1),
+        );
+        td.dispatch_completed_secret_net();
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1, "the fatal fires the discard tail");
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::messages_discardEncryption::ID
+        );
+        match telegram_api::Function::parse(sent[0].query()).unwrap() {
+            telegram_api::Function::messages_discardEncryption(function) => {
+                assert_eq!(function.chat_id, 9);
+            }
+            other => panic!("unexpected discard query: {other:?}"),
+        }
+        assert_eq!(
+            td.secret_chats_manager
+                .get_chat(crate::secret_chat::SecretChatId::new(9))
+                .unwrap()
+                .state,
+            crate::secret_chat::SecretChatState::Closed
+        );
+
+        // 4. the encryptedChatDiscarded answer closes without a
+        //    discard query (cpp:1800-1803)
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.on_encrypted_chat_requested(
+                env,
+                crate::secret_chat::SecretChatId::new(11),
+                crate::user_manager::UserId::new(7),
+                97,
+                &request_g_a,
+            );
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            wire_encrypted_chat_discarded(11),
+        );
+        td.dispatch_completed_secret_net();
+        assert_eq!(
+            td.secret_chats_manager
+                .get_chat(crate::secret_chat::SecretChatId::new(11))
+                .unwrap()
+                .state,
+            crate::secret_chat::SecretChatState::Closed
+        );
+        assert!(
+            std::mem::take(&mut *rec.sent.lock()).is_empty(),
+            "already discarded — no query"
+        );
+
+        // 5. the bad-g_a band: the SendAccept checks fail → the fatal
+        //    closes and discards without an acceptEncryption query
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.on_encrypted_chat_requested(
+                env,
+                crate::secret_chat::SecretChatId::new(13),
+                crate::user_manager::UserId::new(8),
+                96,
+                &[1],
+            );
+        });
+        assert_eq!(
+            td.secret_chats_manager
+                .get_chat(crate::secret_chat::SecretChatId::new(13))
+                .unwrap()
+                .state,
+            crate::secret_chat::SecretChatState::Closed
+        );
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::messages_discardEncryption::ID
+        );
+        assert!(
+            td.secret_chats_manager.accept_handshakes.is_empty(),
+            "drained"
+        );
+    }
+
+    #[test]
+    fn secret_chat_close_discard_encryption_live_arm_round_trip() {
+        let (mut td, rec, callback) = netted_td_with_callback("secret_chat_close");
+
+        // the chat record folds first (the close needs the record)
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.on_update_chat(
+                env,
+                crate::secret_chat::SecretChatId::new(9),
+                crate::user_manager::UserId::new(5),
+                77,
+                crate::secret_chat::SecretChatState::Active,
+            );
+        });
+
+        // 1. the live arm: closeSecretChat → messages.discardEncryption
+        //    (Requests.cpp:7409-7415 → cpp:707-711)
+        td.request(
+            301,
+            Function::closeSecretChat(td_api::closeSecretChat { secret_chat_id: 9 }),
+        );
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::messages_discardEncryption::ID
+        );
+        match telegram_api::Function::parse(sent[0].query()).unwrap() {
+            telegram_api::Function::messages_discardEncryption(function) => {
+                assert_eq!(function.chat_id, 9);
+                assert!(!function.delete_history, "the arm closes without the flag");
+                assert_eq!(function.flags, 0);
+            }
+            other => panic!("unexpected close query: {other:?}"),
+        }
+        assert_eq!(
+            td.secret_chats_manager
+                .get_chat(crate::secret_chat::SecretChatId::new(9))
+                .unwrap()
+                .state,
+            crate::secret_chat::SecretChatState::Closed
+        );
+        net_complete(sent.into_iter().next().unwrap(), bool_answer(true));
+        td.dispatch_completed_secret_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 301).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 2. the C++ band: the close absorbs every outcome (the
+        //    SafePromise / close_flag_ branch, cpp:108-117) — the wire
+        //    error still answers ok
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.on_update_chat(
+                env,
+                crate::secret_chat::SecretChatId::new(10),
+                crate::user_manager::UserId::new(6),
+                78,
+                crate::secret_chat::SecretChatState::Active,
+            );
+        });
+        td.request(
+            302,
+            Function::closeSecretChat(td_api::closeSecretChat { secret_chat_id: 10 }),
+        );
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        net_fail(sent.into_iter().next().unwrap(), 400, "CHAT_ID_INVALID");
+        td.dispatch_completed_secret_net();
+        td.flush_deferred_results();
+        assert!(
+            matches!(responses_of(&callback, 302).first(), Some(Object::ok(_))),
+            "the absorb band"
+        );
+        assert_eq!(
+            td.secret_chats_manager
+                .get_chat(crate::secret_chat::SecretChatId::new(10))
+                .unwrap()
+                .state,
+            crate::secret_chat::SecretChatState::Closed
+        );
+
+        // 3. the invalid-id band answers 400 with no query
+        td.request(
+            303,
+            Function::closeSecretChat(td_api::closeSecretChat { secret_chat_id: 0 }),
+        );
+        td.flush_deferred_results();
+        assert!(std::mem::take(&mut *rec.sent.lock()).is_empty());
+        let error = error_of(&callback, 303);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Invalid secret chat identifier specified");
+
+        // 4. the empty-actor no-op absorbs into ok with no query
+        //    (SecretChatsManager.cpp:108-112)
+        td.request(
+            304,
+            Function::closeSecretChat(td_api::closeSecretChat { secret_chat_id: 55 }),
+        );
+        td.flush_deferred_results();
+        assert!(std::mem::take(&mut *rec.sent.lock()).is_empty());
+        assert!(matches!(
+            responses_of(&callback, 304).first(),
+            Some(Object::ok(_))
+        ));
+        assert!(
+            td.secret_chats_manager.pending.discards.is_empty(),
+            "drained"
+        );
+
+        // 5. the already-closed band (the C++ close_flag_ short-circuit,
+        //    cpp:644-647): the second close settles ok immediately — no
+        //    fresh chat update, no wire query, no parked receipt
+        td.request(
+            306,
+            Function::closeSecretChat(td_api::closeSecretChat { secret_chat_id: 9 }),
+        );
+        td.flush_deferred_results();
+        assert!(
+            std::mem::take(&mut *rec.sent.lock()).is_empty(),
+            "no re-dispatch on the closed chat"
+        );
+        assert!(
+            td.secret_chats_manager.pending.discards.is_empty(),
+            "nothing parks"
+        );
+        assert!(matches!(
+            responses_of(&callback, 306).first(),
+            Some(Object::ok(_))
+        ));
+    }
+
+    #[test]
+    fn secret_chat_read_encrypted_history_round_trip() {
+        let (mut td, rec) = netted_td("secret_chat_read");
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.on_update_chat(
+                env,
+                crate::secret_chat::SecretChatId::new(9),
+                crate::user_manager::UserId::new(5),
+                77,
+                crate::secret_chat::SecretChatState::Active,
+            );
+        });
+
+        // 1. the send rides the peer + date; the Bool answer settles Unit
+        let (promise, slot) = record_translation_unit();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.send_read_history(env, crate::secret_chat::SecretChatId::new(9), 500, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::messages_readEncryptedHistory::ID
+        );
+        match telegram_api::Function::parse(sent[0].query()).unwrap() {
+            telegram_api::Function::messages_readEncryptedHistory(function) => {
+                let peer = function.peer.expect("the inputEncryptedChat peer");
+                assert_eq!(peer.chat_id, 9);
+                assert_eq!(peer.access_hash, 77);
+                assert_eq!(function.max_date, 500);
+            }
+            other => panic!("unexpected read query: {other:?}"),
+        }
+        assert_eq!(
+            td.secret_chats_manager
+                .get_chat(crate::secret_chat::SecretChatId::new(9))
+                .unwrap()
+                .last_read_history_date,
+            500
+        );
+        net_complete(sent.into_iter().next().unwrap(), bool_answer(true));
+        td.dispatch_completed_secret_net();
+        assert!(matches!(
+            slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        // 2. the dedup band: date <= last_read_history_date_ settles
+        //    Unit without a query (cpp:319-320)
+        let (promise, slot) = record_translation_unit();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.send_read_history(env, crate::secret_chat::SecretChatId::new(9), 400, promise);
+        });
+        assert!(matches!(
+            slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(
+            std::mem::take(&mut *rec.sent.lock()).is_empty(),
+            "no query on the dedup"
+        );
+
+        // 3. the not-Ready band (cpp:313-316)
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.on_update_chat(
+                env,
+                crate::secret_chat::SecretChatId::new(12),
+                crate::user_manager::UserId::new(6),
+                78,
+                crate::secret_chat::SecretChatState::Waiting,
+            );
+        });
+        let (promise, slot) = record_translation_unit();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.send_read_history(env, crate::secret_chat::SecretChatId::new(12), 500, promise);
+        });
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.code(), 400);
+                assert_eq!(status.message(), "Can't access the chat");
+            }
+            other => panic!("unexpected read result: {other:?}"),
+        }
+
+        // 4. the closed band (cpp:310-312)
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.on_update_chat(
+                env,
+                crate::secret_chat::SecretChatId::new(9),
+                crate::user_manager::UserId::new(5),
+                77,
+                crate::secret_chat::SecretChatState::Closed,
+            );
+        });
+        let (promise, slot) = record_translation_unit();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.send_read_history(env, crate::secret_chat::SecretChatId::new(9), 600, promise);
+        });
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.message(), "Chat is closed");
+            }
+            other => panic!("unexpected read result: {other:?}"),
+        }
+
+        // 5. the generation pairing: a re-send settles the previous
+        //    receipt (cpp:322-326), the stale gen-0 answer drops and
+        //    the live gen-1 answer settles (cpp:1823-1828)
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.on_update_chat(
+                env,
+                crate::secret_chat::SecretChatId::new(9),
+                crate::user_manager::UserId::new(5),
+                77,
+                crate::secret_chat::SecretChatState::Active,
+            );
+        });
+        let (promise1, slot1) = record_translation_unit();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.send_read_history(env, crate::secret_chat::SecretChatId::new(9), 700, promise1);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        let query1 = sent.into_iter().next().unwrap();
+        let (promise2, slot2) = record_translation_unit();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.send_read_history(env, crate::secret_chat::SecretChatId::new(9), 800, promise2);
+        });
+        assert!(
+            matches!(
+                slot1.lock().unwrap().take(),
+                Some(tdutils::status::Result::Ok(()))
+            ),
+            "the re-send settles the previous receipt"
+        );
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        let query2 = sent.into_iter().next().unwrap();
+        net_complete(query1, bool_answer(true));
+        td.dispatch_completed_secret_net();
+        assert!(slot2.lock().unwrap().is_none(), "the stale answer drops");
+        net_complete(query2, bool_answer(true));
+        td.dispatch_completed_secret_net();
+        assert!(matches!(
+            slot2.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(
+            td.secret_chats_manager.pending.read_history.is_empty(),
+            "drained"
+        );
+
+        // 6. the per-chat cancel (cpp:322-326 — `read_history_promise_`
+        //    is the chat's own actor member): another chat's read leaves
+        //    chat 9's parked receipt alone, and each answer settles its
+        //    own chat's receipt
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.on_update_chat(
+                env,
+                crate::secret_chat::SecretChatId::new(14),
+                crate::user_manager::UserId::new(7),
+                79,
+                crate::secret_chat::SecretChatState::Active,
+            );
+        });
+        let (promise9, slot9) = record_translation_unit();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.send_read_history(env, crate::secret_chat::SecretChatId::new(9), 900, promise9);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        let query9 = sent.into_iter().next().unwrap();
+        let (promise14, slot14) = record_translation_unit();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.send_read_history(
+                env,
+                crate::secret_chat::SecretChatId::new(14),
+                900,
+                promise14,
+            );
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        let query14 = sent.into_iter().next().unwrap();
+        assert!(
+            slot9.lock().unwrap().is_none(),
+            "chat 14's read leaves chat 9's receipt parked"
+        );
+        assert!(slot14.lock().unwrap().is_none(), "chat 14 parks its own");
+        net_complete(query9, bool_answer(true));
+        td.dispatch_completed_secret_net();
+        assert!(matches!(
+            slot9.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(
+            slot14.lock().unwrap().is_none(),
+            "chat 14's receipt waits for its own answer"
+        );
+        net_complete(query14, bool_answer(true));
+        td.dispatch_completed_secret_net();
+        assert!(matches!(
+            slot14.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(
+            td.secret_chats_manager.pending.read_history.is_empty(),
+            "drained"
+        );
+    }
+
+    #[test]
+    fn secret_chat_send_encrypted_round_trip() {
+        let (mut td, rec) = netted_td("secret_chat_send");
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.on_update_chat(
+                env,
+                crate::secret_chat::SecretChatId::new(9),
+                crate::user_manager::UserId::new(5),
+                77,
+                crate::secret_chat::SecretChatState::Active,
+            );
+        });
+
+        // 1. the sendEncrypted leg: the constructor rides the peer + a
+        //    fresh random_id, the payload buffer stays empty (the codec
+        //    parks [blocked: tde2e]); the sentEncryptedMessage answer
+        //    settles Unit (the MessageId routing rides MessagesManager)
+        let (promise, slot) = record_translation_unit();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.send_message(env, crate::secret_chat::SecretChatId::new(9), promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::messages_sendEncrypted::ID
+        );
+        match telegram_api::Function::parse(sent[0].query()).unwrap() {
+            telegram_api::Function::messages_sendEncrypted(function) => {
+                let peer = function.peer.expect("the inputEncryptedChat peer");
+                assert_eq!(peer.chat_id, 9);
+                assert_eq!(peer.access_hash, 77);
+                assert_eq!(function.flags, 0, "not silent");
+                assert!(!function.silent);
+                assert!(function.random_id != 0);
+                assert!(function.data.is_empty());
+            }
+            other => panic!("unexpected send query: {other:?}"),
+        }
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            wire_sent_encrypted_message(500),
+        );
+        td.dispatch_completed_secret_net();
+        assert!(matches!(
+            slot.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+
+        // 2. the error band forwards to the send receipt (the C++
+        //    on_send_message_error tail rides MessagesManager)
+        let (promise, slot) = record_translation_unit();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.send_message(env, crate::secret_chat::SecretChatId::new(9), promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        net_fail(sent.into_iter().next().unwrap(), 400, "PEER_ID_INVALID");
+        td.dispatch_completed_secret_net();
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.code(), 400);
+                assert_eq!(status.message(), "PEER_ID_INVALID");
+            }
+            other => panic!("unexpected send result: {other:?}"),
+        }
+
+        // 3. the service leg: fire-and-forget constructor assert
+        //    (cpp:1386-1404)
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.send_message_action(env, crate::secret_chat::SecretChatId::new(9));
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::messages_sendEncryptedService::ID
+        );
+        match telegram_api::Function::parse(sent[0].query()).unwrap() {
+            telegram_api::Function::messages_sendEncryptedService(function) => {
+                let peer = function.peer.expect("the inputEncryptedChat peer");
+                assert_eq!(peer.chat_id, 9);
+                assert_eq!(peer.access_hash, 77);
+                assert!(function.random_id != 0);
+                assert!(function.data.is_empty());
+            }
+            other => panic!("unexpected service query: {other:?}"),
+        }
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            wire_sent_encrypted_message(501),
+        );
+        td.dispatch_completed_secret_net();
+
+        // 4. the not-Ready bands: the send errors, the action ignores
+        //    (cpp:294-297)
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.on_update_chat(
+                env,
+                crate::secret_chat::SecretChatId::new(12),
+                crate::user_manager::UserId::new(6),
+                78,
+                crate::secret_chat::SecretChatState::Waiting,
+            );
+        });
+        let (promise, slot) = record_translation_unit();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.send_message(env, crate::secret_chat::SecretChatId::new(12), promise);
+        });
+        match slot.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.message(), "Can't access the chat");
+            }
+            other => panic!("unexpected send result: {other:?}"),
+        }
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.send_message_action(env, crate::secret_chat::SecretChatId::new(12));
+        });
+        assert!(
+            std::mem::take(&mut *rec.sent.lock()).is_empty(),
+            "the not-Ready action ignores"
+        );
+        assert!(td.secret_chats_manager.pending.sends.is_empty(), "drained");
+
+        // 5. the §5 FIFO pairing: two parked sends pair with their
+        //    answers in dispatch order — the error answer settles the
+        //    FIRST receipt and the ok answer the second (the C++ carries
+        //    the promise on the query itself; the family lot pops the
+        //    head like the sibling lots)
+        let (promise1, slot1) = record_translation_unit();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.send_message(env, crate::secret_chat::SecretChatId::new(9), promise1);
+        });
+        let (promise2, slot2) = record_translation_unit();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.send_message(env, crate::secret_chat::SecretChatId::new(9), promise2);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 2, "both sends ride");
+        let mut queries = sent.into_iter();
+        let query1 = queries.next().unwrap();
+        let query2 = queries.next().unwrap();
+        net_fail(query1, 400, "PEER_ID_INVALID");
+        td.dispatch_completed_secret_net();
+        match slot1.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.code(), 400);
+                assert_eq!(status.message(), "PEER_ID_INVALID");
+            }
+            other => panic!("the first receipt takes the error answer: {other:?}"),
+        }
+        assert!(slot2.lock().unwrap().is_none(), "the second receipt parks");
+        net_complete(query2, wire_sent_encrypted_message(502));
+        td.dispatch_completed_secret_net();
+        assert!(
+            matches!(
+                slot2.lock().unwrap().take(),
+                Some(tdutils::status::Result::Ok(()))
+            ),
+            "the second receipt takes the ok answer"
+        );
+        assert!(td.secret_chats_manager.pending.sends.is_empty(), "drained");
+    }
+
+    #[test]
+    fn secret_chat_create_new_secret_chat_arm_band() {
+        let (mut td, rec, callback) = netted_td_with_callback("secret_chat_create_arm");
+        // no user planted — the arm's input-user resolution errors
+        // before the wire (UserManager.cpp:9845-9854)
+        td.request(
+            305,
+            Function::createNewSecretChat(td_api::createNewSecretChat { user_id: 5 }),
+        );
+        td.flush_deferred_results();
+        assert!(
+            std::mem::take(&mut *rec.sent.lock()).is_empty(),
+            "no query without the peer"
+        );
+        let error = error_of(&callback, 305);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "User not found");
+        assert!(td.secret_chats_manager.pending.creates.is_empty());
     }
 }

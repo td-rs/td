@@ -33,7 +33,7 @@ fn good_prime_key(prime_str: &[u8]) -> Vec<u8> {
 
 /// The built-in good prime (DhCache.cpp:16-33) — the 2048-bit group prime
 /// hex-decoded (extracted from the source).
-const BUILT_IN_GOOD_PRIME: [u8; 256] = [
+pub(crate) const BUILT_IN_GOOD_PRIME: [u8; 256] = [
     0xc7, 0x1c, 0xae, 0xb9, 0xc6, 0xb1, 0xc9, 0x04, 0x8e, 0x6c, 0x52, 0x2f, 0x70, 0xf1, 0x3f, 0x73,
     0x98, 0x0d, 0x40, 0x23, 0x8e, 0x3e, 0x21, 0xc1, 0x49, 0x34, 0xd0, 0x37, 0x56, 0x3d, 0x93, 0x0f,
     0x48, 0x19, 0x8a, 0x0a, 0xa7, 0xc1, 0x40, 0x58, 0x22, 0x94, 0x93, 0xd2, 0x25, 0x30, 0xf4, 0xdb,
@@ -62,6 +62,18 @@ impl DhCache {
     /// `DhCache::instance` (DhCache.h:13-15) — the collapsed singleton.
     pub fn instance() -> DhCache {
         DhCache
+    }
+
+    /// The built-in seed config — the `G()->get_dh_config()` analog for
+    /// the planes whose `messages.getDhConfig` fetch family is still
+    /// parked (the call plane fetch, the secret-chat fetch): the
+    /// 2048-bit group prime with `g = 2` (DhCache.cpp:16-33).
+    pub fn built_in_dh_config() -> DhConfig {
+        DhConfig {
+            version: 0,
+            prime: BUILT_IN_GOOD_PRIME.to_vec(),
+            g: 2,
+        }
     }
 
     /// `is_good_prime` (DhCache.cpp:15-34).

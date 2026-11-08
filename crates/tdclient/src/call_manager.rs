@@ -10,12 +10,16 @@
 //! `Td::on_call_net_answer`; `phone.saveCallLog` is `[blocked:
 //! net/Files]` — the C++ send resolves the uploaded InputFile through
 //! the FileManager upload chain (CallManager.cpp:368-386), so the
-//! request parks at the upload seam with the answer intake landed.
+//! request parks at the upload seam with the answer intake landed. The
+//! net-drain 54 slice extends the same plane with the eight actor
+//! families (CallActor.cpp): the actor builds the TL at the send site,
+//! the `CallEnv` override dispatches, and the answers route back into
+//! the actors through the `on_*_net_answer` intakes below.
 
 use crate::call_actor::{CallActor, CallActorEnv};
 use crate::call_id::{CallId, InputCallId};
 use crate::call_protocol::CallProtocol;
-use crate::dh_cache::DhCacheEnv;
+use crate::dh_cache::{DhCacheEnv, DhConfig};
 use crate::dialog_id::MessageFullId;
 use crate::td_api;
 use crate::user_manager::UserId;
@@ -84,6 +88,41 @@ pub(crate) enum CallNetKind {
     /// dispatch arrives with the upload chain).
     #[allow(dead_code)]
     SaveCallLog { call_id: InputCallId },
+    /// `do_load_dh_config`'s `messages.getDhConfig` (CallActor.cpp:668-703)
+    /// — the answer parses in the Td router (the DhConfig build + the
+    /// DRBG seed + the stored-config fallback, cpp:683-701) and routes
+    /// [`CallManager::on_dh_config_net_answer`].
+    GetDhConfig { call_id: CallId },
+    /// `start_up`'s `phone.getCallConfig` (CallActor.cpp:884-900) — the
+    /// dataJSON answer routes
+    /// [`CallManager::on_call_config_net_answer`].
+    GetCallConfig { call_id: CallId },
+    /// `try_send_request_query`'s `phone.requestCall` (CallActor.cpp:721-758)
+    /// — the `phone.phoneCall` answer rides
+    /// [`CallManager::on_phone_call_net_answer`].
+    RequestCall { call_id: CallId },
+    /// `try_send_accept_query`'s `phone.acceptCall` (CallActor.cpp:760-789)
+    /// — the answer rides [`CallManager::on_phone_call_net_answer`].
+    AcceptCall { call_id: CallId },
+    /// `try_send_confirm_query`'s `phone.confirmCall` (CallActor.cpp:791-812)
+    /// — the answer rides [`CallManager::on_phone_call_net_answer`].
+    ConfirmCall { call_id: CallId },
+    /// `try_send_discard_query`'s `phone.discardCall` (CallActor.cpp:814-841)
+    /// — the ok answer rides the Updates engine (the Td router um_sends
+    /// it with an empty promise, cpp:837-841), the fetch error routes
+    /// [`CallManager::on_discard_call_net_answer`].
+    DiscardCall { call_id: CallId },
+    /// `send_received_query`'s `phone.receivedCall` (CallActor.cpp:705-719)
+    /// — the ok answer is unused, the fetch error routes
+    /// [`CallManager::on_received_call_net_answer`].
+    ReceivedCall { call_id: CallId },
+    /// `send_call_signaling_data`'s `phone.sendSignalingData`
+    /// (CallActor.cpp:271-292) — the promise rides the FIFO lot; the
+    /// answer settles it in the Td router with no actor tail
+    /// (cpp:280-289), so the routing id never reads back (the
+    /// `SaveCallLog` allow precedent).
+    #[allow(dead_code)]
+    SendSignalingData { call_id: CallId },
 }
 
 /// The parked query promises — the ResultHandler members the `Copy`
@@ -98,6 +137,9 @@ pub(crate) struct PendingCallQueries {
     /// `SaveCallLogQuery::promise_` (cpp:99) — the send parks over the
     /// M.12 upload chain; the answer intake pops the lot.
     pub(crate) save_call_log: Vec<Promise<()>>,
+    /// `send_call_signaling_data`'s request promise (CallActor.cpp:280-289
+    /// — the C++ carries it on the query); the Td router pops the lot.
+    pub(crate) send_signaling_data: Vec<Promise<()>>,
 }
 
 impl CallManager {
@@ -235,7 +277,12 @@ impl CallManager {
         actor.accept_call(env, protocol, promise);
     }
 
-    /// `send_call_signaling_data` (CallManager.cpp:213-220).
+    /// `send_call_signaling_data` (CallManager.cpp:213-220) — the actor
+    /// runs the state gate + the TL build (CallActor.cpp:272-289), then
+    /// the promise parks in the FIFO family lot and the dispatch rides
+    /// the env seam (the `do_send_call_debug_information` ordering,
+    /// cpp:365). The C++ carries the promise on the query itself
+    /// (cpp:280-289).
     pub fn send_call_signaling_data(
         &mut self,
         env: &mut impl CallManagerEnv,
@@ -246,7 +293,12 @@ impl CallManager {
         let Some(actor) = self.id_to_actor.get_mut(&call_id) else {
             return promise.set_error(Status::error(400, "Call not found"));
         };
-        actor.send_call_signaling_data(env, data, promise);
+        let function = match actor.send_call_signaling_data(data) {
+            Ok(function) => function,
+            Err(status) => return promise.set_error(status),
+        };
+        self.pending.send_signaling_data.push(promise);
+        env.send_call_signaling_data_query(call_id, function);
     }
 
     /// `discard_call` (CallManager.cpp:222-231) — the C++ signature shape
@@ -534,6 +586,121 @@ impl CallManager {
         }
     }
 
+    /// The `GetDhConfigQuery` answer intake — the `on_dh_config` tail
+    /// (CallActor.cpp:653-666). The DhConfig build + the DRBG seed + the
+    /// stored-config fallback live in the Td router (the C++ fetch
+    /// lambda, cpp:683-701); the actor-gone case just skips the tail
+    /// (the C++ handler settles independent of the actor).
+    pub(crate) fn on_dh_config_net_answer(
+        &mut self,
+        env: &mut impl CallManagerEnv,
+        call_id: CallId,
+        result: std::result::Result<DhConfig, Status>,
+    ) {
+        let Some(actor) = self.id_to_actor.get_mut(&call_id) else {
+            return;
+        };
+        actor.on_dh_config(env, result);
+        actor.loop_(env);
+        if actor.should_stop() {
+            self.id_to_actor.remove(&call_id);
+        }
+    }
+
+    /// The `GetCallConfigQuery` answer intake — the
+    /// `on_get_call_config_result` tail (CallActor.cpp:893-900).
+    pub(crate) fn on_call_config_net_answer(
+        &mut self,
+        env: &mut impl CallManagerEnv,
+        call_id: CallId,
+        result: std::result::Result<String, Status>,
+    ) {
+        let Some(actor) = self.id_to_actor.get_mut(&call_id) else {
+            return;
+        };
+        actor.on_get_call_config_result(env, result);
+        actor.loop_(env);
+        if actor.should_stop() {
+            self.id_to_actor.remove(&call_id);
+        }
+    }
+
+    /// The `phone.phoneCall` answer intake of the request/accept/confirm
+    /// families — the `update_call_inner` tail (CallActor.cpp:414-418)
+    /// with the post-answer loop sweep (the C++ `on_result` yield
+    /// always runs the loop after the answer event, cpp:941-944) and the
+    /// manager `should_stop` sweep (the `update_call` shape).
+    pub(crate) fn on_phone_call_net_answer(
+        &mut self,
+        env: &mut impl CallManagerEnv,
+        call_id: CallId,
+        result: std::result::Result<telegram_api::phone_PhoneCall, Status>,
+    ) {
+        let Some(actor) = self.id_to_actor.get_mut(&call_id) else {
+            return;
+        };
+        match result {
+            Ok(call) => actor.update_call_inner(env, call),
+            Err(status) => actor.on_error(env, status),
+        }
+        actor.loop_(env);
+        let server_call_id = actor.call_id;
+        if actor.should_stop() {
+            self.id_to_actor.remove(&call_id);
+            return;
+        }
+        // The collapsed create-time `main_promise` hop (CallManager.cpp:486-491
+        // → `set_call_id` cpp:499-514): the actor learned the server call
+        // id from the answer (the C++ `on_get_call_id` fires the
+        // promise); bind it and replay any postponed updates.
+        if server_call_id != 0 {
+            self.set_call_id(env, call_id, std::result::Result::Ok(server_call_id));
+        }
+    }
+
+    /// The `ReceivedCallQuery` answer intake — the
+    /// `on_received_query_result` tail (CallActor.cpp:714-719): the ok
+    /// answer is unused, the fetch error routes into `on_error`.
+    pub(crate) fn on_received_call_net_answer(
+        &mut self,
+        env: &mut impl CallManagerEnv,
+        call_id: CallId,
+        result: std::result::Result<(), Status>,
+    ) {
+        let Some(actor) = self.id_to_actor.get_mut(&call_id) else {
+            return;
+        };
+        if let Err(status) = result {
+            actor.on_error(env, status);
+        }
+        actor.loop_(env);
+        if actor.should_stop() {
+            self.id_to_actor.remove(&call_id);
+        }
+    }
+
+    /// The `DiscardCallQuery` answer intake — the
+    /// `on_discard_query_result` error tail (CallActor.cpp:837-841); the
+    /// ok answer never reaches the actor (the Td router um_sends the
+    /// Updates to the engine with an empty promise before this runs).
+    pub(crate) fn on_discard_call_net_answer(
+        &mut self,
+        env: &mut impl CallManagerEnv,
+        call_id: CallId,
+        result: std::result::Result<(), Status>,
+    ) {
+        let Some(actor) = self.id_to_actor.get_mut(&call_id) else {
+            return;
+        };
+        if let Err(status) = result {
+            actor.on_error(env, status);
+        }
+        actor.loop_(env);
+        if actor.should_stop() {
+            self.id_to_actor.remove(&call_id);
+        }
+    }
+
     /// `create_call_actor` (CallManager.cpp:482-496) — the actor's
     /// `start_up` (the getCallConfig query) fires at creation, the C++
     /// actor-start moment.
@@ -657,10 +824,6 @@ mod tests {
             self.dh_config.clone()
         }
 
-        fn set_dh_config(&mut self, config: DhConfig) {
-            self.dh_config = Some(config);
-        }
-
         fn on_get_users(&mut self, _users: Vec<telegram_api::User>, _source: &str) {}
 
         fn get_input_user(
@@ -685,15 +848,19 @@ mod tests {
 
         fn send_update(&mut self, _update: td_api::Update) {}
 
-        fn send_request_call_query(&mut self, _input_user: &telegram_api::InputUser) {
+        fn send_request_call_query(&mut self, _call_id: CallId, _function: telegram_api::Function) {
             self.queries.push("requestCall".to_string());
         }
 
-        fn send_discard_call_query(&mut self) {
+        fn send_discard_call_query(&mut self, _call_id: CallId, _function: telegram_api::Function) {
             self.queries.push("discardCall".to_string());
         }
 
-        fn send_received_call_query(&mut self) {
+        fn send_received_call_query(
+            &mut self,
+            _call_id: CallId,
+            _function: telegram_api::Function,
+        ) {
             self.queries.push("receivedCall".to_string());
         }
     }
@@ -731,10 +898,12 @@ mod tests {
     #[test]
     fn create_call_allocates_and_dispatches() {
         let mut env = TestEnv::new();
+        // a good stored config — a bad one fails the load (the C++
+        // on_dh_config gate, CallActor.cpp:653-666)
         env.dh_config = Some(DhConfig {
             version: 1,
-            prime: vec![1, 2, 3],
-            g: 2,
+            prime: crate::dh_cache::BUILT_IN_GOOD_PRIME.to_vec(),
+            g: 3,
         });
         let mut manager = CallManager::new();
         let (promise, recorded) = record::<td_api::CallId>();
@@ -894,5 +1063,34 @@ mod tests {
         );
         assert!(recorded.0.lock().unwrap().is_none());
         assert_eq!(manager.pending.save_call_log.len(), 1);
+    }
+
+    #[test]
+    fn signaling_data_gates_before_anything_parks() {
+        let mut env = TestEnv::new();
+        let mut manager = CallManager::new();
+
+        // the unknown-call band errors before anything parks
+        let (promise, recorded) = record::<()>();
+        manager.send_call_signaling_data(&mut env, CallId::new(9), b"x".to_vec(), promise);
+        assert!(matches!(
+            recorded.0.lock().unwrap().take().unwrap(),
+            Result::Err(ref status) if status.message() == "Call not found"
+        ));
+
+        // a fresh (Empty-state) actor takes the "Call is not active"
+        // band before anything parks (cpp:273-275); the Ready-state
+        // parking posture round-trips in the netted dispatcher test
+        manager
+            .id_to_actor
+            .insert(CallId::new(3), CallActor::new(CallId::new(3)));
+        let (promise, recorded) = record::<()>();
+        manager.send_call_signaling_data(&mut env, CallId::new(3), b"x".to_vec(), promise);
+        assert!(matches!(
+            recorded.0.lock().unwrap().take().unwrap(),
+            Result::Err(ref status) if status.message() == "Call is not active"
+        ));
+        assert!(manager.pending.send_signaling_data.is_empty());
+        assert!(env.queries.is_empty());
     }
 }
