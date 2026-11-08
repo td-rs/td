@@ -64,6 +64,18 @@ impl DhCache {
         DhCache
     }
 
+    /// The built-in seed config — the `G()->get_dh_config()` analog for
+    /// the planes whose `messages.getDhConfig` fetch family is still
+    /// parked (the call plane fetch, the secret-chat fetch): the
+    /// 2048-bit group prime with `g = 2` (DhCache.cpp:16-33).
+    pub fn built_in_dh_config() -> DhConfig {
+        DhConfig {
+            version: 0,
+            prime: BUILT_IN_GOOD_PRIME.to_vec(),
+            g: 2,
+        }
+    }
+
     /// `is_good_prime` (DhCache.cpp:15-34).
     pub fn is_good_prime(&self, env: &mut impl DhCacheEnv, prime_str: &[u8]) -> i32 {
         if prime_str == BUILT_IN_GOOD_PRIME {
