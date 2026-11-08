@@ -38680,13 +38680,12 @@ impl crate::call_actor::CallActorEnv for CallEnv<'_> {
         call_id: crate::call_id::CallId,
         function: tdmtproto::telegram_api::Function,
     ) {
-        match &self.call_net {
-            Some(net) => net.dispatch(
-                crate::call_manager::CallNetKind::GetCallConfig { call_id },
-                function,
-            ),
-            None => tdutils::log_info!("Send phone.getCallConfig — [net-inert]"),
-        }
+        dispatch_call_net(
+            &self.call_net,
+            crate::call_manager::CallNetKind::GetCallConfig { call_id },
+            function,
+            "phone.getCallConfig",
+        );
     }
 
     fn send_get_dh_config_query(
@@ -38694,13 +38693,12 @@ impl crate::call_actor::CallActorEnv for CallEnv<'_> {
         call_id: crate::call_id::CallId,
         function: tdmtproto::telegram_api::Function,
     ) {
-        match &self.call_net {
-            Some(net) => net.dispatch(
-                crate::call_manager::CallNetKind::GetDhConfig { call_id },
-                function,
-            ),
-            None => tdutils::log_info!("Send messages.getDhConfig — [net-inert]"),
-        }
+        dispatch_call_net(
+            &self.call_net,
+            crate::call_manager::CallNetKind::GetDhConfig { call_id },
+            function,
+            "messages.getDhConfig",
+        );
     }
 
     fn send_request_call_query(
@@ -38708,13 +38706,12 @@ impl crate::call_actor::CallActorEnv for CallEnv<'_> {
         call_id: crate::call_id::CallId,
         function: tdmtproto::telegram_api::Function,
     ) {
-        match &self.call_net {
-            Some(net) => net.dispatch(
-                crate::call_manager::CallNetKind::RequestCall { call_id },
-                function,
-            ),
-            None => tdutils::log_info!("Send phone.requestCall — [net-inert]"),
-        }
+        dispatch_call_net(
+            &self.call_net,
+            crate::call_manager::CallNetKind::RequestCall { call_id },
+            function,
+            "phone.requestCall",
+        );
     }
 
     fn send_accept_call_query(
@@ -38722,13 +38719,12 @@ impl crate::call_actor::CallActorEnv for CallEnv<'_> {
         call_id: crate::call_id::CallId,
         function: tdmtproto::telegram_api::Function,
     ) {
-        match &self.call_net {
-            Some(net) => net.dispatch(
-                crate::call_manager::CallNetKind::AcceptCall { call_id },
-                function,
-            ),
-            None => tdutils::log_info!("Send phone.acceptCall — [net-inert]"),
-        }
+        dispatch_call_net(
+            &self.call_net,
+            crate::call_manager::CallNetKind::AcceptCall { call_id },
+            function,
+            "phone.acceptCall",
+        );
     }
 
     fn send_confirm_call_query(
@@ -38736,13 +38732,12 @@ impl crate::call_actor::CallActorEnv for CallEnv<'_> {
         call_id: crate::call_id::CallId,
         function: tdmtproto::telegram_api::Function,
     ) {
-        match &self.call_net {
-            Some(net) => net.dispatch(
-                crate::call_manager::CallNetKind::ConfirmCall { call_id },
-                function,
-            ),
-            None => tdutils::log_info!("Send phone.confirmCall — [net-inert]"),
-        }
+        dispatch_call_net(
+            &self.call_net,
+            crate::call_manager::CallNetKind::ConfirmCall { call_id },
+            function,
+            "phone.confirmCall",
+        );
     }
 
     fn send_discard_call_query(
@@ -38750,13 +38745,12 @@ impl crate::call_actor::CallActorEnv for CallEnv<'_> {
         call_id: crate::call_id::CallId,
         function: tdmtproto::telegram_api::Function,
     ) {
-        match &self.call_net {
-            Some(net) => net.dispatch(
-                crate::call_manager::CallNetKind::DiscardCall { call_id },
-                function,
-            ),
-            None => tdutils::log_info!("Send phone.discardCall — [net-inert]"),
-        }
+        dispatch_call_net(
+            &self.call_net,
+            crate::call_manager::CallNetKind::DiscardCall { call_id },
+            function,
+            "phone.discardCall",
+        );
     }
 
     fn send_received_call_query(
@@ -38764,13 +38758,12 @@ impl crate::call_actor::CallActorEnv for CallEnv<'_> {
         call_id: crate::call_id::CallId,
         function: tdmtproto::telegram_api::Function,
     ) {
-        match &self.call_net {
-            Some(net) => net.dispatch(
-                crate::call_manager::CallNetKind::ReceivedCall { call_id },
-                function,
-            ),
-            None => tdutils::log_info!("Send phone.receivedCall — [net-inert]"),
-        }
+        dispatch_call_net(
+            &self.call_net,
+            crate::call_manager::CallNetKind::ReceivedCall { call_id },
+            function,
+            "phone.receivedCall",
+        );
     }
 
     fn send_call_signaling_data_query(
@@ -38778,13 +38771,27 @@ impl crate::call_actor::CallActorEnv for CallEnv<'_> {
         call_id: crate::call_id::CallId,
         function: tdmtproto::telegram_api::Function,
     ) {
-        match &self.call_net {
-            Some(net) => net.dispatch(
-                crate::call_manager::CallNetKind::SendSignalingData { call_id },
-                function,
-            ),
-            None => tdutils::log_info!("Send phone.sendSignalingData — [net-inert]"),
-        }
+        dispatch_call_net(
+            &self.call_net,
+            crate::call_manager::CallNetKind::SendSignalingData { call_id },
+            function,
+            "phone.sendSignalingData",
+        );
+    }
+}
+
+/// The collapsed `CallNetKind` dispatch the eight actor send seams share
+/// — the `Some(net) => net.dispatch(kind, function)` / net-inert log
+/// shape of the CallEnv overrides (the `NetKindHandle` plane).
+fn dispatch_call_net(
+    net: &Option<CallNetHandle>,
+    kind: crate::call_manager::CallNetKind,
+    function: tdmtproto::telegram_api::Function,
+    what: &str,
+) {
+    match net {
+        Some(net) => net.dispatch(kind, function),
+        None => tdutils::log_info!("Send {what} — [net-inert]"),
     }
 }
 
