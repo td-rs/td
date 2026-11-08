@@ -6,9 +6,10 @@
 //! The manager is the collapsed actor: `Td` owns the struct, the
 //! [`LanguagePackManagerEnv`] trait carries the option/update surfaces,
 //! and every `create_handler<...>`/`send_with_promise` network tail is an
-//! env seam marked `[blocked: net]` — the C++ promise lands in the query
-//! (or in the manager's pending-query maps) and stays unanswered offline,
-//! exactly like the collapsed-line convention.
+//! env seam riding the `LangPackNetKind` plane — the unauth dispatch
+//! (`create_unauth`, the main DC) parks the promise in a Td-side pending
+//! slot and the answer drains through `Td::on_lang_pack_net_answer`
+//! into the response halves below.
 //!
 //! Database plane: the C++ keeps one `LanguageDatabase` per
 //! `language_pack_database_path` in a process-static registry
@@ -29,7 +30,8 @@
 //! fully portable and unit-tested against the wire shapes; the net query
 //! tails (`langpack_getLanguages`, `langpack_getLanguage`,
 //! `langpack_getLangPack`, `langpack_getStrings`,
-//! `langpack_getDifference`) are the env seams.
+//! `langpack_getDifference`) dispatch unauth over the `LangPackNetKind`
+//! plane (td.rs) and re-enter the intakes.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -1217,8 +1219,10 @@ pub trait LanguagePackManagerEnv {
     /// `send_closure(G()->td(), &Td::send_update, ...)`.
     fn send_update(&mut self, update: td_api::Update);
 
-    // -- the `[blocked: net]` query tails; each one drops the parked
-    // -- promise(s), keeping the C++ offline request unanswered
+    // -- the query tails, riding the `LangPackNetKind` plane (the
+    // -- unauth band over the main DC); each one parks its promise(s)
+    // -- in a Td-side pending slot and the answer re-enters the
+    // -- response half below
     /// `langpack_getLanguages` (cpp:871-878); the response half is
     /// [`LanguagePackManager::on_get_languages`].
     fn send_get_languages_query(
@@ -1258,6 +1262,49 @@ pub trait LanguagePackManagerEnv {
         language_code: String,
         from_version: i32,
     );
+}
+
+/// One parked `langpack.*` query — the Td-side stand-in for the C++
+/// request-lambda captures (LanguagePackManager.cpp:433-458,
+/// 871-897, 1128-1161): the `Copy` net kind rides only the slot index,
+/// the borrowed state (params + promise) waits in the slot. The answer
+/// intake `take`s the slot, so a stale or duplicated answer cannot
+/// double-answer; the GetLangPack/GetDifference entries carry no
+/// promise — the real promises live in the manager's query map and the
+/// language's difference queue, exactly like the C++ lambdas.
+pub(crate) enum PendingLangPackQuery {
+    /// the `langpack.getLanguages` capture set (cpp:871-876).
+    Languages {
+        language_pack: String,
+        promise: Promise<td_api::LocalizationTargetInfo>,
+    },
+    /// the `langpack.getLanguage` capture set (cpp:887-894).
+    LanguageInfo {
+        language_pack: String,
+        language_code: String,
+        promise: Promise<td_api::LanguagePackInfo>,
+    },
+    /// the `langpack.getLangPack` capture set (cpp:1133-1150) — the
+    /// promise chain parks in the manager's query map.
+    LangPack {
+        language_pack: String,
+        language_code: String,
+    },
+    /// the `langpack.getStrings` capture set (cpp:1152-1158).
+    Strings {
+        language_pack: String,
+        language_code: String,
+        keys: Vec<String>,
+        promise: Promise<td_api::LanguagePackStrings>,
+    },
+    /// the `langpack.getDifference` capture set (cpp:433-455) — the
+    /// promises park in the language's difference queue; from_version
+    /// rides along for the C++ mismatch log (cpp:446-448).
+    Difference {
+        language_pack: String,
+        language_code: String,
+        from_version: i32,
+    },
 }
 
 /// The collapsed `LanguagePackManager` actor (LanguagePackManager.h:31).
@@ -1563,11 +1610,11 @@ impl LanguagePackManager {
     }
 
     /// `send_language_get_difference_query` (cpp:423-459) — the promise
-    /// parks in the language's difference queue and the query goes to
-    /// the `[blocked: net]` seam; the response half (lowercased code,
+    /// parks in the language's difference queue and the query rides the
+    /// `LangPackNetKind` unauth band; the response half (lowercased code,
     /// mismatch logs, `on_get_language_pack_strings(..., is_diff = true)`)
-    /// comes back with the net step. A free function because the caller
-    /// holds the `&mut Language` borrow.
+    /// runs from `Td::on_lang_pack_net_answer`. A free function because the
+    /// caller holds the `&mut Language` borrow.
     fn send_language_get_difference_query(
         env: &mut impl LanguagePackManagerEnv,
         language: &mut Language,
@@ -1752,7 +1799,8 @@ impl LanguagePackManager {
     }
 
     /// `get_languages` (cpp:860-879) — the `only_local` half is fully
-    /// local; the server half is the `[blocked: net]` seam.
+    /// local; the server half dispatches `langpack_getLanguages` over the
+    /// `LangPackNetKind` unauth band.
     pub fn get_languages(
         &mut self,
         env: &mut impl LanguagePackManagerEnv,
@@ -1776,7 +1824,8 @@ impl LanguagePackManager {
     }
 
     /// `search_language_info` (cpp:881-898) — validation is local, the
-    /// query is the `[blocked: net]` seam.
+    /// query dispatches `langpack_getLanguage` over the `LangPackNetKind`
+    /// unauth band.
     pub fn search_language_info(
         &mut self,
         env: &mut impl LanguagePackManagerEnv,
@@ -1961,9 +2010,10 @@ impl LanguagePackManager {
     }
 
     /// `get_language_pack_strings` (cpp:1094-1163) — the loaded-pack
-    /// local halves answer immediately; the rest parks on the
-    /// `[blocked: net]` seams (the get-all promises in the manager's
-    /// query map, the keyed-strings promise on the seam).
+    /// local halves answer immediately; the rest dispatches over the
+    /// `LangPackNetKind` unauth band (the get-all promises in the
+    /// manager's query map, the keyed-strings promise in a pending
+    /// slot).
     pub fn get_language_pack_strings(
         &mut self,
         env: &mut impl LanguagePackManagerEnv,
@@ -2091,9 +2141,10 @@ impl LanguagePackManager {
     /// get-all promises fan out; all but the last non-empty promise get
     /// a copy (the C++ moves the original into the last one — the values
     /// are plain data, so the copy count is the only difference). The
-    /// response half of `langpack_getLangPack` — reached with the net
-    /// step; tests drive it directly.
-    #[allow(dead_code)]
+    /// response half of `langpack_getLangPack` — runs from
+    /// `Td::on_lang_pack_net_answer` after the chained
+    /// `on_get_language_pack_strings` hop (the C++ lambda chain,
+    /// cpp:1133-1150); tests drive it directly too.
     pub(crate) fn on_get_all_language_pack_strings(
         &mut self,
         language_pack: String,
@@ -2716,7 +2767,6 @@ impl LanguagePackManager {
 
 /// `copy_language_pack_strings` — the fan-out copy helper of
 /// `on_get_all_language_pack_strings` (cpp:1244-1250).
-#[allow(dead_code)]
 fn clone_language_pack_strings(
     strings: &td_api::LanguagePackStrings,
 ) -> td_api::LanguagePackStrings {
@@ -2733,9 +2783,8 @@ fn clone_language_pack_strings(
 }
 
 /// `on_failed_get_difference` (cpp:1514-1532) — the net-failure half of
-/// the difference query; unreachable offline (the seam never answers),
-/// kept for the exhaustiveness audit and driven by tests.
-#[allow(dead_code)]
+/// the difference query; runs from `Td::on_lang_pack_net_answer` on the
+/// wire error/parse-fail band.
 pub(crate) fn on_failed_get_difference(
     manager: &mut LanguagePackManager,
     env: &mut impl LanguagePackManagerEnv,
