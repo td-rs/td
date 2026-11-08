@@ -139,9 +139,10 @@ pub(crate) struct PendingSecretQueries {
     /// receipts, FIFO-paired with the discard queries (the C++
     /// absorbs every outcome into `Unit`, cpp:113-117).
     pub(crate) discards: Vec<Promise<()>>,
-    /// The `read_history_promise_` receipts keyed by their query
-    /// generation (cpp:322-332).
-    pub(crate) read_history: Vec<(u64, Promise<()>)>,
+    /// The `read_history_promise_` receipts keyed by their chat and
+    /// query generation (cpp:322-332 — the promise is the chat's own
+    /// actor member, so only the same chat's re-read settles it).
+    pub(crate) read_history: Vec<(SecretChatId, u64, Promise<()>)>,
     /// The outbound send receipts (`on_send_message_ok` routes the
     /// `MessageId(ServerMessageId(random_id))` through MessagesManager,
     /// cpp:1560-1580 — unported; the port settles `Unit`).
@@ -425,7 +426,9 @@ impl SecretChatsManager {
     /// Closed, the `messages.discardEncryption` tail dispatches and the
     /// receipt parks (the C++ absorbs every outcome into `Unit`,
     /// cpp:113-117). A chat with no record absorbs silently (the C++
-    /// empty-actor no-op).
+    /// empty-actor no-op), and an already-closed chat short-circuits the
+    /// `close_flag_` branch — an immediate `Unit` with no re-fold and no
+    /// wire query (cpp:644-647).
     pub fn cancel_chat(
         &mut self,
         env: &mut impl SecretChatsEnv,
@@ -446,6 +449,11 @@ impl SecretChatsManager {
             promise.set_value(());
             return;
         };
+        if chat.state == SecretChatState::Closed {
+            // The `close_flag_` short-circuit (cpp:644-647).
+            promise.set_value(());
+            return;
+        }
         let (user_id, access_hash) = (chat.user_id, chat.access_hash);
         // The close folds Closed and emits the chat update (the C++
         // send_update_secret_chat on the close tail, cpp:701).
@@ -596,16 +604,24 @@ impl SecretChatsManager {
             promise.set_value(());
             return;
         }
-        // The C++ cancels the previous read query and settles its
-        // promise (cpp:322-326); the net plane has no query-cancel —
-        // the parked previous receipt settles Unit (the observable
-        // half) and the generation keeps the stale answers away.
-        for (_, mut previous) in std::mem::take(&mut self.pending.read_history) {
+        // The C++ cancels the same chat's previous read query and
+        // settles its promise (cpp:322-326 — `read_history_promise_` is
+        // the chat's own actor member, so other chats' receipts stay
+        // parked); the net plane has no query-cancel — the parked
+        // previous receipt settles Unit (the observable half) and the
+        // generation keeps the stale answers away.
+        let (mine, theirs) = std::mem::take(&mut self.pending.read_history)
+            .into_iter()
+            .partition(|(parked_chat, _, _)| *parked_chat == secret_chat_id);
+        self.pending.read_history = theirs;
+        for (_, _, mut previous) in mine {
             previous.set_value(());
         }
         let generation = self.next_read_history_generation;
         self.next_read_history_generation += 1;
-        self.pending.read_history.push((generation, promise));
+        self.pending
+            .read_history
+            .push((secret_chat_id, generation, promise));
         let access_hash = chat.access_hash;
         let chat = self
             .chats
@@ -994,6 +1010,33 @@ mod tests {
             other => panic!("unexpected close result: {other:?}"),
         }
         assert!(manager.pending.discards.is_empty(), "no query dispatched");
+    }
+
+    #[test]
+    fn close_short_circuits_an_already_closed_chat() {
+        // the close_flag_ branch settles immediately (cpp:644-647)
+        let mut manager = SecretChatsManager::new(true);
+        let mut env = TestEnv::default();
+        manager.on_update_chat(
+            &mut env,
+            SecretChatId::new(9),
+            UserId::new(5),
+            77,
+            SecretChatState::Closed,
+        );
+        let updates_before = env.updates.len();
+        let (promise, slot) = record_unit();
+        manager.cancel_chat(&mut env, SecretChatId::new(9), true, promise);
+        match slot.lock().unwrap().take() {
+            Some(Result::Ok(())) => {}
+            other => panic!("unexpected close result: {other:?}"),
+        }
+        assert!(manager.pending.discards.is_empty(), "no query dispatched");
+        assert_eq!(
+            env.updates.len(),
+            updates_before,
+            "no re-fold of the record"
+        );
     }
 
     #[test]

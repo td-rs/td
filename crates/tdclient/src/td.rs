@@ -27320,10 +27320,10 @@ impl Td {
                     .pending
                     .read_history
                     .iter()
-                    .position(|(parked, _)| *parked == generation);
+                    .position(|(_, parked, _)| *parked == generation);
                 match position {
                     Some(index) => {
-                        let (_, mut promise) =
+                        let (_, _, mut promise) =
                             self.secret_chats_manager.pending.read_history.remove(index);
                         promise.set_value(());
                     }
@@ -27340,10 +27340,14 @@ impl Td {
             // `MessageId(ServerMessageId(random_id))` routing rides
             // MessagesManager too.
             K::SendEncrypted { service } => {
-                let Some(mut promise) = self.secret_chats_manager.pending.sends.pop() else {
+                if self.secret_chats_manager.pending.sends.is_empty() {
                     tdutils::log_info!("Receive an unexpected messages.sendEncrypted answer");
                     return;
-                };
+                }
+                // The §5 FIFO pairing — the family lot pops the head like
+                // the sibling lots (the C++ carries the promise on the
+                // query itself, so the answers pair in order).
+                let mut promise = self.secret_chats_manager.pending.sends.remove(0);
                 if query.is_error() {
                     promise.set_error(query.error().clone());
                 } else {
@@ -101091,6 +101095,27 @@ kQIDAQAB\n\
             td.secret_chats_manager.pending.discards.is_empty(),
             "drained"
         );
+
+        // 5. the already-closed band (the C++ close_flag_ short-circuit,
+        //    cpp:644-647): the second close settles ok immediately — no
+        //    fresh chat update, no wire query, no parked receipt
+        td.request(
+            306,
+            Function::closeSecretChat(td_api::closeSecretChat { secret_chat_id: 9 }),
+        );
+        td.flush_deferred_results();
+        assert!(
+            std::mem::take(&mut *rec.sent.lock()).is_empty(),
+            "no re-dispatch on the closed chat"
+        );
+        assert!(
+            td.secret_chats_manager.pending.discards.is_empty(),
+            "nothing parks"
+        );
+        assert!(matches!(
+            responses_of(&callback, 306).first(),
+            Some(Object::ok(_))
+        ));
     }
 
     #[test]
@@ -101244,6 +101269,64 @@ kQIDAQAB\n\
             td.secret_chats_manager.pending.read_history.is_empty(),
             "drained"
         );
+
+        // 6. the per-chat cancel (cpp:322-326 — `read_history_promise_`
+        //    is the chat's own actor member): another chat's read leaves
+        //    chat 9's parked receipt alone, and each answer settles its
+        //    own chat's receipt
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.on_update_chat(
+                env,
+                crate::secret_chat::SecretChatId::new(14),
+                crate::user_manager::UserId::new(7),
+                79,
+                crate::secret_chat::SecretChatState::Active,
+            );
+        });
+        let (promise9, slot9) = record_translation_unit();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.send_read_history(env, crate::secret_chat::SecretChatId::new(9), 900, promise9);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        let query9 = sent.into_iter().next().unwrap();
+        let (promise14, slot14) = record_translation_unit();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.send_read_history(
+                env,
+                crate::secret_chat::SecretChatId::new(14),
+                900,
+                promise14,
+            );
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        let query14 = sent.into_iter().next().unwrap();
+        assert!(
+            slot9.lock().unwrap().is_none(),
+            "chat 14's read leaves chat 9's receipt parked"
+        );
+        assert!(slot14.lock().unwrap().is_none(), "chat 14 parks its own");
+        net_complete(query9, bool_answer(true));
+        td.dispatch_completed_secret_net();
+        assert!(matches!(
+            slot9.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(
+            slot14.lock().unwrap().is_none(),
+            "chat 14's receipt waits for its own answer"
+        );
+        net_complete(query14, bool_answer(true));
+        td.dispatch_completed_secret_net();
+        assert!(matches!(
+            slot14.lock().unwrap().take(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        assert!(
+            td.secret_chats_manager.pending.read_history.is_empty(),
+            "drained"
+        );
     }
 
     #[test]
@@ -101367,6 +101450,45 @@ kQIDAQAB\n\
         assert!(
             std::mem::take(&mut *rec.sent.lock()).is_empty(),
             "the not-Ready action ignores"
+        );
+        assert!(td.secret_chats_manager.pending.sends.is_empty(), "drained");
+
+        // 5. the §5 FIFO pairing: two parked sends pair with their
+        //    answers in dispatch order — the error answer settles the
+        //    FIRST receipt and the ok answer the second (the C++ carries
+        //    the promise on the query itself; the family lot pops the
+        //    head like the sibling lots)
+        let (promise1, slot1) = record_translation_unit();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.send_message(env, crate::secret_chat::SecretChatId::new(9), promise1);
+        });
+        let (promise2, slot2) = record_translation_unit();
+        test_secret_chat_arm(&mut td, |env, manager| {
+            manager.send_message(env, crate::secret_chat::SecretChatId::new(9), promise2);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 2, "both sends ride");
+        let mut queries = sent.into_iter();
+        let query1 = queries.next().unwrap();
+        let query2 = queries.next().unwrap();
+        net_fail(query1, 400, "PEER_ID_INVALID");
+        td.dispatch_completed_secret_net();
+        match slot1.lock().unwrap().take() {
+            Some(tdutils::status::Result::Err(status)) => {
+                assert_eq!(status.code(), 400);
+                assert_eq!(status.message(), "PEER_ID_INVALID");
+            }
+            other => panic!("the first receipt takes the error answer: {other:?}"),
+        }
+        assert!(slot2.lock().unwrap().is_none(), "the second receipt parks");
+        net_complete(query2, wire_sent_encrypted_message(502));
+        td.dispatch_completed_secret_net();
+        assert!(
+            matches!(
+                slot2.lock().unwrap().take(),
+                Some(tdutils::status::Result::Ok(()))
+            ),
+            "the second receipt takes the ok answer"
         );
         assert!(td.secret_chats_manager.pending.sends.is_empty(), "drained");
     }
