@@ -26819,6 +26819,9 @@ impl Td {
                 Some(queue.remove(0))
             }
         }
+        // The dispatch surface hoisted before the arms (the env literal's
+        // field borrows must not overlap a `&self` method call).
+        let call_net = self.call_net();
         // The manager-env split for the intakes (the `CallEnv` field
         // borrows stay disjoint from the manager borrow).
         macro_rules! call_env {
@@ -26836,6 +26839,7 @@ impl Td {
                     notification_manager: &mut self.notification_manager,
                     updates: &mut self.call_updates,
                     dh_config: &mut self.call_dh_config,
+                    call_net: call_net.clone(),
                 }
             };
         }
@@ -26902,6 +26906,155 @@ impl Td {
                                 promise.set_value(());
                             }
                             None => promise.set_error(parse_error("phone.saveCallLog")),
+                        }
+                    }
+                }
+            }
+            // `GetDhConfigQuery` — the answer half of `do_load_dh_config`
+            // (CallActor.cpp:683-701): the fetch lambda builds the DhConfig,
+            // feeds the DRBG (`Random::add_seed`, cpp:690) and stores the
+            // full variant in the global config slot (cpp:691) — before
+            // the actor's good-prime check, exactly like the C++ — while
+            // the NotModified leg falls back to the stored config — the
+            // C++ captured it at send time, the store read is the
+            // equivalent — or takes the 500 band (cpp:701); the result
+            // rides `CallActor::on_dh_config` through the manager.
+            K::GetDhConfig { call_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::messages_DhConfig::parse(query.ok()) {
+                        Ok(telegram_api::messages_DhConfig::messages_dhConfig(dh)) => {
+                            tdutils::random::add_seed(&dh.random, 0.0);
+                            let config = DhConfig {
+                                version: dh.version,
+                                prime: dh.p,
+                                g: dh.g,
+                            };
+                            // the fetch lambda stores the config before
+                            // the actor's check runs (cpp:691)
+                            self.call_dh_config = Some(config.clone());
+                            Ok(config)
+                        }
+                        Ok(telegram_api::messages_DhConfig::messages_dhConfigNotModified(dh)) => {
+                            tdutils::random::add_seed(&dh.random, 0.0);
+                            // the stored-config read (the C++ captured the
+                            // old config at send time, cpp:699-701)
+                            self.call_dh_config
+                                .clone()
+                                .ok_or_else(|| Status::error(500, "Can't load DhConfig"))
+                        }
+                        Err(_) => Err(parse_error("messages.getDhConfig")),
+                    }
+                };
+                let mut env = call_env!();
+                self.call_manager
+                    .on_dh_config_net_answer(&mut env, call_id, result);
+            }
+            // `GetCallConfigQuery` — the `start_up` answer (CallActor.cpp:893-900):
+            // the dataJSON rides `call_state_.config` (the Ready flush
+            // waits for it, cpp:866-868).
+            K::GetCallConfig { call_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::DataJSON::parse(query.ok()) {
+                        Ok(data) => Ok(data.data),
+                        Err(_) => Err(parse_error("phone.getCallConfig")),
+                    }
+                };
+                let mut env = call_env!();
+                self.call_manager
+                    .on_call_config_net_answer(&mut env, call_id, result);
+            }
+            // The request/accept/confirm answers — the three
+            // `on_*_query_result` halves (CallActor.cpp:753-758/:784-789/
+            // :808-812) all ride `update_call_inner` on ok and `on_error`
+            // on the fetch error.
+            K::RequestCall { call_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::phone_PhoneCall::parse(query.ok())
+                        .map_err(|_| parse_error("phone.requestCall"))
+                };
+                let mut env = call_env!();
+                self.call_manager
+                    .on_phone_call_net_answer(&mut env, call_id, result);
+            }
+            K::AcceptCall { call_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::phone_PhoneCall::parse(query.ok())
+                        .map_err(|_| parse_error("phone.acceptCall"))
+                };
+                let mut env = call_env!();
+                self.call_manager
+                    .on_phone_call_net_answer(&mut env, call_id, result);
+            }
+            K::ConfirmCall { call_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::phone_PhoneCall::parse(query.ok())
+                        .map_err(|_| parse_error("phone.confirmCall"))
+                };
+                let mut env = call_env!();
+                self.call_manager
+                    .on_phone_call_net_answer(&mut env, call_id, result);
+            }
+            // `DiscardCallQuery` — the ok answer rides the Updates engine
+            // with an empty promise (CallActor.cpp:837-841, the
+            // SetCallRating shape minus the request promise); only the
+            // fetch error routes into the actor.
+            K::DiscardCall { call_id } => {
+                if query.is_error() {
+                    let result = Err(query.error().clone());
+                    let mut env = call_env!();
+                    self.call_manager
+                        .on_discard_call_net_answer(&mut env, call_id, result);
+                } else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => self.um_send(UmMessage::OnGetUpdates {
+                            updates: Box::new(updates),
+                            promise: Promise::default(),
+                        }),
+                        Err(_) => {
+                            let result = Err(parse_error("phone.discardCall"));
+                            let mut env = call_env!();
+                            self.call_manager
+                                .on_discard_call_net_answer(&mut env, call_id, result);
+                        }
+                    }
+                }
+            }
+            // `ReceivedCallQuery` — the ok answer is unused
+            // (CallActor.cpp:714-719), the fetch error routes into the
+            // actor.
+            K::ReceivedCall { call_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    parse_wire_bool(query.ok()).ok_or_else(|| parse_error("phone.receivedCall"))
+                };
+                let mut env = call_env!();
+                self.call_manager
+                    .on_received_call_net_answer(&mut env, call_id, result);
+            }
+            // `SendSignalingDataQuery` — the promise rides the FIFO family
+            // lot and settles in the router with no actor tail
+            // (CallActor.cpp:280-289); a false Bool is still an ok answer.
+            K::SendSignalingData { .. } => {
+                if let Some(mut promise) =
+                    pop_head(&mut self.call_manager.pending.send_signaling_data)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match parse_wire_bool_value(query.ok()) {
+                            Some(_) => promise.set_value(()),
+                            None => promise.set_error(parse_error("phone.sendSignalingData")),
                         }
                     }
                 }
@@ -38283,6 +38436,10 @@ pub(crate) struct CallEnv<'a> {
     pub(crate) notification_manager: &'a mut NotificationManager,
     pub(crate) updates: &'a mut Vec<td_api::Update>,
     pub(crate) dh_config: &'a mut Option<DhConfig>,
+    /// The collapsed `G()` dispatch surface of the actor send seams (the
+    /// net-drain 61 second-handle precedent); `None` keeps the net-inert
+    /// posture (the pre-init windows and the net-inert tests).
+    pub(crate) call_net: Option<CallNetHandle>,
 }
 
 impl crate::dh_cache::DhCacheEnv for CallEnv<'_> {
@@ -38354,6 +38511,118 @@ impl crate::call_actor::CallActorEnv for CallEnv<'_> {
 
     fn send_update(&mut self, update: td_api::Update) {
         self.updates.push(update);
+    }
+
+    fn send_get_call_config_query(
+        &mut self,
+        call_id: crate::call_id::CallId,
+        function: tdmtproto::telegram_api::Function,
+    ) {
+        match &self.call_net {
+            Some(net) => net.dispatch(
+                crate::call_manager::CallNetKind::GetCallConfig { call_id },
+                function,
+            ),
+            None => tdutils::log_info!("Send phone.getCallConfig — [net-inert]"),
+        }
+    }
+
+    fn send_get_dh_config_query(
+        &mut self,
+        call_id: crate::call_id::CallId,
+        function: tdmtproto::telegram_api::Function,
+    ) {
+        match &self.call_net {
+            Some(net) => net.dispatch(
+                crate::call_manager::CallNetKind::GetDhConfig { call_id },
+                function,
+            ),
+            None => tdutils::log_info!("Send messages.getDhConfig — [net-inert]"),
+        }
+    }
+
+    fn send_request_call_query(
+        &mut self,
+        call_id: crate::call_id::CallId,
+        function: tdmtproto::telegram_api::Function,
+    ) {
+        match &self.call_net {
+            Some(net) => net.dispatch(
+                crate::call_manager::CallNetKind::RequestCall { call_id },
+                function,
+            ),
+            None => tdutils::log_info!("Send phone.requestCall — [net-inert]"),
+        }
+    }
+
+    fn send_accept_call_query(
+        &mut self,
+        call_id: crate::call_id::CallId,
+        function: tdmtproto::telegram_api::Function,
+    ) {
+        match &self.call_net {
+            Some(net) => net.dispatch(
+                crate::call_manager::CallNetKind::AcceptCall { call_id },
+                function,
+            ),
+            None => tdutils::log_info!("Send phone.acceptCall — [net-inert]"),
+        }
+    }
+
+    fn send_confirm_call_query(
+        &mut self,
+        call_id: crate::call_id::CallId,
+        function: tdmtproto::telegram_api::Function,
+    ) {
+        match &self.call_net {
+            Some(net) => net.dispatch(
+                crate::call_manager::CallNetKind::ConfirmCall { call_id },
+                function,
+            ),
+            None => tdutils::log_info!("Send phone.confirmCall — [net-inert]"),
+        }
+    }
+
+    fn send_discard_call_query(
+        &mut self,
+        call_id: crate::call_id::CallId,
+        function: tdmtproto::telegram_api::Function,
+    ) {
+        match &self.call_net {
+            Some(net) => net.dispatch(
+                crate::call_manager::CallNetKind::DiscardCall { call_id },
+                function,
+            ),
+            None => tdutils::log_info!("Send phone.discardCall — [net-inert]"),
+        }
+    }
+
+    fn send_received_call_query(
+        &mut self,
+        call_id: crate::call_id::CallId,
+        function: tdmtproto::telegram_api::Function,
+    ) {
+        match &self.call_net {
+            Some(net) => net.dispatch(
+                crate::call_manager::CallNetKind::ReceivedCall { call_id },
+                function,
+            ),
+            None => tdutils::log_info!("Send phone.receivedCall — [net-inert]"),
+        }
+    }
+
+    fn send_call_signaling_data_query(
+        &mut self,
+        call_id: crate::call_id::CallId,
+        function: tdmtproto::telegram_api::Function,
+    ) {
+        match &self.call_net {
+            Some(net) => net.dispatch(
+                crate::call_manager::CallNetKind::SendSignalingData { call_id },
+                function,
+            ),
+            None => tdutils::log_info!("Send phone.sendSignalingData — [net-inert]"),
+        }
     }
 }
 
@@ -58025,6 +58294,26 @@ mod tests {
             "expected exactly one {constructor:#x} query"
         );
         matches.pop().unwrap()
+    }
+
+    /// Take the sent queries of two constructors sharing one flush (the
+    /// paired `start_up` + first-load sends), one each.
+    fn take_sent_pair(
+        rec: &std::sync::Arc<RecNetSession>,
+        first: i32,
+        second: i32,
+    ) -> (NetQuery, NetQuery) {
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        let (mut firsts, seconds): (Vec<_>, Vec<_>) = sent
+            .into_iter()
+            .partition(|query| query.tl_constructor() == first);
+        let mut seconds: Vec<_> = seconds
+            .into_iter()
+            .filter(|query| query.tl_constructor() == second)
+            .collect();
+        assert_eq!(firsts.len(), 1, "expected exactly one {first:#x} query");
+        assert_eq!(seconds.len(), 1, "expected exactly one {second:#x} query");
+        (firsts.pop().unwrap(), seconds.pop().unwrap())
     }
 
     /// The net-drain 36 band sweep — the remaining dispatcher families
@@ -96120,6 +96409,8 @@ kQIDAQAB\n\
     }
 
     fn call_manager_families_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-call-manager");
+        let call_net = td.call_net();
         // The env exactly as the request arms build it — expanded at the
         // call site so the field borrows stay disjoint.
         macro_rules! call_env {
@@ -96134,10 +96425,10 @@ kQIDAQAB\n\
                     notification_manager: &mut $td.notification_manager,
                     updates: &mut $td.call_updates,
                     dh_config: &mut $td.call_dh_config,
+                    call_net: call_net.clone(),
                 }
             }};
         }
-        let (mut td, rec, callback) = netted_td_with_callback("netfix-call-manager");
 
         // A resolvable call: the requested update creates the actor and
         // binds the server id (CallId 1 ← server 100/7).
@@ -96384,6 +96675,826 @@ kQIDAQAB\n\
                 .map(|(_, error)| error.clone())
                 .expect("the empty-call band");
             assert_eq!(error.message, "Input call must be non-empty");
+        }
+    }
+
+    // ---- the net-drain 54 call-actor families: the §3.9 eight wire
+    // queries (CallActor.cpp send/answer bands) ride the `CallNetKind`
+    // plane; the DH peer is fabricated with a scratch `DhHandshake` over
+    // the built-in good prime (g = 3 passes the mod-4g check). ----
+
+    #[test]
+    fn call_actor_families_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(call_actor_families_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn call_actor_families_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-call-actor");
+        let call_net = td.call_net();
+        // The env exactly as the request arms build it — expanded at the
+        // call site so the field borrows stay disjoint.
+        macro_rules! call_env {
+            ($td:ident) => {{
+                CallEnv {
+                    user_env: UserEnv {
+                        global: &mut $td.global,
+                        options: $td.option_manager.as_mut().expect("option manager set"),
+                        auth_is_bot: $td.auth_manager.is_bot(),
+                    },
+                    user_manager: &mut $td.user_manager,
+                    notification_manager: &mut $td.notification_manager,
+                    updates: &mut $td.call_updates,
+                    dh_config: &mut $td.call_dh_config,
+                    call_net: call_net.clone(),
+                }
+            }};
+        }
+        let dh_prime = crate::dh_cache::BUILT_IN_GOOD_PRIME.to_vec();
+        let wire_protocol = telegram_api::PhoneCallProtocol {
+            flags: 0,
+            udp_p2p: true,
+            udp_reflector: false,
+            min_layer: 65,
+            max_layer: 92,
+            library_versions: vec!["4".to_string()],
+        };
+        let call_error_state = |td: &Td, code: i32, message: &str| match td.call_updates.last() {
+            Some(td_api::Update::updateCall(update)) => {
+                let call = update.call.as_ref().expect("the call");
+                match call.state.as_ref().expect("the call state") {
+                    td_api::CallState::callStateError(state) => {
+                        let error = state.error.as_ref().expect("the error");
+                        assert_eq!(
+                            (error.code, error.message.as_str()),
+                            (code, message),
+                            "the callStateError flush"
+                        );
+                    }
+                    other => panic!("expected the error state: {other:?}"),
+                }
+            }
+            other => panic!("expected updateCall: {other:?}"),
+        };
+
+        // The resolvable call peer (the `get_input_user` band).
+        with_user_manager(&mut td, |manager, env| {
+            manager.on_get_user(env, wire_user(5, "Peer"), "test");
+        });
+
+        // 1. getDhConfig, NotModified with no stored config — the fetch
+        //    lambda falls through to the 500 band (cpp:699-701), the
+        //    machine errors out and the call_id == 0 discard takes the
+        //    immediate-Missed fallback (cpp:815-825): no wire query.
+        {
+            td.request(
+                50,
+                Function::createCall(td_api::createCall {
+                    user_id: 5,
+                    protocol: Some(td_api::CallProtocol {
+                        udp_p2p: true,
+                        udp_reflector: true,
+                        min_layer: 65,
+                        max_layer: 92,
+                        library_versions: vec!["4".to_string()],
+                    }),
+                    is_video: false,
+                }),
+            );
+            td.flush_deferred_results();
+            let call_id = callback
+                .responses
+                .lock()
+                .iter()
+                .find(|(response_id, _)| *response_id == 50)
+                .map(|(_, object)| object.clone())
+                .expect("the createCall answer");
+            assert!(
+                matches!(call_id, Object::callId(_)),
+                "the local call id answer: {call_id:?}"
+            );
+            let (_config_sent, dh_sent) = take_sent_pair(
+                &rec,
+                telegram_api::phone_getCallConfig::ID,
+                telegram_api::messages_getDhConfig::ID,
+            );
+            let body = telegram_api::messages_getDhConfig::parse(dh_sent.query())
+                .expect("the getDhConfig body");
+            assert_eq!((body.version, body.random_length), (0, 0));
+            let mut not_modified = Vec::new();
+            telegram_api::messages_DhConfig::messages_dhConfigNotModified(
+                telegram_api::messages_dhConfigNotModified {
+                    random: b"seed".to_vec(),
+                },
+            )
+            .store(&mut not_modified);
+            net_complete(dh_sent, not_modified);
+            td.dispatch_completed_call_net();
+            call_error_state(&td, 500, "Can't load DhConfig");
+            let sent_after = std::mem::take(&mut *rec.sent.lock());
+            assert!(
+                sent_after
+                    .iter()
+                    .all(|q| q.tl_constructor() != telegram_api::phone_discardCall::ID),
+                "the unknown call id discards without a query"
+            );
+            assert!(
+                td.call_manager
+                    .get_call_actor(crate::call_id::CallId::new(1))
+                    .is_none()
+            );
+        }
+
+        // 2. getDhConfig, NotModified with a stored config — the
+        //    store-read fallback (the C++ captured old_dh_config,
+        //    cpp:699-701) proceeds to the request; the requestCall error
+        //    band (cpp:753-758 → on_error) repeats the call_id == 0
+        //    fallback with no query.
+        {
+            td.request(
+                51,
+                Function::createCall(td_api::createCall {
+                    user_id: 5,
+                    protocol: Some(td_api::CallProtocol {
+                        udp_p2p: true,
+                        udp_reflector: true,
+                        min_layer: 65,
+                        max_layer: 92,
+                        library_versions: vec!["4".to_string()],
+                    }),
+                    is_video: false,
+                }),
+            );
+            let (_config_sent, dh_sent) = take_sent_pair(
+                &rec,
+                telegram_api::phone_getCallConfig::ID,
+                telegram_api::messages_getDhConfig::ID,
+            );
+            // the store populates between the send and the answer
+            td.call_dh_config = Some(crate::dh_cache::DhConfig {
+                version: 7,
+                prime: dh_prime.clone(),
+                g: 3,
+            });
+            let mut not_modified = Vec::new();
+            telegram_api::messages_DhConfig::messages_dhConfigNotModified(
+                telegram_api::messages_dhConfigNotModified {
+                    random: b"seed".to_vec(),
+                },
+            )
+            .store(&mut not_modified);
+            net_complete(dh_sent, not_modified);
+            td.dispatch_completed_call_net();
+            let request_sent = take_sent_query(&rec, telegram_api::phone_requestCall::ID);
+            net_fail(request_sent, 400, "PARTICIPANT_CALL_DECLINED");
+            td.dispatch_completed_call_net();
+            call_error_state(&td, 400, "PARTICIPANT_CALL_DECLINED");
+            let sent_after = std::mem::take(&mut *rec.sent.lock());
+            assert!(
+                sent_after
+                    .iter()
+                    .all(|q| q.tl_constructor() != telegram_api::phone_discardCall::ID),
+                "the unknown call id discards without a query"
+            );
+            assert!(
+                td.call_manager
+                    .get_call_actor(crate::call_id::CallId::new(2))
+                    .is_none()
+            );
+        }
+
+        // 3. the outgoing happy chain — requestCall (the g_b hash + the
+        //    input user + the protocol ride, cpp:734-736), the waiting
+        //    answer round-trip, the accepted update (the DH key
+        //    generates), confirmCall (the g_b rides the g_a field,
+        //    cpp:797-799), the fingerprint-mismatch band (cpp:641-643 →
+        //    on_error → the cleanup discard), the discard round-trip with
+        //    the Updates answer (cpp:837-841), and the double-discard
+        //    band (cpp:293-295).
+        {
+            td.request(
+                52,
+                Function::createCall(td_api::createCall {
+                    user_id: 5,
+                    protocol: Some(td_api::CallProtocol {
+                        udp_p2p: true,
+                        udp_reflector: true,
+                        min_layer: 65,
+                        max_layer: 92,
+                        library_versions: vec!["4".to_string()],
+                    }),
+                    is_video: false,
+                }),
+            );
+            let (_config_sent, request_sent) = take_sent_pair(
+                &rec,
+                telegram_api::phone_getCallConfig::ID,
+                telegram_api::phone_requestCall::ID,
+            );
+            let body = telegram_api::phone_requestCall::parse(request_sent.query())
+                .expect("the requestCall body");
+            assert!(!body.video);
+            assert_eq!(body.g_a_hash.len(), 32, "the g_b hash rides");
+            assert!(body.random_id != 0, "the secure random id");
+            let protocol = body.protocol.as_ref().expect("the protocol");
+            assert_eq!(
+                (
+                    protocol.min_layer,
+                    protocol.max_layer,
+                    protocol.library_versions.as_slice()
+                ),
+                (65, 92, ["4".to_string()].as_slice())
+            );
+            match body.user_id.as_ref().expect("the input user") {
+                telegram_api::InputUser::inputUser(user) => {
+                    assert_eq!((user.user_id, user.access_hash), (5, 42));
+                }
+                other => panic!("the input user: {other:?}"),
+            }
+            let mut waiting = Vec::new();
+            telegram_api::phone_PhoneCall {
+                phone_call: Some(telegram_api::PhoneCall::phoneCallWaiting(
+                    telegram_api::phoneCallWaiting {
+                        flags: 0,
+                        video: false,
+                        id: 100,
+                        access_hash: 7,
+                        date: 0,
+                        admin_id: 5,
+                        participant_id: 5,
+                        protocol: None,
+                        receive_date: 0,
+                    },
+                )),
+                users: Vec::new(),
+            }
+            .store_boxed(&mut waiting);
+            net_complete(request_sent, waiting);
+            td.dispatch_completed_call_net();
+            assert!(
+                matches!(td.call_updates.last(), Some(td_api::Update::updateCall(_))),
+                "the Pending flush"
+            );
+
+            // the accepted update (the sink is parked — the manager is
+            // driven directly, the 44-test convention); the scratch
+            // handshake plays the peer.
+            let mut peer = tdmtproto::dh_handshake::DhHandshake::new();
+            peer.set_config(3, &dh_prime);
+            {
+                let mut env = call_env!(td);
+                td.call_manager.update_call(
+                    &mut env,
+                    telegram_api::updatePhoneCall {
+                        phone_call: Some(telegram_api::PhoneCall::phoneCallAccepted(
+                            telegram_api::phoneCallAccepted {
+                                flags: 0,
+                                video: false,
+                                id: 100,
+                                access_hash: 7,
+                                date: 0,
+                                admin_id: 5,
+                                participant_id: 5,
+                                g_b: peer.get_g_b(),
+                                protocol: None,
+                            },
+                        )),
+                    },
+                );
+            }
+            let confirm_sent = take_sent_query(&rec, telegram_api::phone_confirmCall::ID);
+            let body = telegram_api::phone_confirmCall::parse(confirm_sent.query())
+                .expect("the confirmCall body");
+            let confirm_peer = body.peer.as_ref().expect("the input phone call");
+            assert_eq!((confirm_peer.id, confirm_peer.access_hash), (100, 7));
+            assert!(
+                !body.g_a.is_empty(),
+                "the g_b rides the g_a field (cpp:797-798)"
+            );
+            assert!(body.key_fingerprint != 0, "the generated key id");
+            let mut ready_wrong = Vec::new();
+            telegram_api::phone_PhoneCall {
+                phone_call: Some(telegram_api::PhoneCall::phoneCall(
+                    telegram_api::phoneCall {
+                        flags: 0,
+                        p2p_allowed: false,
+                        video: false,
+                        conference_supported: false,
+                        id: 100,
+                        access_hash: 7,
+                        date: 0,
+                        admin_id: 5,
+                        participant_id: 5,
+                        g_a_or_b: b"unused-on-confirm".to_vec(),
+                        key_fingerprint: 999,
+                        protocol: Some(wire_protocol.clone()),
+                        connections: Vec::new(),
+                        start_date: 0,
+                        custom_parameters: None,
+                    },
+                )),
+                users: Vec::new(),
+            }
+            .store_boxed(&mut ready_wrong);
+            net_complete(confirm_sent, ready_wrong);
+            td.dispatch_completed_call_net();
+            call_error_state(&td, 400, "Key fingerprints mismatch");
+            let discard_sent = take_sent_query(&rec, telegram_api::phone_discardCall::ID);
+            let body = telegram_api::phone_discardCall::parse(discard_sent.query())
+                .expect("the discard body");
+            let discard_peer = body.peer.as_ref().expect("the input phone call");
+            assert_eq!((discard_peer.id, discard_peer.access_hash), (100, 7));
+            assert!(
+                matches!(
+                    body.reason,
+                    Some(telegram_api::PhoneCallDiscardReason::phoneCallDiscardReasonDisconnect(_))
+                ),
+                "the ExchangingKey error derives Disconnected"
+            );
+            net_complete(discard_sent, wire_empty_updates());
+            td.dispatch_completed_call_net();
+            // the double-discard band: the actor sits in
+            // WaitDiscardResult, the live arm settles without a query
+            td.request(
+                53,
+                Function::discardCall(td_api::discardCall {
+                    call_id: 3,
+                    is_disconnected: false,
+                    invite_link: String::new(),
+                    duration: 0,
+                    is_video: false,
+                    connection_id: 0,
+                }),
+            );
+            td.flush_deferred_results();
+            assert!(
+                callback
+                    .responses
+                    .lock()
+                    .iter()
+                    .any(|(response_id, _)| *response_id == 53),
+                "the double-discard settles"
+            );
+            let sent_after = std::mem::take(&mut *rec.sent.lock());
+            assert!(
+                sent_after
+                    .iter()
+                    .all(|q| q.tl_constructor() != telegram_api::phone_discardCall::ID),
+                "no second discard query"
+            );
+        }
+
+        // 4. the incoming chain, receivedCall band first — the requested
+        //    update creates the actor (start_up getCallConfig + the
+        //    received query, cpp:449-472), the receivedCall fetch error
+        //    routes into on_error (cpp:714-719) and the cleanup discard
+        //    fires with the Missed reason.
+        {
+            let mut env = call_env!(td);
+            td.call_manager.update_call(
+                &mut env,
+                telegram_api::updatePhoneCall {
+                    phone_call: Some(telegram_api::PhoneCall::phoneCallRequested(
+                        telegram_api::phoneCallRequested {
+                            flags: 0,
+                            video: false,
+                            id: 200,
+                            access_hash: 9,
+                            date: 0,
+                            admin_id: 5,
+                            participant_id: 6,
+                            g_a_hash: tdutils::crypto::sha256(b"peer-g-a").to_vec(),
+                            protocol: Some(wire_protocol.clone()),
+                        },
+                    )),
+                },
+            );
+            let (_config_sent, received_sent) = take_sent_pair(
+                &rec,
+                telegram_api::phone_getCallConfig::ID,
+                telegram_api::phone_receivedCall::ID,
+            );
+            let body = telegram_api::phone_receivedCall::parse(received_sent.query())
+                .expect("the receivedCall body");
+            let peer = body.peer.as_ref().expect("the input phone call");
+            assert_eq!((peer.id, peer.access_hash), (200, 9));
+            net_fail(received_sent, 400, "CALL_ALREADY_DECLINED");
+            td.dispatch_completed_call_net();
+            call_error_state(&td, 400, "CALL_ALREADY_DECLINED");
+            let discard_sent = take_sent_query(&rec, telegram_api::phone_discardCall::ID);
+            let body = telegram_api::phone_discardCall::parse(discard_sent.query())
+                .expect("the discard body");
+            let discard_peer = body.peer.as_ref().expect("the input phone call");
+            assert_eq!((discard_peer.id, discard_peer.access_hash), (200, 9));
+            assert!(matches!(
+                body.reason,
+                Some(telegram_api::PhoneCallDiscardReason::phoneCallDiscardReasonMissed(_))
+            ));
+        }
+
+        // 5. the incoming happy chain — receivedCall ok (the answer is
+        //    unused, cpp:714-719), acceptCall (the live arm; the g_b
+        //    rides, cpp:772-774), the ready answer with the fabricated
+        //    peer's g_a + the shared key fingerprint, the Ready flush
+        //    waiting for the getCallConfig answer (cpp:866-868) and then
+        //    carrying the key + config + emojis.
+        let shared_key = {
+            let mut peer = tdmtproto::dh_handshake::DhHandshake::new();
+            peer.set_config(3, &dh_prime);
+            let peer_g_a = peer.get_g_b();
+            {
+                let mut env = call_env!(td);
+                td.call_manager.update_call(
+                    &mut env,
+                    telegram_api::updatePhoneCall {
+                        phone_call: Some(telegram_api::PhoneCall::phoneCallRequested(
+                            telegram_api::phoneCallRequested {
+                                flags: 0,
+                                video: false,
+                                id: 300,
+                                access_hash: 11,
+                                date: 0,
+                                admin_id: 5,
+                                participant_id: 6,
+                                g_a_hash: tdutils::crypto::sha256(&peer_g_a).to_vec(),
+                                protocol: Some(wire_protocol.clone()),
+                            },
+                        )),
+                    },
+                );
+            }
+            let (config_sent, received_sent) = take_sent_pair(
+                &rec,
+                telegram_api::phone_getCallConfig::ID,
+                telegram_api::phone_receivedCall::ID,
+            );
+            net_complete(received_sent, bool_answer(true));
+            td.dispatch_completed_call_net();
+            td.request(
+                54,
+                Function::acceptCall(td_api::acceptCall {
+                    call_id: 5,
+                    protocol: Some(td_api::CallProtocol {
+                        udp_p2p: true,
+                        udp_reflector: true,
+                        min_layer: 65,
+                        max_layer: 92,
+                        library_versions: vec!["4".to_string()],
+                    }),
+                }),
+            );
+            let accept_sent = take_sent_query(&rec, telegram_api::phone_acceptCall::ID);
+            let body = telegram_api::phone_acceptCall::parse(accept_sent.query())
+                .expect("the acceptCall body");
+            let accept_peer = body.peer.as_ref().expect("the input phone call");
+            assert_eq!((accept_peer.id, accept_peer.access_hash), (300, 11));
+            let accept_protocol = body.protocol.as_ref().expect("the protocol");
+            assert_eq!(accept_protocol.max_layer, 92);
+            assert!(!body.g_b.is_empty(), "the local DH public rides");
+            // the peer processes the actor's public: the shared key and
+            // its id are computable from the scratch handshake
+            peer.set_g_a(&body.g_b);
+            let shared_key = peer.get_g_ab().to_binary(2048 / 8);
+            let fingerprint = tdmtproto::dh_handshake::DhHandshake::calc_key_id(&shared_key);
+            let updates_before = td.call_updates.len();
+            let mut ready = Vec::new();
+            telegram_api::phone_PhoneCall {
+                phone_call: Some(telegram_api::PhoneCall::phoneCall(
+                    telegram_api::phoneCall {
+                        flags: 0,
+                        p2p_allowed: true,
+                        video: false,
+                        conference_supported: false,
+                        id: 300,
+                        access_hash: 11,
+                        date: 0,
+                        admin_id: 5,
+                        participant_id: 6,
+                        g_a_or_b: peer_g_a,
+                        key_fingerprint: fingerprint,
+                        protocol: Some(wire_protocol.clone()),
+                        connections: vec![telegram_api::PhoneConnection::phoneConnection(
+                            telegram_api::phoneConnection {
+                                flags: 0,
+                                tcp: false,
+                                id: 7,
+                                ip: "1.2.3.4".to_string(),
+                                ipv6: "::1".to_string(),
+                                port: 443,
+                                peer_tag: b"tag".to_vec(),
+                            },
+                        )],
+                        start_date: 0,
+                        custom_parameters: None,
+                    },
+                )),
+                users: Vec::new(),
+            }
+            .store_boxed(&mut ready);
+            net_complete(accept_sent, ready);
+            td.dispatch_completed_call_net();
+            assert_eq!(
+                td.call_updates.len(),
+                updates_before,
+                "the Ready flush waits for the config (cpp:866-868)"
+            );
+            let mut data_json = Vec::new();
+            telegram_api::DataJSON {
+                data: "{\"cfg\":1}".to_string(),
+            }
+            .store_boxed(&mut data_json);
+            net_complete(config_sent, data_json);
+            td.dispatch_completed_call_net();
+            match td.call_updates.last() {
+                Some(td_api::Update::updateCall(update)) => {
+                    let call = update.call.as_ref().expect("the call");
+                    assert_eq!(call.id, 5);
+                    match call.state.as_ref().expect("the state") {
+                        td_api::CallState::callStateReady(state) => {
+                            assert_eq!(state.config.as_str(), "{\"cfg\":1}");
+                            assert_eq!(state.encryption_key, shared_key, "the DH key agrees");
+                            assert_eq!(state.emojis.len(), 4, "the emoji fingerprints");
+                            assert_eq!(state.servers.len(), 1);
+                            assert!(state.allow_p2p);
+                            let protocol = state.protocol.as_ref().expect("the protocol");
+                            assert_eq!((protocol.min_layer, protocol.max_layer), (65, 92));
+                        }
+                        other => panic!("expected the ready state: {other:?}"),
+                    }
+                }
+                other => panic!("expected updateCall: {other:?}"),
+            }
+            shared_key
+        };
+
+        // 6. sendSignalingData — the FIFO lot pairs the promises in the
+        //    dispatch order (cpp:280-289), a false Bool still settles,
+        //    the error forwards, and the not-active band errors before
+        //    anything parks (cpp:273-275).
+        {
+            td.request(
+                55,
+                Function::sendCallSignalingData(td_api::sendCallSignalingData {
+                    call_id: 5,
+                    data: b"sig1".to_vec(),
+                }),
+            );
+            td.request(
+                56,
+                Function::sendCallSignalingData(td_api::sendCallSignalingData {
+                    call_id: 5,
+                    data: b"sig2".to_vec(),
+                }),
+            );
+            let sent = std::mem::take(&mut *rec.sent.lock());
+            let mut sigs: Vec<_> = sent
+                .into_iter()
+                .filter(|query| query.tl_constructor() == telegram_api::phone_sendSignalingData::ID)
+                .collect();
+            assert_eq!(sigs.len(), 2, "the two signaling queries ride in order");
+            let sig2 = sigs.pop().unwrap();
+            let sig1 = sigs.pop().unwrap();
+            let body1 = telegram_api::phone_sendSignalingData::parse(sig1.query())
+                .expect("the signaling body");
+            let body2 = telegram_api::phone_sendSignalingData::parse(sig2.query())
+                .expect("the signaling body");
+            assert_eq!(&body1.data, b"sig1");
+            assert_eq!(&body2.data, b"sig2");
+            let peer1 = body1.peer.as_ref().expect("the input phone call");
+            assert_eq!((peer1.id, peer1.access_hash), (300, 11));
+            net_fail(sig1, 500, "Internal Server Error");
+            net_complete(sig2, bool_answer(false));
+            td.dispatch_completed_call_net();
+            td.flush_deferred_results();
+            let error = callback
+                .errors
+                .lock()
+                .iter()
+                .find(|(error_id, _)| *error_id == 55)
+                .map(|(_, error)| error.clone())
+                .expect("the first signal forwards the error");
+            assert_eq!(error.message, "Internal Server Error");
+            assert!(
+                callback
+                    .responses
+                    .lock()
+                    .iter()
+                    .any(|(response_id, _)| *response_id == 56),
+                "the false Bool still settles"
+            );
+            td.request(
+                57,
+                Function::sendCallSignalingData(td_api::sendCallSignalingData {
+                    call_id: 4,
+                    data: b"sig3".to_vec(),
+                }),
+            );
+            td.flush_deferred_results();
+            let error = callback
+                .errors
+                .lock()
+                .iter()
+                .find(|(error_id, _)| *error_id == 57)
+                .map(|(_, error)| error.clone())
+                .expect("the not-active band");
+            assert_eq!(error.message, "Call is not active");
+            let _ = shared_key;
+        }
+
+        // 7. getCallConfig's error band — the fetch error routes into
+        //    on_error (cpp:893-897) and the cleanup discard fires with
+        //    the Missed reason (the incoming Pending state).
+        {
+            let mut env = call_env!(td);
+            td.call_manager.update_call(
+                &mut env,
+                telegram_api::updatePhoneCall {
+                    phone_call: Some(telegram_api::PhoneCall::phoneCallRequested(
+                        telegram_api::phoneCallRequested {
+                            flags: 0,
+                            video: false,
+                            id: 400,
+                            access_hash: 13,
+                            date: 0,
+                            admin_id: 5,
+                            participant_id: 6,
+                            g_a_hash: tdutils::crypto::sha256(b"peer-g-a").to_vec(),
+                            protocol: Some(wire_protocol.clone()),
+                        },
+                    )),
+                },
+            );
+            let (config_sent, _received_sent) = take_sent_pair(
+                &rec,
+                telegram_api::phone_getCallConfig::ID,
+                telegram_api::phone_receivedCall::ID,
+            );
+            net_fail(config_sent, 420, "SLOWMODE_WAIT");
+            td.dispatch_completed_call_net();
+            call_error_state(&td, 420, "SLOWMODE_WAIT");
+            let discard_sent = take_sent_query(&rec, telegram_api::phone_discardCall::ID);
+            let body = telegram_api::phone_discardCall::parse(discard_sent.query())
+                .expect("the discard body");
+            let discard_peer = body.peer.as_ref().expect("the input phone call");
+            assert_eq!((discard_peer.id, discard_peer.access_hash), (400, 13));
+            assert!(matches!(
+                body.reason,
+                Some(telegram_api::PhoneCallDiscardReason::phoneCallDiscardReasonMissed(_))
+            ));
+            net_complete(discard_sent, wire_empty_updates());
+            td.dispatch_completed_call_net();
+            // the actor sits in WaitDiscardResult until the Updates
+            // engine routes the phoneCallDiscarded update back (the
+            // case-3 posture — the ok answer never reaches the actor,
+            // cpp:837-841)
+        }
+
+        // 8. getDhConfig's full variant, bad prime — the fetch lambda
+        //    stores the config before the actor's check runs
+        //    (cpp:691 vs the check at cpp:657-661), so the store
+        //    carries the bad config even though the call errors out;
+        //    the call_id == 0 discard stays local (no wire query).
+        {
+            td.call_dh_config = None;
+            td.request(
+                58,
+                Function::createCall(td_api::createCall {
+                    user_id: 5,
+                    protocol: Some(td_api::CallProtocol {
+                        udp_p2p: true,
+                        udp_reflector: true,
+                        min_layer: 65,
+                        max_layer: 92,
+                        library_versions: vec!["4".to_string()],
+                    }),
+                    is_video: false,
+                }),
+            );
+            let (_config_sent, dh_sent) = take_sent_pair(
+                &rec,
+                telegram_api::phone_getCallConfig::ID,
+                telegram_api::messages_getDhConfig::ID,
+            );
+            let mut full = Vec::new();
+            telegram_api::messages_DhConfig::messages_dhConfig(telegram_api::messages_dhConfig {
+                g: 3,
+                p: vec![0xff; 256],
+                version: 9,
+                random: b"seed".to_vec(),
+            })
+            .store(&mut full);
+            net_complete(dh_sent, full);
+            td.dispatch_completed_call_net();
+            // error_message carries code 0 (the C++ Status::Error(message))
+            call_error_state(&td, 0, "Bad prime mod 4g");
+            // the fetch-lambda store write (cpp:691) precedes the check
+            let stored = td
+                .call_dh_config
+                .clone()
+                .expect("the store write rides the fetch lambda");
+            assert_eq!((stored.version, stored.g, stored.prime.len()), (9, 3, 256));
+            let sent_after = std::mem::take(&mut *rec.sent.lock());
+            assert!(
+                sent_after
+                    .iter()
+                    .all(|q| q.tl_constructor() != telegram_api::phone_discardCall::ID),
+                "the unknown call id discards without a query"
+            );
+            assert!(
+                td.call_manager
+                    .get_call_actor(crate::call_id::CallId::new(7))
+                    .is_none()
+            );
+        }
+
+        // 9. getDhConfig's full variant, good prime — the fresh config
+        //    serves the request leg, and the next call reuses the store
+        //    without a fresh query (the `load_dh_config` read,
+        //    cpp:612-615).
+        {
+            td.call_dh_config = None;
+            td.request(
+                59,
+                Function::createCall(td_api::createCall {
+                    user_id: 5,
+                    protocol: Some(td_api::CallProtocol {
+                        udp_p2p: true,
+                        udp_reflector: true,
+                        min_layer: 65,
+                        max_layer: 92,
+                        library_versions: vec!["4".to_string()],
+                    }),
+                    is_video: false,
+                }),
+            );
+            let (_config_sent, dh_sent) = take_sent_pair(
+                &rec,
+                telegram_api::phone_getCallConfig::ID,
+                telegram_api::messages_getDhConfig::ID,
+            );
+            let mut full = Vec::new();
+            telegram_api::messages_DhConfig::messages_dhConfig(telegram_api::messages_dhConfig {
+                g: 3,
+                p: dh_prime.clone(),
+                version: 9,
+                random: b"seed".to_vec(),
+            })
+            .store(&mut full);
+            net_complete(dh_sent, full);
+            td.dispatch_completed_call_net();
+            let request_sent = take_sent_query(&rec, telegram_api::phone_requestCall::ID);
+            net_fail(request_sent, 400, "PARTICIPANT_CALL_DECLINED");
+            td.dispatch_completed_call_net();
+            let stored = td
+                .call_dh_config
+                .clone()
+                .expect("the store write rides the fetch lambda");
+            assert_eq!((stored.version, stored.g), (9, 3));
+            assert!(stored.prime == dh_prime, "the fresh prime is stored");
+
+            // the second call skips the dh query over the stored config
+            td.request(
+                60,
+                Function::createCall(td_api::createCall {
+                    user_id: 5,
+                    protocol: Some(td_api::CallProtocol {
+                        udp_p2p: true,
+                        udp_reflector: true,
+                        min_layer: 65,
+                        max_layer: 92,
+                        library_versions: vec!["4".to_string()],
+                    }),
+                    is_video: false,
+                }),
+            );
+            let sent = std::mem::take(&mut *rec.sent.lock());
+            assert!(
+                sent.iter()
+                    .all(|q| q.tl_constructor() != telegram_api::messages_getDhConfig::ID),
+                "the stored config serves the load"
+            );
+            assert_eq!(
+                sent.iter()
+                    .filter(|q| q.tl_constructor() == telegram_api::phone_requestCall::ID)
+                    .count(),
+                1,
+                "the request rides straight away"
+            );
+            let request_sent = sent
+                .into_iter()
+                .find(|q| q.tl_constructor() == telegram_api::phone_requestCall::ID)
+                .unwrap();
+            net_fail(request_sent, 400, "PARTICIPANT_CALL_DECLINED");
+            td.dispatch_completed_call_net();
+            assert!(
+                td.call_manager
+                    .get_call_actor(crate::call_id::CallId::new(9))
+                    .is_none()
+            );
         }
     }
 
