@@ -25875,6 +25875,139 @@ pub fn send_ton_wallet_transfer(
 /// `inputMessageForwarded` arm routes to `forward_message` in the C++ — the
 /// M.10.11 forward plane ([blocked: the forwardMessages flip]).
 #[allow(clippy::too_many_arguments)]
+/// The `messages.editMessage` wire payload built by
+/// [`edit_message_text`] (`EditMessageQuery::send`,
+/// MessagesManager.cpp:1872-1931).
+pub(crate) struct EditMessageWire {
+    pub server_message_id: i32,
+    pub message: String,
+    pub entities: Vec<tdmtproto::telegram_api::MessageEntity>,
+    pub no_webpage: bool,
+}
+
+/// `MessagesManager::edit_message_text`
+/// (MessagesManager.cpp:23493-23530) — the editMessageText validation
+/// chain, in the C++ order and error strings. The local content update is
+/// applied optimistically with the `updateMessageContent` emission; the
+/// authoritative `updateMessageEdited` rides the server answer's update
+/// stream (the C++ applies it in `EditMessageQuery::on_result`'s
+/// `on_get_updates`). `can_edit_message` covers the outgoing-text slice
+/// of the C++ rights band — channel-admin, poll and business edits ride
+/// their slices.
+pub(crate) fn edit_message_text(
+    manager: &mut MessagesManager,
+    state: &mut dyn ReadStateContext,
+    my_id: crate::user_manager::UserId,
+    dialog_id: DialogId,
+    message_id: MessageId,
+    input_message_content: Option<td_api::InputMessageContent>,
+) -> Result<EditMessageWire, (i32, String)> {
+    if input_message_content.is_none() {
+        return Err((400, "Can't edit message without new content".to_owned()));
+    }
+    let Some(td_api::InputMessageContent::inputMessageText(input_text)) = input_message_content
+    else {
+        // the C++ accepts inputMessageText or inputMessageRichMessage;
+        // the RichMessage processing stays its slice
+        return Err((
+            400,
+            "Input message content type must be inputMessageText or inputMessageRichMessage"
+                .to_owned(),
+        ));
+    };
+
+    // `check_dialog_access(force=true, Edit)` — the known-peer on-demand
+    // create (the send_message band shape); the rights level rides the
+    // same have_input_peer seam (Read is the only level the context
+    // trait checks).
+    if manager.get_dialog(dialog_id).is_none() && state.have_input_peer(dialog_id, false) {
+        manager.add_dialog_for_new_message(dialog_id);
+    }
+    let Some(d) = manager.get_dialog_mut(dialog_id) else {
+        return Err((400, "Chat not found".to_owned()));
+    };
+    let Some(m) = d.messages.get_mut(&message_id) else {
+        return Err((400, "Message not found".to_owned()));
+    };
+    let m = m.as_mut();
+    // `can_edit_message(dialog_id, m, true)` — the outgoing-text slice
+    // (own messages; the saved-messages self-message rides the sender id
+    // since the send-answer intake does not set the wire `out` flag on
+    // its stored copy). The not-yet-sent band (a non-server id has no
+    // wire message to edit — the C++ rights band rejects it before the
+    // query).
+    let _ = manager;
+    if !m.is_outgoing && m.sender_user_id != my_id {
+        return Err((400, "Message can't be edited".to_owned()));
+    }
+    if !m.message_id.is_server() {
+        return Err((400, "Message can't be edited".to_owned()));
+    }
+    let Some(crate::message_content::MessageContent::Text(_)) = m.content.as_ref() else {
+        return Err((400, "There is no text in the message to edit".to_owned()));
+    };
+
+    // the text + entities conversion (`process_input_message_text` +
+    // `EditMessageQuery::send`'s `get_input_message_entities` — the
+    // None-backed pass is the () resolver, like the send path)
+    // the text is the required payload; `disable_web_page_preview` moved
+    // into link_preview_options.is_disabled in the 1.8.68 model — the
+    // wire no_webpage flag maps from it (the EditMessageQuery flag
+    // semantics are unchanged)
+    let Some(text) = input_text.text else {
+        return Err((400, "Can't edit message without new content".to_owned()));
+    };
+    let no_webpage = input_text
+        .link_preview_options
+        .as_ref()
+        .is_some_and(|options| options.is_disabled);
+    // the two-step conversion: td_api TextEntity -> the internal
+    // MessageEntity (`get_message_entities`, like
+    // process_input_message_content) -> the wire entities
+    // (`get_input_message_entities`, EditMessageQuery::send)
+    let internal_entities =
+        crate::message_entity::get_message_entities::<()>(None, text.entities.clone(), false)
+            .map_err(|status| (400, status.message().to_owned()))?;
+    let entities = crate::message_entity::get_input_message_entities::<()>(
+        None,
+        &internal_entities,
+        "EditMessageQuery",
+    );
+
+    // the optimistic local content update + the `updateMessageContent`
+    // emission (send_update_message_content, MessagesManager.cpp:27428):
+    // the stored content carries the internal FormattedText, the emitted
+    // update carries the td_api one
+    m.content = Some(crate::message_content::MessageContent::Text(
+        crate::message_content::MessageText {
+            text: crate::message_entity::FormattedText {
+                text: text.text.clone(),
+                entities: internal_entities.clone(),
+            },
+            ..crate::message_content::MessageText::default()
+        },
+    ));
+    state.send_update(td_api::Object::updateMessageContent(
+        td_api::updateMessageContent {
+            chat_id: dialog_id.get(),
+            message_id: message_id.get(),
+            new_content: Some(td_api::MessageContent::messageText(td_api::messageText {
+                text: Some(text.clone()),
+                link_preview: None,
+                link_preview_options: input_text.link_preview_options,
+            })),
+        },
+    ));
+
+    Ok(EditMessageWire {
+        server_message_id: message_id.get_server_message_id().get(),
+        message: text.text,
+        entities,
+        no_webpage,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn send_message(
     global: &mut crate::global::Global,
     manager: &mut MessagesManager,

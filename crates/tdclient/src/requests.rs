@@ -15105,14 +15105,93 @@ fn run_message_dialog_requests(td: &mut Td, id: u64, function: Function) {
             }
             let _promise = td.deferred_promise::<td_api::RichMessage, _>(id, Object::richMessage);
         }
-        Function::editMessageText(_) => {
-            let _promise = td.deferred_promise::<Option<td_api::Message>, _>(id, |opt| match opt {
-                Some(message) => Object::message(message),
-                None => Object::error(td_api::Error {
-                    code: 404,
-                    message: "Not Found".to_string(),
-                }),
-            });
+        Function::editMessageText(request) => {
+            // EditMessageTextRequest (Requests.cpp:803-817): the
+            // validation + optimistic local edit ride
+            // messages_manager::edit_message_text; the wire query parks on
+            // the walking lane (PendingNetKind::EditMessage) and the
+            // answer tail feeds the Updates pipe then builds the
+            // do_send_result object.
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let message_id = crate::messages_manager::MessageId::new(request.message_id);
+            let td_ptr = std::ptr::from_mut(td);
+            let manager: &mut crate::messages_manager::MessagesManager =
+                unsafe { &mut (*td_ptr).messages_manager };
+            let state: &mut dyn crate::messages_manager::ReadStateContext =
+                unsafe { crate::td::split_context_alias(td_ptr) };
+            let wire = match crate::messages_manager::edit_message_text(
+                manager,
+                state,
+                td.user_manager.get_my_id(),
+                dialog_id,
+                message_id,
+                request.input_message_content.map(|content| *content),
+            ) {
+                Ok(wire) => wire,
+                Err((code, message)) => return td.send_error_impl(id, code, &message),
+            };
+            // the reply-markup conversion — the C++
+            // get_inline_reply_markup(reply_markup, is_bot, ...) band: the
+            // td_api markup converts through get_reply_markup (the
+            // only-inline gate rides its slice; the server rejects
+            // non-inline edits)
+            let edit_markup = match crate::reply_markup::get_reply_markup(
+                request.reply_markup,
+                dialog_id.get_type(),
+                false,
+                td.auth_manager.is_bot(),
+                false,
+                td.global.is_test_dc(),
+            ) {
+                Ok(markup) => markup,
+                Err(status) => return td.send_error_impl(id, 400, status.message()),
+            };
+            // `EditMessageQuery::send`'s peer (AccessRights::Edit)
+            let Some(peer) = crate::dialog_manager::get_input_peer(
+                td,
+                dialog_id,
+                crate::user_manager::AccessRights::Edit,
+            ) else {
+                return td.send_error_impl(id, 400, "Can't access the chat");
+            };
+            let mut flags = 0;
+            const EDIT_MESSAGE_FLAG_MESSAGE: i32 = 1;
+            const EDIT_MESSAGE_FLAG_NO_WEBPAGE: i32 = 2;
+            const EDIT_MESSAGE_FLAG_ENTITIES: i32 = 3;
+            flags |= EDIT_MESSAGE_FLAG_MESSAGE;
+            if wire.no_webpage {
+                flags |= 1 << EDIT_MESSAGE_FLAG_NO_WEBPAGE;
+            }
+            if !wire.entities.is_empty() {
+                flags |= 1 << EDIT_MESSAGE_FLAG_ENTITIES;
+            }
+            let function = tdmtproto::telegram_api::Function::messages_editMessage(
+                tdmtproto::telegram_api::messages_editMessage {
+                    flags,
+                    no_webpage: wire.no_webpage,
+                    invert_media: false,
+                    peer: Some(Box::new(peer)),
+                    id: wire.server_message_id,
+                    message: wire.message,
+                    media: None,
+                    reply_markup: edit_markup
+                        .as_ref()
+                        .and_then(crate::reply_markup::get_input_reply_markup),
+                    entities: wire.entities,
+                    schedule_date: 0,
+                    schedule_repeat_period: 0,
+                    quick_reply_shortcut_id: 0,
+                    rich_message: None,
+                },
+            );
+            let token = td.park_net(
+                id,
+                crate::td::PendingNetKind::EditMessage {
+                    dialog_id,
+                    message_id,
+                },
+            );
+            td.dispatch_walking_query(token, function, tdnet::net_query::AuthFlag::On);
         }
         Function::editMessageCaption(_) => {
             let _promise = td.deferred_promise::<Option<td_api::Message>, _>(id, |opt| match opt {
