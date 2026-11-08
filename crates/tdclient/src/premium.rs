@@ -11,8 +11,9 @@
 //! convention), so the flows resolve peers/chats/users through the same
 //! trait; the gift-with-stars form→send chain rides the same plane
 //! (`GetPremiumGiftPaymentFormQuery` → `SendPremiumGiftQuery`, the
-//! promise chaining into `on_get_updates`); the promo parks with the
-//! files plane.
+//! promise chaining into `on_get_updates`); the promo answer builds the
+//! promotion animations over the animations plane (the §6 flip, net-drain
+//! 56) while the envs without the plane answer the miss band.
 
 use crate::chat_manager::{ChannelId, DialogParticipantStatus};
 use crate::dialog_id::DialogId;
@@ -242,14 +243,14 @@ pub trait PremiumEnv {
     }
 
     /// `td_->animations_manager_->get_animation_object(file_id)`
-    /// (Premium.cpp:371/377) — the animations record parks at the M.20
-    /// integration (`create_animation` is the collapsed seam), so the
-    /// object stays absent until that plane lands.
+    /// (Premium.cpp:371/377) over the animations record — the default is
+    /// the miss band for the envs without the animations plane; the
+    /// whole-Td env builds the real object (the §6 flip, net-drain 56).
     fn get_animation_object(
         &mut self,
         _file_id: crate::files::FileId,
     ) -> Option<td_api::Animation> {
-        tdutils::log_info!("get_animation_object — [blocked: animations integration]");
+        tdutils::log_info!("get_animation_object — [net-inert miss band]");
         None
     }
     fn send_get_premium_gift_options_query(&mut self) {
@@ -741,8 +742,9 @@ impl PremiumManager {
     /// users intake, the status text, the video-section bands (the
     /// count mismatch, the duplicates/empties, the non-document videos,
     /// the non-Animation parses, the unknown features), and the
-    /// payment-option conversion; the animation objects park at the
-    /// M.20 animations integration.
+    /// payment-option conversion; the animation objects ride the env's
+    /// animations plane (`get_animation_object`) — the whole-Td env
+    /// builds them (net-drain 56), the bare envs answer the miss band.
     pub(crate) fn on_get_premium_promo(
         &mut self,
         env: &mut impl PremiumEnv,
@@ -1997,7 +1999,7 @@ mod tests {
                 ));
                 assert!(
                     state.animations[0].animation.is_none(),
-                    "the animation object parks at the M.20 integration"
+                    "the env without the animations plane answers the miss band"
                 );
                 assert_eq!(state.business_animations.len(), 1);
                 assert!(matches!(

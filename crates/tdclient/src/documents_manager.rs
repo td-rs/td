@@ -248,9 +248,11 @@ pub trait DocumentsManagerEnv {
     // (Td.cpp constructor order: audios/documents/videos in
     // init_managers, voice/video notes as actors)
 
-    /// `animations_manager_->create_animation` — the M.20 seam; the
-    /// collapsed line answers nothing and the animation record is not
-    /// built until its integration.
+    /// `animations_manager_->create_animation` — the record dispatch of
+    /// the Animation arm (DocumentsManager.cpp:552); the route carries
+    /// the empty sticker-file-ids vector into the animations manager
+    /// over the env's `animations` sibling (the create_animation bool
+    /// form — the only env read is `auth_is_bot`).
     #[allow(clippy::too_many_arguments)]
     fn create_animation(
         &mut self,

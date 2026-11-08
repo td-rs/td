@@ -4451,9 +4451,9 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             }
         }
         // --- the AnimationsManager arm set (M.20): Requests.cpp:1793-1830.
-        // The saved-animations ring answers offline; the GetSavedGifsQuery/
-        // SaveGifQuery tails are the [blocked: net] env seams and park the
-        // promises exactly like the C++ request without a network ---
+        // The saved-animations ring answers over the animations net plane
+        // (net-drain 56): the GetSavedGifsQuery/SaveGifQuery send legs ride
+        // the manager-held AnimationsNetHandle ---
         Function::getSavedAnimations(_) => {
             // Requests.cpp:1793-1802; the two-step RequestActor collapses
             // into the manager's promise (it answers the Animations
@@ -9359,6 +9359,7 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
                 file_load_manager: std::sync::Arc::clone(&td.file_load_manager),
                 file_reference_manager: &mut td.file_reference_manager,
                 documents_manager: &mut td.documents_manager,
+                animations: &mut td.animations_manager,
                 audios: &mut td.audios_manager,
                 videos: &mut td.videos_manager,
                 voice_notes: &mut td.voice_notes_manager,
