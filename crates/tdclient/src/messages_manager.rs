@@ -1468,6 +1468,11 @@ impl NotificationGroupInfo {
 /// 18th entry of the database serializer version enum.
 pub const ADD_NOTIFICATION_GROUP_INFO_MAX_REMOVED_MESSAGE_ID: i32 = 18;
 
+/// `MessagesManager::PERSISTENT_MESSAGE_ID_CACHE_TIME`
+/// (MessagesManager.h, 09e41c5a8) — the yet-unsent → persistent-id
+/// rewrite registry drops entries not written to within the hour.
+const PERSISTENT_MESSAGE_ID_CACHE_TIME: f64 = 3600.0;
+
 /// `td::InputDialogId` (InputDialogId.{h,cpp}) — a dialog id paired with the
 /// access hash needed to address it from the client.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -9323,12 +9328,15 @@ pub struct MessagesManager {
     pub(crate) being_sent_messages: HashMap<i64, MessageFullId>,
     /// `yet_unsent_message_full_id_to_persistent_message_id_`
     /// (MessagesManager.h:3324) — the yet-unsent → server-id rewrite
-    /// registry. M.10.8 lands the read side (`get_persistent_message_id`);
-    /// the writes ride `on_message_sent`/`updateMessageID` (M.10.9), so the
-    /// map stays empty until that slice.
+    /// registry, with the 09e41c5a8 idle expiry
+    /// (`PERSISTENT_MESSAGE_ID_CACHE_TIME`, 1 hour from the write; the
+    /// read never extends the life). M.10.8 lands the read side
+    /// (`get_persistent_message_id`); the writes ride
+    /// `on_message_sent`/`updateMessageID` (M.10.9), so the map stays
+    /// empty until that slice.
     #[allow(dead_code)]
     pub(crate) yet_unsent_message_full_id_to_persistent_message_id:
-        HashMap<MessageFullId, MessageId>,
+        HashMap<MessageFullId, (MessageId, f64)>,
     // `being_readded_message_full_id_` — the delete/files path reads it
     #[allow(dead_code)]
     pub(crate) being_readded_message_full_id: MessageFullId,
@@ -23504,11 +23512,12 @@ pub fn get_persistent_message_id(
     if message_id.is_yet_unsent() {
         // it is possible that user tries to do something with an already sent
         // message by its temporary identifier; use the real message then
-        if let Some(persistent) = manager
+        if let Some(&(persistent, expires_at)) = manager
             .yet_unsent_message_full_id_to_persistent_message_id
             .get(&MessageFullId::new(d.dialog_id, message_id))
+            && expires_at > tdutils::time::now()
         {
-            return *persistent;
+            return persistent;
         }
     }
     message_id
@@ -28781,9 +28790,10 @@ pub fn send_update_message_send_succeeded(
         // the StarManager pending refund seam
     }
     if !ctx.is_bot() {
-        manager
-            .yet_unsent_message_full_id_to_persistent_message_id
-            .insert(MessageFullId::new(dialog_id, old_message_id), m.message_id);
+        manager.yet_unsent_message_full_id_to_persistent_message_id.insert(
+            MessageFullId::new(dialog_id, old_message_id),
+            (m.message_id, tdutils::time::now() + PERSISTENT_MESSAGE_ID_CACHE_TIME),
+        );
 
         let deleted = delete_message(
             global,
@@ -29814,9 +29824,10 @@ pub fn fail_send_message(
     }
     // `register_new_local_message_id` — the local-id registry seam
 
-    manager
-        .yet_unsent_message_full_id_to_persistent_message_id
-        .insert(MessageFullId::new(dialog_id, old_message_id), m_message_id);
+    manager.yet_unsent_message_full_id_to_persistent_message_id.insert(
+        MessageFullId::new(dialog_id, old_message_id),
+        (m_message_id, tdutils::time::now() + PERSISTENT_MESSAGE_ID_CACHE_TIME),
+    );
     tracing::info!(
         "Send updateMessageSendFailed for {}:{}",
         dialog_id.get(),
@@ -44869,7 +44880,10 @@ mod tests {
             .yet_unsent_message_full_id_to_persistent_message_id
             .insert(
                 MessageFullId::new(dialog_id, m10_8_yet_unsent(3)),
-                MessageId::from_server_message_id(ServerMessageId::new(500)),
+                (
+                    MessageId::from_server_message_id(ServerMessageId::new(500)),
+                    f64::MAX,
+                ),
             );
         let d = manager.get_dialog(dialog_id).unwrap();
         assert_eq!(
@@ -45962,7 +45976,7 @@ mod tests {
             .yet_unsent_message_full_id_to_persistent_message_id
             .insert(
                 MessageFullId::new(dialog_id, m10_8_yet_unsent(3)),
-                target_id,
+                (target_id, f64::MAX),
             );
         let d = manager.get_dialog(dialog_id).unwrap();
         assert_eq!(

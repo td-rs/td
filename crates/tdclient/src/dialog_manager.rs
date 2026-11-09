@@ -1114,6 +1114,40 @@ pub struct ResolvedUsername {
 #[allow(dead_code)]
 const USERNAME_CACHE_EXPIRE_TIME: i64 = 86400;
 
+/// `DialogManager::SEARCH_PUBLIC_DIALOGS_CACHE_TIME` (DialogManager.h,
+/// d3811ddfa) — the found-dialogs caches drop entries not written to
+/// within the hour (the `ExpiringFlatHashMap` write-refresh/idle-expiry
+/// pair; reads never extend the life).
+const SEARCH_PUBLIC_DIALOGS_CACHE_TIME: f64 = 3600.0;
+
+/// `using FoundDialogs = ExpiringFlatHashMap<string, vector<DialogId>>`
+/// (DialogManager.h, d3811ddfa) — one found-dialogs cache entry: the ids
+/// and the moment the entry goes stale.
+pub struct FoundDialogs {
+    pub(crate) dialog_ids: Vec<DialogId>,
+    pub(crate) expires_at: f64,
+}
+
+impl FoundDialogs {
+    /// The fresh-entry shape (`operator[]`/insert with the access clock
+    /// bumped).
+    fn fresh(dialog_ids: Vec<DialogId>) -> FoundDialogs {
+        FoundDialogs {
+            dialog_ids,
+            expires_at: tdutils::time::now() + SEARCH_PUBLIC_DIALOGS_CACHE_TIME,
+        }
+    }
+
+    /// The `get()` read — `None` when missing or stale.
+    fn fresh_get<'a>(
+        map: &'a HashMap<String, FoundDialogs>,
+        query: &str,
+    ) -> Option<&'a Vec<DialogId>> {
+        let entry = map.get(query)?;
+        (entry.expires_at > tdutils::time::now()).then_some(&entry.dialog_ids)
+    }
+}
+
 /// `DialogManager::MIN_SEARCH_PUBLIC_DIALOG_PREFIX_LEN` (DialogManager.h:337)
 /// — the server-side prefix limit.
 const MIN_SEARCH_PUBLIC_DIALOG_PREFIX_LEN: usize = 4;
@@ -1282,8 +1316,8 @@ pub struct DialogManager {
     /// `found_public_dialogs_` / `found_on_server_dialogs_` (DialogManager.h)
     /// — the searchPublicChatsByUsername caches, indexed by the
     /// `DialogTypeFilter` number (the C++ `static_cast<int32>`).
-    pub(crate) found_public_dialogs: [HashMap<String, Vec<DialogId>>; 3],
-    pub(crate) found_on_server_dialogs: [HashMap<String, Vec<DialogId>>; 3],
+    pub(crate) found_public_dialogs: [HashMap<String, FoundDialogs>; 3],
+    pub(crate) found_on_server_dialogs: [HashMap<String, FoundDialogs>; 3],
     /// `reload_video_chat_on_search_usernames_` (DialogManager.h).
     pub(crate) reload_video_chat_on_search_usernames: std::collections::BTreeSet<String>,
     /// The net dispatch surface — the `td_` back-pointer the C++ manager
@@ -5624,7 +5658,7 @@ pub fn search_public_dialogs(
     }
 
     let type_num = type_filter as usize;
-    if let Some(found) = td.dialog_manager.found_public_dialogs[type_num].get(query) {
+    if let Some(found) = FoundDialogs::fresh_get(&td.dialog_manager.found_public_dialogs[type_num], query) {
         let found = found.clone();
         promise.set_value(());
         return found;
@@ -5658,7 +5692,7 @@ pub fn search_dialogs_on_server(
     }
 
     let type_num = type_filter as usize;
-    if let Some(found) = td.dialog_manager.found_on_server_dialogs[type_num].get(query) {
+    if let Some(found) = FoundDialogs::fresh_get(&td.dialog_manager.found_on_server_dialogs[type_num], query) {
         // messages_manager_->sort_dialogs_by_order — no order source in the
         // port, the truncation is the observable part (stub inventory).
         let found = found[..found.len().min(limit.max(0) as usize)].to_vec();
@@ -6076,10 +6110,14 @@ pub(crate) fn on_get_public_dialogs_search_result(
         }
     }
     let mut manager = std::mem::take(&mut td.dialog_manager);
-    manager.found_public_dialogs[type_num]
-        .insert(query.to_owned(), get_peers_dialog_ids(td, &peers, false));
-    manager.found_on_server_dialogs[type_num]
-        .insert(query.to_owned(), get_peers_dialog_ids(td, &my_peers, false));
+    manager.found_public_dialogs[type_num].insert(
+        query.to_owned(),
+        FoundDialogs::fresh(get_peers_dialog_ids(td, &peers, false)),
+    );
+    manager.found_on_server_dialogs[type_num].insert(
+        query.to_owned(),
+        FoundDialogs::fresh(get_peers_dialog_ids(td, &my_peers, false)),
+    );
     td.dialog_manager = manager;
     drain_search_dialogs_requests(td);
     drain_search_public_chat_requests(td);
@@ -6113,12 +6151,14 @@ pub(crate) fn on_failed_public_dialogs_search(
     let mut manager = std::mem::take(&mut td.dialog_manager);
     // the negative cache — the empty entries make the next search a
     // local no-hit success
-    manager.found_public_dialogs[type_num]
+    manager
+        .found_public_dialogs[type_num]
         .entry(query.to_owned())
-        .or_default();
-    manager.found_on_server_dialogs[type_num]
+        .or_insert_with(|| FoundDialogs::fresh(Vec::new()));
+    manager
+        .found_on_server_dialogs[type_num]
         .entry(query.to_owned())
-        .or_default();
+        .or_insert_with(|| FoundDialogs::fresh(Vec::new()));
     td.dialog_manager = manager;
     drain_search_dialogs_requests(td);
     drain_search_public_chat_requests(td);
@@ -7645,11 +7685,15 @@ mod tests {
         let public_dialog = DialogId::from_user_id(crate::user_manager::UserId::new(43));
         let server_dialog = DialogId::from_user_id(crate::user_manager::UserId::new(42));
         assert_eq!(
-            td.dialog_manager.found_public_dialogs[0].get("query"),
+            td.dialog_manager.found_public_dialogs[0].get("query").map(
+                |found| &found.dialog_ids
+            ),
             Some(&vec![public_dialog])
         );
         assert_eq!(
-            td.dialog_manager.found_on_server_dialogs[0].get("query"),
+            td.dialog_manager.found_on_server_dialogs[0]
+                .get("query")
+                .map(|found| &found.dialog_ids),
             Some(&vec![server_dialog])
         );
 
@@ -7658,6 +7702,22 @@ mod tests {
         let found = search_public_dialogs(&mut td, "query", None, promise);
         assert_eq!(found, vec![public_dialog]);
         assert!(matches!(slot.lock().unwrap().take(), Some(Result::Ok(()))));
+
+        // d3811ddfa — a stale entry answers as a miss (the query re-sends)
+        td.dialog_manager.found_public_dialogs[0]
+            .get_mut("query")
+            .unwrap()
+            .expires_at = 0.0;
+        let (promise, slot) = capture_unit_promise();
+        let found = search_public_dialogs(&mut td, "query", None, promise);
+        assert!(found.is_empty());
+        assert!(slot.lock().unwrap().take().is_none());
+        assert_eq!(
+            td.dialog_manager.search_public_dialogs_queries[0]
+                .get("query")
+                .map(Vec::len),
+            Some(1)
+        );
 
         // the failed search parks, fails its promise, and leaves the
         // negative cache (the next search answers locally, empty)
