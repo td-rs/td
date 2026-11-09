@@ -64,6 +64,7 @@ use tdutils::status::{Result, Status};
 use tdutils::time;
 
 use crate::chat_manager::ChannelType;
+use crate::community_id::CommunityId;
 use crate::dialog_id::DialogId;
 use crate::misc::{clean_username, get_valid_short_usernames};
 use crate::td::Td;
@@ -655,6 +656,24 @@ pub fn get_dialog_notification_setting_scope(
         crate::dialog_id::DialogType::None => {
             unreachable!("get_dialog_notification_setting_scope on DialogType::None")
         }
+    }
+}
+
+/// `DialogManager::get_dialog_linked_community_id`
+/// (DialogManager.cpp:1774-1786, the #113 slice) — the user/channel
+/// linked-community lookup behind the dialog-default notification
+/// helpers.
+pub fn get_dialog_linked_community_id(td: &Td, dialog_id: DialogId) -> CommunityId {
+    match dialog_id.get_type() {
+        crate::dialog_id::DialogType::User => td
+            .user_manager
+            .get_user_linked_community_id(dialog_id.get_user_id()),
+        crate::dialog_id::DialogType::Channel => td
+            .chat_manager
+            .get_channel_linked_community_id(dialog_id.get_channel_id()),
+        crate::dialog_id::DialogType::Chat
+        | crate::dialog_id::DialogType::SecretChat
+        | crate::dialog_id::DialogType::None => CommunityId::default(),
     }
 }
 

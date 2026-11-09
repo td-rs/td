@@ -3389,41 +3389,11 @@ impl MessageReplyInfo {
     }
 }
 
-/// `td::NotificationSoundType` (NotificationSoundType.h:13).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(i32)]
-pub enum NotificationSoundType {
-    #[default]
-    None = 0,
-    Local = 1,
-    Ringtone = 2,
-}
-
-/// `td::NotificationSound` (NotificationSound.h) — the virtual-base class
-/// hierarchy (NotificationSound.cpp:14-44: None/Local/Ringtone) flattened
-/// into an enum; the store/parse format lands with the notification-settings
-/// slice.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum NotificationSound {
-    /// `NotificationSoundNone`
-    #[default]
-    None,
-    /// `NotificationSoundLocal`
-    Local(String),
-    /// `NotificationSoundRingtone` — a ringtone document id
-    Ringtone(i64),
-}
-
-impl NotificationSound {
-    /// The `NotificationSound::get_type` overloads of the three subclasses.
-    pub fn get_type(&self) -> NotificationSoundType {
-        match self {
-            NotificationSound::None => NotificationSoundType::None,
-            NotificationSound::Local(_) => NotificationSoundType::Local,
-            NotificationSound::Ringtone(_) => NotificationSoundType::Ringtone,
-        }
-    }
-}
+// The M.10 foundation carried a local `NotificationSound`/
+// `NotificationSoundType` twin; the community notification-settings slice
+// (#113) unifies the two planes on the M.13S value type, exactly like the
+// C++ single `td::NotificationSound`.
+pub use crate::notification_settings::NotificationSound;
 
 /// `td::DialogNotificationSettings` (DialogNotificationSettings.h) — the
 /// per-dialog notification settings with the C++ in-class defaults; the
@@ -3471,6 +3441,304 @@ impl Default for DialogNotificationSettings {
             disable_mention_notifications: false,
         }
     }
+}
+
+impl DialogNotificationSettings {
+    /// `DialogNotificationSettings::get_input_peer_notify_settings`
+    /// (DialogNotificationSettings.cpp:11-33) — the
+    /// `account_updateNotifySettings` value form; the flag bits are the
+    /// `peerNotifySettings` masks (show_previews `0`, silent `1`,
+    /// mute_until `2`, sound `3`, stories_muted `6`,
+    /// stories_hide_sender `7`, stories_sound `8`).
+    pub fn get_input_peer_notify_settings(&self) -> telegram_api::InputPeerNotifySettings {
+        let mut flags = 0;
+        if !self.use_default_mute_until {
+            flags |= 1 << 2;
+        }
+        if !self.use_default_show_preview {
+            flags |= 1 << 0;
+        }
+        if !self.use_default_mute_stories {
+            flags |= 1 << 6;
+        }
+        if !self.use_default_hide_story_sender {
+            flags |= 1 << 7;
+        }
+        if self.silent_send_message {
+            flags |= 1 << 1;
+        }
+        telegram_api::InputPeerNotifySettings {
+            flags,
+            show_previews: self.show_preview,
+            silent: self.silent_send_message,
+            mute_until: self.mute_until,
+            sound: crate::notification_settings::get_input_notification_sound(&self.sound, false),
+            stories_muted: self.mute_stories,
+            stories_hide_sender: self.hide_story_sender,
+            stories_sound: crate::notification_settings::get_input_notification_sound(
+                &self.story_sound,
+                false,
+            ),
+        }
+    }
+
+    /// `DialogNotificationSettings::fix_mute_until(bool)`
+    /// (DialogNotificationSettings.cpp:56-60, b1afb1e44) — a bot, a
+    /// default mute and an expired mute all read as "not muted". The
+    /// `G()->unix_time()` read rides the parameter (the port's clock is
+    /// injected).
+    pub fn fix_mute_until(&mut self, is_bot: bool, unix_time: i32) {
+        if is_bot || self.use_default_mute_until || self.mute_until <= unix_time {
+            self.mute_until = 0;
+        }
+    }
+}
+
+/// `get_chat_notification_settings_object`
+/// (DialogNotificationSettings.cpp:73-84) — the td_api form; `mute_for` is
+/// the clamped remaining time and `show_story_poster` is the inverted
+/// `hide_story_sender`.
+pub fn get_chat_notification_settings_object(
+    notification_settings: &DialogNotificationSettings,
+    unix_time: i32,
+) -> td_api::ChatNotificationSettings {
+    use crate::notification_settings::{
+        get_notification_sound_ringtone_id, is_notification_sound_default,
+    };
+    td_api::ChatNotificationSettings {
+        use_default_mute_for: notification_settings.use_default_mute_until,
+        mute_for: std::cmp::max(0, notification_settings.mute_until - unix_time),
+        use_default_sound: is_notification_sound_default(&notification_settings.sound),
+        sound_id: get_notification_sound_ringtone_id(&notification_settings.sound),
+        use_default_show_preview: notification_settings.use_default_show_preview,
+        show_preview: notification_settings.show_preview,
+        use_default_mute_stories: notification_settings.use_default_mute_stories,
+        mute_stories: notification_settings.mute_stories,
+        use_default_story_sound: is_notification_sound_default(&notification_settings.story_sound),
+        story_sound_id: get_notification_sound_ringtone_id(&notification_settings.story_sound),
+        use_default_show_story_poster: notification_settings.use_default_hide_story_sender,
+        show_story_poster: !notification_settings.hide_story_sender,
+        use_default_disable_pinned_message_notifications: notification_settings
+            .use_default_disable_pinned_message_notifications,
+        disable_pinned_message_notifications: notification_settings
+            .disable_pinned_message_notifications,
+        use_default_disable_mention_notifications: notification_settings
+            .use_default_disable_mention_notifications,
+        disable_mention_notifications: notification_settings.disable_mention_notifications,
+    }
+}
+
+/// `get_mute_until` (DialogNotificationSettings.cpp:86-97) — the
+/// `mute_for` → absolute `mute_until` lift; everything past the precise
+/// window pins to `i32::MAX`.
+fn get_mute_until(mute_for: i32, unix_time: i32) -> i32 {
+    if mute_for <= 0 {
+        return 0;
+    }
+    const MAX_PRECISE_MUTE_FOR: i32 = 366 * 86400;
+    if mute_for > MAX_PRECISE_MUTE_FOR || mute_for >= i32::MAX - unix_time {
+        return i32::MAX;
+    }
+    mute_for + unix_time
+}
+
+/// `get_dialog_notification_settings(td_api::chatNotificationSettings &&,
+/// const DialogNotificationSettings *)`
+/// (DialogNotificationSettings.cpp:99-127) — the request-side intake; the
+/// local-only fields (`silent_send_message` and the sound inheritance)
+/// survive from the old settings.
+pub fn get_dialog_notification_settings_from_td_api(
+    notification_settings: Option<&td_api::ChatNotificationSettings>,
+    old_settings: &DialogNotificationSettings,
+    unix_time: i32,
+) -> Result<DialogNotificationSettings, Status> {
+    use crate::notification_settings::{
+        dup_notification_sound, get_notification_sound_from_id, is_notification_sound_default,
+    };
+    let Some(notification_settings) = notification_settings else {
+        return Err(Status::error(
+            400,
+            "New notification settings must be non-empty",
+        ));
+    };
+
+    let mute_until = if notification_settings.use_default_mute_for {
+        0
+    } else {
+        get_mute_until(notification_settings.mute_for, unix_time)
+    };
+    let mut notification_sound = get_notification_sound_from_id(
+        notification_settings.use_default_sound,
+        notification_settings.sound_id,
+    );
+    if is_notification_sound_default(&old_settings.sound)
+        && is_notification_sound_default(&notification_sound)
+    {
+        notification_sound = dup_notification_sound(&old_settings.sound);
+    }
+    let mut story_notification_sound = get_notification_sound_from_id(
+        notification_settings.use_default_story_sound,
+        notification_settings.story_sound_id,
+    );
+    if is_notification_sound_default(&old_settings.story_sound)
+        && is_notification_sound_default(&story_notification_sound)
+    {
+        story_notification_sound = dup_notification_sound(&old_settings.story_sound);
+    }
+    Ok(DialogNotificationSettings {
+        use_default_mute_until: notification_settings.use_default_mute_for,
+        mute_until,
+        sound: notification_sound,
+        use_default_show_preview: notification_settings.use_default_show_preview,
+        show_preview: notification_settings.show_preview,
+        use_default_mute_stories: notification_settings.use_default_mute_stories,
+        mute_stories: notification_settings.mute_stories,
+        story_sound: story_notification_sound,
+        use_default_hide_story_sender: notification_settings.use_default_show_story_poster,
+        hide_story_sender: !notification_settings.show_story_poster,
+        silent_send_message: old_settings.silent_send_message,
+        use_default_disable_pinned_message_notifications: notification_settings
+            .use_default_disable_pinned_message_notifications,
+        disable_pinned_message_notifications: notification_settings
+            .disable_pinned_message_notifications,
+        use_default_disable_mention_notifications: notification_settings
+            .use_default_disable_mention_notifications,
+        disable_mention_notifications: notification_settings.disable_mention_notifications,
+        // The C++ 15-argument constructor marks every converted settings
+        // object as synchronized.
+        is_synchronized: true,
+    })
+}
+
+/// `get_dialog_notification_settings(peerNotifySettings &&, const
+/// DialogNotificationSettings *)`
+/// (DialogNotificationSettings.cpp:141-185) — the wire intake; the local
+/// pinned/mention fields survive from the old settings and an absent
+/// settings object means "not yet synchronized".
+pub fn get_dialog_notification_settings_from_telegram(
+    settings: Option<&telegram_api::PeerNotifySettings>,
+    old_settings: Option<&DialogNotificationSettings>,
+    unix_time: i32,
+) -> DialogNotificationSettings {
+    use crate::notification_settings::get_notification_sound_from_peer_settings;
+    let (old_use_default_disable_pinned, old_disable_pinned) = old_settings
+        .map(|s| {
+            (
+                s.use_default_disable_pinned_message_notifications,
+                s.disable_pinned_message_notifications,
+            )
+        })
+        .unwrap_or((true, false));
+    let (old_use_default_disable_mention, old_disable_mention) = old_settings
+        .map(|s| {
+            (
+                s.use_default_disable_mention_notifications,
+                s.disable_mention_notifications,
+            )
+        })
+        .unwrap_or((true, false));
+
+    let Some(settings) = settings else {
+        return DialogNotificationSettings {
+            use_default_disable_pinned_message_notifications: old_use_default_disable_pinned,
+            disable_pinned_message_notifications: old_disable_pinned,
+            use_default_disable_mention_notifications: old_use_default_disable_mention,
+            disable_mention_notifications: old_disable_mention,
+            ..DialogNotificationSettings::default()
+        };
+    };
+
+    // The flag bits are the peerNotifySettings masks (show_previews `0`,
+    // mute_until `2`, stories_muted `6`, stories_hide_sender `7`).
+    let use_default_mute_until = settings.flags & (1 << 2) == 0;
+    let use_default_show_preview = settings.flags & (1 << 0) == 0;
+    let use_default_mute_stories = settings.flags & (1 << 6) == 0;
+    let use_default_hide_story_sender = settings.flags & (1 << 7) == 0;
+    let mute_until = if use_default_mute_until || settings.mute_until <= unix_time {
+        0
+    } else {
+        settings.mute_until
+    };
+    DialogNotificationSettings {
+        use_default_mute_until,
+        mute_until,
+        sound: get_notification_sound_from_peer_settings(settings, false),
+        use_default_show_preview,
+        show_preview: settings.show_previews,
+        use_default_mute_stories,
+        mute_stories: settings.stories_muted,
+        story_sound: get_notification_sound_from_peer_settings(settings, true),
+        use_default_hide_story_sender,
+        hide_story_sender: settings.stories_hide_sender,
+        silent_send_message: settings.silent,
+        use_default_disable_pinned_message_notifications: old_use_default_disable_pinned,
+        disable_pinned_message_notifications: old_disable_pinned,
+        use_default_disable_mention_notifications: old_use_default_disable_mention,
+        disable_mention_notifications: old_disable_mention,
+        // The C++ 15-argument constructor marks every converted settings
+        // object as synchronized; only the absent-settings default stays
+        // unsynchronized.
+        is_synchronized: true,
+    }
+}
+
+/// `NeedUpdateDialogNotificationSettings`
+/// (DialogNotificationSettings.h:88-95) — the three-way update verdict.
+#[derive(Default, Debug, PartialEq, Eq)]
+pub struct NeedUpdateDialogNotificationSettings {
+    /// The server-visible settings changed.
+    pub need_update_server: bool,
+    /// The local pinned/mention settings changed.
+    pub need_update_local: bool,
+    /// The stored settings changed at all (incl. synchronization and
+    /// equivalent-but-different sounds).
+    pub are_changed: bool,
+}
+
+/// `need_update_dialog_notification_settings`
+/// (DialogNotificationSettings.cpp:201-218).
+pub fn need_update_dialog_notification_settings(
+    current_settings: &DialogNotificationSettings,
+    new_settings: &DialogNotificationSettings,
+) -> NeedUpdateDialogNotificationSettings {
+    use crate::notification_settings::{
+        are_different_equivalent_notification_sounds, are_equivalent_notification_sounds,
+    };
+    let mut result = NeedUpdateDialogNotificationSettings::default();
+    result.need_update_server = current_settings.mute_until != new_settings.mute_until
+        || !are_equivalent_notification_sounds(&current_settings.sound, &new_settings.sound)
+        || !are_equivalent_notification_sounds(
+            &current_settings.story_sound,
+            &new_settings.story_sound,
+        )
+        || current_settings.show_preview != new_settings.show_preview
+        || current_settings.mute_stories != new_settings.mute_stories
+        || current_settings.hide_story_sender != new_settings.hide_story_sender
+        || current_settings.use_default_mute_until != new_settings.use_default_mute_until
+        || current_settings.use_default_show_preview != new_settings.use_default_show_preview
+        || current_settings.use_default_mute_stories != new_settings.use_default_mute_stories
+        || current_settings.use_default_hide_story_sender
+            != new_settings.use_default_hide_story_sender;
+    result.need_update_local = current_settings.use_default_disable_pinned_message_notifications
+        != new_settings.use_default_disable_pinned_message_notifications
+        || current_settings.disable_pinned_message_notifications
+            != new_settings.disable_pinned_message_notifications
+        || current_settings.use_default_disable_mention_notifications
+            != new_settings.use_default_disable_mention_notifications
+        || current_settings.disable_mention_notifications
+            != new_settings.disable_mention_notifications;
+    result.are_changed = result.need_update_server
+        || result.need_update_local
+        || current_settings.is_synchronized != new_settings.is_synchronized
+        || are_different_equivalent_notification_sounds(
+            &current_settings.sound,
+            &new_settings.sound,
+        )
+        || are_different_equivalent_notification_sounds(
+            &current_settings.story_sound,
+            &new_settings.story_sound,
+        );
+    result
 }
 
 /// `td::DialogActionBar` (DialogActionBar.h) — the peer-report/join-request
@@ -17612,7 +17880,22 @@ pub fn on_get_dialogs(
                 }
                 log_error!("Receive unexpected {folder:?}");
             }
-            telegram_api::Dialog::dialogCommunity(_) => {}
+            telegram_api::Dialog::dialogCommunity(dialog_community) => {
+                // 99302f0e2 (MessagesManager.cpp:12727-12737): the
+                // community notify settings piggybacked on the getDialogs
+                // answer route into the community manager.
+                let community_id =
+                    crate::community_id::CommunityId::new(dialog_community.community_id);
+                if community_id.is_valid() {
+                    ctx.community_on_update_notify_settings(
+                        community_id,
+                        dialog_community.notify_settings.as_ref(),
+                        "on_get_dialogs",
+                    );
+                } else {
+                    log_error!("Receive {dialog_community:?}");
+                }
+            }
         }
     }
 
@@ -31835,6 +32118,16 @@ pub trait MmRequestContext:
         false
     }
 
+    /// `CommunityManager::on_update_community_notify_settings`
+    /// (99302f0e2) — the `on_get_dialogs` `dialogCommunity` intake.
+    fn community_on_update_notify_settings(
+        &mut self,
+        _community_id: crate::community_id::CommunityId,
+        _peer_notify_settings: Option<&telegram_api::PeerNotifySettings>,
+        _source: &str,
+    ) {
+    }
+
     /// `ChatManager::get_channel_effective_has_hidden_participants`.
     fn get_channel_effective_has_hidden_participants(&mut self, _channel_id: ChannelId) -> bool {
         false
@@ -37934,22 +38227,6 @@ mod tests {
     }
 
     #[test]
-    fn notification_sound_types() {
-        assert_eq!(
-            NotificationSound::default().get_type(),
-            NotificationSoundType::None
-        );
-        assert_eq!(
-            NotificationSound::Local("classic".to_string()).get_type(),
-            NotificationSoundType::Local
-        );
-        assert_eq!(
-            NotificationSound::Ringtone(77).get_type(),
-            NotificationSoundType::Ringtone
-        );
-    }
-
-    #[test]
     fn dialog_notification_settings_defaults() {
         let settings = DialogNotificationSettings::default();
         assert_eq!(settings.mute_until, 0);
@@ -37968,6 +38245,260 @@ mod tests {
         assert!(!settings.disable_pinned_message_notifications);
         assert!(settings.use_default_disable_mention_notifications);
         assert!(!settings.disable_mention_notifications);
+    }
+
+    #[test]
+    fn fix_mute_until_bands() {
+        // b1afb1e44: a bot, a default mute and an expired mute all clear.
+        let mut bot = DialogNotificationSettings {
+            use_default_mute_until: false,
+            mute_until: i32::MAX,
+            ..DialogNotificationSettings::default()
+        };
+        bot.fix_mute_until(true, 100);
+        assert_eq!(bot.mute_until, 0);
+
+        let mut default = DialogNotificationSettings {
+            mute_until: 500,
+            ..DialogNotificationSettings::default()
+        };
+        default.fix_mute_until(false, 100);
+        assert_eq!(default.mute_until, 0, "use_default_mute_until clears");
+
+        let mut expired = DialogNotificationSettings {
+            use_default_mute_until: false,
+            mute_until: 100,
+            ..DialogNotificationSettings::default()
+        };
+        expired.fix_mute_until(false, 100);
+        assert_eq!(expired.mute_until, 0, "mute_until == now clears");
+
+        let mut live = DialogNotificationSettings {
+            use_default_mute_until: false,
+            mute_until: 101,
+            ..DialogNotificationSettings::default()
+        };
+        live.fix_mute_until(false, 100);
+        assert_eq!(live.mute_until, 101, "a future mute survives");
+    }
+
+    #[test]
+    fn chat_notification_settings_object_bands() {
+        // get_chat_notification_settings_object: the remaining-mute clamp
+        // and the inverted story-poster field.
+        let settings = DialogNotificationSettings {
+            use_default_mute_until: false,
+            mute_until: 1_000,
+            sound: Some(NotificationSound::Ringtone { ringtone_id: 7 }),
+            story_sound: Some(NotificationSound::NoSound),
+            use_default_hide_story_sender: false,
+            hide_story_sender: true,
+            ..DialogNotificationSettings::default()
+        };
+        let object = get_chat_notification_settings_object(&settings, 400);
+        assert_eq!(object.mute_for, 600);
+        assert!(!object.use_default_mute_for);
+        assert!(!object.use_default_sound);
+        assert_eq!(object.sound_id, 7);
+        assert!(!object.use_default_story_sound);
+        assert_eq!(object.story_sound_id, 0);
+        assert!(!object.use_default_show_story_poster);
+        assert!(!object.show_story_poster);
+
+        // an expired mute clamps to 0 instead of going negative
+        let mut expired = settings.clone();
+        expired.mute_until = 100;
+        assert_eq!(
+            get_chat_notification_settings_object(&expired, 400).mute_for,
+            0
+        );
+    }
+
+    #[test]
+    fn dialog_notification_settings_from_td_api_bands() {
+        let old = DialogNotificationSettings::default();
+
+        // null settings → the 400
+        assert!(get_dialog_notification_settings_from_td_api(None, &old, 100).is_err());
+
+        // the mute_for ladder: <= 0 → 0, the precise window → the lift,
+        // past it → i32::MAX
+        let request = |mute_for: i32| td_api::ChatNotificationSettings {
+            use_default_mute_for: false,
+            mute_for,
+            ..make_chat_notification_settings_request()
+        };
+        let lifted =
+            get_dialog_notification_settings_from_td_api(Some(&request(60)), &old, 100).unwrap();
+        assert_eq!(lifted.mute_until, 160);
+        assert!(lifted.is_synchronized);
+        assert_eq!(
+            get_dialog_notification_settings_from_td_api(Some(&request(0)), &old, 100)
+                .unwrap()
+                .mute_until,
+            0
+        );
+        assert_eq!(
+            get_dialog_notification_settings_from_td_api(
+                Some(&request(366 * 86400 + 1)),
+                &old,
+                100
+            )
+            .unwrap()
+            .mute_until,
+            i32::MAX
+        );
+
+        // a non-default sound survives; a default request sound inherits
+        // the old (default) sound; silent survives from the old settings
+        let mut with_sound = make_chat_notification_settings_request();
+        with_sound.use_default_sound = false;
+        with_sound.sound_id = 5;
+        let converted =
+            get_dialog_notification_settings_from_td_api(Some(&with_sound), &old, 100).unwrap();
+        assert_eq!(
+            converted.sound,
+            Some(NotificationSound::Ringtone { ringtone_id: 5 })
+        );
+        assert!(!converted.silent_send_message);
+
+        // show_story_poster inverts into hide_story_sender
+        let mut poster = make_chat_notification_settings_request();
+        poster.use_default_show_story_poster = false;
+        poster.show_story_poster = false;
+        let converted =
+            get_dialog_notification_settings_from_td_api(Some(&poster), &old, 100).unwrap();
+        assert!(converted.hide_story_sender);
+        assert!(!converted.use_default_hide_story_sender);
+    }
+
+    fn make_chat_notification_settings_request() -> td_api::ChatNotificationSettings {
+        td_api::ChatNotificationSettings {
+            use_default_mute_for: true,
+            mute_for: 0,
+            use_default_sound: true,
+            sound_id: 0,
+            use_default_show_preview: true,
+            show_preview: true,
+            use_default_mute_stories: true,
+            mute_stories: false,
+            use_default_story_sound: true,
+            story_sound_id: 0,
+            use_default_show_story_poster: true,
+            show_story_poster: true,
+            use_default_disable_pinned_message_notifications: true,
+            disable_pinned_message_notifications: false,
+            use_default_disable_mention_notifications: true,
+            disable_mention_notifications: false,
+        }
+    }
+
+    #[test]
+    fn dialog_notification_settings_from_telegram_bands() {
+        // absent settings → the unsynchronized default with the local
+        // pinned/mention fields preserved from the old settings
+        let old = DialogNotificationSettings {
+            use_default_disable_pinned_message_notifications: false,
+            disable_pinned_message_notifications: true,
+            ..DialogNotificationSettings::default()
+        };
+        let absent = get_dialog_notification_settings_from_telegram(None, Some(&old), 100);
+        assert!(!absent.is_synchronized);
+        assert!(!absent.use_default_disable_pinned_message_notifications);
+        assert!(absent.disable_pinned_message_notifications);
+
+        // present settings: the flag bits drive the use_default band, an
+        // expired mute clears, and the object is synchronized
+        let wire = telegram_api::PeerNotifySettings {
+            flags: (1 << 0) | (1 << 2),
+            show_previews: false,
+            silent: true,
+            mute_until: 90,
+            ios_sound: None,
+            android_sound: None,
+            other_sound: None,
+            stories_muted: true,
+            stories_hide_sender: false,
+            stories_ios_sound: None,
+            stories_android_sound: None,
+            stories_other_sound: None,
+        };
+        let converted =
+            get_dialog_notification_settings_from_telegram(Some(&wire), Some(&old), 100);
+        assert!(converted.is_synchronized);
+        assert!(!converted.use_default_mute_until);
+        assert_eq!(converted.mute_until, 0, "the expired wire mute clears");
+        assert!(!converted.use_default_show_preview);
+        assert!(!converted.show_preview);
+        assert!(converted.use_default_mute_stories);
+        assert!(converted.mute_stories);
+        assert!(converted.silent_send_message);
+
+        let mut future = wire.clone();
+        future.mute_until = 300;
+        let converted = get_dialog_notification_settings_from_telegram(Some(&future), None, 100);
+        assert_eq!(converted.mute_until, 300);
+        // no old settings → the local defaults
+        assert!(converted.use_default_disable_pinned_message_notifications);
+    }
+
+    #[test]
+    fn need_update_dialog_notification_settings_bands() {
+        let base = DialogNotificationSettings::default();
+
+        // the local band: a pinned change needs a local update only
+        let mut local = base.clone();
+        local.disable_pinned_message_notifications = true;
+        let verdict = need_update_dialog_notification_settings(&base, &local);
+        assert!(verdict.need_update_local);
+        assert!(!verdict.need_update_server);
+        assert!(verdict.are_changed);
+
+        // the synchronization band counts as changed without either band
+        let mut synced = base.clone();
+        synced.is_synchronized = true;
+        let verdict = need_update_dialog_notification_settings(&base, &synced);
+        assert!(!verdict.need_update_server);
+        assert!(!verdict.need_update_local);
+        assert!(verdict.are_changed);
+
+        // the server band
+        let mut server = base.clone();
+        server.use_default_mute_until = false;
+        server.mute_until = 500;
+        let verdict = need_update_dialog_notification_settings(&base, &server);
+        assert!(verdict.need_update_server);
+        assert!(verdict.are_changed);
+
+        // equivalent-but-different Local sounds count as changed only
+        let with_local = DialogNotificationSettings {
+            sound: Some(NotificationSound::Local {
+                title: "a".to_owned(),
+                data: String::new(),
+            }),
+            ..base.clone()
+        };
+        let with_other_local = DialogNotificationSettings {
+            sound: Some(NotificationSound::Local {
+                title: "b".to_owned(),
+                data: String::new(),
+            }),
+            ..base.clone()
+        };
+        let verdict = need_update_dialog_notification_settings(&with_local, &with_other_local);
+        assert!(!verdict.need_update_server);
+        assert!(verdict.are_changed);
+
+        // identical settings need nothing
+        let verdict = need_update_dialog_notification_settings(&base, &base.clone());
+        assert_eq!(
+            verdict,
+            NeedUpdateDialogNotificationSettings {
+                need_update_server: false,
+                need_update_local: false,
+                are_changed: false
+            }
+        );
     }
 
     #[test]

@@ -38,6 +38,7 @@ use std::sync::Arc;
 
 use crate::boost_manager::{BoostManager, BoostManagerEnv};
 use crate::bot_info_manager::BotInfoNetKind;
+use crate::community_id::CommunityId;
 use crate::community_manager::{CommunityManager, CommunityManagerEnv};
 use crate::premium::{PremiumEnv, PremiumManager, PremiumNetKind};
 use crate::quick_reply_manager::{QuickReplyManager, QuickReplyManagerEnv, QuickReplyNetKind};
@@ -3127,10 +3128,11 @@ enum CommunityNetKind {
     /// cache-load plane (no ported flow dispatches it yet).
     #[allow(dead_code)]
     GetCommunities,
-    /// `GetFullCommunityQuery` (cpp:83) — reserved for the community-full
-    /// cache-load plane (no ported flow dispatches it yet).
-    #[allow(dead_code)]
-    GetFullCommunity,
+    /// `GetFullCommunityQuery` (cpp:83) — the notification-settings
+    /// postpone reload (the reload promise resolves on error too,
+    /// applying the parked settings); the general community-full
+    /// cache-load plane reuses the kind when it lands.
+    GetFullCommunity { community_id: CommunityId },
     /// `CreateCommunityQuery` (cpp:120) — the error ladder's
     /// `on_get_dialog_error` keys on the request dialog.
     CreateCommunity { dialog_id: DialogId },
@@ -3140,6 +3142,13 @@ enum CommunityNetKind {
     EditDefaultBannedRights,
     /// `DeleteCommunityQuery` (cpp:231).
     DeleteCommunity,
+    /// `GetCommunityNotifySettingsQuery` (99302f0e2, cpp:121-138) — the
+    /// community settings fetch; the answer routes into
+    /// `on_update_community_notify_settings`.
+    GetNotifySettings { community_id: CommunityId },
+    /// `UpdateCommunityNotifySettingsQuery` (99302f0e2, cpp:140-168) —
+    /// the set flow's server write.
+    UpdateNotifySettings { community_id: CommunityId },
 }
 
 /// The cloned community dispatch surface the [`CommunityEnv`] senders
@@ -8905,6 +8914,13 @@ impl Td {
             && (expire_time == 0.0 || settings_deadline < expire_time)
         {
             expire_time = settings_deadline;
+        }
+        // The community notification-settings unmute deadline (#113, the
+        // `community_unmute_timeout_` MultiTimeout).
+        if let Some(community_deadline) = self.community_manager.next_deadline()
+            && (expire_time == 0.0 || community_deadline < expire_time)
+        {
+            expire_time = community_deadline;
         }
         if let Some(token_deadline) = self.device_token_manager.next_deadline()
             && (expire_time == 0.0 || token_deadline < expire_time)
@@ -25072,12 +25088,24 @@ impl Td {
             }
             // `GetFullCommunityQuery` (cpp:83-118) — the users/chats
             // intakes, the communityFull gate, `on_get_community_full`.
-            CommunityNetKind::GetFullCommunity => {
+            CommunityNetKind::GetFullCommunity { community_id } => {
+                // The c9ed2c390 reload promise resolves on error too, so
+                // every failure branch applies the parked settings (the
+                // `on_reload_community_full_for_notification_settings`
+                // chain).
+                let failed_reload = |td: &mut Self, community_id: CommunityId| {
+                    let mut manager = std::mem::take(&mut td.community_manager);
+                    let mut env = CommunityEnv { td: &mut *td };
+                    manager
+                        .on_reload_community_full_for_notification_settings(&mut env, community_id);
+                    td.community_manager = manager;
+                };
                 if query.is_error() {
                     tdutils::log_debug!(
                         "GetFullCommunityQuery failed: {}",
                         query.error().message()
                     );
+                    failed_reload(self, community_id);
                     return;
                 }
                 match telegram_api::messages_ChatFull::parse(query.ok()) {
@@ -25093,11 +25121,13 @@ impl Td {
                             }
                             _ => {
                                 tdutils::log_error!("Receive a non-community chatFull");
+                                failed_reload(self, community_id);
                             }
                         }
                     }
                     Err(_) => {
-                        tdutils::log_error!("Failed to parse the channels_getFullChannel answer")
+                        tdutils::log_error!("Failed to parse the channels_getFullChannel answer");
+                        failed_reload(self, community_id);
                     }
                 }
             }
@@ -25149,6 +25179,85 @@ impl Td {
                             Err(_) => promise.set_error(parse_error("channels_deleteChannel")),
                         }
                     }
+                }
+            }
+            // `GetCommunityNotifySettingsQuery` (99302f0e2 + 09634ee46,
+            // cpp:121-152) — the settings answer re-enters the update
+            // flow; the error/parse-failure band erases the query-map
+            // entry (the C++ promise lambda).
+            CommunityNetKind::GetNotifySettings { community_id } => {
+                let erase_query_entry = |td: &mut Self, community_id: CommunityId| {
+                    let mut manager = std::mem::take(&mut td.community_manager);
+                    manager.on_get_community_notification_settings_error(community_id);
+                    td.community_manager = manager;
+                };
+                if query.is_error() {
+                    tdutils::log_info!(
+                        "Receive error for GetCommunityNotifySettingsQuery: {}",
+                        query.error().message()
+                    );
+                    erase_query_entry(self, community_id);
+                    return;
+                }
+                match telegram_api::PeerNotifySettings::parse(query.ok()) {
+                    Ok(settings) => {
+                        let mut manager = std::mem::take(&mut self.community_manager);
+                        let mut env = CommunityEnv { td: &mut *self };
+                        manager.on_update_community_notify_settings(
+                            &mut env,
+                            community_id,
+                            Some(&settings),
+                            "GetCommunityNotifySettingsQuery",
+                        );
+                        self.community_manager = manager;
+                    }
+                    Err(_) => {
+                        tdutils::log_info!(
+                            "Receive invalid peer notify settings for {community_id:?}"
+                        );
+                        erase_query_entry(self, community_id);
+                    }
+                }
+            }
+            // `UpdateCommunityNotifySettingsQuery` (99302f0e2, cpp:140-168)
+            // — the false-as-result 400 band, the error-arm repair query
+            // and the promise settle (the promise pairs by community, as
+            // the C++ query carries its own).
+            CommunityNetKind::UpdateNotifySettings { community_id } => {
+                let promise = self
+                    .community_manager
+                    .pending_set_notification_settings
+                    .iter()
+                    .position(|(id, _)| *id == community_id.get())
+                    .map(|index| {
+                        self.community_manager
+                            .pending_set_notification_settings
+                            .remove(index)
+                            .1
+                    });
+                let Some(mut promise) = promise else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    tdutils::log_info!(
+                        "Receive error for UpdateCommunityNotifySettingsQuery: {status}"
+                    );
+                    // trying to repair notification settings for the
+                    // community (the empty-promise Get re-send)
+                    if let Some(input_community) = self
+                        .community_manager
+                        .get_input_community_impl(self.auth_manager.is_bot(), community_id)
+                    {
+                        let mut env = CommunityEnv { td: &mut *self };
+                        env.send_get_community_notify_settings_query(community_id, input_community);
+                    }
+                    return promise.set_error(status);
+                }
+                match parse_wire_bool_value(query.ok()) {
+                    Some(true) => promise.set_value(()),
+                    Some(false) => promise.set_error(Status::error(400, "Receive false as result")),
+                    None => promise.set_error(parse_error("account_updateNotifySettings")),
                 }
             }
         }
@@ -34859,6 +34968,14 @@ impl Actor for Td {
             sponsored_message_manager.tick_timeouts(&mut sponsored_env);
             self.sponsored_message_manager = sponsored_message_manager;
         }
+        // The community notification-settings unmute sweep (#113, the
+        // `community_unmute_timeout_` callback).
+        {
+            let mut manager = std::mem::take(&mut self.community_manager);
+            let mut env = CommunityEnv { td: &mut *self };
+            manager.tick_timeouts(&mut env);
+            self.community_manager = manager;
+        }
         {
             let (mut promo_data_manager, mut promo_env) = promo_env_split(self);
             promo_data_manager.tick_timeouts(&mut promo_env);
@@ -40141,6 +40258,92 @@ impl CommunityManagerEnv for CommunityEnv<'_> {
                 ),
             ),
             None => tdutils::log_info!("Send channels.deleteChannel — [net-inert]"),
+        }
+    }
+
+    // ---- The notification-settings senders (99302f0e2, cpp:121-168 and
+    // the c9ed2c390 postpone reload). ----
+
+    fn unix_time(&self) -> i32 {
+        self.td.global.unix_time()
+    }
+
+    fn now(&self) -> f64 {
+        tdutils::time::now()
+    }
+
+    /// `GetCommunityNotifySettingsQuery::send` — the input is resolved
+    /// manager-side (the manager is taken out under the env).
+    fn send_get_community_notify_settings_query(
+        &mut self,
+        community_id: CommunityId,
+        input_community: telegram_api::InputChannel,
+    ) {
+        let Some(net) = self.td.community_net() else {
+            return tdutils::log_info!(
+                "Send account_getNotifySettings for {community_id:?} — [net-inert]"
+            );
+        };
+        net.dispatch(
+            CommunityNetKind::GetNotifySettings { community_id },
+            telegram_api::Function::account_getNotifySettings(
+                telegram_api::account_getNotifySettings {
+                    peer: Some(telegram_api::InputNotifyPeer::inputNotifyCommunity(
+                        telegram_api::inputNotifyCommunity {
+                            community: Some(input_community),
+                        },
+                    )),
+                },
+            ),
+        )
+    }
+
+    /// `UpdateCommunityNotifySettingsQuery::send` — the wire form is the
+    /// full's converted settings.
+    fn send_update_community_notify_settings_query(
+        &mut self,
+        community_id: CommunityId,
+        input_community: telegram_api::InputChannel,
+        notification_settings: &crate::messages_manager::DialogNotificationSettings,
+    ) {
+        let Some(net) = self.td.community_net() else {
+            return tdutils::log_info!(
+                "Send account_updateNotifySettings for {community_id:?} — [net-inert]"
+            );
+        };
+        net.dispatch(
+            CommunityNetKind::UpdateNotifySettings { community_id },
+            telegram_api::Function::account_updateNotifySettings(
+                telegram_api::account_updateNotifySettings {
+                    peer: Some(telegram_api::InputNotifyPeer::inputNotifyCommunity(
+                        telegram_api::inputNotifyCommunity {
+                            community: Some(input_community),
+                        },
+                    )),
+                    settings: Some(notification_settings.get_input_peer_notify_settings()),
+                },
+            ),
+        )
+    }
+
+    /// The c9ed2c390 postpone arm's `reload_community_full` — the
+    /// `channels.getFullChannel` query behind the parked settings (the
+    /// answer's tail applies them).
+    fn reload_community_full(
+        &mut self,
+        community_id: CommunityId,
+        input_community: telegram_api::InputChannel,
+    ) {
+        match self.td.community_net() {
+            Some(net) => net.dispatch(
+                CommunityNetKind::GetFullCommunity { community_id },
+                telegram_api::Function::channels_getFullChannel(
+                    telegram_api::channels_getFullChannel {
+                        channel: Some(input_community),
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Reload community full {community_id:?} — [net-inert]"),
         }
     }
 }
@@ -53421,6 +53624,23 @@ impl crate::messages_manager::MmRequestContext for Td {
 
     // -- the message-properties mutable reads
 
+    fn community_on_update_notify_settings(
+        &mut self,
+        community_id: CommunityId,
+        peer_notify_settings: Option<&telegram_api::PeerNotifySettings>,
+        source: &str,
+    ) {
+        let mut manager = std::mem::take(&mut self.community_manager);
+        let mut env = CommunityEnv { td: &mut *self };
+        manager.on_update_community_notify_settings(
+            &mut env,
+            community_id,
+            peer_notify_settings,
+            source,
+        );
+        self.community_manager = manager;
+    }
+
     fn get_user_read_dates_private(&mut self, user_id: crate::user_manager::UserId) -> bool {
         let mut env = crate::user_manager::UserEnv {
             global: &mut self.global,
@@ -58650,6 +58870,260 @@ mod tests {
             recorded.lock().unwrap().as_ref(),
             Some(tdutils::status::Result::Ok(()))
         ));
+        assert!(td.community_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn community_notification_settings_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(community_notification_settings_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn community_notification_settings_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-cm-notify-settings");
+        const BOOL_TRUE: i32 = 0x9972_75b5u32 as i32;
+        let unix_time = td.get_unix_time();
+
+        // seed a creator community + its full
+        let wire_community = telegram_api::community {
+            flags: 1,
+            creator: true,
+            left: false,
+            min: false,
+            flags2: 0,
+            collapsed_in_dialogs: false,
+            id: 7,
+            access_hash: 11,
+            title: "My community".to_owned(),
+            photo: None,
+            date: 10,
+            admin_rights: None,
+            default_banned_rights: None,
+        };
+        let wire_full = telegram_api::communityFull {
+            flags: 0,
+            id: 7,
+            about: "about".to_owned(),
+            chat_photo: None,
+            linked_peers: vec![telegram_api::CommunityPeer {
+                flags: 0,
+                can_view_history: true,
+                visible: true,
+                peer: Some(telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                    channel_id: 3,
+                })),
+            }],
+            admins_count: 2,
+            kicked_count: 1,
+            peer_link_requests_pending: 0,
+        };
+        with_community_manager(&mut td, |manager, env| {
+            manager.on_get_community(env, &wire_community, "test");
+            manager.on_get_community_full(env, &wire_full);
+        });
+        // the full's unsynchronized settings trigger the Get query
+        // (99302f0e2's on_get_community_full tail)
+        let mut sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::account_getNotifySettings::ID
+        );
+        net_complete(sent.drain(..).next().unwrap(), {
+            let mut out = Vec::new();
+            telegram_api::PeerNotifySettings {
+                flags: 0,
+                show_previews: true,
+                silent: false,
+                mute_until: 0,
+                ios_sound: None,
+                android_sound: None,
+                other_sound: None,
+                stories_muted: false,
+                stories_hide_sender: false,
+                stories_ios_sound: None,
+                stories_android_sound: None,
+                stories_other_sound: None,
+            }
+            .store_boxed(&mut out);
+            out
+        });
+        td.dispatch_completed_community_net();
+
+        // 1. setCommunityNotificationSettings — the full-gated request
+        //    writes both halves locally and mirrors on the wire over
+        //    inputNotifyCommunity; boolTrue settles the promise
+        td.request(
+            1,
+            Function::setCommunityNotificationSettings(td_api::setCommunityNotificationSettings {
+                community_id: 7,
+                notification_settings: Some(td_api::ChatNotificationSettings {
+                    use_default_mute_for: false,
+                    mute_for: 100,
+                    use_default_sound: true,
+                    sound_id: 0,
+                    use_default_show_preview: true,
+                    show_preview: true,
+                    use_default_mute_stories: true,
+                    mute_stories: false,
+                    use_default_story_sound: true,
+                    story_sound_id: 0,
+                    use_default_show_story_poster: true,
+                    show_story_poster: true,
+                    use_default_disable_pinned_message_notifications: true,
+                    disable_pinned_message_notifications: false,
+                    use_default_disable_mention_notifications: true,
+                    disable_mention_notifications: false,
+                }),
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent_query(&rec, telegram_api::account_updateNotifySettings::ID);
+        let body =
+            telegram_api::account_updateNotifySettings::parse(sent.query()).expect("the sent body");
+        assert!(matches!(
+            body.peer,
+            Some(telegram_api::InputNotifyPeer::inputNotifyCommunity(_))
+        ));
+        let settings = body.settings.expect("the wire settings");
+        assert_eq!(settings.mute_until, unix_time + 100);
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_community_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::ok(_))
+        ));
+        with_community_manager(&mut td, |manager, env| {
+            let settings = manager
+                .get_community_notification_settings(env, CommunityId::new(7))
+                .expect("the synchronized community settings");
+            assert!(!settings.use_default_mute_until);
+            assert_eq!(settings.mute_until, unix_time + 100);
+        });
+
+        // 2. the error arm — the failed server write repairs via the Get
+        //    query and forwards the error to the request
+        td.request(
+            2,
+            Function::setCommunityNotificationSettings(td_api::setCommunityNotificationSettings {
+                community_id: 7,
+                notification_settings: Some(td_api::ChatNotificationSettings {
+                    use_default_mute_for: false,
+                    mute_for: 200,
+                    use_default_sound: true,
+                    sound_id: 0,
+                    use_default_show_preview: true,
+                    show_preview: true,
+                    use_default_mute_stories: true,
+                    mute_stories: false,
+                    use_default_story_sound: true,
+                    story_sound_id: 0,
+                    use_default_show_story_poster: true,
+                    show_story_poster: true,
+                    use_default_disable_pinned_message_notifications: true,
+                    disable_pinned_message_notifications: false,
+                    use_default_disable_mention_notifications: true,
+                    disable_mention_notifications: false,
+                }),
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent_query(&rec, telegram_api::account_updateNotifySettings::ID);
+        net_fail(sent, 400, "PEER_ID_INVALID");
+        td.dispatch_completed_community_net();
+        td.flush_deferred_results();
+        // the repair Get query went out and the request failed
+        let repair = take_sent_query(&rec, telegram_api::account_getNotifySettings::ID);
+        net_complete(repair, {
+            let mut out = Vec::new();
+            telegram_api::PeerNotifySettings {
+                flags: 0,
+                show_previews: true,
+                silent: false,
+                mute_until: 0,
+                ios_sound: None,
+                android_sound: None,
+                other_sound: None,
+                stories_muted: false,
+                stories_hide_sender: false,
+                stories_ios_sound: None,
+                stories_android_sound: None,
+                stories_other_sound: None,
+            }
+            .store_boxed(&mut out);
+            out
+        });
+        td.dispatch_completed_community_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 2);
+        assert_eq!(error.message, "PEER_ID_INVALID");
+        assert!(td.community_net_completed.lock().is_empty(), "drained");
+
+        // 3. the Get dedup — an unsynchronized community reads None and
+        //    sends the query once; the error erases the map entry so the
+        //    next read re-sends (09634ee46)
+        let wire_community = telegram_api::community {
+            id: 8,
+            access_hash: 12,
+            ..wire_community.clone()
+        };
+        with_community_manager(&mut td, |manager, env| {
+            manager.on_get_community(env, &wire_community, "test");
+        });
+        with_community_manager(&mut td, |manager, env| {
+            assert!(
+                manager
+                    .get_community_notification_settings(env, CommunityId::new(8))
+                    .is_none()
+            );
+            assert!(
+                manager
+                    .get_community_notification_settings(env, CommunityId::new(8))
+                    .is_none()
+            );
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1, "the in-flight Get query dedups across reads");
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::account_getNotifySettings::ID
+        );
+        net_fail(sent.into_iter().next().unwrap(), 400, "TIMEOUT");
+        td.dispatch_completed_community_net();
+        with_community_manager(&mut td, |manager, env| {
+            assert!(
+                manager
+                    .get_community_notification_settings(env, CommunityId::new(8))
+                    .is_none()
+            );
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1, "the erased entry re-sends the query");
+        // drain the last query so the drained-assert below holds
+        net_complete(sent.into_iter().next().unwrap(), {
+            let mut out = Vec::new();
+            telegram_api::PeerNotifySettings {
+                flags: 0,
+                show_previews: true,
+                silent: false,
+                mute_until: 0,
+                ios_sound: None,
+                android_sound: None,
+                other_sound: None,
+                stories_muted: false,
+                stories_hide_sender: false,
+                stories_ios_sound: None,
+                stories_android_sound: None,
+                stories_other_sound: None,
+            }
+            .store_boxed(&mut out);
+            out
+        });
+        td.dispatch_completed_community_net();
         assert!(td.community_net_completed.lock().is_empty(), "drained");
     }
 

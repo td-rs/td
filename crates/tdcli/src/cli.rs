@@ -2601,7 +2601,7 @@ impl CliClient {
         let mut op_not_found_count = 0;
 
         // The 19 blocks, in cli.cpp order; the census fixture
-        // (`testdata/cli_census.txt`, 1294 arms) pins the per-block command
+        // (`testdata/cli_census.txt`, 1295 arms) pins the per-block command
         // inventory, and the slices fill them in: M.14.3 auth, M.14.4
         // messages/dialogs, M.14.5 files, M.14.6 misc/dev.
         if !self.op_block_auth(&op, &args) {
@@ -14778,7 +14778,7 @@ impl CliClient {
                 },
             ));
             true
-        } else if op == "scns" || op == "ssns" || op == "sftns" {
+        } else if op == "scns" || op == "ssns" || op == "sftns" || op == "scons" {
             let (scope, rest0) = tokenizer::split(args, ' ');
             let (mute_for, rest1) = tokenizer::split(&rest0, ' ');
             let (sound_id, rest2) = tokenizer::split(&rest1, ' ');
@@ -14838,6 +14838,15 @@ impl CliClient {
                     self.send_request(Function::setChatNotificationSettings(
                         td_api::setChatNotificationSettings {
                             chat_id: self.as_chat_id(&scope),
+                            notification_settings: Some(settings),
+                        },
+                    ));
+                } else if op == "scons" {
+                    // cli.cpp:8938-8940 (99302f0e2) — the community form
+                    // over the raw id (as_community_id).
+                    self.send_request(Function::setCommunityNotificationSettings(
+                        td_api::setCommunityNotificationSettings {
+                            community_id: tokenizer::to_integer_i64(trim_td(&scope)),
                             notification_settings: Some(settings),
                         },
                     ));
@@ -15851,7 +15860,7 @@ mod tests {
         drop(guard);
     }
 
-    /// The M.14.2 census gate: the fixture pins all 1294 command arms of the
+    /// The M.14.2 census gate: the fixture pins all 1295 command arms of the
     /// C++ `on_cmd` (regenerate with
     /// `conformance/cli_gate/extract_cli_census.sh`); every arm whose slice
     /// has landed must be routed by the dispatcher, every not-yet-ported arm
@@ -15862,7 +15871,7 @@ mod tests {
         const CENSUS: &str = include_str!("../testdata/cli_census.txt");
         assert_eq!(
             CENSUS.lines().count(),
-            1294,
+            1295,
             "the C++ tree changed — regenerate the census with \
              conformance/cli_gate/extract_cli_census.sh"
         );
@@ -17051,6 +17060,7 @@ mod tests {
             ("gsns", 17),
             ("scns", 17),
             ("ssns", 17),
+            ("scons", 17),
             ("sftns", 17),
             ("srns", 17),
             ("rans", 17),
