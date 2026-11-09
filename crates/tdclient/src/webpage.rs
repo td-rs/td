@@ -317,6 +317,26 @@ impl RichText {
         self.r#type == RichTextType::Plain && self.content.is_empty()
     }
 
+    /// `RichText::create_plain` (RichText.cpp:540-547).
+    pub fn create_plain(text: String) -> RichText {
+        RichText {
+            r#type: RichTextType::Plain,
+            content: text,
+            ..RichText::default()
+        }
+    }
+
+    /// `RichText::create_math` (RichText.cpp:549-554) — the math text
+    /// builder the quote plane uses for pageBlockMath sources (upstream
+    /// df92bc788).
+    pub fn create_math(source: String) -> RichText {
+        RichText {
+            r#type: RichTextType::Math,
+            content: source,
+            ..RichText::default()
+        }
+    }
+
     /// `append_file_ids` (WebPageBlock.cpp:419-428) — the General
     /// document's thumbnail plane arrives with the Document record
     /// (M.28); the file id itself appends locally.
@@ -329,6 +349,24 @@ impl RichText {
             for text in &self.texts {
                 text.append_file_ids(file_ids);
             }
+        }
+    }
+
+    /// `RichText::add_dependencies` (RichText.cpp:570-580) — the
+    /// recursive walk the quote plane feeds the rich texts through
+    /// (upstream 4e1635ac8). The C++ `dependencies.add(web_page_id_)`
+    /// slot (the WebPagesManager dep resolve) has no Dependencies set in
+    /// the port yet; the user/button ids walk exactly.
+    pub fn add_dependencies(
+        &self,
+        dependencies: &mut dyn crate::inline_keyboard_button::DependenciesSink,
+    ) {
+        for text in &self.texts {
+            text.add_dependencies(dependencies);
+        }
+        dependencies.add_user(self.user_id);
+        if let Some(button) = &self.button {
+            button.add_dependencies(dependencies);
         }
     }
 
@@ -360,6 +398,209 @@ impl RichText {
         result
     }
 
+    /// `get_quote_text` (RichText.cpp:602-621) — the text of the rich text
+    /// as used in quotes (upstream df92bc788): Plain/Math/CustomEmoji keep
+    /// the content, Icon is unquotable, Diff quotes only the new text.
+    pub fn get_quote_text(&self) -> String {
+        match self.r#type {
+            RichTextType::Plain | RichTextType::Math | RichTextType::CustomEmoji => {
+                self.content.clone()
+            }
+            RichTextType::Icon => String::new(),
+            RichTextType::Diff => {
+                // only the new text can be quoted
+                assert!(!self.texts.is_empty(), "the C++ CHECKs the text count");
+                self.texts[0].get_quote_text()
+            }
+            _ => {
+                let mut result = String::new();
+                for text in &self.texts {
+                    result.push_str(&text.get_quote_text());
+                }
+                result
+            }
+        }
+    }
+
+    /// `get_quote_fragment` (RichText.cpp:624-627) — the part of the rich
+    /// text between the `begin` and `end` UTF-8 characters of its quote
+    /// text, shaped for a quote (upstream 23c7272d7).
+    pub fn get_quote_fragment(&self, begin: usize, end: usize) -> RichText {
+        let mut pos = 0usize;
+        self.get_quote_fragment_impl(&mut pos, begin, end)
+    }
+
+    /// `get_quote_fragment_impl` (RichText.cpp:629-711) — the recursive
+    /// walker sharing the quote-text position across the tree; the
+    /// formatting-is-dropped case list is the simplified post-1e7c9a1a8
+    /// fold (MentionName/Button/TonAddress ride the Diff arm).
+    fn get_quote_fragment_impl(&self, pos: &mut usize, begin: usize, end: usize) -> RichText {
+        match self.r#type {
+            RichTextType::Plain => {
+                let size = tdutils::utf8::utf8_length(&self.content);
+                let from = begin.max(*pos);
+                let to = end.min(*pos + size);
+                let mut result = RichText::default();
+                if from < to {
+                    result.content =
+                        tdutils::utf8::utf8_substr_range(&self.content, from - *pos, to - from)
+                            .to_owned();
+                }
+                *pos += size;
+                result
+            }
+            RichTextType::Math | RichTextType::CustomEmoji => {
+                let size = tdutils::utf8::utf8_length(&self.content);
+                let is_included = begin <= *pos && *pos + size <= end;
+                *pos += size;
+                if !is_included {
+                    return RichText::default();
+                }
+                let mut context = CloneWebPageBlockContext::new(DialogId::default());
+                self.clone_rich_text(&mut context, false)
+            }
+            RichTextType::Icon => {
+                // icons can't be quoted
+                RichText::default()
+            }
+            RichTextType::Concatenation => {
+                let mut texts = Vec::new();
+                for text in &self.texts {
+                    let fragment = text.get_quote_fragment_impl(pos, begin, end);
+                    if !fragment.empty() {
+                        texts.push(fragment);
+                    }
+                }
+                if texts.is_empty() {
+                    return RichText::default();
+                }
+                RichText {
+                    r#type: RichTextType::Concatenation,
+                    texts,
+                    ..RichText::default()
+                }
+            }
+            RichTextType::Fixed
+            | RichTextType::Url
+            | RichTextType::EmailAddress
+            | RichTextType::Marked
+            | RichTextType::PhoneNumber
+            | RichTextType::Anchor
+            | RichTextType::Mention
+            | RichTextType::Hashtag
+            | RichTextType::Cashtag
+            | RichTextType::BotCommand
+            | RichTextType::AutoUrl
+            | RichTextType::AutoEmailAddress
+            | RichTextType::AutoPhoneNumber
+            | RichTextType::BankCardNumber
+            | RichTextType::MentionName
+            | RichTextType::Button
+            | RichTextType::TonAddress
+            | RichTextType::Diff => {
+                // the formatting isn't supported in quotes, so only the text is quoted
+                assert!(!self.texts.is_empty(), "the C++ CHECKs the text count");
+                self.texts[0].get_quote_fragment_impl(pos, begin, end)
+            }
+            _ => {
+                if self.texts.len() != 1 {
+                    tdutils::log_error!(
+                        "Receive rich text of type {} with {} texts",
+                        self.r#type as i32,
+                        self.texts.len()
+                    );
+                    for text in &self.texts {
+                        *pos += tdutils::utf8::utf8_length(&text.get_quote_text());
+                    }
+                    return RichText::default();
+                }
+                let fragment = self.texts[0].get_quote_fragment_impl(pos, begin, end);
+                if fragment.empty() {
+                    return RichText::default();
+                }
+                let mut context = CloneWebPageBlockContext::new(DialogId::default());
+                let mut result = self.clone_rich_text(&mut context, true);
+                result.texts.push(fragment);
+                result
+            }
+        }
+    }
+
+    /// `remove_unallowed_quote_entities` (RichText.cpp:716-783) — drops the
+    /// formatting that can't be kept in a quote, answering whether the text
+    /// changed (upstream fd3863de4).
+    pub fn remove_unallowed_quote_entities(&mut self) -> bool {
+        match self.r#type {
+            RichTextType::Plain | RichTextType::Math | RichTextType::CustomEmoji => false,
+            RichTextType::Icon => {
+                // icons can't be quoted
+                *self = RichText::default();
+                true
+            }
+            RichTextType::Concatenation => {
+                let mut is_changed = false;
+                for text in &mut self.texts {
+                    if text.remove_unallowed_quote_entities() {
+                        is_changed = true;
+                    }
+                }
+                let before = self.texts.len();
+                self.texts.retain(|text| !text.empty());
+                if self.texts.len() != before {
+                    is_changed = true;
+                }
+                if self.texts.is_empty() {
+                    *self = RichText::default();
+                    return true;
+                }
+                is_changed
+            }
+            RichTextType::Fixed
+            | RichTextType::Url
+            | RichTextType::EmailAddress
+            | RichTextType::Marked
+            | RichTextType::PhoneNumber
+            | RichTextType::Anchor
+            | RichTextType::Mention
+            | RichTextType::Hashtag
+            | RichTextType::Cashtag
+            | RichTextType::BotCommand
+            | RichTextType::AutoUrl
+            | RichTextType::AutoEmailAddress
+            | RichTextType::AutoPhoneNumber
+            | RichTextType::BankCardNumber
+            | RichTextType::MentionName
+            | RichTextType::Button
+            | RichTextType::TonAddress
+            | RichTextType::Diff => {
+                // the formatting isn't supported in quotes, so only the text is kept
+                assert!(!self.texts.is_empty(), "the C++ CHECKs the text count");
+                let mut text = std::mem::take(&mut self.texts[0]);
+                text.remove_unallowed_quote_entities();
+                *self = text;
+                true
+            }
+            _ => {
+                if self.texts.len() != 1 {
+                    tdutils::log_error!(
+                        "Receive rich text of type {} with {} texts",
+                        self.r#type as i32,
+                        self.texts.len()
+                    );
+                    *self = RichText::default();
+                    return true;
+                }
+                if !self.texts[0].remove_unallowed_quote_entities() {
+                    return false;
+                }
+                if self.texts[0].empty() {
+                    *self = RichText::default();
+                }
+                true
+            }
+        }
+    }
+
     /// `get_index_mask` (WebPageBlock.cpp:461-475).
     pub fn get_index_mask(&self) -> i32 {
         match self.r#type {
@@ -380,16 +621,25 @@ impl RichText {
         }
     }
 
-    /// `RichText::clone` (WebPageBlock.cpp:477-501).
-    fn clone_rich_text(&self, context: &mut CloneWebPageBlockContext) -> RichText {
+    /// `RichText::clone` (RichText.cpp:812-839) — `skip_texts` clones the
+    /// node without the children (the get_quote_fragment default arm
+    /// re-fills them with the fragment).
+    fn clone_rich_text(
+        &self,
+        context: &mut CloneWebPageBlockContext,
+        skip_texts: bool,
+    ) -> RichText {
         let mut result = RichText {
             r#type: self.r#type,
             content: self.content.clone(),
-            texts: self
-                .texts
-                .iter()
-                .map(|t| t.clone_rich_text(context))
-                .collect(),
+            texts: if skip_texts {
+                Vec::new()
+            } else {
+                self.texts
+                    .iter()
+                    .map(|t| t.clone_rich_text(context, false))
+                    .collect()
+            },
             document_file_id: self.document_file_id,
             custom_emoji_id: self.custom_emoji_id,
             web_page_id: self.web_page_id,
@@ -1454,8 +1704,8 @@ impl WebPageBlockCaption {
     /// `clone` (WebPageBlock.cpp:841-846).
     fn clone_caption(&self, context: &mut CloneWebPageBlockContext) -> WebPageBlockCaption {
         WebPageBlockCaption {
-            text: self.text.clone_rich_text(context),
-            credit: self.credit.clone_rich_text(context),
+            text: self.text.clone_rich_text(context, false),
+            credit: self.credit.clone_rich_text(context, false),
         }
     }
 
@@ -1524,7 +1774,7 @@ impl WebPageBlockTableCell {
     /// `clone` (WebPageBlock.cpp:898-911).
     fn clone_cell(&self, context: &mut CloneWebPageBlockContext) -> WebPageBlockTableCell {
         WebPageBlockTableCell {
-            text: self.text.clone_rich_text(context),
+            text: self.text.clone_rich_text(context, false),
             ..self.clone()
         }
     }
@@ -2209,7 +2459,7 @@ impl WebPageBlockButtonRow {
                         result.text.r#type = RichTextType::Plain;
                         result.text.content = button.button.get_forward_text().to_owned();
                     } else {
-                        result.text = button.text.clone_rich_text(context);
+                        result.text = button.text.clone_rich_text(context, false);
                     }
                     result
                 })
@@ -2277,7 +2527,7 @@ impl WebPageBlockTable {
     /// `clone` (WebPageBlock.cpp:4023-4034).
     fn clone_table(&self, context: &mut CloneWebPageBlockContext) -> WebPageBlockTable {
         WebPageBlockTable {
-            title: self.title.clone_rich_text(context),
+            title: self.title.clone_rich_text(context, false),
             cells: self
                 .cells
                 .iter()
@@ -2934,6 +3184,114 @@ impl WebPageBlock {
         }
     }
 
+    /// `for_each_quote_text` (WebPageBlock.h:148-152 + overrides) — calls
+    /// the callback for each quotable text in the order of their
+    /// appearance; the default answers `for_each_rich_text(false, …)`, the
+    /// overrides collect the sub-blocks and captions (upstream ecb7fb163).
+    /// The callback borrows are short-lived: the Math arm hands out a
+    /// freshly built `create_math` node like the C++.
+    pub fn for_each_quote_text(&self, callback: &mut impl FnMut(&RichText)) {
+        match self {
+            // the overrides: WebPageBlockMath, WebPageBlockList,
+            // WebPageBlockButtonRow, WebPageBlockCover, WebPageBlockEmbeddedPost,
+            // WebPageBlockCollage, WebPageBlockSlideshow, WebPageBlockDetails,
+            // WebPageBlockBlockQuoteBlocks
+            WebPageBlock::Math { source } => {
+                let math = RichText::create_math(source.clone());
+                callback(&math);
+            }
+            WebPageBlock::List(list) => {
+                for item in &list.items {
+                    for_each_web_page_blocks_quote_text(&item.page_blocks, callback);
+                }
+            }
+            WebPageBlock::ButtonRow(_) => {}
+            WebPageBlock::Cover(cover) => cover.for_each_quote_text(callback),
+            WebPageBlock::EmbeddedPost {
+                page_blocks,
+                caption,
+                ..
+            }
+            | WebPageBlock::Collage {
+                page_blocks,
+                caption,
+                ..
+            }
+            | WebPageBlock::Slideshow {
+                page_blocks,
+                caption,
+                ..
+            } => {
+                for_each_web_page_blocks_quote_text(page_blocks, callback);
+                caption.for_each_rich_text(false, callback);
+            }
+            WebPageBlock::Details {
+                header,
+                page_blocks,
+                ..
+            } => {
+                header.for_each_rich_text(false, callback);
+                for_each_web_page_blocks_quote_text(page_blocks, callback);
+            }
+            WebPageBlock::BlockQuoteBlocks {
+                page_blocks,
+                caption,
+            } => {
+                for_each_web_page_blocks_quote_text(page_blocks, callback);
+                caption.for_each_rich_text(false, callback);
+            }
+            // the virtual default: for_each_rich_text(false, callback)
+            block => block.for_each_rich_text(false, callback),
+        }
+    }
+
+    /// `remove_empty_media_blocks` (WebPageBlock.h:143 + overrides) —
+    /// removes nested media blocks without files; answers whether the
+    /// block itself has no files and must be removed (upstream
+    /// a7ccc2344). The RichMessage ctor/parse call sites ride the
+    /// unmodeled RichMessage class (Wave-2 WebPages).
+    pub fn remove_empty_media_blocks(&mut self) -> bool {
+        match self {
+            WebPageBlock::List(list) => {
+                for item in &mut list.items {
+                    remove_empty_media_page_blocks(&mut item.page_blocks);
+                }
+                false
+            }
+            WebPageBlock::Animation {
+                animation_file_id, ..
+            } => !animation_file_id.is_valid(),
+            WebPageBlock::Photo { photo, .. } => photo.is_empty(),
+            WebPageBlock::Video { video_file_id, .. } => !video_file_id.is_valid(),
+            WebPageBlock::Cover(cover) => cover.remove_empty_media_blocks(),
+            WebPageBlock::Collage { page_blocks, .. } => {
+                remove_empty_media_page_blocks(page_blocks);
+                page_blocks.is_empty()
+            }
+            WebPageBlock::Slideshow { page_blocks, .. } => {
+                remove_empty_media_page_blocks(page_blocks);
+                page_blocks.is_empty()
+            }
+            WebPageBlock::Audio { audio_file_id, .. } => !audio_file_id.is_valid(),
+            WebPageBlock::Details { page_blocks, .. } => {
+                remove_empty_media_page_blocks(page_blocks);
+                false
+            }
+            WebPageBlock::BlockQuoteBlocks { page_blocks, .. } => {
+                remove_empty_media_page_blocks(page_blocks);
+                false
+            }
+            WebPageBlock::VoiceNote {
+                voice_note_file_id, ..
+            } => !voice_note_file_id.is_valid(),
+            WebPageBlock::Document {
+                document_file_id, ..
+            } => !document_file_id.is_valid(),
+            // the virtual default
+            _ => false,
+        }
+    }
+
     /// `get_index_mask` (WebPageBlock.h:154 + overrides).
     pub fn get_index_mask(&self) -> i32 {
         match self {
@@ -3103,30 +3461,40 @@ impl WebPageBlock {
     /// `clone` (WebPageBlock.h:156 + overrides).
     pub fn clone_block(&self, context: &mut CloneWebPageBlockContext) -> WebPageBlock {
         match self {
-            WebPageBlock::Title(text) => WebPageBlock::Title(text.clone_rich_text(context)),
-            WebPageBlock::Subtitle(text) => WebPageBlock::Subtitle(text.clone_rich_text(context)),
+            WebPageBlock::Title(text) => WebPageBlock::Title(text.clone_rich_text(context, false)),
+            WebPageBlock::Subtitle(text) => {
+                WebPageBlock::Subtitle(text.clone_rich_text(context, false))
+            }
             WebPageBlock::AuthorDate { author, date } => WebPageBlock::AuthorDate {
-                author: author.clone_rich_text(context),
+                author: author.clone_rich_text(context, false),
                 date: *date,
             },
-            WebPageBlock::Header(text) => WebPageBlock::Header(text.clone_rich_text(context)),
-            WebPageBlock::Subheader(text) => WebPageBlock::Subheader(text.clone_rich_text(context)),
-            WebPageBlock::Paragraph(text) => WebPageBlock::Paragraph(text.clone_rich_text(context)),
+            WebPageBlock::Header(text) => {
+                WebPageBlock::Header(text.clone_rich_text(context, false))
+            }
+            WebPageBlock::Subheader(text) => {
+                WebPageBlock::Subheader(text.clone_rich_text(context, false))
+            }
+            WebPageBlock::Paragraph(text) => {
+                WebPageBlock::Paragraph(text.clone_rich_text(context, false))
+            }
             WebPageBlock::Preformatted { text, language } => WebPageBlock::Preformatted {
-                text: text.clone_rich_text(context),
+                text: text.clone_rich_text(context, false),
                 language: language.clone(),
             },
-            WebPageBlock::Footer(text) => WebPageBlock::Footer(text.clone_rich_text(context)),
+            WebPageBlock::Footer(text) => {
+                WebPageBlock::Footer(text.clone_rich_text(context, false))
+            }
             WebPageBlock::Divider => WebPageBlock::Divider,
             WebPageBlock::Anchor { name } => WebPageBlock::Anchor { name: name.clone() },
             WebPageBlock::List(list) => WebPageBlock::List(list.clone_list(context)),
             WebPageBlock::BlockQuote { text, credit } => WebPageBlock::BlockQuote {
-                text: text.clone_rich_text(context),
-                credit: credit.clone_rich_text(context),
+                text: text.clone_rich_text(context, false),
+                credit: credit.clone_rich_text(context, false),
             },
             WebPageBlock::PullQuote { text, credit } => WebPageBlock::PullQuote {
-                text: text.clone_rich_text(context),
-                credit: credit.clone_rich_text(context),
+                text: text.clone_rich_text(context, false),
+                credit: credit.clone_rich_text(context, false),
             },
             WebPageBlock::Animation {
                 animation_file_id,
@@ -3220,14 +3588,16 @@ impl WebPageBlock {
                 audio_file_id: *audio_file_id,
                 caption: caption.clone_caption(context),
             },
-            WebPageBlock::Kicker(kicker) => WebPageBlock::Kicker(kicker.clone_rich_text(context)),
+            WebPageBlock::Kicker(kicker) => {
+                WebPageBlock::Kicker(kicker.clone_rich_text(context, false))
+            }
             WebPageBlock::Table(table) => WebPageBlock::Table(table.clone_table(context)),
             WebPageBlock::Details {
                 header,
                 page_blocks,
                 is_open,
             } => WebPageBlock::Details {
-                header: header.clone_rich_text(context),
+                header: header.clone_rich_text(context, false),
                 page_blocks: clone_web_page_blocks(page_blocks, context),
                 is_open: *is_open,
             },
@@ -3235,7 +3605,7 @@ impl WebPageBlock {
                 header,
                 related_articles,
             } => WebPageBlock::RelatedArticles {
-                header: header.clone_rich_text(context),
+                header: header.clone_rich_text(context, false),
                 related_articles: related_articles.clone(),
             },
             WebPageBlock::Map {
@@ -3257,19 +3627,21 @@ impl WebPageBlock {
                 caption: caption.clone_caption(context),
             },
             WebPageBlock::Heading { text, size } => WebPageBlock::Heading {
-                text: text.clone_rich_text(context),
+                text: text.clone_rich_text(context, false),
                 size: *size,
             },
             WebPageBlock::Math { source } => WebPageBlock::Math {
                 source: source.clone(),
             },
-            WebPageBlock::Thinking(text) => WebPageBlock::Thinking(text.clone_rich_text(context)),
+            WebPageBlock::Thinking(text) => {
+                WebPageBlock::Thinking(text.clone_rich_text(context, false))
+            }
             WebPageBlock::BlockQuoteBlocks {
                 page_blocks,
                 caption,
             } => WebPageBlock::BlockQuoteBlocks {
                 page_blocks: clone_web_page_blocks(page_blocks, context),
-                caption: caption.clone_rich_text(context),
+                caption: caption.clone_rich_text(context, false),
             },
             WebPageBlock::Document {
                 document_file_id,
@@ -3283,8 +3655,8 @@ impl WebPageBlock {
             }
             WebPageBlock::ExpandableBlockQuote { text, credit } => {
                 WebPageBlock::ExpandableBlockQuote {
-                    text: text.clone_rich_text(context),
-                    credit: credit.clone_rich_text(context),
+                    text: text.clone_rich_text(context, false),
+                    credit: credit.clone_rich_text(context, false),
                 }
             }
             WebPageBlock::Unsupported { version } => {
@@ -3386,6 +3758,191 @@ pub fn clone_web_page_blocks(
         .iter()
         .map(|page_block| page_block.clone_block(context))
         .collect()
+}
+
+/// `for_each_web_page_blocks_quote_text` (WebPageBlock.cpp:4856-4861) —
+/// the walker the `RichMessage::for_each_quote_text` quote plane runs on
+/// (upstream ecb7fb163; the `RichMessage` method itself rides the
+/// unported RichMessage class).
+pub fn for_each_web_page_blocks_quote_text(
+    page_blocks: &[WebPageBlock],
+    callback: &mut impl FnMut(&RichText),
+) {
+    for page_block in page_blocks {
+        page_block.for_each_quote_text(callback);
+    }
+}
+
+/// `remove_empty_media_page_blocks` (WebPageBlock.cpp:4924-4928) — drops
+/// the blocks whose `remove_empty_media_blocks` answers true (upstream
+/// a7ccc2344); the recursive arms run first, like the C++ remove_if.
+pub fn remove_empty_media_page_blocks(page_blocks: &mut Vec<WebPageBlock>) {
+    let mut i = 0;
+    while i < page_blocks.len() {
+        if page_blocks[i].remove_empty_media_blocks() {
+            page_blocks.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// `MessageQuote::get_rich_texts_object` (MessageQuote.cpp:246-251) — the
+/// object build of the quote's rich texts: the C++ constructs the default
+/// `GetWebPageBlockObjectContext` over Td with `skip_bot_commands_ =
+/// true`; the quote-stripped rich texts only reach the env-free object
+/// arms (Plain/Math/CustomEmoji/Concatenation and the basic formatting
+/// nodes), so the env stands in as the no-op below.
+pub fn get_quote_rich_texts_object(rich_texts: &[RichText]) -> Vec<Box<td_api::RichText>> {
+    let mut env = NoObjectEnv;
+    let mut user_manager = ();
+    let mut context = WebPageBlockObjectContext {
+        env: &mut env,
+        base_url: String::new(),
+        real_url_host: String::new(),
+        real_url_rhash: String::new(),
+        skip_bot_commands: true,
+        is_first_pass: true,
+        has_anchor_urls: false,
+        anchors: std::collections::HashMap::new(),
+        user_manager: &mut user_manager,
+    };
+    rich_texts
+        .iter()
+        .map(|rich_text| rich_text.get_rich_text_object(&mut context, false))
+        .map(|object| object.expect("allow_null=false always answers"))
+        .collect()
+}
+
+/// The binlog codec of a quote's rich texts — the C++
+/// `td::store/parse(vector<RichText>)` inside MessageQuote.hpp over the
+/// no-op env: the quote-stripped rich texts carry no Icon file ids (the
+/// only env-armed store arm), so the env answers nothing. A corrupt row
+/// with an icon zeroes out at parse (the no-op file id parses invalid)
+/// instead of loading through the FileManager — the defensive divergence
+/// on adversarial input only.
+pub fn store_quote_rich_texts(rich_texts: &[RichText], out: &mut Vec<u8>) {
+    let mut env = NoObjectEnv;
+    store_i32(out, rich_texts.len() as i32);
+    for rich_text in rich_texts {
+        rich_text.store(&mut env, out);
+    }
+}
+
+/// The parse twin of [`store_quote_rich_texts`].
+pub fn parse_quote_rich_texts(parser: &mut Parser<'_>) -> Result<Vec<RichText>, &'static str> {
+    let mut env = NoObjectEnv;
+    let len = parser.i32_()?;
+    if len < 0 {
+        return Err("Invalid vector size");
+    }
+    let mut rich_texts = Vec::new();
+    for _ in 0..len {
+        rich_texts.push(RichText::parse(&mut env, parser)?);
+    }
+    Ok(rich_texts)
+}
+
+/// The wire half of [`get_quote_rich_texts_object`] — the `quote_rich_`
+/// vector of `MessageQuote::update_input_reply_to_message`
+/// (MessageQuote.cpp:206-211): the C++ fills a `GetInputPageBlockContext`
+/// over Td; the quote-stripped rich texts only reach the env-free input
+/// arms, so the no-op env stands in again.
+pub fn get_quote_rich_texts_input(rich_texts: &[RichText]) -> Vec<Box<telegram_api::RichText>> {
+    let mut env = NoObjectEnv;
+    let mut user_manager = ();
+    let mut context = GetInputPageBlockContext {
+        env: &mut env,
+        photos: Vec::new(),
+        documents: Vec::new(),
+        media_pos: 0,
+        user_manager: &mut user_manager,
+    };
+    rich_texts
+        .iter()
+        .map(|rich_text| rich_text.get_input_rich_text(&mut context))
+        .map(Box::new)
+        .collect()
+}
+
+/// The no-op env behind [`get_quote_rich_texts_object`] — every method
+/// answers the empty default; none is reachable for quote-stripped rich
+/// texts (the env-armed arms — Icon/MentionName/Button and the
+/// instant-view Url rewrite — are stripped from quotes).
+struct NoObjectEnv;
+
+impl crate::photo::PhotoStoreEnv for NoObjectEnv {
+    fn store_file_id(&mut self, _file_id: FileId, _out: &mut Vec<u8>) {}
+    fn parse_file_id(
+        &mut self,
+        _parser: &mut Parser<'_>,
+    ) -> std::result::Result<FileId, &'static str> {
+        Ok(FileId::default())
+    }
+}
+
+impl WebPageBlockEnv for NoObjectEnv {
+    fn get_document_object(&self, _file_id: FileId) -> Option<td_api::Document> {
+        None
+    }
+    fn get_animation_object(&self, _file_id: FileId) -> Option<td_api::Animation> {
+        None
+    }
+    fn get_audio_object(&self, _file_id: FileId) -> Option<td_api::Audio> {
+        None
+    }
+    fn get_video_object(&self, _file_id: FileId) -> Option<td_api::Video> {
+        None
+    }
+    fn get_video_note_object(&self, _file_id: FileId) -> Option<td_api::VideoNote> {
+        None
+    }
+    fn get_voice_note_object(&self, _file_id: FileId) -> Option<td_api::VoiceNote> {
+        None
+    }
+    fn get_accent_color_id_object(
+        &self,
+        _accent_color_id: crate::peer_color::AccentColorId,
+        _fallback: crate::peer_color::AccentColorId,
+    ) -> Option<i32> {
+        None
+    }
+    fn get_chat_photo_info_object(&self, _photo: &DialogPhoto) -> Option<td_api::ChatPhotoInfo> {
+        None
+    }
+    fn get_instant_view_link(&self, _url: &str, _rhash: &str) -> String {
+        String::new()
+    }
+    fn get_instant_view_link_rhash(&self, _real_url: &str) -> String {
+        String::new()
+    }
+    fn get_instant_view_link_url(&self, _real_url: &str) -> String {
+        String::new()
+    }
+    fn as_input_document(
+        &mut self,
+        _file_id: FileId,
+    ) -> Option<(i64, telegram_api::InputDocument)> {
+        None
+    }
+    fn as_input_photo(&mut self, _file_id: FileId) -> Option<(i64, telegram_api::InputPhoto)> {
+        None
+    }
+    fn ensure_input_user(&mut self, _user_id: crate::user_manager::UserId) -> Result<(), Status> {
+        Ok(())
+    }
+    fn get_user_id_object(&mut self, _user_id: crate::user_manager::UserId, _source: &str) -> i64 {
+        0
+    }
+    fn is_my_user_bot(&self) -> bool {
+        false
+    }
+    fn on_get_page_block_channel(
+        &mut self,
+        _channel: telegram_api::channel,
+    ) -> Option<ChatLinkInfo> {
+        None
+    }
 }
 
 /// `get_input_page_blocks` (WebPageBlock.cpp:5824-5829).
@@ -5986,6 +6543,443 @@ mod tests {
             content: text.to_owned(),
             ..RichText::default()
         }
+    }
+
+    /// A rich text node with the given type, content and children.
+    fn node(r#type: RichTextType, content: &str, texts: Vec<RichText>) -> RichText {
+        RichText {
+            r#type,
+            content: content.to_owned(),
+            texts,
+            ..RichText::default()
+        }
+    }
+
+    fn icon() -> RichText {
+        RichText {
+            r#type: RichTextType::Icon,
+            content: "131074".to_owned(),
+            document_file_id: FileId::new(1, 0),
+            ..RichText::default()
+        }
+    }
+
+    // ===== the 1.8.70 quote plane (RichText.cpp) =====
+
+    /// `RichText::create_math` + `get_quote_text` (upstream df92bc788) —
+    /// the quote text of every node kind, worked out from the C++ switch.
+    #[test]
+    fn rich_text_create_math_and_get_quote_text() {
+        let math = RichText::create_math("x^2 + 1".to_owned());
+        assert_eq!(math.r#type, RichTextType::Math);
+        assert_eq!(math.content, "x^2 + 1");
+        assert_eq!(math.get_quote_text(), "x^2 + 1");
+
+        let create_plain = RichText::create_plain("abc".to_owned());
+        assert_eq!(create_plain, plain("abc"));
+        assert_eq!(create_plain.get_quote_text(), "abc");
+
+        // CustomEmoji keeps its content; Icon is unquotable.
+        let emoji = RichText {
+            r#type: RichTextType::CustomEmoji,
+            content: "\u{1F600}".to_owned(),
+            custom_emoji_id: CustomEmojiId::new(7),
+            ..RichText::default()
+        };
+        assert_eq!(emoji.get_quote_text(), "\u{1F600}");
+        assert_eq!(icon().get_quote_text(), "");
+
+        // Concatenation joins the children's quote texts.
+        let concat = node(
+            RichTextType::Concatenation,
+            "",
+            vec![node(RichTextType::Bold, "", vec![plain("bo")]), plain("ld")],
+        );
+        assert_eq!(concat.get_quote_text(), "bold");
+
+        // Diff quotes only the new text.
+        let diff = node(RichTextType::Diff, "", vec![plain("new"), plain("old")]);
+        assert_eq!(diff.get_quote_text(), "new");
+    }
+
+    /// `get_quote_fragment` (upstream 23c7272d7, 1e7c9a1a8, dbeb09f45) —
+    /// the UTF-8-code-point slicing and per-node-kind shapes.
+    #[test]
+    fn rich_text_get_quote_fragment() {
+        // Plain slices by code points; empty and out-of-range windows are
+        // empty fragments.
+        let hello = plain("hello world");
+        assert_eq!(hello.get_quote_fragment(0, 5).get_quote_text(), "hello");
+        assert_eq!(hello.get_quote_fragment(6, 11).get_quote_text(), "world");
+        assert_eq!(hello.get_quote_fragment(3, 8).get_quote_text(), "lo wo");
+        assert!(hello.get_quote_fragment(5, 5).empty());
+        assert!(hello.get_quote_fragment(50, 60).empty());
+        assert_eq!(plain("").get_quote_fragment(0, 5).get_quote_text(), "");
+
+        // Multibyte characters stay whole.
+        let emoji_text = plain("\u{1F600}\u{1F601}");
+        assert_eq!(
+            emoji_text.get_quote_fragment(0, 1).get_quote_text(),
+            "\u{1F600}"
+        );
+        assert_eq!(
+            emoji_text.get_quote_fragment(1, 2).get_quote_text(),
+            "\u{1F601}"
+        );
+
+        // Concatenation keeps the non-empty fragments in order: the
+        // (1, 5) window of "ab|cd|ef" is cut per child — the second child
+        // lies fully inside and survives whole.
+        let concat = node(
+            RichTextType::Concatenation,
+            "",
+            vec![plain("ab"), plain("cd"), plain("ef")],
+        );
+        let fragment = concat.get_quote_fragment(1, 5);
+        assert_eq!(fragment.r#type, RichTextType::Concatenation);
+        let texts: Vec<String> = fragment.texts.iter().map(|t| t.get_quote_text()).collect();
+        assert_eq!(texts, vec!["b", "cd", "e"]);
+
+        // The keep-formatting default arm clones the node (skip_texts) and
+        // re-fills it with the fragment: Bold survives, the window cut
+        // applies to the inner Plain.
+        let bold = node(RichTextType::Bold, "", vec![plain("abcd")]);
+        let fragment = bold.get_quote_fragment(1, 3);
+        assert_eq!(fragment.r#type, RichTextType::Bold);
+        assert_eq!(fragment.texts.len(), 1);
+        assert_eq!(fragment.texts[0].get_quote_text(), "bc");
+
+        // The formatting-is-dropped case list keeps only the inner text:
+        // Url with a cut window, Diff from the new text only, Button via
+        // its single text.
+        let url = node(
+            RichTextType::Url,
+            "https://example.com",
+            vec![plain("link")],
+        );
+        let fragment = url.get_quote_fragment(0, 4);
+        assert_eq!(fragment.r#type, RichTextType::Plain);
+        assert_eq!(fragment.get_quote_text(), "link");
+        let diff = node(RichTextType::Diff, "", vec![plain("new"), plain("old")]);
+        let fragment = diff.get_quote_fragment(1, 2);
+        assert_eq!(fragment.get_quote_text(), "e");
+        let button = node(RichTextType::Button, "", vec![plain("Press")]);
+        assert_eq!(button.get_quote_fragment(0, 5).get_quote_text(), "Press");
+
+        // Math/CustomEmoji are all-or-nothing (cloned whole when fully
+        // inside the window, dropped otherwise).
+        let math = RichText::create_math("x^2".to_owned());
+        let fragment = math.get_quote_fragment(0, 3);
+        assert_eq!(fragment.r#type, RichTextType::Math);
+        assert_eq!(fragment.content, "x^2");
+        assert!(math.get_quote_fragment(0, 2).empty());
+        assert!(math.get_quote_fragment(1, 3).empty());
+
+        // Icons are never quoted.
+        assert!(icon().get_quote_fragment(0, 100).empty());
+    }
+
+    /// `remove_unallowed_quote_entities` (upstream fd3863de4) — which
+    /// formatting a quote keeps and the changed flag.
+    #[test]
+    fn rich_text_remove_unallowed_quote_entities() {
+        // Plain/Math/CustomEmoji are kept as-is.
+        let mut text = plain("abc");
+        assert!(!text.remove_unallowed_quote_entities());
+        assert_eq!(text, plain("abc"));
+        let mut text = RichText::create_math("x".to_owned());
+        assert!(!text.remove_unallowed_quote_entities());
+        assert_eq!(text, RichText::create_math("x".to_owned()));
+
+        // Icon is dropped.
+        let mut text = icon();
+        assert!(text.remove_unallowed_quote_entities());
+        assert!(text.empty());
+
+        // A dropped-format node unwraps to its single text.
+        let mut text = node(
+            RichTextType::Url,
+            "https://example.com",
+            vec![plain("link")],
+        );
+        assert!(text.remove_unallowed_quote_entities());
+        assert_eq!(text, plain("link"));
+
+        // Concatenation strips per child and drops the emptied ones: the
+        // Icon dies and is removed, while the Bold child is allowed
+        // formatting and stays.
+        let mut text = node(
+            RichTextType::Concatenation,
+            "",
+            vec![
+                node(RichTextType::Bold, "", vec![plain("a")]),
+                icon(),
+                plain("b"),
+            ],
+        );
+        assert!(text.remove_unallowed_quote_entities());
+        assert_eq!(
+            text,
+            node(
+                RichTextType::Concatenation,
+                "",
+                vec![node(RichTextType::Bold, "", vec![plain("a")]), plain("b")]
+            )
+        );
+
+        // An all-emptied Concatenation collapses to the empty node.
+        let mut text = node(RichTextType::Concatenation, "", vec![icon()]);
+        assert!(text.remove_unallowed_quote_entities());
+        assert!(text.empty());
+
+        // The allowed formatting (the default arm) survives unchanged:
+        // Bold/Italic/Underline/Strikethrough/Spoiler/DateTime keep their
+        // node, the child is left untouched.
+        let mut text = node(RichTextType::Bold, "", vec![plain("keep")]);
+        assert!(!text.remove_unallowed_quote_entities());
+        assert_eq!(text, node(RichTextType::Bold, "", vec![plain("keep")]));
+    }
+
+    /// `for_each_quote_text` + `for_each_web_page_blocks_quote_text`
+    /// (upstream ecb7fb163) — the quotable-text walk order per block kind.
+    #[test]
+    fn for_each_web_page_blocks_quote_text_walk() {
+        // The virtual default answers for_each_rich_text(false, …): the
+        // top-level node only; Divider contributes nothing; Math
+        // contributes its create_math source; ButtonRow nothing.
+        let blocks = vec![
+            WebPageBlock::Paragraph(plain("para")),
+            WebPageBlock::Divider,
+            WebPageBlock::Math {
+                source: "x^2".to_owned(),
+            },
+            WebPageBlock::ButtonRow(WebPageBlockButtonRow::default()),
+        ];
+        let mut collected = Vec::new();
+        for_each_web_page_blocks_quote_text(&blocks, &mut |text| {
+            collected.push((text.r#type, text.get_quote_text()));
+        });
+        assert_eq!(
+            collected,
+            vec![
+                (RichTextType::Plain, "para".to_owned()),
+                (RichTextType::Math, "x^2".to_owned()),
+            ]
+        );
+
+        // Cover delegates to the inner block; List and Details recurse
+        // into their sub-blocks after the header.
+        let blocks = vec![
+            WebPageBlock::Cover(Box::new(WebPageBlock::Header(plain("cover")))),
+            WebPageBlock::List(WebPageBlockList {
+                items: vec![WebPageBlockListItem {
+                    page_blocks: vec![WebPageBlock::Paragraph(plain("item"))],
+                    ..WebPageBlockListItem::default()
+                }],
+                ..WebPageBlockList::default()
+            }),
+            WebPageBlock::Details {
+                header: plain("details"),
+                page_blocks: vec![WebPageBlock::Paragraph(plain("inner"))],
+                is_open: false,
+            },
+        ];
+        let mut collected = Vec::new();
+        for_each_web_page_blocks_quote_text(&blocks, &mut |text| {
+            collected.push(text.get_quote_text());
+        });
+        assert_eq!(collected, vec!["cover", "item", "details", "inner"]);
+
+        // EmbeddedPost walks the sub-blocks, then the caption's top-level
+        // texts (recurse_text=false keeps the caption node itself).
+        let post = WebPageBlock::EmbeddedPost {
+            url: String::new(),
+            author: String::new(),
+            author_photo: Photo::default(),
+            date: 0,
+            page_blocks: vec![WebPageBlock::Paragraph(plain("post"))],
+            caption: WebPageBlockCaption {
+                text: plain("caption"),
+                credit: plain("credit"),
+            },
+        };
+        let mut collected = Vec::new();
+        post.for_each_quote_text(&mut |text| collected.push(text.get_quote_text()));
+        assert_eq!(collected, vec!["post", "caption", "credit"]);
+
+        // BlockQuoteBlocks has the same blocks-then-caption order.
+        let quote = WebPageBlock::BlockQuoteBlocks {
+            page_blocks: vec![WebPageBlock::Paragraph(plain("quoted"))],
+            caption: plain("cap"),
+        };
+        let mut collected = Vec::new();
+        quote.for_each_quote_text(&mut |text| collected.push(text.get_quote_text()));
+        assert_eq!(collected, vec!["quoted", "cap"]);
+    }
+
+    /// `remove_empty_media_page_blocks` (upstream a7ccc2344) — the
+    /// fileless media blocks drop, the nested containers recurse.
+    #[test]
+    fn remove_empty_media_page_blocks_drops_fileless_media() {
+        let caption = WebPageBlockCaption {
+            text: plain("cap"),
+            credit: plain("credit"),
+        };
+        let non_empty_photo = crate::photo::Photo {
+            id: 1,
+            ..crate::photo::Photo::default()
+        };
+        // A fileless Animation, a real Photo, a fileless Document and a
+        // paragraph survive-or-drop per their media validity.
+        let mut blocks = vec![
+            WebPageBlock::Animation {
+                animation_file_id: FileId::default(),
+                caption: caption.clone(),
+                need_autoplay: false,
+                has_spoiler: false,
+            },
+            WebPageBlock::Photo {
+                photo: non_empty_photo,
+                caption: caption.clone(),
+                url: String::new(),
+                web_page_id: WebPageId::default(),
+                has_spoiler: false,
+            },
+            WebPageBlock::Paragraph(plain("kept")),
+            WebPageBlock::Document {
+                document_file_id: FileId::default(),
+                caption: caption.clone(),
+            },
+        ];
+        remove_empty_media_page_blocks(&mut blocks);
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(blocks[0], WebPageBlock::Photo { .. }));
+        assert!(matches!(blocks[1], WebPageBlock::Paragraph(_)));
+
+        // An emptied Collage drops itself (the last live block dies), a
+        // Cover delegates to its inner block, and List/Details/
+        // BlockQuoteBlocks recurse without dropping themselves.
+        let mut blocks = vec![
+            WebPageBlock::Collage {
+                page_blocks: vec![WebPageBlock::VoiceNote {
+                    voice_note_file_id: FileId::default(),
+                    caption: caption.clone(),
+                }],
+                caption: caption.clone(),
+            },
+            WebPageBlock::Cover(Box::new(WebPageBlock::Audio {
+                audio_file_id: FileId::default(),
+                caption: caption.clone(),
+            })),
+            WebPageBlock::List(WebPageBlockList {
+                items: vec![WebPageBlockListItem {
+                    page_blocks: vec![WebPageBlock::Video {
+                        video_file_id: FileId::default(),
+                        caption: caption.clone(),
+                        need_autoplay: false,
+                        is_looped: false,
+                        has_spoiler: false,
+                    }],
+                    ..WebPageBlockListItem::default()
+                }],
+                ..WebPageBlockList::default()
+            }),
+            WebPageBlock::Details {
+                header: plain("h"),
+                page_blocks: Vec::new(),
+                is_open: true,
+            },
+        ];
+        remove_empty_media_page_blocks(&mut blocks);
+        // the Collage and the Audio-covered Cover die; the emptied List
+        // and Details survive — containers never self-drop outside
+        // Collage/Slideshow.
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(blocks[0], WebPageBlock::List(_)));
+        assert!(matches!(
+            blocks[1],
+            WebPageBlock::Details { is_open: true, .. }
+        ));
+        let WebPageBlock::List(list) = &blocks[0] else {
+            unreachable!()
+        };
+        assert!(list.items[0].page_blocks.is_empty());
+    }
+
+    /// `RichText::add_dependencies` (upstream 4e1635ac8) — the recursive
+    /// user/button id walk the quote plane feeds rich texts through.
+    #[test]
+    fn rich_text_add_dependencies_walks_users() {
+        #[derive(Default)]
+        struct TestSink(std::collections::BTreeSet<crate::user_manager::UserId>);
+        impl crate::inline_keyboard_button::DependenciesSink for TestSink {
+            fn add_user(&mut self, user_id: crate::user_manager::UserId) {
+                // the real Dependencies::add(UserId) filters invalid ids
+                if user_id.is_valid() {
+                    self.0.insert(user_id);
+                }
+            }
+        }
+        let text = node(
+            RichTextType::Concatenation,
+            "",
+            vec![
+                RichText {
+                    r#type: RichTextType::MentionName,
+                    user_id: crate::user_manager::UserId::new(7),
+                    ..RichText::default()
+                },
+                plain("no users"),
+            ],
+        );
+        let mut sink = TestSink::default();
+        text.add_dependencies(&mut sink);
+        assert_eq!(sink.0, [crate::user_manager::UserId::new(7)].into());
+    }
+
+    /// `get_quote_rich_texts_object` (upstream 4e1635ac8/1631ed57b) —
+    /// the td_api objects of the quote's rich texts over the default
+    /// object context.
+    #[test]
+    fn get_quote_rich_texts_object_builds_objects() {
+        let rich_texts = vec![
+            plain("hi"),
+            node(RichTextType::Bold, "", vec![plain("b")]),
+            RichText::create_math("x".to_owned()),
+            RichText {
+                r#type: RichTextType::CustomEmoji,
+                content: "\u{1F600}".to_owned(),
+                custom_emoji_id: CustomEmojiId::new(42),
+                ..RichText::default()
+            },
+            node(
+                RichTextType::Concatenation,
+                "",
+                vec![plain("a"), plain("b")],
+            ),
+        ];
+        let objects = get_quote_rich_texts_object(&rich_texts);
+        assert_eq!(objects.len(), 5);
+        assert!(matches!(
+            objects[0].as_ref(),
+            td_api::RichText::richTextPlain(t) if t.text == "hi"
+        ));
+        assert!(matches!(
+            objects[1].as_ref(),
+            td_api::RichText::richTextBold(_)
+        ));
+        assert!(matches!(
+            objects[2].as_ref(),
+            td_api::RichText::richTextMathematicalExpression(t) if t.expression == "x"
+        ));
+        assert!(matches!(
+            objects[3].as_ref(),
+            td_api::RichText::richTextCustomEmoji(t) if t.custom_emoji_id == 42
+        ));
+        assert!(matches!(
+            objects[4].as_ref(),
+            td_api::RichText::richTexts(t) if t.texts.len() == 2
+        ));
     }
 
     #[test]
