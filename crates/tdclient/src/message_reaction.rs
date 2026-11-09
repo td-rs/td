@@ -257,6 +257,20 @@ impl MessageReaction {
         false
     }
 
+    /// `remove_recent_chooser_dialog_id` (MessageReaction.cpp:365-373,
+    /// upstream 496863e4c) — the sender's removal drops the choose
+    /// count; the my-recent-chooser slot is never touched here.
+    pub fn remove_recent_chooser_dialog_id(&mut self, dialog_id: DialogId) -> bool {
+        if dialog_id == self.my_recent_chooser_dialog_id
+            || !remove_first(&mut self.recent_chooser_dialog_ids, &dialog_id)
+        {
+            return false;
+        }
+        self.choose_count -= 1;
+        self.fix_choose_count();
+        true
+    }
+
     /// `update_from` (MessageReaction.cpp:375-383).
     pub fn update_from(&mut self, old_reaction: &MessageReaction) {
         debug_assert!(old_reaction.is_chosen(), "the C++ CHECKs is_chosen");
@@ -800,6 +814,46 @@ impl MessageReactions {
             return true;
         }
         false
+    }
+
+    /// `remove_reactions_by_sender` (MessageReaction.cpp:777-801,
+    /// upstream 496863e4c) — drops the sender's every trace: my own
+    /// chosen reactions when the sender is me, the sender's recent-
+    /// chooser entries (never the paid reaction), and the unread marks.
+    pub fn remove_reactions_by_sender(
+        &mut self,
+        env: &impl MessageReactionEnv,
+        sender_dialog_id: DialogId,
+        my_dialog_id: DialogId,
+    ) -> bool {
+        let mut is_changed = false;
+        if sender_dialog_id == my_dialog_id {
+            for reaction_type in self.get_chosen_reaction_types() {
+                if self.remove_my_reaction(env, &reaction_type, my_dialog_id) {
+                    is_changed = true;
+                }
+            }
+        }
+        let mut i = 0;
+        while i < self.reactions.len() {
+            let is_removed = !self.reactions[i].get_reaction_type().is_paid_reaction()
+                && self.reactions[i].remove_recent_chooser_dialog_id(sender_dialog_id);
+            if is_removed {
+                is_changed = true;
+                if self.reactions[i].is_empty() {
+                    self.reactions.remove(i);
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        let old_len = self.unread_reactions.len();
+        self.unread_reactions
+            .retain(|unread_reaction| unread_reaction.sender_dialog_id != sender_dialog_id);
+        if self.unread_reactions.len() != old_len {
+            is_changed = true;
+        }
+        is_changed
     }
 
     /// `do_remove_my_reaction` (MessageReaction.cpp:778-793).
@@ -1539,6 +1593,103 @@ mod message_reaction_tests {
             vec![emoji("👍"), emoji("😂")]
         );
         assert!(!reactions.remove_my_reaction(&env, &emoji("❤"), me));
+    }
+
+    /// `remove_reactions_by_sender` (MessageReaction.cpp:777-801,
+    /// upstream 496863e4c) — the sender's chosen reactions drop when
+    /// the sender is me, foreign chooser entries drop their count (the
+    /// paid reaction never does), and the unread marks clear.
+    #[test]
+    fn remove_reactions_by_sender_drops_every_trace_of_the_sender() {
+        let mut env = Env::default();
+        env.is_premium = true;
+        let me = DialogId::new(-99);
+        let sender = DialogId::new(-7);
+
+        let mut reactions = MessageReactions::default();
+        // my chosen 👍 (me among the choosers) with the sender as a
+        // second chooser, a foreign 🔥 row whose only chooser is the
+        // sender, and an unread mark by the sender on 🔥
+        reactions.reactions.push(MessageReaction::new(
+            emoji("👍"),
+            3,
+            true,
+            me,
+            vec![me, sender],
+            Vec::new(),
+        ));
+        reactions.reactions.push(MessageReaction::new(
+            emoji("🔥"),
+            1,
+            false,
+            DialogId::new(0),
+            vec![sender],
+            Vec::new(),
+        ));
+        reactions
+            .unread_reactions
+            .push(UnreadMessageReaction::new(emoji("🔥"), sender, true));
+
+        // the sender's removal: the 👍 count drops (the foreign chooser
+        // entry), the 🔥 row empties and drops, the unread mark clears —
+        // but my own chosen 👍 stays (the sender is not me)
+        assert!(reactions.remove_reactions_by_sender(&env, sender, me));
+        assert_eq!(
+            reactions.get_chosen_reaction_types(),
+            vec![emoji("👍")],
+            "my chosen reaction survives a foreign sender removal"
+        );
+        assert_eq!(reactions.get_reaction(&emoji("🔥")), None);
+        assert!(reactions.unread_reactions.is_empty());
+
+        // removing myself drops every chosen reaction
+        assert!(reactions.remove_reactions_by_sender(&env, me, me));
+        assert!(reactions.get_chosen_reaction_types().is_empty());
+
+        // a sender with no traces changes nothing
+        let mut empty_touch = reactions;
+        assert!(!empty_touch.remove_reactions_by_sender(&env, DialogId::new(-11), me));
+        assert!(empty_touch.get_chosen_reaction_types().is_empty());
+    }
+
+    /// `remove_recent_chooser_dialog_id` (MessageReaction.cpp:365-373)
+    /// — the my-recent-chooser slot refuses the removal; a plain entry
+    /// drops the count.
+    #[test]
+    fn remove_recent_chooser_dialog_id_bands() {
+        let me = DialogId::new(-99);
+        let other = DialogId::new(-7);
+        let mut reaction = MessageReaction::new(
+            emoji("👍"),
+            2,
+            false,
+            DialogId::new(0),
+            vec![other, DialogId::new(-8)],
+            Vec::new(),
+        );
+
+        assert!(reaction.remove_recent_chooser_dialog_id(other));
+        assert_eq!(reaction.get_choose_count(), 1);
+        assert_eq!(
+            reaction.get_recent_chooser_dialog_ids(),
+            &[DialogId::new(-8)]
+        );
+
+        // an unknown sender is a no-op
+        assert!(!reaction.remove_recent_chooser_dialog_id(DialogId::new(-11)));
+        assert_eq!(reaction.get_choose_count(), 1);
+
+        // the my-recent-chooser slot refuses (remove_my_reaction owns it)
+        let mut mine = MessageReaction::new(
+            emoji("👍"),
+            2,
+            false,
+            DialogId::new(0),
+            Vec::new(),
+            Vec::new(),
+        );
+        mine.set_as_chosen(me, true);
+        assert!(!mine.remove_recent_chooser_dialog_id(me));
     }
 
     #[test]

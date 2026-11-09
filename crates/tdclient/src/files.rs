@@ -7757,6 +7757,18 @@ impl FileManager {
 
         self.file_nodes[other_node_id] = None;
 
+        // `send_updates_flag` (FileManager.cpp:2411, upstream 175048b69)
+        // — unsent changes of the absorbed node would be lost with it,
+        // so they must be sent with the survivor. (The 1.8.68 form was
+        // an inert `false` flag — the port had no band to carry.)
+        let send_updates_flag = nodes[other_node_i].need_info_flush();
+        if send_updates_flag {
+            self.file_nodes[node_id]
+                .as_mut()
+                .expect("node")
+                .on_info_changed();
+        }
+
         events.push(MergeEvent::RunNode(Box::new(
             self.file_nodes[node_id].as_ref().expect("node").clone(),
         )));
@@ -14386,6 +14398,64 @@ mod tests {
             .merge(FileId::new(1, 0), FileId::new(2, 0))
             .unwrap();
         assert_eq!(log.0.lock().len(), 7);
+    }
+
+    /// The merged-file update band (FileManager.cpp:2411-2422, upstream
+    /// a94b83d67 → 631edce27 → 175048b69) — unsent changes of the
+    /// absorbed node ride the survivor; a clean absorbed node leaves
+    /// the survivor's info flag clear (the update would pin file
+    /// identifiers that are about to be forgotten).
+    #[test]
+    fn merge_sends_updates_only_for_unsent_changes_of_the_absorbed_node() {
+        let mut file_manager = FileManager::new();
+        file_manager.register_file_node(
+            FileId::new(1, 0),
+            0,
+            document_node(FileId::new(1, 0), 100, "ref"),
+        );
+        file_manager.register_file_node(
+            FileId::new(2, 0),
+            0,
+            document_node(FileId::new(2, 0), 100, "ref"),
+        );
+        // the absorbed node carries an unsent info change
+        file_manager
+            .get_file_node_mut(FileId::new(2, 0))
+            .unwrap()
+            .on_info_changed();
+        file_manager
+            .merge(FileId::new(1, 0), FileId::new(2, 0))
+            .unwrap();
+        assert!(
+            file_manager
+                .get_file_node(FileId::new(1, 0))
+                .unwrap()
+                .need_info_flush(),
+            "the survivor inherits the unsent change"
+        );
+
+        // a clean absorbed node does not flush the survivor
+        let mut file_manager = FileManager::new();
+        file_manager.register_file_node(
+            FileId::new(1, 0),
+            0,
+            document_node(FileId::new(1, 0), 100, "ref"),
+        );
+        file_manager.register_file_node(
+            FileId::new(2, 0),
+            0,
+            document_node(FileId::new(2, 0), 100, "ref"),
+        );
+        file_manager
+            .merge(FileId::new(1, 0), FileId::new(2, 0))
+            .unwrap();
+        assert!(
+            !file_manager
+                .get_file_node(FileId::new(1, 0))
+                .unwrap()
+                .need_info_flush(),
+            "a clean merge sends no updateFile"
+        );
     }
 
     #[test]
