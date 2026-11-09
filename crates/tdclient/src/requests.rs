@@ -9090,9 +9090,8 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
 
         // getUpgradedGift (Requests.cpp:8644-8649)
         Function::getUpgradedGift(request) => {
-            if !check_is_user(td, id) {
-                return;
-            }
+            // f8595a08f — the CHECK_IS_USER gate leaves (bots may read
+            // an upgraded gift)
             let Some(name) = clean_or_utf8_error(td, id, &request.name) else {
                 return;
             };

@@ -7563,14 +7563,16 @@ impl UserManager {
         let Some(u) = self.get_user(user_id) else {
             return Err(Status::error(400, "Bot not found"));
         };
-        if !u.is_bot {
-            return Err(Status::error(400, "User is not a bot"));
+        // bb34046eb — received/deleted before the bot check, the
+        // user-worded errors
+        if !u.is_received {
+            return Err(Status::error(400, "User is inaccessible"));
         }
         if u.is_deleted {
-            return Err(Status::error(400, "Bot is deleted"));
+            return Err(Status::error(400, "User is deleted"));
         }
-        if !u.is_received {
-            return Err(Status::error(400, "Bot is inaccessible"));
+        if !u.is_bot {
+            return Err(Status::error(400, "User is not a bot"));
         }
         Ok(BotData {
             username: u.usernames.get_first_username().to_owned(),
@@ -17629,9 +17631,11 @@ mod tests {
             telegram_api::User::user(min_bot),
             "test",
         );
+        // bb34046eb — the user-worded errors in the received/deleted
+        // order
         assert!(matches!(
             um.get_bot_data(min_bot_id),
-            Err(status) if status.message() == "Bot is inaccessible"
+            Err(status) if status.message() == "User is inaccessible"
         ));
 
         // A deleted bot is refused even when received.
@@ -17639,7 +17643,7 @@ mod tests {
         um.users.get_mut(&plain_id.get()).unwrap().is_deleted = true;
         assert!(matches!(
             um.get_bot_data(plain_id),
-            Err(status) if status.message() == "Bot is deleted"
+            Err(status) if status.message() == "User is deleted"
         ));
 
         let bot_id = um.on_get_user(
