@@ -3814,6 +3814,35 @@ pub fn get_quote_rich_texts_object(rich_texts: &[RichText]) -> Vec<Box<td_api::R
         .collect()
 }
 
+/// The binlog codec of a quote's rich texts — the C++
+/// `td::store/parse(vector<RichText>)` inside MessageQuote.hpp over the
+/// no-op env: the quote-stripped rich texts carry no Icon file ids (the
+/// only env-armed store arm), so the env answers nothing. A corrupt row
+/// with an icon zeroes out at parse (the no-op file id parses invalid)
+/// instead of loading through the FileManager — the defensive divergence
+/// on adversarial input only.
+pub fn store_quote_rich_texts(rich_texts: &[RichText], out: &mut Vec<u8>) {
+    let mut env = NoObjectEnv;
+    store_i32(out, rich_texts.len() as i32);
+    for rich_text in rich_texts {
+        rich_text.store(&mut env, out);
+    }
+}
+
+/// The parse twin of [`store_quote_rich_texts`].
+pub fn parse_quote_rich_texts(parser: &mut Parser<'_>) -> Result<Vec<RichText>, &'static str> {
+    let mut env = NoObjectEnv;
+    let len = parser.i32_()?;
+    if len < 0 {
+        return Err("Invalid vector size");
+    }
+    let mut rich_texts = Vec::new();
+    for _ in 0..len {
+        rich_texts.push(RichText::parse(&mut env, parser)?);
+    }
+    Ok(rich_texts)
+}
+
 /// The no-op env behind [`get_quote_rich_texts_object`] — every method
 /// answers the empty default; none is reachable for quote-stripped rich
 /// texts (the env-armed arms — Icon/MentionName/Button and the

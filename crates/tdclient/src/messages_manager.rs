@@ -4997,24 +4997,94 @@ pub struct LogEventIdWithGeneration {
     pub generation: u64,
 }
 
-/// `td::MessageQuote` (MessageQuote.h) — the text quote a reply points at.
-/// The wire/td_api constructors and `search_quote` land with their slices;
-/// the ctor keeps `max(0, position)` and the `remove_unallowed_quote_entities`
-/// call for them.
+/// `td::MessageQuote` (MessageQuote.h) — the text quote a reply points at;
+/// the 1.8.70 quotes plane adds the rich-message parts (upstream
+/// 4e1635ac8/1631ed57b). `search_quote` lands with its slice.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MessageQuote {
     pub text: FormattedText,
+    /// `rich_texts_` (MessageQuote.h:26, upstream 4e1635ac8) — the quote
+    /// parts chosen from a rich message, in their appearance order.
+    pub rich_texts: Vec<crate::webpage::RichText>,
     pub position: i32,
     pub is_manual: bool,
 }
 
+/// `get_quote_rich_texts` (MessageQuote.cpp:30-41) — the wire rich-quote
+/// intake: every rich text is stripped of the unallowed quote entities
+/// (upstream fd3863de4 logs the strip) and the emptied ones drop; the
+/// documents map stays empty like the C++ (icons are stripped anyway).
+fn get_quote_rich_texts(
+    rich_text_ptrs: &[Box<telegram_api::RichText>],
+) -> Vec<crate::webpage::RichText> {
+    let documents = std::collections::HashMap::new();
+    let mut result = Vec::new();
+    for rich_text_ptr in rich_text_ptrs {
+        let mut rich_text =
+            crate::webpage::get_rich_text_from_telegram((**rich_text_ptr).clone(), &documents);
+        if rich_text.remove_unallowed_quote_entities() {
+            log_error!("Receive a rich quote with unexpected entities");
+        }
+        if !rich_text.empty() {
+            result.push(rich_text);
+        }
+    }
+    result
+}
+
 impl MessageQuote {
-    /// `MessageQuote::MessageQuote(Td *, messageReplyHeader)` (MessageQuote.cpp:40-52).
+    /// `MessageQuote::MessageQuote(FormattedText &&, vector<RichText> &&,
+    /// int32, bool)` (MessageQuote.h:49-52) — the stripping ctor every
+    /// local construction goes through: the text entities and the rich
+    /// texts both lose the unallowed quote formatting, and the position
+    /// clamps non-negative.
+    pub fn new_stripped(
+        text: FormattedText,
+        rich_texts: Vec<crate::webpage::RichText>,
+        position: i32,
+        is_manual: bool,
+    ) -> MessageQuote {
+        let mut text = text;
+        crate::message_entity::remove_unallowed_quote_entities(&mut text);
+        let mut rich_texts = rich_texts;
+        MessageQuote::remove_unallowed_quote_entities_from_rich_texts(&mut rich_texts);
+        MessageQuote {
+            text,
+            rich_texts,
+            position: position.max(0),
+            is_manual,
+        }
+    }
+
+    /// `MessageQuote::remove_unallowed_quote_entities_from_rich_texts`
+    /// (MessageQuote.cpp:117-127, upstream fd3863de4) — strips every rich
+    /// text and drops the emptied ones; answers whether anything changed.
+    pub fn remove_unallowed_quote_entities_from_rich_texts(
+        rich_texts: &mut Vec<crate::webpage::RichText>,
+    ) -> bool {
+        let mut is_changed = false;
+        for rich_text in rich_texts.iter_mut() {
+            if rich_text.remove_unallowed_quote_entities() {
+                is_changed = true;
+            }
+        }
+        let before = rich_texts.len();
+        rich_texts.retain(|rich_text| !rich_text.empty());
+        if rich_texts.len() != before {
+            is_changed = true;
+        }
+        is_changed
+    }
+
+    /// `MessageQuote::MessageQuote(Td *, messageReplyHeader)` (MessageQuote.cpp:40-52)
+    /// — the wire intake reads `quote_rich_` first (upstream 4e1635ac8):
+    /// a header with only rich quote parts still yields a quote.
     pub fn from_reply_header<U: crate::message_entity::UserManagerLike + ?Sized>(
         user_manager: Option<&mut U>,
         reply_header: &telegram_api::messageReplyHeader,
     ) -> MessageQuote {
-        if reply_header.quote_text.is_empty() {
+        let rich_texts = get_quote_rich_texts(&reply_header.quote_rich);
+        if reply_header.quote_text.is_empty() && rich_texts.is_empty() {
             return MessageQuote::default();
         }
         let mut text = crate::message_entity::get_formatted_text(
@@ -5030,19 +5100,21 @@ impl MessageQuote {
         }
         MessageQuote {
             text,
+            rich_texts,
             position: reply_header.quote_offset.max(0),
             is_manual: reply_header.quote,
         }
     }
 
-    /// `MessageQuote::is_empty` (MessageQuote.h).
+    /// `MessageQuote::is_empty` (MessageQuote.h:62-64, upstream
+    /// 4e1635ac8) — a rich-only quote is not empty.
     pub fn is_empty(&self) -> bool {
-        self.text.text.is_empty()
+        self.text.text.is_empty() && self.rich_texts.is_empty()
     }
 
-    /// `MessageQuote::get_text_quote_object` (MessageQuote.cpp:139-145).
     /// `MessageQuote::get_input_text_quote_object`
-    /// (MessageQuote.cpp:129-137).
+    /// (MessageQuote.cpp:216-224) — the draft-side object; the rich texts
+    /// ride the object context (upstream 1631ed57b).
     pub fn get_input_text_quote_object<U: crate::message_entity::UserManagerLike + ?Sized>(
         &self,
         user_manager: Option<&mut U>,
@@ -5057,13 +5129,13 @@ impl MessageQuote {
                 true,
                 -1,
             )),
+            rich_texts: crate::webpage::get_quote_rich_texts_object(&self.rich_texts),
             position: self.position,
-            // The rich-quote plane (MessageQuote.hpp rich_texts) rides the
-            // 1.8.70 quotes-family follow-up; the plain-text quote ports now.
-            rich_texts: Vec::new(),
         })
     }
 
+    /// `MessageQuote::get_text_quote_object` (MessageQuote.cpp:226-231) —
+    /// the received-quote object with the rich texts (upstream 4e1635ac8).
     pub fn get_text_quote_object<U: crate::message_entity::UserManagerLike + ?Sized>(
         &self,
         user_manager: Option<&mut U>,
@@ -5078,39 +5150,52 @@ impl MessageQuote {
                 true,
                 -1,
             )),
+            rich_texts: crate::webpage::get_quote_rich_texts_object(&self.rich_texts),
             position: self.position,
-            // The rich-quote plane (MessageQuote.hpp rich_texts) rides the
-            // 1.8.70 quotes-family follow-up; the plain-text quote ports now.
-            rich_texts: Vec::new(),
             is_manual: self.is_manual,
         })
     }
 
-    /// `MessageQuote::store` (MessageQuote.hpp:16-33).
+    /// `MessageQuote::store` (MessageQuote.hpp:16-43, upstream
+    /// 4e1635ac8) — the fourth flag bit gates the rich texts.
     pub fn store(&self, out: &mut Vec<u8>) {
         let has_text = !self.text.text.is_empty();
         let has_position = self.position != 0;
-        store_flags(out, [has_text, has_position, self.is_manual]);
+        let has_rich_texts = !self.rich_texts.is_empty();
+        store_flags(
+            out,
+            [has_text, has_position, self.is_manual, has_rich_texts],
+        );
         if has_text {
             self.text.store(out);
         }
         if has_position {
             store_i32(out, self.position);
         }
+        if has_rich_texts {
+            crate::webpage::store_quote_rich_texts(&self.rich_texts, out);
+        }
     }
 
-    /// `MessageQuote::parse` (MessageQuote.hpp:35-56) — the text is passed
-    /// through `remove_unallowed_quote_entities` like the C++.
+    /// `MessageQuote::parse` (MessageQuote.hpp:45-73) — the text is passed
+    /// through `remove_unallowed_quote_entities` like the C++, and so are
+    /// the rich texts (upstream fd3863de4).
     pub fn parse_from(parser: &mut Parser) -> Result<MessageQuote, &'static str> {
-        let [has_text, has_position, is_manual] = parser.parse_flags::<3>()?;
+        let [has_text, has_position, is_manual, has_rich_texts] = parser.parse_flags::<4>()?;
         let mut text = FormattedText::default();
         if has_text {
             text = FormattedText::parse(parser)?;
             crate::message_entity::remove_unallowed_quote_entities(&mut text);
         }
         let position = if has_position { parser.i32_()? } else { 0 };
+        let mut rich_texts = Vec::new();
+        if has_rich_texts {
+            rich_texts = crate::webpage::parse_quote_rich_texts(parser)?;
+            MessageQuote::remove_unallowed_quote_entities_from_rich_texts(&mut rich_texts);
+        }
         Ok(MessageQuote {
             text,
+            rich_texts,
             position,
             is_manual,
         })
@@ -5953,11 +6038,12 @@ impl RepliedMessageInfo {
         if has_quote {
             result.quote = MessageQuote::parse_from(parser)?;
         } else if let Some(text) = quote_legacy {
-            result.quote = MessageQuote {
+            result.quote = MessageQuote::new_stripped(
                 text,
-                position: quote_position_legacy,
-                is_manual: is_quote_manual_legacy,
-            };
+                Vec::new(),
+                quote_position_legacy,
+                is_quote_manual_legacy,
+            );
         }
         if has_todo_item_id {
             result.todo_item_id = parser.i32_()?;
@@ -6140,11 +6226,10 @@ impl MessageInputReplyTo {
         if has_quote {
             result.quote = MessageQuote::parse_from(parser)?;
         } else if let Some(text) = quote_legacy {
-            result.quote = MessageQuote {
-                text,
-                position: quote_position_legacy,
-                is_manual: false,
-            };
+            // the C++ delegating ctor defaults is_manual to true
+            // (MessageInputReplyTo.hpp:105)
+            result.quote =
+                MessageQuote::new_stripped(text, Vec::new(), quote_position_legacy, true);
         }
         if has_todo_item_id {
             result.todo_item_id = parser.i32_()?;
@@ -11624,6 +11709,11 @@ fn add_message_quote_dependencies(dependencies: &mut Dependencies, quote: &Messa
         if entity.user_id.is_valid() {
             dependencies.add_user(entity.user_id);
         }
+    }
+    // `MessageQuote::add_dependencies` rich half (MessageQuote.cpp:224-229,
+    // upstream 4e1635ac8): the rich texts walk their own user/button ids.
+    for rich_text in &quote.rich_texts {
+        rich_text.add_dependencies(dependencies);
     }
 }
 
@@ -24733,9 +24823,102 @@ pub fn can_reply_to_message_in_another_dialog(
         }) && dialog_id.get_type() == DialogType::Channel)
 }
 
+/// The `RichText::get_rich_text` user-check env for the quote intake —
+/// the C++ passes the whole Td, but the td_api rich-text conversion only
+/// consults the user manager (the MentionName `get_input_user`
+/// validation); every other env arm is unreachable for quote rich texts
+/// (the quote strip removes each env-armed node kind).
+struct QuoteRichTextIntakeEnv<'a> {
+    content_context: &'a dyn crate::message_content::MessageContentContext,
+}
+
+impl crate::photo::PhotoStoreEnv for QuoteRichTextIntakeEnv<'_> {
+    fn store_file_id(&mut self, _file_id: FileId, _out: &mut Vec<u8>) {}
+    fn parse_file_id(&mut self, _parser: &mut Parser<'_>) -> Result<FileId, &'static str> {
+        Ok(FileId::default())
+    }
+}
+
+impl crate::webpage::WebPageBlockEnv for QuoteRichTextIntakeEnv<'_> {
+    fn get_document_object(&self, _file_id: FileId) -> Option<td_api::Document> {
+        None
+    }
+    fn get_animation_object(&self, _file_id: FileId) -> Option<td_api::Animation> {
+        None
+    }
+    fn get_audio_object(&self, _file_id: FileId) -> Option<td_api::Audio> {
+        None
+    }
+    fn get_video_object(&self, _file_id: FileId) -> Option<td_api::Video> {
+        None
+    }
+    fn get_video_note_object(&self, _file_id: FileId) -> Option<td_api::VideoNote> {
+        None
+    }
+    fn get_voice_note_object(&self, _file_id: FileId) -> Option<td_api::VoiceNote> {
+        None
+    }
+    fn get_accent_color_id_object(
+        &self,
+        _accent_color_id: crate::peer_color::AccentColorId,
+        _fallback: crate::peer_color::AccentColorId,
+    ) -> Option<i32> {
+        None
+    }
+    fn get_chat_photo_info_object(
+        &self,
+        _photo: &crate::photo::DialogPhoto,
+    ) -> Option<td_api::ChatPhotoInfo> {
+        None
+    }
+    fn get_instant_view_link(&self, _url: &str, _rhash: &str) -> String {
+        String::new()
+    }
+    fn get_instant_view_link_rhash(&self, _real_url: &str) -> String {
+        String::new()
+    }
+    fn get_instant_view_link_url(&self, _real_url: &str) -> String {
+        String::new()
+    }
+    fn as_input_document(
+        &mut self,
+        _file_id: FileId,
+    ) -> Option<(i64, tdmtproto::telegram_api::InputDocument)> {
+        None
+    }
+    fn as_input_photo(
+        &mut self,
+        _file_id: FileId,
+    ) -> Option<(i64, tdmtproto::telegram_api::InputPhoto)> {
+        None
+    }
+    fn ensure_input_user(
+        &mut self,
+        user_id: crate::user_manager::UserId,
+    ) -> Result<(), tdutils::status::Status> {
+        self.content_context.ensure_input_user(user_id)
+    }
+    fn get_user_id_object(&mut self, user_id: crate::user_manager::UserId, source: &str) -> i64 {
+        self.content_context.get_user_id_object(user_id, source)
+    }
+    fn is_my_user_bot(&self) -> bool {
+        false
+    }
+    fn on_get_page_block_channel(
+        &mut self,
+        _channel: tdmtproto::telegram_api::channel,
+    ) -> Option<crate::webpage::ChatLinkInfo> {
+        None
+    }
+}
+
 /// `MessageQuote::MessageQuote(Td *, td_api::InputTextQuote)`
-/// (MessageQuote.cpp:54-70) — the input quote parse behind the
-/// `inputMessageReplyToMessage`/`...ExternalMessage` arms.
+/// (MessageQuote.cpp:75-113) — the input quote parse behind the
+/// `inputMessageReplyToMessage`/`...ExternalMessage` arms. The rich arm
+/// (upstream 1631ed57b) shapes every part through
+/// `get_quote_fragment(0, 1e9)` — quoting it whole — and any conversion
+/// error clears the quote; a rich quote keeps `is_manual` (the C++ ctor
+/// never assigns it, and `update_input_reply_to_message` CHECKs it).
 fn get_message_quote_from_input(
     ctx: &mut dyn SendMessageContext,
     quote: Option<td_api::InputTextQuote>,
@@ -24743,6 +24926,37 @@ fn get_message_quote_from_input(
     let Some(quote) = quote else {
         return MessageQuote::default();
     };
+    if !quote.rich_texts.is_empty() {
+        let mut rich_texts = Vec::new();
+        for rich_text_object in quote.rich_texts {
+            let mut env = QuoteRichTextIntakeEnv {
+                content_context: ctx.content_context(),
+            };
+            let rich_text =
+                match crate::webpage::get_rich_text_from_td_api(&mut env, Some(rich_text_object)) {
+                    Ok(rich_text) => rich_text,
+                    Err(_) => return MessageQuote::default(),
+                };
+            let rich_text = rich_text.get_quote_fragment(0, 1_000_000_000);
+            if !rich_text.empty() {
+                rich_texts.push(rich_text);
+            }
+        }
+        if rich_texts.is_empty() {
+            return MessageQuote::default();
+        }
+        let mut position = quote.position;
+        if !(0..=1_000_000).contains(&position) {
+            // some unreasonably big bound
+            position = 0;
+        }
+        return MessageQuote {
+            rich_texts,
+            position,
+            is_manual: true,
+            ..MessageQuote::default()
+        };
+    }
     let mut ltrim_count = 0i32;
     let my_dialog_id = ctx.get_my_dialog_id();
     let always_parse_markdown = ctx
@@ -24786,7 +25000,8 @@ fn get_message_quote_from_input(
     MessageQuote {
         text,
         position,
-        is_manual: false,
+        is_manual: true,
+        ..MessageQuote::default()
     }
 }
 
@@ -39981,6 +40196,7 @@ mod tests {
                     text: "quote".to_string(),
                     entities: Vec::new(),
                 },
+                rich_texts: Vec::new(),
                 position: 3,
                 is_manual: true,
             },
@@ -39993,6 +40209,205 @@ mod tests {
         assert_eq!(
             RepliedMessageInfo::parse_from(&mut parser, &mut NoStorage).unwrap(),
             info
+        );
+    }
+
+    /// The wire rich-quote intake (upstream 4e1635ac8 + fd3863de4) —
+    /// `quote_rich` alone yields a quote, the unallowed formatting is
+    /// stripped at intake, and a rich-only emptied header stays empty.
+    #[test]
+    fn message_quote_wire_rich_intake() {
+        let wire_bold = Box::new(telegram_api::RichText::textBold(telegram_api::textBold {
+            text: Some(Box::new(telegram_api::RichText::textPlain(
+                telegram_api::textPlain {
+                    text: "Q".to_owned(),
+                },
+            ))),
+        }));
+        let header = telegram_api::messageReplyHeader {
+            quote_rich: vec![wire_bold],
+            ..telegram_api::messageReplyHeader::default()
+        };
+        let quote = MessageQuote::from_reply_header::<()>(None, &header);
+        assert!(!quote.is_empty());
+        assert!(quote.text.text.is_empty());
+        assert_eq!(quote.rich_texts.len(), 1);
+        assert_eq!(quote.rich_texts[0].get_quote_text(), "Q");
+        // the header's `quote` flag (manual) and offset carry over
+        let header = telegram_api::messageReplyHeader {
+            quote_rich: vec![Box::new(telegram_api::RichText::textMath(
+                telegram_api::textMath {
+                    source: "x+1".to_owned(),
+                },
+            ))],
+            quote_text: "x+1".to_owned(),
+            quote: true,
+            quote_offset: -3,
+            ..telegram_api::messageReplyHeader::default()
+        };
+        let quote = MessageQuote::from_reply_header::<()>(None, &header);
+        assert_eq!(quote.text.text, "x+1");
+        assert_eq!(quote.position, 0); // max(0, -3)
+        assert!(quote.is_manual);
+        assert_eq!(quote.rich_texts[0].get_quote_text(), "x+1");
+
+        // a wire icon (textImage) without a document empties out and the
+        // header's quote stays empty.
+        let header = telegram_api::messageReplyHeader {
+            quote_rich: vec![Box::new(telegram_api::RichText::textImage(
+                telegram_api::textImage {
+                    document_id: 999,
+                    w: 1,
+                    h: 1,
+                },
+            ))],
+            ..telegram_api::messageReplyHeader::default()
+        };
+        assert!(MessageQuote::from_reply_header::<()>(None, &header).is_empty());
+
+        // an Url-node rich quote is stripped to its plain text
+        let header = telegram_api::messageReplyHeader {
+            quote_rich: vec![Box::new(telegram_api::RichText::textUrl(
+                telegram_api::textUrl {
+                    text: Some(Box::new(telegram_api::RichText::textPlain(
+                        telegram_api::textPlain {
+                            text: "link".to_owned(),
+                        },
+                    ))),
+                    url: "https://example.com".to_owned(),
+                    webpage_id: 0,
+                },
+            ))],
+            ..telegram_api::messageReplyHeader::default()
+        };
+        let quote = MessageQuote::from_reply_header::<()>(None, &header);
+        assert!(!quote.is_empty());
+        // the Url formatting is dropped: only the plain text survives
+        assert_eq!(quote.rich_texts.len(), 1);
+        assert_eq!(quote.rich_texts[0].get_quote_text(), "link");
+    }
+
+    /// The stripping ctor + rich-text binlog round-trip (upstream
+    /// 4e1635ac8 flag bit, fd3863de4 parse strip) — and the legacy
+    /// three-flag rows still parse.
+    #[test]
+    fn message_quote_store_parse_rich_texts() {
+        let rich_texts = vec![crate::webpage::RichText::create_math("a^2".to_owned())];
+        let quote = MessageQuote::new_stripped(
+            FormattedText {
+                text: "q".to_owned(),
+                entities: Vec::new(),
+            },
+            rich_texts,
+            7,
+            true,
+        );
+        let mut bytes = Vec::new();
+        quote.store(&mut bytes);
+        let mut parser = Parser::new(&bytes);
+        assert_eq!(MessageQuote::parse_from(&mut parser).unwrap(), quote);
+
+        // a rich-only quote round-trips too (no text flag, no position)
+        let quote = MessageQuote {
+            rich_texts: vec![crate::webpage::RichText::create_plain("r".to_owned())],
+            is_manual: false,
+            ..MessageQuote::default()
+        };
+        let mut bytes = Vec::new();
+        quote.store(&mut bytes);
+        let mut parser = Parser::new(&bytes);
+        assert_eq!(MessageQuote::parse_from(&mut parser).unwrap(), quote);
+
+        // the pre-1.8.70 three-flag rows parse with no rich texts
+        let mut bytes = Vec::new();
+        store_flags(&mut bytes, [true, false, true]);
+        FormattedText {
+            text: "old".to_owned(),
+            entities: Vec::new(),
+        }
+        .store(&mut bytes);
+        let mut parser = Parser::new(&bytes);
+        let parsed = MessageQuote::parse_from(&mut parser).unwrap();
+        assert_eq!(parsed.text.text, "old");
+        assert!(parsed.rich_texts.is_empty());
+        assert!(parsed.is_manual);
+
+        // the stripping ctor: an unallowed text entity and an unallowed
+        // rich node both lose their formatting, and the position clamps
+        let quote = MessageQuote::new_stripped(
+            FormattedText {
+                text: "ab".to_owned(),
+                entities: vec![crate::message_entity::MessageEntity {
+                    r#type: Some(crate::message_entity::Type::Url),
+                    offset: 0,
+                    length: 2,
+                    ..crate::message_entity::MessageEntity::default()
+                }],
+            },
+            Vec::new(),
+            -1,
+            true,
+        );
+        assert!(quote.text.entities.is_empty());
+        assert_eq!(quote.position, 0);
+    }
+
+    /// The received/draft quote objects carry the rich texts (upstream
+    /// 4e1635ac8 + 1631ed57b) — a rich-only quote answers objects too.
+    #[test]
+    fn message_quote_objects_carry_rich_texts() {
+        let quote = MessageQuote {
+            text: FormattedText {
+                text: "q".to_owned(),
+                entities: Vec::new(),
+            },
+            rich_texts: vec![crate::webpage::RichText::create_plain("r".to_owned())],
+            position: 4,
+            is_manual: true,
+        };
+        let td_api::TextQuote {
+            text,
+            rich_texts,
+            position,
+            is_manual,
+        } = quote.get_text_quote_object::<()>(None).unwrap();
+        assert_eq!(text.unwrap().text, "q");
+        assert_eq!(rich_texts.len(), 1);
+        assert!(matches!(
+            rich_texts[0].as_ref(),
+            td_api::RichText::richTextPlain(t) if t.text == "r"
+        ));
+        assert_eq!(position, 4);
+        assert!(is_manual);
+
+        // a rich-only quote: not empty, the text object answers the empty
+        // formatted text, and the input (draft) object mirrors the shape
+        let quote = MessageQuote {
+            rich_texts: vec![crate::webpage::RichText::create_math("x".to_owned())],
+            is_manual: true,
+            ..MessageQuote::default()
+        };
+        assert!(!quote.is_empty());
+        let object = quote.get_text_quote_object::<()>(None).unwrap();
+        assert!(object.text.unwrap().text.is_empty());
+        assert!(matches!(
+            object.rich_texts[0].as_ref(),
+            td_api::RichText::richTextMathematicalExpression(t) if t.expression == "x"
+        ));
+        let input = quote.get_input_text_quote_object::<()>(None).unwrap();
+        assert_eq!(input.rich_texts.len(), 1);
+        assert_eq!(input.position, 0);
+
+        // an empty quote answers no objects at all
+        assert!(
+            MessageQuote::default()
+                .get_text_quote_object::<()>(None)
+                .is_none()
+        );
+        assert!(
+            MessageQuote::default()
+                .get_input_text_quote_object::<()>(None)
+                .is_none()
         );
     }
 
@@ -40132,6 +40547,7 @@ mod tests {
                     text: "q".to_string(),
                     entities: Vec::new(),
                 },
+                rich_texts: Vec::new(),
                 position: 0,
                 is_manual: false,
             },
