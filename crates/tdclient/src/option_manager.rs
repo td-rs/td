@@ -244,6 +244,7 @@ fn is_internal_option(name: &str) -> bool {
         "story_expiring_limit_premium",
         "ton_proxy_address",
         "ton_stakedice_stake_suggested_amounts",
+        "ton_wallet_card_background_gifts",
         "upload_premium_speedup_notify_period",
         "video_ignore_alt_documents",
         "video_note_size_max",
@@ -1290,6 +1291,7 @@ impl OptionManager {
             "gift_resale_toncoin_cent_count_max",
             "gift_resale_toncoin_earnings_per_mille",
             "toncoin_top_up_url",
+            "venue_search_bot_username",
         ] {
             self.set_option_empty(name);
         }

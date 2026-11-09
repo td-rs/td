@@ -224,7 +224,6 @@ upload_premium_speedup_notify_period	I30
 usd_to_thousand_star_rate	I1410
 user_note_text_length_max	I128
 utc_time_offset	I0
-venue_search_bot_username	Sfoursquarebot
 verification_codes_bot_chat_id	I489000
 video_note_size_max	I12582912
 weather_bot_username	Sizweatherbot

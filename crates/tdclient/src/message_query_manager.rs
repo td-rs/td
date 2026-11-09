@@ -97,6 +97,27 @@ pub trait MessageQueryManagerEnv {
     /// `messages_manager_->get_messages_from_server` — the
     /// [blocked: M.10 integration] refetch.
     fn get_messages_from_server(&mut self, _message_full_ids: Vec<MessageFullId>) {}
+    /// `messages_manager_->delete_local_reactions_by_sender`
+    /// (MessagesManager.cpp:9126-9142, upstream 496863e4c) — the local
+    /// removal rides before the server delete; the
+    /// [blocked: M.10 integration] seam (the messages
+    /// reaction-notification plane is unported).
+    fn delete_local_reactions_by_sender(
+        &mut self,
+        _dialog_id: DialogId,
+        _sender_dialog_id: DialogId,
+    ) {
+    }
+    /// `messages_manager_->delete_reaction_by_sender`
+    /// (MessagesManager.cpp:9144-9156, upstream 74e914ee7) — the
+    /// per-message twin of the seam above (the same plane).
+    fn delete_reaction_by_sender_locally(
+        &mut self,
+        _dialog_id: DialogId,
+        _message_id: MessageId,
+        _sender_dialog_id: DialogId,
+    ) {
+    }
 
     // -- the pts bookkeeping of the affected-history loop
     /// `updates_manager_->add_pending_pts_update` with the `dummyUpdate`.
@@ -3774,6 +3795,7 @@ impl MessageQueryManager {
             return;
         }
 
+        env.delete_local_reactions_by_sender(dialog_id, sender_dialog_id);
         env.send_delete_participant_reactions_query(dialog_id, sender_dialog_id, promise);
     }
 
@@ -3814,6 +3836,9 @@ impl MessageQueryManager {
             return;
         }
 
+        // the local delete rides before the server query
+        // (MessageQueryManager.cpp:4869, upstream 74e914ee7)
+        env.delete_reaction_by_sender_locally(dialog_id, message_id, sender_dialog_id);
         env.send_delete_participant_reaction_query(
             dialog_id,
             message_id,
@@ -4645,11 +4670,33 @@ mod tests {
         /// admits every dialog through the access gate (the M.mp tests
         /// that exercise the post-gate bands)
         access_all: bool,
+        /// the local reaction-delete seam calls (None message id = the
+        /// whole-dialog form)
+        local_reaction_deletes: Vec<(DialogId, Option<MessageId>, DialogId)>,
     }
 
     impl MessageQueryManagerEnv for RecordingEnv {
         fn auth_is_bot(&self) -> bool {
             self.base.is_bot
+        }
+
+        fn delete_local_reactions_by_sender(
+            &mut self,
+            dialog_id: DialogId,
+            sender_dialog_id: DialogId,
+        ) {
+            self.local_reaction_deletes
+                .push((dialog_id, None, sender_dialog_id));
+        }
+
+        fn delete_reaction_by_sender_locally(
+            &mut self,
+            dialog_id: DialogId,
+            message_id: MessageId,
+            sender_dialog_id: DialogId,
+        ) {
+            self.local_reaction_deletes
+                .push((dialog_id, Some(message_id), sender_dialog_id));
         }
 
         fn close_flag(&self) -> bool {
@@ -5785,6 +5832,30 @@ mod tests {
         assert_eq!(
             recorded_error(&cell),
             (400, "Invalid message identifier specified".to_owned())
+        );
+        assert!(
+            env.local_reaction_deletes.is_empty(),
+            "no local delete before the bands pass"
+        );
+
+        // a server message id passes the bands: the local delete rides
+        // before the server query (upstream 74e914ee7)
+        let sender = DialogId::from_user_id(crate::user_manager::UserId::new(42));
+        let (promise, _) = record::<()>();
+        manager.delete_reaction_by_sender(
+            &mut env,
+            user_dialog(777),
+            crate::messages_manager::MessageId::new(5 << 20),
+            sender,
+            promise,
+        );
+        assert_eq!(
+            env.local_reaction_deletes,
+            vec![(
+                user_dialog(777),
+                Some(crate::messages_manager::MessageId::new(5 << 20)),
+                sender
+            )]
         );
     }
 

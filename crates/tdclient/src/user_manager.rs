@@ -141,6 +141,12 @@ const USER_CACHE_VERSION: u32 = 4;
 const USER_FULL_EXPIRE_TIME: f64 = 60.0;
 /// `MAX_ACTIVE_STORY_ID_RELOAD_TIME` (UserManager.h:874).
 const MAX_ACTIVE_STORY_ID_RELOAD_TIME: f64 = 3600.0;
+/// `USER_FULL_CONTACT_PRICE_CACHE_TIME` (UserManager.h, edc438da9).
+const USER_FULL_CONTACT_PRICE_CACHE_TIME: f64 = 3600.0;
+/// `USER_PHOTOS_CACHE_TIME` (UserManager.h, 079246056).
+const USER_PHOTOS_CACHE_TIME: f64 = 3600.0;
+/// `USER_SAVED_MUSIC_CACHE_TIME` (UserManager.h, 079246056).
+const USER_SAVED_MUSIC_CACHE_TIME: f64 = 3600.0;
 /// `SecretChatLayer::Default` (SecretChatId.h).
 const SECRET_CHAT_DEFAULT_LAYER: i32 = 73;
 /// `MAX_NAME_LENGTH` (UserManager.h:872).
@@ -2127,12 +2133,15 @@ pub(crate) struct UploadedProfilePhoto {
 
 /// `UserManager::UserPhotos` (UserManager.h:848) — the cached window of
 /// the user's profile photos; `count`/`offset` `-1` = unknown (the C++
-/// default member initializers).
+/// default member initializers). `expires_at` is the 079246056
+/// `ExpiringWaitFreeHashMap` idle expiry (`USER_PHOTOS_CACHE_TIME` from
+/// the write; reads never extend the life — `0.0` reads stale).
 #[derive(Clone, Debug, PartialEq)]
 pub struct UserPhotos {
     pub photos: Vec<Photo>,
     pub count: i32,
     pub offset: i32,
+    pub expires_at: f64,
 }
 
 impl Default for UserPhotos {
@@ -2147,7 +2156,12 @@ impl UserPhotos {
             photos: Vec::new(),
             count: -1,
             offset: -1,
+            expires_at: 0.0,
         }
+    }
+
+    fn is_fresh(&self) -> bool {
+        self.expires_at > tdutils::time::now()
     }
 }
 
@@ -2160,12 +2174,16 @@ pub struct PendingGetSavedMusicRequest {
 }
 
 /// `UserManager::UserSavedMusic` (UserManager.h:861) — `count`/`offset`
-/// `-1` = unknown (the C++ default member initializers).
+/// `-1` = unknown (the C++ default member initializers). `expires_at` is
+/// the 079246056 `ExpiringWaitFreeHashMap` idle expiry
+/// (`USER_SAVED_MUSIC_CACHE_TIME` from the write; reads never extend the
+/// life — `0.0` reads stale).
 #[derive(Clone, Debug, PartialEq)]
 pub struct UserSavedMusic {
     pub saved_music_file_ids: Vec<FileId>,
     pub count: i32,
     pub offset: i32,
+    pub expires_at: f64,
 }
 
 impl Default for UserSavedMusic {
@@ -2180,7 +2198,12 @@ impl UserSavedMusic {
             saved_music_file_ids: Vec::new(),
             count: -1,
             offset: -1,
+            expires_at: 0.0,
         }
+    }
+
+    fn is_fresh(&self) -> bool {
+        self.expires_at > tdutils::time::now()
     }
 }
 
@@ -2441,8 +2464,10 @@ pub struct UserManager {
     user_messages: BTreeMap<i64, BTreeSet<MessageFullId>>,
     /// `user_full_contact_price_` (UserManager.h:1377) — the cached
     /// premium-required-to-contact price per user: `-1` premium required,
-    /// `0` no restriction, `> 0` the paid-messages star count.
-    user_full_contact_price: BTreeMap<i64, i64>,
+    /// `0` no restriction, `> 0` the paid-messages star count. The entry
+    /// carries the edc438da9 expiry (`ExpiringFlatHashMap`, 1 hour from
+    /// the write; reads never extend the life).
+    user_full_contact_price: BTreeMap<i64, (i64, f64)>,
     /// `noforwards_request_ids_` / `noforwards_request_message_full_ids_`
     /// (UserManager.h:1379-1380) — the two directions of the
     /// noforwards-request registry. Hash maps like the C++ FlatHashMaps:
@@ -7538,14 +7563,16 @@ impl UserManager {
         let Some(u) = self.get_user(user_id) else {
             return Err(Status::error(400, "Bot not found"));
         };
-        if !u.is_bot {
-            return Err(Status::error(400, "User is not a bot"));
+        // bb34046eb — received/deleted before the bot check, the
+        // user-worded errors
+        if !u.is_received {
+            return Err(Status::error(400, "User is inaccessible"));
         }
         if u.is_deleted {
-            return Err(Status::error(400, "Bot is deleted"));
+            return Err(Status::error(400, "User is deleted"));
         }
-        if !u.is_received {
-            return Err(Status::error(400, "Bot is inaccessible"));
+        if !u.is_bot {
+            return Err(Status::error(400, "User is not a bot"));
         }
         Ok(BotData {
             username: u.usernames.get_first_username().to_owned(),
@@ -10101,6 +10128,7 @@ impl UserManager {
         if is_me && !is_fallback && !photo.is_empty() {
             let mut registered: Option<Photo> = None;
             if let Some(user_photos) = self.user_photos.get_mut(&user_id.get())
+                && user_photos.is_fresh()
                 && user_photos.count != -1
             {
                 if user_photos.offset == 0 {
@@ -10330,7 +10358,8 @@ impl UserManager {
                 self.update_user_full(env, user_id, "delete_my_profile_photo_from_cache", false);
             }
         }
-        if let Some(user_photos) = user_photos {
+        if let Some(mut user_photos) = user_photos {
+            user_photos.expires_at = tdutils::time::now() + USER_PHOTOS_CACHE_TIME;
             self.user_photos.insert(user_id.get(), user_photos);
         }
         need_reget_user
@@ -10620,15 +10649,21 @@ impl UserManager {
         FileSourceId::new(self.next_file_source_id)
     }
 
-    /// `UserManager::add_user_photos` (UserManager.cpp:7015-7022).
+    /// `UserManager::add_user_photos` (UserManager.cpp:7015-7022). The
+    /// `operator[]` access-refresh of the expiring map lands here
+    /// (079246056): every call restarts the entry's clock.
     fn add_user_photos(&mut self, user_id: UserId) -> &mut UserPhotos {
         assert!(user_id.is_valid());
-        self.user_photos.entry(user_id.get()).or_default()
+        let entry = self.user_photos.entry(user_id.get()).or_default();
+        entry.expires_at = tdutils::time::now() + USER_PHOTOS_CACHE_TIME;
+        entry
     }
 
     /// `UserManager::drop_user_photos` (UserManager.cpp:9519-9534).
     fn drop_user_photos(&mut self, user_id: UserId, is_empty: bool, source: &str) {
-        if let Some(user_photos) = self.user_photos.get_mut(&user_id.get()) {
+        if let Some(user_photos) = self.user_photos.get_mut(&user_id.get())
+            && user_photos.is_fresh()
+        {
             let new_count = if is_empty { 0 } else { -1 };
             if user_photos.count == new_count {
                 debug_assert!(user_photos.photos.is_empty());
@@ -10786,6 +10821,7 @@ impl UserManager {
 
         self.add_user_photos(user_id);
         if let Some(user_photos) = self.user_photos.get(&user_id.get())
+            && user_photos.is_fresh()
             && user_photos.count != -1
         {
             // know photo count
@@ -10854,6 +10890,7 @@ impl UserManager {
         let mut offset = requests[0].offset;
         let mut limit = requests[0].limit;
         if let Some(user_photos) = self.user_photos.get(&user_id.get())
+            && user_photos.is_fresh()
             && user_photos.count != -1
             && offset >= user_photos.offset
         {
@@ -11113,6 +11150,7 @@ impl UserManager {
                 .photos
                 .truncate((user_photos.count - user_photos.offset) as usize);
         }
+        user_photos.expires_at = tdutils::time::now() + USER_PHOTOS_CACHE_TIME;
         self.user_photos.insert(user_id.get(), user_photos);
     }
 
@@ -11731,9 +11769,13 @@ impl UserManager {
     }
 
     /// `UserManager::add_user_saved_music` (UserManager.cpp:7566-7573).
+    /// The `operator[]` access-refresh of the expiring map lands here
+    /// (079246056): every call restarts the entry's clock.
     fn add_user_saved_music(&mut self, user_id: UserId) -> &mut UserSavedMusic {
         assert!(user_id.is_valid());
-        self.user_saved_music.entry(user_id.get()).or_default()
+        let entry = self.user_saved_music.entry(user_id.get()).or_default();
+        entry.expires_at = tdutils::time::now() + USER_SAVED_MUSIC_CACHE_TIME;
+        entry
     }
 
     /// `UserManager::drop_user_saved_music` (UserManager.cpp:9535-9550);
@@ -11743,6 +11785,9 @@ impl UserManager {
         let Some(cache) = self.user_saved_music.get(&user_id.get()) else {
             return;
         };
+        if !cache.is_fresh() {
+            return;
+        }
         let new_count = if is_empty { 0 } else { -1 };
         if cache.count == new_count {
             debug_assert!(cache.saved_music_file_ids.is_empty());
@@ -11790,6 +11835,7 @@ impl UserManager {
 
         self.add_user_saved_music(user_id);
         if let Some(user_saved_music) = self.user_saved_music.get(&user_id.get())
+            && user_saved_music.is_fresh()
             && user_saved_music.count != -1
         {
             // know saved music count
@@ -11862,6 +11908,7 @@ impl UserManager {
         let mut offset = requests[0].offset;
         let mut limit = requests[0].limit;
         if let Some(user_saved_music) = self.user_saved_music.get(&user_id.get())
+            && user_saved_music.is_fresh()
             && user_saved_music.count != -1
             && offset >= user_saved_music.offset
         {
@@ -12120,6 +12167,7 @@ impl UserManager {
         } else {
             user_saved_music.saved_music_file_ids[0]
         };
+        user_saved_music.expires_at = tdutils::time::now() + USER_SAVED_MUSIC_CACHE_TIME;
         self.user_saved_music
             .insert(user_id.get(), user_saved_music);
 
@@ -14253,7 +14301,13 @@ impl UserManager {
                 ),
             );
         }
-        match self.user_full_contact_price.get(&user_id.get()).copied() {
+        // edc438da9 — `ExpiringFlatHashMap::get`: a stale entry is a miss
+        let cached_price = self
+            .user_full_contact_price
+            .get(&user_id.get())
+            .filter(|(_, expires_at)| *expires_at > tdutils::time::now())
+            .map(|(price, _)| *price);
+        match cached_price {
             Some(price) if price > 0 => {
                 return promise.set_value(
                 td_api::CanSendMessageToUserResult::canSendMessageToUserResultUserHasPaidMessages(
@@ -14533,7 +14587,13 @@ impl UserManager {
                         get_star_count(r.stars_amount)
                     }
                 };
-                self.user_full_contact_price.insert(user_id.get(), price);
+                self.user_full_contact_price.insert(
+                    user_id.get(),
+                    (
+                        price,
+                        tdutils::time::now() + USER_FULL_CONTACT_PRICE_CACHE_TIME,
+                    ),
+                );
             }
         }
         promise.set_value(());
@@ -14545,9 +14605,10 @@ impl UserManager {
         if self.get_user_full(user_id).is_none() {
             assert!(user_id.is_valid());
             if let Some(price) = self.user_full_contact_price.get_mut(&user_id.get())
-                && *price == -1
+                && price.1 > tdutils::time::now()
+                && price.0 == -1
             {
-                *price = 0;
+                price.0 = 0;
             }
         }
     }
@@ -17564,9 +17625,11 @@ mod tests {
             telegram_api::User::user(min_bot),
             "test",
         );
+        // bb34046eb — the user-worded errors in the received/deleted
+        // order
         assert!(matches!(
             um.get_bot_data(min_bot_id),
-            Err(status) if status.message() == "Bot is inaccessible"
+            Err(status) if status.message() == "User is inaccessible"
         ));
 
         // A deleted bot is refused even when received.
@@ -17574,7 +17637,7 @@ mod tests {
         um.users.get_mut(&plain_id.get()).unwrap().is_deleted = true;
         assert!(matches!(
             um.get_bot_data(plain_id),
-            Err(status) if status.message() == "Bot is deleted"
+            Err(status) if status.message() == "User is deleted"
         ));
 
         let bot_id = um.on_get_user(
@@ -19015,8 +19078,8 @@ mod tests {
 
         // An empty userFull photo set drops the photos cache to empty
         // and the saved-music cache too (cpp:9299-9310).
-        um.user_photos.entry(5).or_default();
-        um.user_saved_music.entry(5).or_default();
+        um.add_user_photos(user_id);
+        um.add_user_saved_music(user_id);
         um.on_get_user_full(
             &mut temp.env(false),
             telegram_api::UserFull {
@@ -20078,7 +20141,7 @@ mod tests {
         env.options.set_option_boolean("is_premium", false);
 
         // the cached contact price answers (paid / premium / none)
-        um.user_full_contact_price.insert(8, 12);
+        um.user_full_contact_price.insert(8, (12, f64::MAX));
         let (promise, result) = promise_can_send_result();
         um.can_send_message_to_user(&mut env, mutual_user_id, false, promise);
         assert!(matches!(
@@ -20087,7 +20150,7 @@ mod tests {
                 td_api::CanSendMessageToUserResult::canSendMessageToUserResultUserHasPaidMessages(v)
             )) if v.outgoing_paid_message_star_count == 12
         ));
-        um.user_full_contact_price.insert(8, -1);
+        um.user_full_contact_price.insert(8, (-1, f64::MAX));
         let (promise, result) = promise_can_send_result();
         um.can_send_message_to_user(&mut env, mutual_user_id, false, promise);
         assert!(matches!(
@@ -20098,7 +20161,7 @@ mod tests {
                 )
             ))
         ));
-        um.user_full_contact_price.insert(8, 0);
+        um.user_full_contact_price.insert(8, (0, f64::MAX));
         let (promise, result) = promise_can_send_result();
         um.can_send_message_to_user(&mut env, mutual_user_id, false, promise);
         assert!(is_can_send_ok(&result.lock().unwrap()));
@@ -20293,9 +20356,9 @@ mod tests {
             promise,
         );
         assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
-        assert_eq!(um.user_full_contact_price.get(&5), Some(&0));
-        assert_eq!(um.user_full_contact_price.get(&6), Some(&-1));
-        assert_eq!(um.user_full_contact_price.get(&7), Some(&15));
+        assert_eq!(um.user_full_contact_price.get(&5).map(|e| e.0), Some(0));
+        assert_eq!(um.user_full_contact_price.get(&6).map(|e| e.0), Some(-1));
+        assert_eq!(um.user_full_contact_price.get(&7).map(|e| e.0), Some(15));
 
         // a user with a cached UserFull is skipped
         um.add_user_full(UserId::new(8));
@@ -20320,9 +20383,9 @@ mod tests {
 
         // allow_send_message_to_user clears the premium flag only
         um.allow_send_message_to_user(&env, UserId::new(6));
-        assert_eq!(um.user_full_contact_price.get(&6), Some(&0));
+        assert_eq!(um.user_full_contact_price.get(&6).map(|e| e.0), Some(0));
         um.allow_send_message_to_user(&env, UserId::new(7));
-        assert_eq!(um.user_full_contact_price.get(&7), Some(&15));
+        assert_eq!(um.user_full_contact_price.get(&7).map(|e| e.0), Some(15));
     }
 
     #[test]
@@ -20921,6 +20984,7 @@ mod tests {
                 photos: vec![photo_with_id(31)],
                 count: 2,
                 offset: 0,
+                expires_at: f64::MAX,
             },
         );
         assert!(!um.delete_my_profile_photo_from_cache(&mut temp.env(false), 99));
@@ -20951,6 +21015,7 @@ mod tests {
                 photos: vec![photo_with_id(41)],
                 count: 3,
                 offset: 1,
+                expires_at: f64::MAX,
             },
         );
         um.users.get_mut(&7).unwrap().photo = as_profile_photo(&photo_with_id(41), false);
@@ -20967,6 +21032,7 @@ mod tests {
                 photos: vec![photo_with_id(51)],
                 count: 1,
                 offset: 0,
+                expires_at: f64::MAX,
             },
         );
         assert!(!um.delete_my_profile_photo_from_cache(&mut temp.env(false), 99));
@@ -20996,6 +21062,7 @@ mod tests {
                 photos: vec![photo_with_id(31)],
                 count: 1,
                 offset: 0,
+                expires_at: f64::MAX,
             },
         );
         let (promise, result) = promise_result();
@@ -21013,6 +21080,7 @@ mod tests {
                 photos: vec![photo_with_id(41)],
                 count: 3,
                 offset: 1,
+                expires_at: f64::MAX,
             },
         );
         um.users.get_mut(&7).unwrap().photo = as_profile_photo(&photo_with_id(41), false);

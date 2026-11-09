@@ -3384,7 +3384,10 @@ impl NotificationManager {
                         .expect("pending updates hold a notification");
                     if is_removed(notification) {
                         assert!(notification.id != 0);
-                        removed_notification_ids.insert(notification.id);
+                        // 4c6377aa7 — an edit doesn't make a notification
+                        // new; its later removal stays live unless an
+                        // addition was cancelled too (the id is NOT
+                        // remembered as already removed).
                         is_whole_update_removed = true;
                     }
                 }
@@ -4623,6 +4626,53 @@ fn base64_decode_url(input: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    /// 4c6377aa7 — an edit (updateNotification) of a removed notification
+    /// no longer remembers the id as already-removed: the later
+    /// removal inside a pending group update survives.
+    #[test]
+    fn edit_removal_keeps_the_later_group_removal() {
+        let mut manager = NotificationManager::default();
+        let notification = td_api::Notification {
+            id: 5,
+            date: 0,
+            is_silent: false,
+            r#type: None,
+        };
+        manager.pending_updates.insert(
+            1,
+            vec![
+                Some(td_api::Update::updateNotification(
+                    td_api::updateNotification {
+                        notification_group_id: 1,
+                        notification: Some(notification),
+                    },
+                )),
+                Some(td_api::Update::updateNotificationGroup(
+                    td_api::updateNotificationGroup {
+                        notification_group_id: 1,
+                        r#type: None,
+                        chat_id: 0,
+                        notification_settings_chat_id: 0,
+                        notification_sound_id: 0,
+                        total_count: 0,
+                        added_notifications: Vec::new(),
+                        removed_notification_ids: vec![5],
+                    },
+                )),
+            ],
+        );
+        manager.remove_added_notifications_from_pending_updates(
+            NotificationGroupId::new(1),
+            |notification| notification.id == 5,
+        );
+        let updates = manager.pending_updates.get(&1).unwrap();
+        assert!(updates[0].is_none(), "the edit update itself is dropped");
+        let Some(td_api::Update::updateNotificationGroup(group)) = &updates[1] else {
+            panic!("the group update stays");
+        };
+        assert_eq!(group.removed_notification_ids, vec![5]);
+    }
+
     use super::*;
     use tdutils::promise::PromiseCreator;
 

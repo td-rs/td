@@ -494,11 +494,21 @@ impl RequestedDialogType {
     ) -> Result<(), Status> {
         match dialog_id.get_type() {
             DialogType::User => {
-                if self.type_ != RequestedDialogTypeType::User {
+                // 26766da73 — check_shared_user: a managed-bot
+                // (CreateBot) request shares a user dialog too
+                if self.type_ != RequestedDialogTypeType::User
+                    && self.type_ != RequestedDialogTypeType::CreateBot
+                {
                     return Err(Status::error(400, "Wrong chat type"));
                 }
                 let user_id = dialog_id.get_user_id();
-                if self.restrict_is_bot && env.is_user_bot(user_id) != self.is_bot {
+                // The server verifies ownership and the manager of a
+                // newly created bot; locally, never accept an ordinary
+                // user for a managed-bot request.
+                let is_bot = env.is_user_bot(user_id);
+                if (self.type_ == RequestedDialogTypeType::CreateBot && !is_bot)
+                    || (self.restrict_is_bot && is_bot != self.is_bot)
+                {
                     return Err(Status::error(400, "Wrong is_bot value"));
                 }
                 if self.restrict_is_premium && env.is_user_premium(user_id) != self.is_premium {
@@ -611,12 +621,19 @@ impl RequestedDialogType {
         Ok(())
     }
 
-    /// `check_shared_dialog_count` (RequestedDialogType.cpp:313-321).
+    /// `check_shared_dialog_count` (RequestedDialogType.cpp:313-321)
+    /// with the 26766da73 managed-bot cap: a CreateBot request accepts
+    /// one dialog regardless of max_quantity.
     pub fn check_shared_dialog_count(&self, count: usize) -> Result<(), Status> {
         if count == 0 {
             return Err(Status::error(400, "Too few chats are chosen"));
         }
-        if count > self.max_quantity as usize {
+        let max_quantity = if self.type_ == RequestedDialogTypeType::CreateBot {
+            1
+        } else {
+            self.max_quantity
+        };
+        if count > max_quantity as usize {
             return Err(Status::error(400, "Too many chats are chosen"));
         }
         Ok(())
@@ -1021,6 +1038,33 @@ mod tests {
                 .expect_err("not a bot")
                 .message(),
             "Wrong is_bot value"
+        );
+        // 26766da73 — a managed-bot (CreateBot) request shares a user
+        // dialog, but never an ordinary user; its count caps at 1.
+        let create_bot = RequestedDialogType {
+            type_: RequestedDialogTypeType::CreateBot,
+            max_quantity: 5,
+            ..RequestedDialogType::default()
+        };
+        assert!(
+            create_bot
+                .check_shared_dialog(&env, DialogId::new(100))
+                .is_ok()
+        );
+        assert_eq!(
+            create_bot
+                .check_shared_dialog(&env, DialogId::new(200))
+                .expect_err("an ordinary user is not a managed bot")
+                .message(),
+            "Wrong is_bot value"
+        );
+        assert!(create_bot.check_shared_dialog_count(1).is_ok());
+        assert_eq!(
+            create_bot
+                .check_shared_dialog_count(2)
+                .expect_err("the managed-bot cap is 1")
+                .message(),
+            "Too many chats are chosen"
         );
         // A group request against a user dialog is a type mismatch.
         let group = RequestedDialogType {

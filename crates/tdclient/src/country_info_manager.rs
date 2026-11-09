@@ -830,7 +830,8 @@ pub(crate) fn get_country_flag_emoji(country_code: &str) -> String {
         return "\u{1F52E}".to_string(); // crystal ball
     }
     if first == b'F' && second == b'T' {
-        return "\u{1F3F4}\u{200D}\u{2620}\u{FE0F}".to_string(); // pirate flag
+        // 4a85043f5 — the gem stone replaced the pirate flag
+        return "\u{1F48E}".to_string(); // gem stone
     }
     if first == b'X' && second == b'G' {
         return "\u{1F6F0}".to_string(); // satellite
@@ -1125,10 +1126,7 @@ mod tests {
         assert_eq!(get_country_flag_emoji("GB"), "\u{1F1EC}\u{1F1E7}");
         // the special codes are case-insensitive like the C++ to_upper
         assert_eq!(get_country_flag_emoji("yl"), "\u{1F52E}"); // crystal ball
-        assert_eq!(
-            get_country_flag_emoji("FT"),
-            "\u{1F3F4}\u{200D}\u{2620}\u{FE0F}"
-        );
+        assert_eq!(get_country_flag_emoji("FT"), "\u{1F48E}"); // gem stone (4a85043f5)
         assert_eq!(get_country_flag_emoji("xg"), "\u{1F6F0}"); // satellite
         assert_eq!(get_country_flag_emoji("XV"), "\u{1F30D}"); // Europe-Africa globe
         // the validation bands

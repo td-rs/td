@@ -302,11 +302,12 @@ impl PartialOrd for MessageReactor {
     }
 }
 
-/// `operator==` (MessageReactor.cpp:143-146) — `min_channel_` is
-/// deliberately not compared, like the C++.
+/// `operator==` (MessageReactor.cpp:143-146) — 7c9c98cd2 added
+/// `min_channel_` to the comparison.
 impl PartialEq for MessageReactor {
     fn eq(&self, other: &Self) -> bool {
         self.dialog_id == other.dialog_id
+            && self.min_channel == other.min_channel
             && self.count == other.count
             && self.is_top == other.is_top
             && self.is_me == other.is_me

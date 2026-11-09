@@ -126,6 +126,16 @@ pub trait ForumTopicEnv {
         let _ = dialog_id;
         String::new()
     }
+    /// `user_manager_->get_user_first_username(bot_user_id)`
+    /// (b6f529c9e, the getForumTopicLink bot-forum arm).
+    fn get_user_first_username(&self, user_id: i64) -> String {
+        let _ = user_id;
+        String::new()
+    }
+    /// `user_manager_->get_my_id()` (b6f529c9e — the self-bot form).
+    fn get_my_user_id(&self) -> i64 {
+        0
+    }
     /// `messages_manager_->get_dialog_default_send_message_as_dialog_id`
     /// (MessagesManager.cpp:20886-20890) — the dialog record's field,
     /// invalid until set; the real read lands with the messages plane.
@@ -648,7 +658,9 @@ impl ForumTopicManager {
         );
     }
 
-    /// `get_forum_topic_link` (ForumTopicManager.cpp:881-901).
+    /// `get_forum_topic_link` (ForumTopicManager.cpp:881-901) with the
+    /// b6f529c9e bot-forum arm: the topic link of a chat with a bot
+    /// names the bot (never public).
     pub fn get_forum_topic_link(
         &mut self,
         env: &mut impl ForumTopicEnv,
@@ -656,7 +668,7 @@ impl ForumTopicManager {
         forum_topic_id: ForumTopicId,
         mut promise: Promise<td_api::MessageLink>,
     ) {
-        let status = env.is_forum(dialog_id, false);
+        let status = env.is_forum(dialog_id, true);
         if status.is_error() {
             promise.set_error(status);
             return;
@@ -668,12 +680,27 @@ impl ForumTopicManager {
         }
         let mut link = "https://t.me/".to_owned();
         let mut is_public = false;
-        let dialog_username = env.get_channel_first_username(dialog_id);
-        if !dialog_username.is_empty() {
-            link.push_str(&dialog_username);
-            is_public = true;
+        if dialog_id.get_type() == crate::dialog_id::DialogType::User {
+            // the topic exists only in the chat between the user and the
+            // bot, so the link isn't public
+            let bot_user_id = if env.is_bot() {
+                env.get_my_user_id()
+            } else {
+                dialog_id.get_user_id().get()
+            };
+            let bot_username = env.get_user_first_username(bot_user_id);
+            if bot_username.is_empty() {
+                return promise.set_error(Status::error(400, "The bot has no username"));
+            }
+            link.push_str(&bot_username);
         } else {
-            link.push_str(&format!("c/{}", dialog_id.get_channel_id().get()));
+            let dialog_username = env.get_channel_first_username(dialog_id);
+            if !dialog_username.is_empty() {
+                link.push_str(&dialog_username);
+                is_public = true;
+            } else {
+                link.push_str(&format!("c/{}", dialog_id.get_channel_id().get()));
+            }
         }
         link.push_str(&format!("/{}", forum_topic_id.get()));
         promise.set_value(td_api::MessageLink { link, is_public });
@@ -1426,6 +1453,7 @@ mod tests {
         can_edit_topics: bool,
         can_pin_topics: bool,
         can_delete_messages: bool,
+        bot_username: String,
     }
 
     impl Default for TestEnv {
@@ -1438,6 +1466,7 @@ mod tests {
                 can_edit_topics: true,
                 can_pin_topics: true,
                 can_delete_messages: true,
+                bot_username: String::new(),
             }
         }
     }
@@ -1445,6 +1474,10 @@ mod tests {
     impl ForumTopicEnv for TestEnv {
         fn is_bot(&self) -> bool {
             self.bot
+        }
+
+        fn get_user_first_username(&self, _user_id: i64) -> String {
+            self.bot_username.clone()
         }
 
         fn unix_time(&mut self) -> i32 {
@@ -1765,6 +1798,45 @@ mod tests {
         assert_eq!(manager.pending.delete_tails.len(), 1);
     }
 
+    /// b6f529c9e — getForumTopicLink over a bot forum: the link names the
+    /// bot and is never public; a username-less bot is a 400.
+    #[test]
+    fn get_forum_topic_link_answers_the_bot_forum_arm() {
+        let mut manager = ForumTopicManager::new();
+        let bot_dialog = DialogId::from_user_id(crate::user_manager::UserId::new(42));
+        let topic = ForumTopicId::new(7);
+
+        let (promise, slot) = record::<td_api::MessageLink>();
+        manager.get_forum_topic_link(&mut TestEnv::default(), FORUM, topic, promise);
+        match &*slot.lock().unwrap() {
+            Some(tdutils::status::Result::Ok(link)) => {
+                assert!(!link.is_public);
+                assert!(link.link.starts_with("https://t.me/c/"), "{}", link.link);
+            }
+            other => panic!("the channel arm: {other:?}"),
+        }
+
+        let mut env = TestEnv {
+            bot_username: "my_bot".to_owned(),
+            ..TestEnv::default()
+        };
+        let (promise, slot) = record::<td_api::MessageLink>();
+        manager.get_forum_topic_link(&mut env, bot_dialog, topic, promise);
+        match &*slot.lock().unwrap() {
+            Some(tdutils::status::Result::Ok(link)) => {
+                assert_eq!(link.link, "https://t.me/my_bot/7");
+                assert!(!link.is_public);
+            }
+            other => panic!("the bot arm: {other:?}"),
+        }
+
+        let (promise, slot) = record::<td_api::MessageLink>();
+        manager.get_forum_topic_link(&mut TestEnv::default(), bot_dialog, topic, promise);
+        assert!(
+            matches!(&*slot.lock().unwrap(), Some(tdutils::status::Result::Err(e)) if e.message() == "The bot has no username"),
+            "the username-less bot is a 400"
+        );
+    }
     #[test]
     fn get_forum_topics_validation_bands() {
         let mut manager = ForumTopicManager::new();

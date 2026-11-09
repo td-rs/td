@@ -3881,6 +3881,35 @@ pub(crate) type BoostNetHandle = NetKindHandle<crate::boost_manager::BoostNetKin
 /// `FinishCreateCommunityChain` convention).
 type ConvertGiftQueue = Arc<Mutex<Vec<(crate::dialog_id::DialogId, Promise<()>)>>>;
 
+/// The phone-number-privacy chain queue — the C++
+/// `PromiseCreator::lambda` of `AccountManager::create_user_link`
+/// (AccountManager.cpp:1407-1420): the `get_privacy` answer parks here
+/// and the pump re-enters `on_get_find_by_phone_number_privacy` with the
+/// FIFO-paired `(token, expiry, promise)` triple (the same
+/// queue-decoupling convention).
+type PhonePrivacyAnswerQueue =
+    Arc<Mutex<Vec<tdutils::status::Result<td_api::UserPrivacySettingRules>>>>;
+
+/// The `PrivacyManager::get_privacy` promise of the `getUserLink`
+/// phone-number arm — parks the rules answer onto the
+/// [`PhonePrivacyAnswerQueue`] (the C++ lambda's
+/// `on_get_find_by_phone_number_privacy` send_closure).
+struct PhonePrivacyChain {
+    answers: PhonePrivacyAnswerQueue,
+}
+
+impl tdutils::promise::PromiseInterface<td_api::UserPrivacySettingRules> for PhonePrivacyChain {
+    fn set_value(&mut self, value: td_api::UserPrivacySettingRules) {
+        self.answers.lock().push(tdutils::status::Result::Ok(value));
+    }
+
+    fn set_error(&mut self, error: Status) {
+        self.answers
+            .lock()
+            .push(tdutils::status::Result::Err(error));
+    }
+}
+
 /// The `delete_forum_topic` continuation queue — the C++
 /// `PromiseCreator::lambda` (ForumTopicManager.cpp:1028-1037): the
 /// affected-history loop's completion parks the request promise for the
@@ -6569,6 +6598,12 @@ pub struct Td {
     /// The ConvertStarGiftQuery continuation queue (the reload-completes-
     /// into-transfer-tail hop).
     convert_gift_queue: ConvertGiftQueue,
+    /// The phone-number-privacy chain answers — the C++
+    /// `PromiseCreator::lambda` queue of `create_user_link`
+    /// (AccountManager.cpp:1407-1420); the pump drains them into the
+    /// account manager's `on_get_find_by_phone_number_privacy`
+    /// FIFO-paired with its `pending_phone_privacy_link` triples.
+    phone_privacy_answers: PhonePrivacyAnswerQueue,
     /// The interned sponsored-peer search queries (the
     /// `GetSponsoredPeers { query_index }` kind payload).
     sponsored_peer_queries: Vec<std::sync::Arc<str>>,
@@ -7095,6 +7130,7 @@ impl Td {
             forum_topic_delete_completions: Arc::new(Mutex::new(Vec::new())),
             message_query_net_pending: crate::message_query_manager::PendingNetQueries::default(),
             convert_gift_queue: Arc::new(Mutex::new(Vec::new())),
+            phone_privacy_answers: Arc::new(Mutex::new(Vec::new())),
             sponsored_peer_queries: Vec::new(),
             nearest_dc_promises: Vec::new(),
             country_language_codes: Vec::new(),
@@ -9465,6 +9501,13 @@ impl Td {
         self.dispatch_completed_star_gift_net();
         self.dispatch_completed_messages_net();
         self.dispatch_completed_send_message_net();
+        // The `getUserLink` phone-number arm (AccountManager.cpp:1401-1427)
+        // — the parked `get_privacy` drives fire after the privacy plane
+        // drained, so both the synchronized-cache and the net-answer
+        // completions reach `on_get_find_by_phone_number_privacy` in this
+        // tick.
+        self.drive_phone_privacy_links();
+        self.drain_phone_privacy_answers();
         let completed = std::mem::take(&mut *self.net_completed.lock());
         for (token, query) in completed {
             let Some((request_id, kind)) = self.pending_net.remove(&token) else {
@@ -9479,6 +9522,73 @@ impl Td {
         if tdactor::Scheduler::in_scheduler_context() {
             tdactor::send_closure_later(self.actor_id_of::<Td>(), TdMessage::FlushDeferred);
         }
+    }
+
+    /// Drive the parked `getUserLink` phone-number-privacy lookups
+    /// (AccountManager.cpp:1416-1420) — one `get_privacy` per pump pass
+    /// serves the whole FIFO lot (the privacy manager's own promise
+    /// dedup; the marker count collapses to at most one in-flight
+    /// query per setting).
+    fn drive_phone_privacy_links(&mut self) {
+        let requests = std::mem::take(&mut self.account_manager.phone_privacy_requests);
+        if requests == 0 {
+            return;
+        }
+        let promise = Promise::from_interface(PhonePrivacyChain {
+            answers: Arc::clone(&self.phone_privacy_answers),
+        });
+        let (mut privacy_manager, mut env) = privacy_env_split(self);
+        let _ = privacy_manager.get_privacy(
+            &mut env,
+            Some(
+                &td_api::UserPrivacySetting::userPrivacySettingAllowFindingByPhoneNumber(
+                    td_api::userPrivacySettingAllowFindingByPhoneNumber,
+                ),
+            ),
+            promise,
+        );
+        self.privacy_manager = privacy_manager;
+    }
+
+    /// Drain the phone-number-privacy chain answers — FIFO-pair each
+    /// rules result with the account manager's oldest parked
+    /// `(token, expiry, promise)` triple and re-enter
+    /// `on_get_find_by_phone_number_privacy` (the C++
+    /// `PromiseCreator::lambda`).
+    fn drain_phone_privacy_answers(&mut self) {
+        let answers = std::mem::take(&mut *self.phone_privacy_answers.lock());
+        if answers.is_empty() {
+            return;
+        }
+        let mut parked = std::mem::take(&mut self.account_manager.pending_phone_privacy_link);
+        let mut paired = 0;
+        for answer in answers {
+            if paired >= parked.len() {
+                break;
+            }
+            let (token, expire_date, promise) = std::mem::take(&mut parked[paired]);
+            paired += 1;
+            let net = self.account_net();
+            let mut env = AccountEnv {
+                global: &mut self.global,
+                options: self.option_manager.as_mut(),
+                user_manager: &mut self.user_manager,
+                chat_manager: &mut self.chat_manager,
+                device_token_manager: &mut self.device_token_manager,
+                auth_is_bot: self.auth_manager.is_bot(),
+                updates: &mut self.account_updates,
+                net,
+            };
+            self.account_manager.on_get_find_by_phone_number_privacy(
+                &mut env,
+                answer,
+                token,
+                expire_date,
+                promise,
+            );
+        }
+        parked.drain(0..paired);
+        self.account_manager.pending_phone_privacy_link = parked;
     }
 
     /// The cloned updates dispatch surface for the env builders — `None`
@@ -10136,32 +10246,6 @@ impl Td {
         result
     }
 
-    /// The chat twin of [`Self::with_user_manager_env`] — the
-    /// `reload_channel_full` tail's manager pair.
-    fn with_chat_manager_env<R>(
-        &mut self,
-        f: impl FnOnce(
-            &mut crate::chat_manager::ChatManager,
-            &mut crate::user_manager::UserManager,
-            &mut crate::user_manager::UserEnv,
-        ) -> R,
-    ) -> R {
-        let mut chat_manager = std::mem::take(&mut self.chat_manager);
-        let mut user_manager = std::mem::take(&mut self.user_manager);
-        let mut env = crate::user_manager::UserEnv {
-            global: &mut self.global,
-            options: self
-                .option_manager
-                .as_mut()
-                .expect("the option manager is set for the netted td"),
-            auth_is_bot: self.auth_manager.is_bot(),
-        };
-        let result = f(&mut chat_manager, &mut user_manager, &mut env);
-        self.user_manager = user_manager;
-        self.chat_manager = chat_manager;
-        result
-    }
-
     /// The cloned bot-info dispatch surface (the `BotInfoEnv` senders —
     /// the C++ ResultHandler send legs of the bot-administration
     /// families).
@@ -10441,6 +10525,26 @@ impl Td {
         self.user_manager = user_manager;
     }
 
+    /// `td_->user_manager_->invalidate_user_full(td_->user_manager_->get_my_id())`
+    /// — the 788e3b74c self-UserFull invalidation of the wallet-replace
+    /// answer (the take/env/restore shape of the intake helpers).
+    fn invalidate_my_user_full(&mut self) {
+        let my_id = self.user_manager.get_my_id();
+        let mut user_manager = std::mem::take(&mut self.user_manager);
+        let is_bot = self.auth_manager.is_bot();
+        let Some(options) = self.option_manager.as_mut() else {
+            self.user_manager = user_manager;
+            return;
+        };
+        let mut env = crate::user_manager::UserEnv {
+            global: &mut self.global,
+            options,
+            auth_is_bot: is_bot,
+        };
+        user_manager.invalidate_user_full(&mut env, my_id);
+        self.user_manager = user_manager;
+    }
+
     /// `G()->get_webfile_dc_id()` (Global.cpp:254-264) — the toncenter
     /// perform request rides the webfile DC like the C++; the config
     /// seam answers the empty id until the option lands (the dispatcher
@@ -10678,7 +10782,9 @@ impl Td {
             // `EnableWalletBackupQuery` (cpp:294-322),
             // `DisableWalletBackupQuery` (cpp:324-361) and
             // `ReplaceWalletQuery` (cpp:419-450) — the WalletState answer
-            // feeds `on_update_wallet_state`, then the promise value.
+            // feeds `on_update_wallet_state`, then the promise value; the
+            // replace flow additionally invalidates the self UserFull
+            // (788e3b74c — the TON wallet card has changed).
             TonWalletNetKind::EnableBackup
             | TonWalletNetKind::DisableBackup
             | TonWalletNetKind::ReplaceWallet => {
@@ -10699,6 +10805,11 @@ impl Td {
                                 let mut env = TonWalletEnv { td: &mut *self };
                                 manager.on_update_wallet_state(&mut env, wallet_state);
                                 self.ton_wallet_manager = manager;
+                                if matches!(kind, TonWalletNetKind::ReplaceWallet) {
+                                    // 788e3b74c — the TON wallet card has
+                                    // changed: invalidate the self UserFull
+                                    self.invalidate_my_user_full();
+                                }
                                 promise.set_value(());
                             }
                             Err(_) => promise.set_error(parse_error("the wallet backup answer")),
@@ -18232,7 +18343,21 @@ impl Td {
                         promise.set_error(query.error().clone());
                     } else {
                         match telegram_api::payments_PaymentResult::parse(query.ok()) {
-                            Ok(telegram_api::payments_PaymentResult::payments_paymentResult(_)) => {
+                            Ok(telegram_api::payments_PaymentResult::payments_paymentResult(
+                                result,
+                            )) => {
+                                // 6aa26a95f — process_updates_users_and_chats
+                                // over the payment updates before the promise
+                                if let Some(mut updates) = result.updates {
+                                    let mut sink = TdSink::default();
+                                    crate::updates_manager::process_updates_users_and_chats(
+                                        &mut sink,
+                                        &mut updates,
+                                    );
+                                    self.updates_manager.sink().users.append(&mut sink.users);
+                                    self.updates_manager.sink().chats.append(&mut sink.chats);
+                                    self.drain_sink();
+                                }
                                 promise.set_value(())
                             }
                             Ok(telegram_api::payments_PaymentResult::payments_paymentVerificationNeeded(
@@ -19509,7 +19634,9 @@ impl Td {
                 }
             }
             // `DeleteParticipantReactionQuery`
-            // (MessageQueryManager.cpp:2026-2040) — the same head gate.
+            // (MessageQueryManager.cpp:2026-2040) — the same head gate;
+            // 6aa26a95f: the Updates answer re-enters `on_get_updates`
+            // with the query-carried promise instead of dropping.
             MessageQueryNetKind::DeleteParticipantReaction {
                 dialog_id,
                 sender_dialog_id,
@@ -19519,7 +19646,16 @@ impl Td {
                 else {
                     return;
                 };
-                let result = unit_bool_result(&query, "messages.deleteParticipantReaction");
+                let result = if query.is_error() {
+                    tdutils::status::Result::Err(query.error().clone())
+                } else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => tdutils::status::Result::Ok(updates),
+                        Err(_) => tdutils::status::Result::Err(parse_error(
+                            "messages.deleteParticipantReaction",
+                        )),
+                    }
+                };
                 // cpp:2035-2039 — the same off-channel head gate
                 let head_status = match &result {
                     tdutils::status::Result::Err(status)
@@ -19538,7 +19674,10 @@ impl Td {
                     );
                 }
                 match result {
-                    tdutils::status::Result::Ok(()) => promise.set_value(()),
+                    tdutils::status::Result::Ok(updates) => self.um_send(UmMessage::OnGetUpdates {
+                        updates: Box::new(updates),
+                        promise,
+                    }),
                     tdutils::status::Result::Err(status) => {
                         // cpp:2039-2041 — MESSAGE_NOT_MODIFIED answers ok
                         if status.message() == "MESSAGE_NOT_MODIFIED" {
@@ -23818,9 +23957,10 @@ impl Td {
     }
 
     /// Route one quick-reply net answer by kind — the ok values drop
-    /// (`Promise<Unit>`); the delete-messages error tail logs the
-    /// deferred `reload_quick_reply_messages` re-entry (the messages
-    /// plane).
+    /// (`Promise<Unit>`), except the 6aa26a95f delete-messages band: its
+    /// Updates answer re-enters `on_get_updates` with the query-carried
+    /// promise; the delete-messages error tail logs the deferred
+    /// `reload_quick_reply_messages` re-entry (the messages plane).
     fn on_quick_reply_net_answer(&mut self, kind: QuickReplyNetKind, query: NetQuery) {
         if query.is_error() {
             let mut manager = std::mem::take(&mut self.quick_reply_manager);
@@ -23830,17 +23970,40 @@ impl Td {
         }
         // `fetch_result` only unwraps — the ok values drop; the parse
         // validates the constructor the C++ fetches.
-        let parsed = match kind {
-            QuickReplyNetKind::EditShortcut | QuickReplyNetKind::DeleteMessages { .. } => {
-                telegram_api::Updates::parse(query.ok())
-                    .map(|_| ())
-                    .map_err(|_| Status::error(500, "Failed to parse the quick-reply answer"))
+        if let QuickReplyNetKind::DeleteMessages { .. } = kind {
+            match telegram_api::Updates::parse(query.ok()) {
+                Ok(updates) => {
+                    let mut manager = std::mem::take(&mut self.quick_reply_manager);
+                    let promise = manager.take_net_promise(kind);
+                    self.quick_reply_manager = manager;
+                    if let Some(promise) = promise {
+                        self.um_send(UmMessage::OnGetUpdates {
+                            updates: Box::new(updates),
+                            promise,
+                        });
+                    }
+                }
+                Err(_) => {
+                    let mut manager = std::mem::take(&mut self.quick_reply_manager);
+                    manager.on_net_answer(
+                        kind,
+                        Err(Status::error(500, "Failed to parse the quick-reply answer")),
+                    );
+                    self.quick_reply_manager = manager;
+                }
             }
+            return;
+        }
+        let parsed = match kind {
+            QuickReplyNetKind::EditShortcut => telegram_api::Updates::parse(query.ok())
+                .map(|_| ())
+                .map_err(|_| Status::error(500, "Failed to parse the quick-reply answer")),
             QuickReplyNetKind::DeleteShortcut | QuickReplyNetKind::Reorder => {
                 parse_wire_bool_value(query.ok())
                     .map(|_| ())
                     .ok_or_else(|| Status::error(500, "Failed to parse the quick-reply answer"))
             }
+            QuickReplyNetKind::DeleteMessages { .. } => unreachable!("handled above"),
         };
         let mut manager = std::mem::take(&mut self.quick_reply_manager);
         manager.on_net_answer(kind, parsed);
@@ -25575,39 +25738,102 @@ impl Td {
                     }
                 }
             }
-            // `ExportContactTokenQuery` (cpp:545-572) — the expires
-            // clamp keeps the link alive for at least a second; the
-            // token link answers `can_get_permanent_link = false`
-            // (cpp:625).
+            // `ExportContactTokenQuery` (cpp:578-616) — the expires clamp
+            // keeps the link alive for at least a second; the token link
+            // answers `can_get_permanent_link = false` (cpp:615). A
+            // carried unpaid-messages token rewrites the answer through
+            // the link manager: the url must parse to an
+            // internalLinkTypeUserToken, the `free=` query is appended,
+            // and the earlier of the two expiries wins.
             AccountNetKind::ExportContactToken => {
-                let promise = self
-                    .account_manager
-                    .take_promise(|m| &mut m.pending_user_link);
+                let promise = (!self.account_manager.pending_user_link.is_empty())
+                    .then(|| self.account_manager.pending_user_link.remove(0));
                 if query.is_error() {
-                    if let Some(mut promise) = promise {
+                    if let Some((_, _, mut promise)) = promise {
                         promise.set_error(query.error().clone());
                     }
                     return;
                 }
                 match telegram_api::ExportedContactToken::parse(query.ok()) {
                     Ok(ptr) => {
-                        if let Some(mut promise) = promise {
-                            // get_user_link_expires_in (cpp:571-576)
-                            // — the zero guard before the clamp.
-                            let expires_in = if ptr.expires == 0 {
-                                0
-                            } else {
-                                (ptr.expires - self.global.unix_time()).max(1)
-                            };
+                        if let Some((token, token_expire_date, mut promise)) = promise {
+                            let mut url = ptr.url;
+                            let mut expire_date = ptr.expires;
+                            if !token.is_empty() {
+                                let rewrite_error =
+                                    |promise: &mut Promise<td_api::UserLink>, status: Status| {
+                                        promise.set_error(status);
+                                    };
+                                let mut env = TdLinkEnv {
+                                    global: &mut self.global,
+                                    options: self.option_manager.as_mut(),
+                                };
+                                match crate::link_manager::parse_internal_link(
+                                    &mut env, &url, false,
+                                ) {
+                                    Some(link) => {
+                                        let link_type = link.get_internal_link_type_object(&env);
+                                        match link_type {
+                                            td_api::InternalLinkType::internalLinkTypeUserToken(
+                                                mut type_token,
+                                            ) => {
+                                                type_token.unpaid_messages_token = token.clone();
+                                                match crate::link_manager::get_internal_link(
+                                                    &mut env,
+                                                    Some(&td_api::InternalLinkType::internalLinkTypeUserToken(type_token)),
+                                                    false,
+                                                ) {
+                                                    Ok(r_url) => url = r_url,
+                                                    Err(status) => {
+                                                        rewrite_error(
+                                                            &mut promise,
+                                                            status,
+                                                        );
+                                                        return;
+                                                    }
+                                                }
+                                                if token_expire_date != 0
+                                                    && token_expire_date < expire_date
+                                                {
+                                                    expire_date = token_expire_date;
+                                                }
+                                            }
+                                            _ => {
+                                                rewrite_error(
+                                                    &mut promise,
+                                                    Status::error(
+                                                        500,
+                                                        "Receive unsupported user link",
+                                                    ),
+                                                );
+                                                return;
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        rewrite_error(
+                                            &mut promise,
+                                            Status::error(500, "Receive invalid user link"),
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
                             promise.set_value(td_api::UserLink {
-                                url: ptr.url,
-                                expires_in,
+                                url,
+                                // get_user_link_expires_in (cpp:571-576)
+                                // — the zero guard before the clamp.
+                                expires_in: if expire_date == 0 {
+                                    0
+                                } else {
+                                    (expire_date - self.global.unix_time()).max(1)
+                                },
                                 can_get_permanent_link: false,
                             });
                         }
                     }
                     Err(_) => {
-                        if let Some(mut promise) = promise {
+                        if let Some((_, _, mut promise)) = promise {
                             promise.set_error(parse_error("contacts_exportContactToken"));
                         }
                     }
@@ -28702,31 +28928,11 @@ impl Td {
                     promise: Some(promise),
                     convert_queue: Arc::clone(&self.convert_gift_queue),
                 };
+                // cb4cb24a9 — the reload-user-full/channel-full chain
+                // leaves (it double-counted the gift): the promise
+                // settles directly
                 let mut chain_promise: Promise<()> = Promise::from_interface(chain);
-                let my_dialog_id = crate::dialog_manager::get_my_dialog_id(self);
-                if dialog_id == my_dialog_id {
-                    let my_id = self.user_manager.get_my_id();
-                    self.with_user_manager_env(|user_manager, env| {
-                        user_manager.reload_user_full(
-                            env,
-                            my_id,
-                            chain_promise,
-                            "ConvertStarGiftQuery",
-                        )
-                    });
-                } else if dialog_id.get_type() == crate::dialog_id::DialogType::Channel {
-                    let channel_id = dialog_id.get_channel_id();
-                    self.with_chat_manager_env(|chat_manager, _user_manager, env| {
-                        chat_manager.reload_channel_full(
-                            env,
-                            channel_id,
-                            chain_promise,
-                            "ConvertStarGiftQuery",
-                        )
-                    });
-                } else {
-                    chain_promise.set_value(());
-                }
+                chain_promise.set_value(());
             }
             // `SaveStarGiftQuery::on_result`/`on_error`
             // (StarGiftManager.cpp:549-561).
@@ -28853,6 +29059,8 @@ impl Td {
             // `GetSavedStarGiftQuery::on_result`/`on_error`
             // (StarGiftManager.cpp:1761-1784).
             StarGiftNetKind::GetSavedStarGift { dialog_id } => {
+                let mut users = Vec::new();
+                let mut chats = Vec::new();
                 let result = if query.is_error() {
                     let status = query.error().clone();
                     crate::dialog_manager::on_get_dialog_error(
@@ -28864,10 +29072,18 @@ impl Td {
                     Err(status)
                 } else {
                     match telegram_api::payments_SavedStarGifts::parse(query.ok()) {
-                        Ok(ptr) => Ok(ptr),
+                        Ok(mut ptr) => {
+                            // 6aa26a95f — on_get_users/on_get_chats before
+                            // the gifts walk
+                            users = std::mem::take(&mut ptr.users);
+                            chats = std::mem::take(&mut ptr.chats);
+                            Ok(ptr)
+                        }
                         Err(_) => Err(parse_error("payments.getSavedStarGift")),
                     }
                 };
+                self.intake_users(users, "GetSavedStarGiftQuery");
+                self.intake_chats(chats, "GetSavedStarGiftQuery");
                 self.with_star_gift_manager(|env, manager| {
                     manager.on_get_saved_star_gift(env, result)
                 });
@@ -38478,7 +38694,15 @@ impl crate::message_query_manager::MessageQueryManagerEnv for MessageQueryEnv<'_
             // query goes out.
             self.add_pending_owned_star_count(-star_count, false);
         }
-        let mut flags = 1 << 1; // QUERY_MASK
+        // the QUERY_MASK constant left with the C++ writer's auto-flag
+        // for non-empty strings (upstream ddf621c1d): the C++ store sets
+        // the query bit itself when the string is non-empty — the Rust
+        // store stays purely conditional, so the bit rides here, iff
+        // the query is non-empty like the C++ wire form.
+        let mut flags = 0;
+        if !query.is_empty() {
+            flags |= 1 << 1; // QUERY_MASK
+        }
         if star_count > 0 {
             flags |= 1 << 2; // ALLOW_PAID_STARS_MASK
         }
@@ -39655,6 +39879,32 @@ impl AccountManagerEnv for AccountEnv<'_> {
             .to_owned()
     }
 
+    /// `LinkManager::get_internal_link(internalLinkTypeUserPhoneNumber
+    /// (phone, "", false, token), false)` — the phone-number arm of
+    /// `on_get_find_by_phone_number_privacy` (AccountManager.cpp:1410-1417).
+    fn get_phone_number_user_link(
+        &mut self,
+        phone_number: &str,
+        unpaid_messages_token: &str,
+    ) -> std::result::Result<String, Status> {
+        let mut env = TdLinkEnv {
+            global: self.global,
+            options: self.options.as_deref_mut(),
+        };
+        crate::link_manager::get_internal_link(
+            &mut env,
+            Some(&td_api::InternalLinkType::internalLinkTypeUserPhoneNumber(
+                td_api::internalLinkTypeUserPhoneNumber {
+                    phone_number: phone_number.to_owned(),
+                    draft_text: String::new(),
+                    open_profile: false,
+                    unpaid_messages_token: unpaid_messages_token.to_owned(),
+                },
+            )),
+            false,
+        )
+    }
+
     // ---- The net query senders — the C++ ResultHandler send legs
     // (AccountManager.cpp:180-612). The dispatch-dependency argument of
     // the C++ `net_query_creator().create` calls collapses (the port's
@@ -40167,6 +40417,15 @@ impl CommunityManagerEnv for CommunityEnv<'_> {
 
     fn get_chat_id_object(&mut self, dialog_id: crate::dialog_id::DialogId) -> i64 {
         dialog_id.get()
+    }
+
+    // ea2241d48 — the collapse-change fan-out into the dialog filters.
+    fn remove_community_from_dialog_filters(
+        &mut self,
+        community_id: crate::community_id::CommunityId,
+    ) {
+        let (mut filter_env, dialog_filter_manager) = dialog_filter_env_split(self.td);
+        dialog_filter_manager.remove_community_from_dialog_filters(&mut filter_env, community_id);
     }
 
     fn auth_is_bot(&self) -> bool {
@@ -49118,6 +49377,16 @@ impl crate::forum_topic_manager::ForumTopicEnv for ForumTopicTdEnv<'_> {
 
     fn get_my_dialog_id(&mut self) -> DialogId {
         DialogId::from_user_id(self.user_manager.get_my_id())
+    }
+
+    fn get_user_first_username(&self, user_id: i64) -> String {
+        self.user_manager
+            .get_user_first_username_of(crate::user_manager::UserId::new(user_id))
+            .to_owned()
+    }
+
+    fn get_my_user_id(&self) -> i64 {
+        self.user_manager.get_my_id().get()
     }
 
     // `td_->dialog_manager_->get_input_peer(dialog_id, rights)` — the
@@ -60558,12 +60827,33 @@ mod tests {
 
         // 1. getUserLink — the plain form (remove_messages_fee =
         //    false) with the empty first username parks at the
-        //    contacts_exportContactToken query; the answer clamps the
+        //    phone-number privacy (AccountManager.cpp:1401-1420); the
+        //    pump drives account.getPrivacy, and without a
+        //    my_phone_number option the chain falls through to the
+        //    contacts_exportContactToken query — the answer clamps the
         //    expiry against the td clock.
         let (promise, slot) = record_account_user_link();
         with_account_manager(&mut td, |manager, env| {
             manager.get_user_link(env, false, false, false, promise);
         });
+        assert!(
+            rec.sent.lock().is_empty(),
+            "the phone arm waits for the privacy drive"
+        );
+        td.dispatch_completed_walking();
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::account_getPrivacy::ID
+        );
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            wire_privacy_rules_answer(vec![telegram_api::PrivacyRule::privacyValueAllowAll(
+                telegram_api::privacyValueAllowAll,
+            )]),
+        );
+        td.dispatch_completed_walking();
         let sent = std::mem::take(&mut *rec.sent.lock());
         assert_eq!(sent.len(), 1);
         assert_eq!(
@@ -76331,6 +76621,45 @@ mod tests {
             other => panic!("the error tail answers 400: {other:?}"),
         }
 
+        // 3.5 the delete-messages ok tail (6aa26a95f) — the Updates
+        //     answer re-enters `on_get_updates` carrying the promise; an
+        //     empty umbrella settles it ok.
+        {
+            let (mut manager, mut env) = quick_reply_env_split(&mut td);
+            manager.on_update_quick_reply_shortcut(&mut env, 2, "notes".to_string());
+            td.quick_reply_manager = manager;
+        }
+        let (promise, slot) = record_translation_unit();
+        {
+            let (mut manager, mut env) = quick_reply_env_split(&mut td);
+            manager.delete_quick_reply_shortcut_messages(&mut env, 2, &[100], promise);
+            td.quick_reply_manager = manager;
+        }
+        // (the empty umbrella's state reconciliation may queue its own
+        // query — pick the delete answer by constructor)
+        let sent = std::mem::take(&mut *rec.sent.lock())
+            .into_iter()
+            .find(|q| q.tl_constructor() == telegram_api::messages_deleteQuickReplyMessages::ID)
+            .expect("the delete-messages query rode the dispatcher");
+        let mut answer = Vec::new();
+        telegram_api::Updates::updates(telegram_api::updates {
+            updates: Vec::new(),
+            users: Vec::new(),
+            chats: Vec::new(),
+            seq: 0,
+            date: 0,
+        })
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_quick_reply_net();
+        assert!(
+            matches!(
+                slot.lock().unwrap().take(),
+                Some(tdutils::status::Result::Ok(()))
+            ),
+            "the promise settles through on_get_updates"
+        );
+
         // 4. reorderQuickReplies — answers Bool (the value drops).
         {
             let (mut manager, mut env) = quick_reply_env_split(&mut td);
@@ -76343,13 +76672,11 @@ mod tests {
             manager.reorder_quick_reply_shortcuts(&mut env, &[3, 2], promise);
             td.quick_reply_manager = manager;
         }
-        let sent = std::mem::take(&mut *rec.sent.lock());
-        assert_eq!(sent.len(), 1);
-        assert_eq!(
-            sent[0].tl_constructor(),
-            telegram_api::messages_reorderQuickReplies::ID
-        );
-        net_complete(sent.into_iter().next().unwrap(), bool_answer(true));
+        let sent = std::mem::take(&mut *rec.sent.lock())
+            .into_iter()
+            .find(|q| q.tl_constructor() == telegram_api::messages_reorderQuickReplies::ID)
+            .expect("the reorder query rode the dispatcher");
+        net_complete(sent, bool_answer(true));
         td.dispatch_completed_quick_reply_net();
         assert!(matches!(
             slot.lock().unwrap().take(),

@@ -41,8 +41,36 @@ pub const MAX_MNEMONIC_BACKUP_SIZE: usize = 215;
 /// 48 base64(any-alphabet) characters decoding to 36 bytes with a valid
 /// CRC-16/XMODEM checksum over the first 34 and the anycast/metadata bits
 /// in the first byte.
+///
+/// The 4af7ec065 raw form: with `allow_raw`, a `"<workchain>:<64
+/// hexadecimal digits>"` address passes without the checksum walk.
 pub fn check_ton_address(address: &str) -> Result<()> {
+    check_ton_address_impl(address, false)
+}
+
+/// `check_ton_address(address, true)` — the raw-address arm of
+/// getAddressTonWallet/sendTonWalletTransfer
+/// (TonWalletManager.cpp:1437-1458, 4af7ec065).
+pub fn check_ton_address_allow_raw(address: &str) -> Result<()> {
+    check_ton_address_impl(address, true)
+}
+
+fn check_ton_address_impl(address: &str, allow_raw: bool) -> Result<()> {
     let error = |code: i32, msg: &str| Status::error(code, msg);
+    if allow_raw && let Some(colon_pos) = address.find(':') {
+        // raw address "<workchain>:<64 hexadecimal digits>"
+        if address[..colon_pos].parse::<i32>().is_err() {
+            return Result::Err(error(400, "Invalid address workchain"));
+        }
+        let account_id = &address[colon_pos + 1..];
+        if account_id.len() != 64 {
+            return Result::Err(error(400, "Invalid address length"));
+        }
+        if !account_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Result::Err(error(400, "Invalid address format"));
+        }
+        return Result::Ok(());
+    }
     if address.len() != 48 {
         return Result::Err(error(400, "Invalid address length"));
     }
@@ -1348,7 +1376,7 @@ impl TonWalletManager {
         address: &str,
         mut promise: Promise<td_api::UserTonWalletAddress>,
     ) {
-        match check_ton_address(address) {
+        match check_ton_address_allow_raw(address) {
             Result::Ok(()) => {}
             Result::Err(status) => return promise.set_error(status),
         }
@@ -1661,7 +1689,7 @@ impl TonWalletManager {
         sending_id: i32,
         mut promise: Promise<td_api::TonWalletTransferResult>,
     ) {
-        match check_ton_address(peer_address) {
+        match check_ton_address_allow_raw(peer_address) {
             Result::Ok(()) => {}
             Result::Err(status) => return promise.set_error(status),
         }
@@ -2554,6 +2582,37 @@ mod tests {
 
         // Wrong length.
         assert!(check_ton_address(&address[..47]).is_error());
+
+        // 4af7ec065 — the raw "<workchain>:<64 hex digits>" form: the
+        // allow_raw arms accept it, the strict arm does not.
+        let raw_address = "0:8002F3AB9BE0AC5D76E6E0A73E33C33E0E6F9EDF1CBC3A71D24A0AF1D6C1D70B";
+        assert_eq!(raw_address.len(), "0:".len() + 64);
+        assert!(check_ton_address_allow_raw(raw_address).is_ok());
+        assert!(check_ton_address(raw_address).is_error());
+        assert!(
+            check_ton_address_allow_raw(
+                "-1:8002f3ab9be0ac5d76e6e0a73e33c33e0e6f9edf1cbc3a71d24a0af1d6c1d70b"
+            )
+            .is_ok()
+        );
+        // non-numeric workchain
+        assert!(
+            check_ton_address_allow_raw(
+                "x:8002f3ab9be0ac5d76e6e0a73e33c33e0e6f9edf1cbc3a71d24a0af1d6c1d70b"
+            )
+            .is_error()
+        );
+        // wrong account length
+        assert!(check_ton_address_allow_raw("0:8002f3ab").is_error());
+        // non-hex digit
+        assert!(
+            check_ton_address_allow_raw(
+                "0:8002f3ab9be0ac5d76e6e0a73e33c33e0e6f9edf1cbc3a71d24a0af1d6c1d70g"
+            )
+            .is_error()
+        );
+        // the user-friendly form still passes the allow_raw arm
+        assert!(check_ton_address_allow_raw(&address).is_ok());
     }
 
     /// The recording env: the update outbox + the seam sends.
