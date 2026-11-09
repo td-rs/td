@@ -3447,16 +3447,16 @@ impl DialogNotificationSettings {
     /// `DialogNotificationSettings::get_input_peer_notify_settings`
     /// (DialogNotificationSettings.cpp:11-33) — the
     /// `account_updateNotifySettings` value form; the flag bits are the
-    /// `peerNotifySettings` masks (mute_until `0`, silent `1`,
-    /// show_previews `2`, sound `3`, stories_muted `6`,
+    /// `peerNotifySettings` masks (show_previews `0`, silent `1`,
+    /// mute_until `2`, sound `3`, stories_muted `6`,
     /// stories_hide_sender `7`, stories_sound `8`).
     pub fn get_input_peer_notify_settings(&self) -> telegram_api::InputPeerNotifySettings {
         let mut flags = 0;
         if !self.use_default_mute_until {
-            flags |= 1 << 0;
+            flags |= 1 << 2;
         }
         if !self.use_default_show_preview {
-            flags |= 1 << 2;
+            flags |= 1 << 0;
         }
         if !self.use_default_mute_stories {
             flags |= 1 << 6;
@@ -3642,10 +3642,10 @@ pub fn get_dialog_notification_settings_from_telegram(
         return result;
     };
 
-    // The flag bits are the peerNotifySettings masks (mute_until `0`,
-    // show_previews `2`, stories_muted `6`, stories_hide_sender `7`).
-    let use_default_mute_until = settings.flags & (1 << 0) == 0;
-    let use_default_show_preview = settings.flags & (1 << 2) == 0;
+    // The flag bits are the peerNotifySettings masks (show_previews `0`,
+    // mute_until `2`, stories_muted `6`, stories_hide_sender `7`).
+    let use_default_mute_until = settings.flags & (1 << 2) == 0;
+    let use_default_show_preview = settings.flags & (1 << 0) == 0;
     let use_default_mute_stories = settings.flags & (1 << 6) == 0;
     let use_default_hide_story_sender = settings.flags & (1 << 7) == 0;
     let mute_until = if use_default_mute_until || settings.mute_until <= unix_time {
@@ -17834,7 +17834,22 @@ pub fn on_get_dialogs(
                 }
                 log_error!("Receive unexpected {folder:?}");
             }
-            telegram_api::Dialog::dialogCommunity(_) => {}
+            telegram_api::Dialog::dialogCommunity(dialog_community) => {
+                // 99302f0e2 (MessagesManager.cpp:12727-12737): the
+                // community notify settings piggybacked on the getDialogs
+                // answer route into the community manager.
+                let community_id =
+                    crate::community_id::CommunityId::new(dialog_community.community_id);
+                if community_id.is_valid() {
+                    ctx.community_on_update_notify_settings(
+                        community_id,
+                        dialog_community.notify_settings.as_ref(),
+                        "on_get_dialogs",
+                    );
+                } else {
+                    log_error!("Receive {dialog_community:?}");
+                }
+            }
         }
     }
 
@@ -31908,6 +31923,16 @@ pub trait MmRequestContext:
     /// read-date privacy read (the properties/read-date planes).
     fn get_user_read_dates_private(&mut self, _user_id: UserId) -> bool {
         false
+    }
+
+    /// `CommunityManager::on_update_community_notify_settings`
+    /// (99302f0e2) — the `on_get_dialogs` `dialogCommunity` intake.
+    fn community_on_update_notify_settings(
+        &mut self,
+        _community_id: crate::community_id::CommunityId,
+        _peer_notify_settings: Option<&telegram_api::PeerNotifySettings>,
+        _source: &str,
+    ) {
     }
 
     /// `ChatManager::get_channel_effective_has_hidden_participants`.

@@ -116,32 +116,46 @@ pub trait CommunityManagerEnv {
     /// `GetCommunityNotifySettingsQuery::send` (99302f0e2,
     /// CommunityManager.cpp:121-138) — `account_getNotifySettings` over
     /// `inputNotifyCommunity`; the answer routes through the community
-    /// net-answer drain (`GetNotifySettings`).
-    fn send_get_community_notify_settings_query(&mut self, community_id: CommunityId) {
+    /// net-answer drain (`GetNotifySettings`). The input is resolved
+    /// manager-side (the manager is taken out under the env).
+    fn send_get_community_notify_settings_query(
+        &mut self,
+        community_id: CommunityId,
+        input_community: telegram_api::InputChannel,
+    ) {
         tdutils::log_info!(
             "Send account_getNotifySettings for {community_id:?} — [net-inert]"
         );
+        let _ = input_community;
     }
 
     /// `UpdateCommunityNotifySettingsQuery::send` (99302f0e2,
     /// CommunityManager.cpp:140-168) — `account_updateNotifySettings` over
     /// the full's converted settings; the answer routes through the
-    /// community net-answer drain (`UpdateNotifySettings`).
+    /// community net-answer drain (`UpdateNotifySettings`). The input is
+    /// resolved manager-side.
     fn send_update_community_notify_settings_query(
         &mut self,
         community_id: CommunityId,
+        input_community: telegram_api::InputChannel,
         notification_settings: &DialogNotificationSettings,
     ) {
         tdutils::log_info!(
             "Send account_updateNotifySettings for {community_id:?} — [net-inert]"
         );
-        let _ = notification_settings;
+        let _ = (input_community, notification_settings);
     }
 
     /// `reload_community_full` (c9ed2c390's postpone arm) — the
-    /// `channels.getFullCommunity` reload behind the parked settings.
-    fn reload_community_full(&mut self, community_id: CommunityId) {
+    /// `channels.getFullCommunity` reload behind the parked settings
+    /// (the input resolved manager-side).
+    fn reload_community_full(
+        &mut self,
+        community_id: CommunityId,
+        input_community: telegram_api::InputChannel,
+    ) {
         tdutils::log_info!("Reload community full {community_id:?} — [net-inert]");
+        let _ = input_community;
     }
 
     /// The `MessagesManager::on_update_dialog_community_notification_settings`
@@ -423,7 +437,13 @@ impl CommunityManager {
             .is_some_and(|full| full.notification_settings.is_synchronized)
             && !env.auth_is_bot()
         {
-            env.send_get_community_notify_settings_query(community_id);
+            // The C++ CHECK band: the cached community exists (the intake
+            // gate above).
+            if let Some(input_community) =
+                self.get_input_community_impl(env.auth_is_bot(), community_id)
+            {
+                env.send_get_community_notify_settings_query(community_id, input_community);
+            }
         }
         // c9ed2c390: the settings parked at the missing full apply now
         // that the chat list is here (the `on_reload_community_full_`
@@ -544,7 +564,11 @@ impl CommunityManager {
                 .pending_community_notification_settings
                 .contains_key(&community_id.get())
             {
-                env.reload_community_full(community_id);
+                if let Some(input_community) =
+                    self.get_input_community_impl(env.auth_is_bot(), community_id)
+                {
+                    env.reload_community_full(community_id, input_community);
+                }
             }
             self.pending_community_notification_settings
                 .insert(community_id.get(), new_settings);
@@ -770,7 +794,13 @@ impl CommunityManager {
                 .get_community_notification_settings_queries
                 .insert(community_id.get())
             {
-                env.send_get_community_notify_settings_query(community_id);
+                // The C++ CHECK band: the community is cached (the gate
+                // above).
+                if let Some(input_community) =
+                    self.get_input_community_impl(env.auth_is_bot(), community_id)
+                {
+                    env.send_get_community_notify_settings_query(community_id, input_community);
+                }
             }
             return None;
         }
@@ -842,11 +872,20 @@ impl CommunityManager {
         if !need_update_server {
             return promise.set_value(());
         }
-        // The wire form is the full's (already updated) settings.
+        // The wire form is the full's (already updated) settings. The C++
+        // CHECK band: the community is cached (the have_community gate).
         let wire_settings =
-            self.communities_full[&community_id.get()].notification_settings.clone();
-        env.send_update_community_notify_settings_query(community_id, &wire_settings);
-        self.pending_set_notification_settings.push(promise);
+            self.communities_full[&community_id.get()].notification_settings.clone();        if let Some(input_community) = self.get_input_community_impl(env.auth_is_bot(), community_id)
+        {
+            env.send_update_community_notify_settings_query(
+                community_id,
+                input_community,
+                &wire_settings,
+            );
+            self.pending_set_notification_settings.push(promise);
+        } else {
+            promise.set_error(Status::error(500, "Community not found"));
+        }
     }
 
     /// The earliest community unmute deadline — the Td timeout slot merge
@@ -1256,7 +1295,11 @@ mod tests {
             self.now
         }
 
-        fn send_get_community_notify_settings_query(&mut self, community_id: CommunityId) {
+        fn send_get_community_notify_settings_query(
+            &mut self,
+            community_id: CommunityId,
+            _input_community: telegram_api::InputChannel,
+        ) {
             self.queries
                 .push(format!("getNotifySettings {}", community_id.get()));
         }
@@ -1264,13 +1307,18 @@ mod tests {
         fn send_update_community_notify_settings_query(
             &mut self,
             community_id: CommunityId,
+            _input_community: telegram_api::InputChannel,
             _notification_settings: &DialogNotificationSettings,
         ) {
             self.queries
                 .push(format!("updateNotifySettings {}", community_id.get()));
         }
 
-        fn reload_community_full(&mut self, community_id: CommunityId) {
+        fn reload_community_full(
+            &mut self,
+            community_id: CommunityId,
+            _input_community: telegram_api::InputChannel,
+        ) {
             self.reloaded_fulls.push(community_id.get());
         }
 
@@ -1651,7 +1699,8 @@ mod tests {
 
     fn wire_peer_notify_settings(mute_until: i32) -> telegram_api::PeerNotifySettings {
         telegram_api::PeerNotifySettings {
-            flags: 1 << 0,
+            // the mute_until flag (peerNotifySettings bit 2)
+            flags: 1 << 2,
             show_previews: true,
             silent: false,
             mute_until,
