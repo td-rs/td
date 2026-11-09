@@ -40466,6 +40466,15 @@ impl CommunityManagerEnv for CommunityEnv<'_> {
         dialog_id.get()
     }
 
+    // ea2241d48 — the collapse-change fan-out into the dialog filters.
+    fn remove_community_from_dialog_filters(
+        &mut self,
+        community_id: crate::community_id::CommunityId,
+    ) {
+        let (mut filter_env, mut dialog_filter_manager) = dialog_filter_env_split(&mut self.td);
+        dialog_filter_manager.remove_community_from_dialog_filters(&mut filter_env, community_id);
+    }
+
     fn auth_is_bot(&self) -> bool {
         self.td.auth_manager.is_bot()
     }

@@ -38,6 +38,14 @@ pub trait CommunityManagerEnv {
     /// `DialogManager::get_chat_id_object` — the collapsed sync form.
     fn get_chat_id_object(&mut self, dialog_id: DialogId) -> i64;
 
+    /// `DialogFilterManager::remove_community_from_dialog_filters`
+    /// (ea2241d48) — the collapse-change fan-out.
+    fn remove_community_from_dialog_filters(&mut self, community_id: CommunityId) {
+        tdutils::log_info!(
+            "Remove community {community_id:?} from dialog filters — [dialog-filter seam]"
+        );
+    }
+
     /// `CreateCommunityQuery::send` (CommunityManager.cpp:129-136) —
     /// `communities.create` over the read-access input peer of the
     /// dialog; the answer routes through `on_get_updates` with the
@@ -369,6 +377,11 @@ impl CommunityManager {
         if community_record.collapsed_in_dialogs != community.collapsed_in_dialogs && !is_min {
             community_record.collapsed_in_dialogs = community.collapsed_in_dialogs;
             community_record.is_changed = true;
+            if !community_record.collapsed_in_dialogs {
+                // ea2241d48 — expanding the chats removes the community
+                // from all chat folders
+                env.remove_community_from_dialog_filters(community_id);
+            }
         }
         if !is_min {
             if community_record.status != status {
