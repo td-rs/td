@@ -38652,7 +38652,15 @@ impl crate::message_query_manager::MessageQueryManagerEnv for MessageQueryEnv<'_
             // query goes out.
             self.add_pending_owned_star_count(-star_count, false);
         }
-        let mut flags = 1 << 1; // QUERY_MASK
+        // the QUERY_MASK constant left with the C++ writer's auto-flag
+        // for non-empty strings (upstream ddf621c1d): the C++ store sets
+        // the query bit itself when the string is non-empty — the Rust
+        // store stays purely conditional, so the bit rides here, iff
+        // the query is non-empty like the C++ wire form.
+        let mut flags = 0;
+        if !query.is_empty() {
+            flags |= 1 << 1; // QUERY_MASK
+        }
         if star_count > 0 {
             flags |= 1 << 2; // ALLOW_PAID_STARS_MASK
         }
