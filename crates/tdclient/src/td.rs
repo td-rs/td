@@ -14978,46 +14978,40 @@ impl Td {
                     let result = tdmtproto::telegram_api::ReportResult::parse(query.ok())
                         .map_err(|_| parse_error("messages_report"));
                     match result {
-                        Ok(tdmtproto::telegram_api::ReportResult::reportResultReported(_)) => {
-                            promise.set_value(crate::td_api::Object::reportChatResultOk(
-                                crate::td_api::reportChatResultOk,
-                            ));
-                        }
-                        Ok(tdmtproto::telegram_api::ReportResult::reportResultChooseOption(
-                            options,
-                        )) => {
-                            if options.options.is_empty() {
-                                promise.set_value(crate::td_api::Object::reportChatResultOk(
-                                    crate::td_api::reportChatResultOk,
-                                ));
-                                return;
-                            }
-                            let report_options = options
-                                .options
-                                .into_iter()
-                                .map(|option| crate::td_api::ReportOption {
-                                    id: option.option,
-                                    text: option.text,
-                                })
-                                .collect();
+                        Ok(result) => {
                             promise.set_value(
-                                crate::td_api::Object::reportChatResultOptionRequired(
-                                    crate::td_api::reportChatResultOptionRequired {
-                                        title: options.title,
-                                        options: report_options,
-                                    },
-                                ),
+                                crate::dialog_manager::get_report_chat_result_object(result),
                             );
                         }
-                        Ok(tdmtproto::telegram_api::ReportResult::reportResultAddComment(
-                            comment,
-                        )) => {
-                            promise.set_value(crate::td_api::Object::reportChatResultTextRequired(
-                                crate::td_api::reportChatResultTextRequired {
-                                    option_id: comment.option,
-                                    is_optional: comment.optional,
-                                },
-                            ));
+                        Err(status) => promise.set_error(status),
+                    }
+                }
+            }
+            // `ReportEphemeralMessageQuery` (DialogManager.cpp:526-555,
+            // d4f71645a) — the same ReportResult mapping; the error head
+            // runs the dialog-error tail with no MESSAGE_ID_REQUIRED
+            // band.
+            crate::dialog_manager::DialogNetKind::ReportEphemeralMessage { dialog_id } => {
+                let Some(mut promise) = self.dialog_manager.take_report_peer_promise() else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        crate::dialog_id::DialogId::new(dialog_id.get()),
+                        &status,
+                        "ReportEphemeralMessageQuery",
+                    );
+                    promise.set_error(status);
+                } else {
+                    let result = tdmtproto::telegram_api::ReportResult::parse(query.ok())
+                        .map_err(|_| parse_error("ephemeral.reportMessage"));
+                    match result {
+                        Ok(result) => {
+                            promise.set_value(
+                                crate::dialog_manager::get_report_chat_result_object(result),
+                            );
                         }
                         Err(status) => promise.set_error(status),
                     }
@@ -19541,15 +19535,26 @@ impl Td {
             }
             // `EditEphemeralMessageQuery` (MessageQueryManager.cpp:1493-1516)
             // — the no-upload legs: the `Updates` answer re-enters
-            // `on_get_updates` with the query-carried promise.
-            MessageQueryNetKind::EditEphemeralMessage => {
+            // `on_get_updates` with the query-carried promise; the error
+            // head runs the send-fail processor before the promise error
+            // (dc124789b over the 050f319cd/f3dba9caf shape).
+            MessageQueryNetKind::EditEphemeralMessage { dialog_id } => {
                 let Some(mut promise) =
                     pop_head(&mut self.message_query_net_pending.ephemeral_edits)
                 else {
                     return;
                 };
                 if query.is_error() {
-                    return promise.set_error(query.error().clone());
+                    let process_send_fail =
+                        crate::message_query_manager::MessageQueryManager::process_send_message_fail_error;
+                    let processed = process_send_fail(
+                        query.error().clone(),
+                        dialog_id,
+                        self.auth_manager.is_bot(),
+                        true,
+                        crate::message_content::MessageContentType::None,
+                    );
+                    return promise.set_error(processed);
                 }
                 match telegram_api::Updates::parse(query.ok()) {
                     Ok(updates) => self.um_send(UmMessage::OnGetUpdates {
@@ -19561,8 +19566,12 @@ impl Td {
             }
             // `DeleteEphemeralMessageQuery`
             // (MessageQueryManager.cpp:1912-1925) — the error head logs
-            // the dialog error before the promise error.
-            MessageQueryNetKind::DeleteEphemeralMessage { dialog_id } => {
+            // the dialog error (INFO, ad2c15162 — never an error log)
+            // before the failed-deletion callback and the promise error.
+            MessageQueryNetKind::DeleteEphemeralMessage {
+                dialog_id,
+                ephemeral_message_id,
+            } => {
                 let Some(mut promise) =
                     pop_head(&mut self.message_query_net_pending.ephemeral_deletes)
                 else {
@@ -19570,11 +19579,22 @@ impl Td {
                 };
                 let result = unit_bool_result(&query, "ephemeral.deleteMessage");
                 if let tdutils::status::Result::Err(status) = &result {
-                    crate::dialog_manager::on_get_dialog_error(
+                    if !crate::dialog_manager::on_get_dialog_error(
                         &self.global,
                         dialog_id,
                         status,
                         "DeleteEphemeralMessageQuery",
+                    ) {
+                        tracing::info!(
+                            "Receive error for delete ephemeral messages: {}",
+                            status.message()
+                        );
+                    }
+                    crate::messages_manager::on_failed_ephemeral_message_deletion(
+                        &mut self.messages_manager,
+                        self.global.close_flag(),
+                        dialog_id,
+                        ephemeral_message_id,
                     );
                 }
                 match result {
@@ -37131,6 +37151,17 @@ impl crate::message_query_manager::MessageQueryManagerEnv for MessageQueryEnv<'_
         self.auth_is_bot
     }
 
+    /// `G()->is_test_dc()` — the ephemeral dedicated-channel table's DC
+    /// switch.
+    fn is_test_dc(&self) -> bool {
+        self.global.is_test_dc()
+    }
+
+    /// `dialog_manager_->get_my_dialog_id` (f2bbf2f7f's upload remap).
+    fn get_my_dialog_id(&self) -> DialogId {
+        DialogId::from_user_id(self.user_manager.get_my_id())
+    }
+
     /// `Random::secure_int64` (td/utils/Random.h).
     fn secure_random_i64(&self) -> i64 {
         tdutils::random::secure_int64()
@@ -37824,7 +37855,8 @@ impl crate::message_query_manager::MessageQueryManagerEnv for MessageQueryEnv<'_
         reply_markup: Option<crate::reply_markup::ReplyMarkup>,
         promise: Promise<()>,
     ) {
-        let kind = crate::message_query_manager::MessageQueryNetKind::EditEphemeralMessage;
+        let kind =
+            crate::message_query_manager::MessageQueryNetKind::EditEphemeralMessage { dialog_id };
         let net = self.net.clone();
         let Some(net) = net else {
             return tdutils::log_info!("Send ephemeral.editMessage — [net-inert]");
@@ -37833,7 +37865,8 @@ impl crate::message_query_manager::MessageQueryManagerEnv for MessageQueryEnv<'_
         const MESSAGE_MASK: i32 = 1; // flags.0
         const ENTITIES_MASK: i32 = 1 << 1; // flags.1
         const REPLY_MARKUP_MASK: i32 = 1 << 2; // flags.2
-        let peer = self.env_input_peer(dialog_id, crate::user_manager::AccessRights::Write);
+        let peer =
+            self.ephemeral_message_input_peer(dialog_id, crate::user_manager::AccessRights::Write);
         let input_user = self.get_input_user(receiver_user_id);
         let entities = input_caption.as_ref().map_or_else(Vec::new, |text| {
             crate::message_entity::get_input_message_entities(
@@ -37908,15 +37941,18 @@ impl crate::message_query_manager::MessageQueryManagerEnv for MessageQueryEnv<'_
         ephemeral_message_id: crate::messages_manager::EphemeralMessageId,
         promise: Promise<()>,
     ) {
-        let kind =
-            crate::message_query_manager::MessageQueryNetKind::DeleteEphemeralMessage { dialog_id };
+        let kind = crate::message_query_manager::MessageQueryNetKind::DeleteEphemeralMessage {
+            dialog_id,
+            ephemeral_message_id,
+        };
         let net = self.net.clone();
         let Some(net) = net else {
             return tdutils::log_info!("Send ephemeral.deleteMessage — [net-inert]");
         };
         const PEER_MASK: i32 = 1; // flags.0
         let receiver_is_user = receiver_dialog_id.get_type() == crate::dialog_id::DialogType::User;
-        let peer = self.env_input_peer(dialog_id, crate::user_manager::AccessRights::Read);
+        let peer =
+            self.ephemeral_message_input_peer(dialog_id, crate::user_manager::AccessRights::Read);
         let input_user = if receiver_is_user {
             Some(self.get_input_user(receiver_dialog_id.get_user_id()))
         } else {
@@ -38725,6 +38761,31 @@ impl MessageQueryEnv<'_> {
             auth_is_bot: self.auth_is_bot,
         };
         self.chat_manager.get_input_channel(&env, channel_id)
+    }
+
+    /// `MessageQueryManager::get_ephemeral_message_input_peer`
+    /// (MessageQueryManager.cpp:4212-4219, the 8fa83fe8a shape) — the
+    /// dedicated ephemeral-message channels are inaccessible, but the
+    /// ephemeral messages in them can be edited and deleted: the peer is
+    /// the raw channel with a zero access hash.
+    fn ephemeral_message_input_peer(
+        &mut self,
+        dialog_id: DialogId,
+        access_rights: crate::user_manager::AccessRights,
+    ) -> Option<telegram_api::InputPeer> {
+        if crate::messages_manager::is_bot_ephemeral_message_channel(
+            self.auth_is_bot,
+            self.global.is_test_dc(),
+            dialog_id,
+        ) {
+            return Some(telegram_api::InputPeer::inputPeerChannel(
+                telegram_api::inputPeerChannel {
+                    channel_id: dialog_id.get_channel_id().get(),
+                    access_hash: 0,
+                },
+            ));
+        }
+        self.env_input_peer(dialog_id, access_rights)
     }
 }
 

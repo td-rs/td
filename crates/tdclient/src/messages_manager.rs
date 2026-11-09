@@ -13146,8 +13146,9 @@ pub fn update_message(
         need_send_update = true;
     }
 
-    if old_message.edit_date > 0 {
-        // inline keyboard can be edited
+    if old_message.edit_date > 0 || is_ephemeral_message(old_message) {
+        // inline keyboard can be edited; ephemeral messages have no edit
+        // date, but can be edited too (a89b35d6b)
         let reply_markup_changed = (old_message.reply_markup.is_none())
             != (new_message.reply_markup.is_none())
             || (old_message.reply_markup.is_some()
@@ -13236,7 +13237,14 @@ pub fn update_message(
         "update_message",
     );
 
+    // `if (is_edited && (!td_->auth_manager_->is_bot() ||
+    // is_ephemeral_message(old_message)))`
+    // (MessagesManager.cpp:32946-32949) — bots receive updateMessageEdited
+    // for other messages from on_message_edited; the emission itself is
+    // the Td update-plane seam, the gate rides the outcome (dd40b4679).
     outcome.is_edited = is_edited;
+    outcome.send_update_message_edited =
+        is_edited && (!ctx.is_bot() || is_ephemeral_message(old_message));
     outcome.need_send_update = need_send_update;
     outcome
 }
@@ -13282,8 +13290,13 @@ fn on_message_changed(
 /// plane (the Td wiring) consumes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UpdateMessageEditOutcome {
-    /// `is_edited` — `updateMessageEdited` must be sent for a non-bot.
+    /// `is_edited` — the edit-date/edited-schedule/reply-markup
+    /// transitions flagged the message as edited.
     pub is_edited: bool,
+    /// `updateMessageEdited` must be sent — `is_edited && (!is_bot ||
+    /// is_ephemeral_message)` (dd40b4679: bots receive it for other
+    /// messages from on_message_edited).
+    pub send_update_message_edited: bool,
     /// `need_send_update` — the message object changed for the app.
     pub need_send_update: bool,
     /// `is_content_changed` — the content object itself was replaced.
@@ -14040,6 +14053,25 @@ pub fn get_required_paid_message_star_count(error_code: i32, error_message: &str
 /// `MessagesManager::is_ephemeral_message` (MessagesManager.cpp:23395-23397).
 pub fn is_ephemeral_message(m: &Message) -> bool {
     m.receiver_user_id.is_valid()
+}
+
+/// `MessagesManager::is_bot_ephemeral_message_channel`
+/// (MessagesManager.cpp:23511-23521, the 171762277 shape) — bots can
+/// receive ephemeral messages in the channels without being their
+/// members; the two hard-coded channel ids per DC kind.
+pub fn is_bot_ephemeral_message_channel(
+    is_bot: bool,
+    is_test_dc: bool,
+    dialog_id: DialogId,
+) -> bool {
+    if !is_bot || dialog_id.get_type() != DialogType::Channel {
+        return false;
+    }
+    let channel_id = dialog_id.get_channel_id().get();
+    if is_test_dc {
+        return channel_id == 8000042883 || channel_id == 8001701879;
+    }
+    channel_id == 3937063115 || channel_id == 4412713723
 }
 
 /// `MessagesManager::is_message_forward` (MessagesManager.cpp:23411-23413).
@@ -21036,7 +21068,10 @@ pub fn get_message_properties_request(
     let can_mark_tasks_as_done = can_mark_message_tasks_as_done(ctx, dialog_id, m);
     let can_recognize_speech = can_recognize_message_speech(dialog_id, m);
     let can_report_chat = if ephemeral_message_id.is_valid() {
-        false
+        // ephemeral messages are reportable by users for incoming
+        // messages (d4f71645a); the report reroutes through
+        // ephemeral.reportMessage
+        !is_bot && !m.is_outgoing
     } else {
         can_report_dialog && can_report_message(message_id).is_ok()
     };
@@ -21176,6 +21211,24 @@ fn get_message_ephemeral_message_id(m: &Message) -> EphemeralMessageId {
         Some(ephemeral_message) => ephemeral_message.ephemeral_message_id,
         None => m.ephemeral_message_id,
     }
+}
+
+/// `MessagesManager::get_ephemeral_message_id_of_message_id`
+/// (MessagesManager.cpp:4199-4201) — the reverse lookup over the loaded
+/// message; `get_message_force`'s db load is the dialog-db receive seam
+/// (the memory probe answers here).
+pub fn get_ephemeral_message_id_of_message_id(
+    manager: &MessagesManager,
+    dialog_id: DialogId,
+    message_id: MessageId,
+) -> EphemeralMessageId {
+    manager
+        .get_dialog(dialog_id)
+        .and_then(|d| get_message_in_dialog(d, message_id))
+        .map_or_else(
+            EphemeralMessageId::default,
+            get_message_ephemeral_message_id,
+        )
 }
 
 /// `MessagesManager::can_share_message_in_story`
@@ -24059,6 +24112,7 @@ pub fn create_message_to_send(
     is_copy: bool,
     send_as_dialog_id: DialogId,
     is_quick_reply_message: bool,
+    is_ephemeral: bool,
 ) -> Box<Message> {
     let is_scheduled = options.schedule_date != 0;
     let dialog_id = d.dialog_id;
@@ -24120,7 +24174,10 @@ pub fn create_message_to_send(
         ..Message::default()
     });
     let is_channel_post = ctx.is_broadcast_channel_dialog(dialog_id);
-    if !is_channel_post
+    if is_ephemeral {
+        // ephemeral messages are always sent by the user itself
+        message.sender_user_id = my_id;
+    } else if !is_channel_post
         || (!is_scheduled && ctx.get_channel_sign_messages(dialog_id.get_channel_id()))
     {
         if message_topic.is_monoforum() {
@@ -24160,7 +24217,10 @@ pub fn create_message_to_send(
     } else {
         message.sender_dialog_id = dialog_id;
     }
-    if is_channel_post && !is_scheduled && ctx.get_channel_sign_messages(dialog_id.get_channel_id())
+    if is_channel_post
+        && !is_scheduled
+        && !is_ephemeral
+        && ctx.get_channel_sign_messages(dialog_id.get_channel_id())
     {
         let show_message_sender = ctx.get_channel_show_message_sender(dialog_id.get_channel_id());
         if message.sender_dialog_id != dialog_id || !message.has_explicit_sender {
@@ -24207,13 +24267,14 @@ pub fn create_message_to_send(
     message.noforwards = options.protect_content;
     message.allow_paid = options.allow_paid;
     message.paid_message_star_count = options.paid_message_star_count;
-    message.view_count = if is_channel_post && !is_scheduled {
+    message.view_count = if is_channel_post && !is_scheduled && !is_ephemeral {
         1
     } else {
         0
     };
     message.forward_count = 0;
     if !suppress_reply_info
+        && !is_ephemeral
         && !is_scheduled
         && dialog_type == DialogType::Channel
         && !ctx.is_bot()
@@ -24235,7 +24296,11 @@ pub fn create_message_to_send(
             }
         }
     }
-    if message.sender_user_id == my_id && dialog_type == DialogType::Channel && !is_channel_post {
+    if message.sender_user_id == my_id
+        && dialog_type == DialogType::Channel
+        && !is_channel_post
+        && !is_ephemeral
+    {
         message.sender_boost_count = ctx.get_channel_my_boost_count(dialog_id.get_channel_id());
         // m->sender_rank = get_my_rank — the DialogManager seam (21058)
     }
@@ -24524,6 +24589,7 @@ pub fn get_message_to_send(
     is_copy: bool,
     send_as_dialog_id: DialogId,
     is_quick_reply_message: bool,
+    is_ephemeral: bool,
 ) -> MessageFullId {
     let message = {
         let d = manager
@@ -24544,6 +24610,7 @@ pub fn get_message_to_send(
             is_copy,
             send_as_dialog_id,
             is_quick_reply_message,
+            is_ephemeral,
         )
     };
     let message_id = message.message_id;
@@ -24557,7 +24624,12 @@ pub fn get_message_to_send(
     message.random_id = random_id;
 
     assert!(
-        ctx.have_input_peer_read(dialog_id, true),
+        ctx.have_input_peer_read(dialog_id, true)
+            || is_bot_ephemeral_message_channel(
+                MessageObjectContext::is_bot(ctx),
+                ctx.is_test_dc(),
+                dialog_id
+            ),
         "have_input_peer(Read) failed for {dialog_id:?} in get_message_to_send"
     );
     let mut need_update = false;
@@ -24812,7 +24884,13 @@ pub fn create_message_input_reply_to_full(
             }
             MessageInputReplyTo {
                 message_id: m.message_id,
-                ephemeral_message_id: m.ephemeral_message_id,
+                // ephemeral messages reply to the ephemeral message, which
+                // replaced the message, if any (c64674d70)
+                ephemeral_message_id: if for_ephemeral_message {
+                    get_message_ephemeral_message_id(m)
+                } else {
+                    EphemeralMessageId::default()
+                },
                 dialog_id: DialogId::default(),
                 quote: get_message_quote_from_input(ctx, reply_to_message.quote),
                 todo_item_id: checklist_task_id,
@@ -25716,6 +25794,7 @@ pub fn send_message_group(
             false,
             DialogId::default(),
             false,
+            false,
         );
         let message_id = message_full_id.get_message_id();
 
@@ -25847,6 +25926,7 @@ pub fn send_ton_wallet_transfer(
         DialogId::default(),
         false,
         DialogId::default(),
+        false,
         false,
     )
     .get_message_id();
@@ -26113,6 +26193,7 @@ pub fn send_message(
         message_content.via_bot_user_id.is_valid(),
         DialogId::default(),
         false,
+        false,
     );
     let message_id = message_full_id.get_message_id();
 
@@ -26233,6 +26314,12 @@ pub fn on_message_media_uploaded(
         panic!("on_message_media_uploaded without the message");
     };
     let is_edit = message_id.is_any_server();
+    if !ctx.have_input_peer_read(dialog_id, true)
+        && !is_bot_ephemeral_message_channel(ctx.is_bot(), ctx.is_test_dc(), dialog_id)
+    {
+        // the message should be deleted soon (7122a0962)
+        return MediaUploadedAction::Dropped;
+    }
     if (!is_edit && m.media_album_id != 0) || media_pos != -1 {
         // `get_message_content_input_media` + `is_uploaded_input_media` —
         // the ready-input decision is the M.9/M.12 file-view seam; the
@@ -26250,6 +26337,9 @@ pub fn on_message_media_uploaded(
 /// effects).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MediaUploadedAction {
+    /// the C++ early return — the dialog is inaccessible (and not a
+    /// dedicated ephemeral-message channel), the message is dropped.
+    Dropped,
     /// `UploadMediaQuery` — the net seam.
     UploadMedia { media_album_id: i64, media_pos: i32 },
     /// `do_send_message_media` — the single-message wire send (net seam).
@@ -26290,7 +26380,9 @@ pub fn on_upload_message_media_file_error(
     if is_edit && m.edit_generation != edit_generation {
         return DoSendAction::None;
     }
-    if !ctx.have_input_peer_read(dialog_id, true) {
+    if !ctx.have_input_peer_read(dialog_id, true)
+        && !is_bot_ephemeral_message_channel(ctx.is_bot(), ctx.is_test_dc(), dialog_id)
+    {
         // the message should be deleted soon
         return DoSendAction::None;
     }
@@ -26319,7 +26411,9 @@ pub fn on_upload_message_media_fail(
     if is_edit && m.edit_generation != edit_generation {
         return UploadFinishedAction::None;
     }
-    if !ctx.have_input_peer_read(dialog_id, true) {
+    if !ctx.have_input_peer_read(dialog_id, true)
+        && !is_bot_ephemeral_message_channel(ctx.is_bot(), ctx.is_test_dc(), dialog_id)
+    {
         return UploadFinishedAction::None;
     }
     assert!(dialog_id.get_type() != DialogType::SecretChat);
@@ -26598,7 +26692,9 @@ pub fn continue_send_message(
         global.td_db().binlog().erase(log_event_id);
         return None;
     }
-    if !ctx.have_input_peer_read(dialog_id, true) {
+    if !ctx.have_input_peer_read(dialog_id, true)
+        && !is_bot_ephemeral_message_channel(ctx.is_bot(), ctx.is_test_dc(), dialog_id)
+    {
         global.td_db().binlog().erase(log_event_id);
         return None;
     }
@@ -27652,6 +27748,14 @@ pub fn do_delete_message(
     }
 
     if let Some(result) = &result {
+        if !only_from_memory || !global.use_message_database() {
+            // unloaded messages can be loaded again from the database
+            // (454670882)
+            let ephemeral_message_id = get_message_ephemeral_message_id(result);
+            if let Some(d) = manager.get_dialog_mut(dialog_id) {
+                unregister_dialog_ephemeral_message(d, ephemeral_message_id);
+            }
+        }
         on_message_deleted(manager, dialog_id, result, is_permanently_deleted, source);
     }
 
@@ -27806,10 +27910,9 @@ pub fn on_message_deleted(
         }
         DialogType::SecretChat | DialogType::None => {}
     }
-    {
-        let d = manager.get_dialog_mut(dialog_id).unwrap();
-        unregister_dialog_ephemeral_message(d, m.ephemeral_message_id);
-    }
+    // `unregister_dialog_ephemeral_message` moved to do_delete_message
+    // (454670882): on_message_deleted also runs for unloaded messages,
+    // whose ephemeral ids must stay registered
     // `ttl_unregister_message`/`ttl_period_unregister_message` — the ttl
     // scheduler seam
     // `unregister_message_content`/`unregister_message_reply` — the M.9.12
@@ -27820,6 +27923,27 @@ pub fn on_message_deleted(
     let _ = source;
 
     manager.added_message_count -= 1;
+}
+
+/// `MessagesManager::on_failed_ephemeral_message_deletion`
+/// (MessagesManager.cpp:8686-8698, the 8831a356c shape) — a failed
+/// `ephemeral.deleteMessage` un-marks the id as deleted: the message
+/// can't be reloaded from the server, but it can be received again.
+pub fn on_failed_ephemeral_message_deletion(
+    manager: &mut MessagesManager,
+    close_flag: bool,
+    dialog_id: DialogId,
+    ephemeral_message_id: EphemeralMessageId,
+) {
+    if close_flag {
+        return;
+    }
+    if let Some(d) = manager.get_dialog_mut(dialog_id) {
+        // the message can't be reloaded from the server, but it can be
+        // received again
+        d.deleted_ephemeral_message_ids
+            .remove(&ephemeral_message_id);
+    }
 }
 
 /// `MessagesManager::try_add_active_live_location`
@@ -28852,6 +28976,36 @@ pub fn on_send_message_fail(
         return;
     }
 
+    // `MessageQueryManager::process_send_message_fail_error`
+    // (MessagesManager.cpp:28338-28341, the f3dba9caf call shape over the
+    // 050f319cd move) — the error remap ladder runs before the fail; the
+    // QUOTE_TEXT_INVALID/REPLY_MESSAGE_ID_INVALID reload legs and the
+    // payment/guest reloads behind it are net seams.
+    let m = manager.get_dialog(dialog_id).and_then(|d| {
+        d.messages.get(&message_id).or_else(|| {
+            d.scheduled_messages
+                .as_ref()
+                .and_then(|s| s.scheduled_messages.get(&message_id))
+        })
+    });
+    let (error_code, error_message) = match m {
+        Some(m) => {
+            let processed =
+                crate::message_query_manager::MessageQueryManager::process_send_message_fail_error(
+                    tdutils::status::Status::error(error_code, error_message),
+                    dialog_id,
+                    ctx.is_bot(),
+                    is_ephemeral_message(m),
+                    m.content
+                        .as_ref()
+                        .expect("message without content")
+                        .get_type(),
+                );
+            (processed.code(), processed.message().to_owned())
+        }
+        None => (error_code, error_message.to_string()),
+    };
+
     let reactions_ctx = MessageObjectReactionsContext { ctx };
     fail_send_message(
         global,
@@ -28861,7 +29015,7 @@ pub fn on_send_message_fail(
         &reactions_ctx,
         message_full_id,
         error_code,
-        error_message,
+        &error_message,
     );
 }
 
@@ -29600,7 +29754,10 @@ pub fn on_get_message_full(
     // the is_sent_message count updates ride the container registries
     // (try_add_active_live_location lands with the live-location plane)
 
-    if dialog_id.get_type() == DialogType::Channel && !state.have_input_peer(dialog_id, false) {
+    if dialog_id.get_type() == DialogType::Channel
+        && !state.have_input_peer(dialog_id, false)
+        && !is_bot_ephemeral_message_channel(ctx.is_bot(), ctx.is_test_dc(), dialog_id)
+    {
         let mut dummy = false;
         let deleted = delete_message(
             global,
@@ -31020,6 +31177,28 @@ pub fn is_editable_media_message_content(content_type: MessageContentType) -> bo
             | MessageContentType::Document
             | MessageContentType::Photo
             | MessageContentType::Video
+    )
+}
+
+/// `is_allowed_ephemeral_message_content` (MessageContentType.cpp:377-396)
+/// (the 1.8.70 shape: the Widget case the range briefly added is gone
+/// again, 741042993).
+pub fn is_allowed_ephemeral_message_content(content_type: MessageContentType) -> bool {
+    matches!(
+        content_type,
+        MessageContentType::Animation
+            | MessageContentType::Audio
+            | MessageContentType::Contact
+            | MessageContentType::Document
+            | MessageContentType::Location
+            | MessageContentType::Photo
+            | MessageContentType::RichText
+            | MessageContentType::Sticker
+            | MessageContentType::Text
+            | MessageContentType::Venue
+            | MessageContentType::Video
+            | MessageContentType::VideoNote
+            | MessageContentType::VoiceNote
     )
 }
 
@@ -37286,6 +37465,40 @@ mod tests {
         (dialog_id, d)
     }
 
+    /// 8831a356c: the failed-deletion callback un-marks the id so the
+    /// ephemeral message can be received again.
+    #[test]
+    fn on_failed_ephemeral_message_deletion_unmarks_the_id() {
+        let mut manager = MessagesManager::default();
+        let (dialog_id, mut d) = channel_dialog(100);
+        let ephemeral_message_id = EphemeralMessageId::new(7);
+        d.deleted_ephemeral_message_ids.insert(ephemeral_message_id);
+        manager.dialogs.insert(dialog_id, d);
+
+        // close flag suppresses the repair
+        on_failed_ephemeral_message_deletion(&mut manager, true, dialog_id, ephemeral_message_id);
+        assert!(
+            manager.dialogs[&dialog_id]
+                .deleted_ephemeral_message_ids
+                .contains(&ephemeral_message_id)
+        );
+
+        on_failed_ephemeral_message_deletion(&mut manager, false, dialog_id, ephemeral_message_id);
+        assert!(
+            !manager.dialogs[&dialog_id]
+                .deleted_ephemeral_message_ids
+                .contains(&ephemeral_message_id)
+        );
+
+        // unknown dialog — a silent no-op like the C++
+        on_failed_ephemeral_message_deletion(
+            &mut manager,
+            false,
+            DialogId::from_user_id(UserId::new(999)),
+            ephemeral_message_id,
+        );
+    }
+
     fn some_reactions_input(emoji: &str) -> Option<td_api::ChatAvailableReactions> {
         Some(td_api::ChatAvailableReactions::chatAvailableReactionsSome(
             td_api::chatAvailableReactionsSome {
@@ -41030,6 +41243,171 @@ mod tests {
         }
     }
 
+    /// a89b35d6b: ephemeral messages have no edit date, but their inline
+    /// keyboard can be edited
+    #[test]
+    fn ephemeral_reply_markup_edits_without_an_edit_date() {
+        let dialog_id = DialogId::from_user_id(UserId::new(2000));
+        let build = |reply_markup: Option<Box<crate::reply_markup::ReplyMarkup>>| {
+            let mut m = Box::new(Message::default());
+            m.message_id = MessageId::from_server_message_id(ServerMessageId::new(400));
+            m.date = 1700000100;
+            m.edit_date = 0;
+            m.receiver_user_id = UserId::new(7);
+            m.reply_markup = reply_markup;
+            m.content = Some(crate::message_content::MessageContent::Text(
+                crate::message_content::MessageText::default(),
+            ));
+            m
+        };
+        let mut ctx = TestObjectContext::default();
+        let mut manager = MessagesManager::default();
+        let global = crate::global::Global::new();
+        let time = crate::user_manager::TimeCtx::from_global(&global);
+
+        let mut old_message = build(None);
+        let mut new_message = build(Some(Box::new(crate::reply_markup::ReplyMarkup::default())));
+        let outcome = update_message(
+            &mut ctx,
+            &global,
+            &time,
+            &mut manager,
+            dialog_id,
+            &mut old_message,
+            &mut new_message,
+            false,
+            "test",
+        );
+        assert!(
+            outcome.is_edited,
+            "the reply markup change edits the message"
+        );
+        assert!(
+            old_message.reply_markup.is_some(),
+            "the new keyboard is applied without an edit date"
+        );
+    }
+
+    /// dd40b4679: the updateMessageEdited emission gate — a bot gets it
+    /// for ephemeral messages; for other messages bots receive it from
+    /// on_message_edited instead.
+    #[test]
+    fn update_message_edited_gate_covers_bot_ephemeral_messages() {
+        let dialog_id = DialogId::from_user_id(UserId::new(2000));
+        let build = |ephemeral: bool| {
+            let mut m = Box::new(Message::default());
+            m.message_id = MessageId::from_server_message_id(ServerMessageId::new(400));
+            m.date = 1700000100;
+            if ephemeral {
+                m.receiver_user_id = UserId::new(7);
+            }
+            m.content = Some(crate::message_content::MessageContent::Text(
+                crate::message_content::MessageText::default(),
+            ));
+            m
+        };
+        let mut manager = MessagesManager::default();
+        let global = crate::global::Global::new();
+        let time = crate::user_manager::TimeCtx::from_global(&global);
+
+        // a bot + an ephemeral message: the gate opens
+        let mut ctx = TestObjectContext {
+            is_bot: true,
+            ..TestObjectContext::default()
+        };
+        let mut old_message = build(true);
+        let mut new_message = build(true);
+        new_message.edit_date = 1700000500;
+        let outcome = update_message(
+            &mut ctx,
+            &global,
+            &time,
+            &mut manager,
+            dialog_id,
+            &mut old_message,
+            &mut new_message,
+            true,
+            "test",
+        );
+        assert!(outcome.is_edited);
+        assert!(
+            outcome.send_update_message_edited,
+            "bots receive updateMessageEdited for ephemeral messages"
+        );
+
+        // a bot + a regular message: on_message_edited owns the emission
+        let mut old_message = build(false);
+        let mut new_message = build(false);
+        new_message.edit_date = 1700000500;
+        let outcome = update_message(
+            &mut ctx,
+            &global,
+            &time,
+            &mut manager,
+            dialog_id,
+            &mut old_message,
+            &mut new_message,
+            true,
+            "test",
+        );
+        assert!(outcome.is_edited);
+        assert!(!outcome.send_update_message_edited);
+
+        // a user: the gate opens for any edited message
+        let mut ctx = TestObjectContext::default();
+        let mut old_message = build(false);
+        let mut new_message = build(false);
+        new_message.edit_date = 1700000500;
+        let outcome = update_message(
+            &mut ctx,
+            &global,
+            &time,
+            &mut manager,
+            dialog_id,
+            &mut old_message,
+            &mut new_message,
+            true,
+            "test",
+        );
+        assert!(outcome.send_update_message_edited);
+    }
+
+    /// 1f10f02c5/741042993: the ephemeral-content allowlist — the media
+    /// basics, the RichText/Text pair, the contact/location/venue trio;
+    /// no widget case exists in the port's content types.
+    #[test]
+    fn is_allowed_ephemeral_message_content_table() {
+        use crate::message_content::MessageContentType as T;
+        for allowed in [
+            T::Animation,
+            T::Audio,
+            T::Contact,
+            T::Document,
+            T::Location,
+            T::Photo,
+            T::RichText,
+            T::Sticker,
+            T::Text,
+            T::Venue,
+            T::Video,
+            T::VideoNote,
+            T::VoiceNote,
+        ] {
+            assert!(is_allowed_ephemeral_message_content(allowed), "{allowed:?}");
+        }
+        for denied in [
+            T::None,
+            T::Poll,
+            T::Game,
+            T::Invoice,
+            T::Story,
+            T::PaidMedia,
+            T::ToDoList,
+        ] {
+            assert!(!is_allowed_ephemeral_message_content(denied), "{denied:?}");
+        }
+    }
+
     /// The edit_date rules (MessagesManager.cpp:32287-32301): the date only
     /// moves forward, a zero edit date is dropped, and `is_edited` fires
     /// only on a shown-edit-date change.
@@ -43257,6 +43635,7 @@ mod tests {
             false,
             DialogId::default(),
             false,
+            false,
         );
         assert_eq!(m.sender_user_id, my_id);
         assert_eq!(m.sender_dialog_id, DialogId::default());
@@ -43290,6 +43669,7 @@ mod tests {
             DialogId::default(),
             false,
             DialogId::default(),
+            false,
             false,
         );
         assert!(!m.is_outgoing, "the Saved Messages chat is not outgoing");
@@ -43327,6 +43707,7 @@ mod tests {
             DialogId::default(),
             false,
             DialogId::default(),
+            false,
             false,
         );
         assert!(m.is_outgoing, "scheduled messages are outgoing");
@@ -43368,6 +43749,7 @@ mod tests {
             DialogId::default(),
             false,
             DialogId::default(),
+            false,
             false,
         );
         assert!(m.is_channel_post);
@@ -43411,6 +43793,7 @@ mod tests {
             false,
             DialogId::default(),
             false,
+            false,
         );
         assert_eq!(m.sender_dialog_id, dialog_id);
         assert_eq!(m.author_signature, "anon");
@@ -43437,6 +43820,7 @@ mod tests {
             false,
             send_as_user,
             false,
+            false,
         );
         assert_eq!(m.sender_user_id, send_as_user.get_user_id());
         assert!(
@@ -43462,6 +43846,7 @@ mod tests {
             DialogId::default(),
             false,
             DialogId::default(),
+            false,
             false,
         );
         assert_eq!(m.sender_dialog_id, default_send_as);
@@ -43491,6 +43876,7 @@ mod tests {
             DialogId::default(),
             false,
             DialogId::default(),
+            false,
             false,
         );
         assert_eq!(
@@ -43524,6 +43910,7 @@ mod tests {
             false,
             DialogId::default(),
             false,
+            false,
         );
         assert!(m.disable_notification, "the explicit flag passes through");
 
@@ -43544,6 +43931,7 @@ mod tests {
             DialogId::default(),
             false,
             DialogId::default(),
+            false,
             false,
         );
         assert!(
@@ -43572,6 +43960,7 @@ mod tests {
             false,
             DialogId::default(),
             false,
+            false,
         );
         assert!(
             !m.disable_notification,
@@ -43599,6 +43988,7 @@ mod tests {
             false,
             DialogId::default(),
             false,
+            false,
         );
         assert_eq!(m.ttl, MessageSelfDestructType::with_ttl(60, false));
 
@@ -43625,6 +44015,7 @@ mod tests {
             DialogId::default(),
             false,
             DialogId::default(),
+            false,
             false,
         );
         assert_eq!(
@@ -43659,6 +44050,7 @@ mod tests {
             false,
             DialogId::default(),
             false,
+            false,
         );
         assert!(
             m.reply_info.is_comment,
@@ -43688,6 +44080,7 @@ mod tests {
             DialogId::default(),
             false,
             DialogId::default(),
+            false,
             false,
         );
         assert!(!m.reply_info.is_comment);
@@ -43719,6 +44112,7 @@ mod tests {
             false,
             DialogId::default(),
             false,
+            false,
         );
         assert_eq!(
             m.reply_to_random_id, 4242,
@@ -43730,6 +44124,171 @@ mod tests {
             "the replied message's thread is inherited"
         );
         assert!(m.is_topic_message);
+    }
+
+    /// 9227dec40: local ephemeral messages are always sent by the user
+    /// itself — no channel-post signature, no view count, no boost count.
+    #[test]
+    fn m10_8_ephemeral_local_message_shape() {
+        let dialog_id = DialogId::from_channel_id(ChannelId::new(100));
+        let mut ctx = SendTestContext::default();
+        ctx.broadcast_dialogs.insert(dialog_id);
+        ctx.sign_messages = true;
+        ctx.channel_boost_count = 5;
+        let my_id = ctx.content_context().get_my_id();
+
+        let mut d = Box::new(Dialog::default());
+        d.dialog_id = dialog_id;
+
+        // a plain channel post in a signing channel: the author signature
+        // is set and the view count starts at 1
+        let m = create_message_to_send(
+            &ctx,
+            &mut d,
+            &MessageTopic::default(),
+            MessageInputReplyTo::default(),
+            &m10_8_send_options(),
+            m10_8_text_content("post"),
+            false,
+            false,
+            None,
+            DialogId::default(),
+            false,
+            DialogId::default(),
+            false,
+            false,
+        );
+        assert!(!m.author_signature.is_empty());
+        assert_eq!(m.view_count, 1);
+
+        // the ephemeral twin: sent by the user itself, unsigned, no views
+        let m = create_message_to_send(
+            &ctx,
+            &mut d,
+            &MessageTopic::default(),
+            MessageInputReplyTo::default(),
+            &m10_8_send_options(),
+            m10_8_text_content("ephemeral"),
+            false,
+            false,
+            None,
+            DialogId::default(),
+            false,
+            DialogId::default(),
+            false,
+            true,
+        );
+        assert_eq!(m.sender_user_id, my_id);
+        assert_eq!(m.sender_dialog_id, DialogId::default());
+        assert!(m.author_signature.is_empty());
+        assert_eq!(m.view_count, 0);
+
+        // a non-broadcast channel: the boost count is skipped for
+        // ephemeral messages
+        let dialog_id = DialogId::from_channel_id(ChannelId::new(101));
+        let mut d = Box::new(Dialog::default());
+        d.dialog_id = dialog_id;
+        let m = create_message_to_send(
+            &ctx,
+            &mut d,
+            &MessageTopic::default(),
+            MessageInputReplyTo::default(),
+            &m10_8_send_options(),
+            m10_8_text_content("ephemeral"),
+            false,
+            false,
+            None,
+            DialogId::default(),
+            false,
+            DialogId::default(),
+            false,
+            true,
+        );
+        assert_eq!(m.sender_boost_count, 0, "ephemeral sends take no boost");
+        let m = create_message_to_send(
+            &ctx,
+            &mut d,
+            &MessageTopic::default(),
+            MessageInputReplyTo::default(),
+            &m10_8_send_options(),
+            m10_8_text_content("plain"),
+            false,
+            false,
+            None,
+            DialogId::default(),
+            false,
+            DialogId::default(),
+            false,
+            false,
+        );
+        assert_eq!(m.sender_boost_count, 5);
+    }
+
+    /// c64674d70: only ephemeral replies carry the replied message's
+    /// ephemeral id; a normal reply to a message with an ephemeral twin
+    /// drops it.
+    #[test]
+    fn m10_8_ephemeral_reply_carries_the_id_only_for_ephemeral_replies() {
+        let dialog_id = DialogId::from_user_id(UserId::new(2));
+        let mut manager = MessagesManager::default();
+        let mut ctx = SendTestContext::default();
+        ctx.inner.is_bot = false;
+
+        let target_id = MessageId::from_server_message_id(ServerMessageId::new(100));
+        let mut target = Box::new(Message::default());
+        target.message_id = target_id;
+        target.sender_user_id = dialog_id.get_user_id();
+        target.ephemeral_message_id = EphemeralMessageId::new(9);
+        target.content = Some(m10_8_text_content("target"));
+        {
+            let d = manager.add_dialog_for_new_message(dialog_id);
+            d.last_new_message_id = target_id;
+            d.messages.insert(target_id, target);
+        }
+
+        let reply_to = || {
+            td_api::InputMessageReplyTo::inputMessageReplyToMessage(
+                td_api::inputMessageReplyToMessage {
+                    message_id: target_id.get(),
+                    quote: None,
+                    checklist_task_id: 0,
+                    poll_option_id: String::new(),
+                },
+            )
+        };
+
+        // a normal reply drops the ephemeral id
+        let input_reply_to = create_message_input_reply_to(
+            &mut ctx,
+            &manager,
+            dialog_id,
+            &MessageTopic::default(),
+            Some(reply_to()),
+            false,
+        );
+        assert_eq!(input_reply_to.message_id, target_id);
+        assert!(
+            !input_reply_to.ephemeral_message_id.is_valid(),
+            "a normal reply carries no ephemeral id"
+        );
+
+        // an ephemeral reply resolves it through the getter
+        let d = manager.get_dialog(dialog_id).unwrap();
+        let input_reply_to = create_message_input_reply_to_full(
+            &mut ctx,
+            &manager,
+            d,
+            &MessageTopic::default(),
+            Some(reply_to()),
+            false,
+            true,
+        );
+        assert_eq!(input_reply_to.message_id, target_id);
+        assert_eq!(
+            input_reply_to.ephemeral_message_id,
+            EphemeralMessageId::new(9),
+            "the ephemeral reply answers to the ephemeral message"
+        );
     }
 
     /// The reply-plumbing table (MessagesManager.cpp:21149-21314 + 21133): the
@@ -44244,6 +44803,7 @@ mod tests {
                     DialogId::default(),
                     false,
                     DialogId::default(),
+                    false,
                     false,
                 );
                 // begin_send_message reads the message through the manager;
@@ -46554,6 +47114,31 @@ mod tests {
             // The ephemeral split runs through the properties ladder; the
             // ephemeral helper pins the actual-content form.
             assert!(!is_ephemeral_message(&m));
+        }
+
+        #[test]
+        fn bot_ephemeral_message_channel_table() {
+            // 171762277: the dedicated-channel table per DC kind — only a
+            // bot in exactly the hard-coded channels matches.
+            let prod = DialogId::from_channel_id(crate::chat_manager::ChannelId::new(3937063115));
+            let prod2 = DialogId::from_channel_id(crate::chat_manager::ChannelId::new(4412713723));
+            let test = DialogId::from_channel_id(crate::chat_manager::ChannelId::new(8000042883));
+            let test2 = DialogId::from_channel_id(crate::chat_manager::ChannelId::new(8001701879));
+            let other = DialogId::from_channel_id(crate::chat_manager::ChannelId::new(1234));
+            assert!(is_bot_ephemeral_message_channel(true, false, prod));
+            assert!(is_bot_ephemeral_message_channel(true, false, prod2));
+            assert!(is_bot_ephemeral_message_channel(true, true, test));
+            assert!(is_bot_ephemeral_message_channel(true, true, test2));
+            assert!(!is_bot_ephemeral_message_channel(true, false, test));
+            assert!(!is_bot_ephemeral_message_channel(true, true, prod));
+            assert!(!is_bot_ephemeral_message_channel(true, false, other));
+            // not a bot / not a channel
+            assert!(!is_bot_ephemeral_message_channel(false, false, prod));
+            assert!(!is_bot_ephemeral_message_channel(
+                true,
+                false,
+                DialogId::from_user_id(crate::user_manager::UserId::new(42))
+            ));
         }
     }
 

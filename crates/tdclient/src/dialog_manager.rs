@@ -1162,6 +1162,12 @@ pub(crate) enum DialogNetKind {
     ReportPeer {
         dialog_id: crate::dialog_id::DialogId,
     },
+    /// `ReportEphemeralMessageQuery` (DialogManager.cpp:526-555, the
+    /// d4f71645a shape) — `ephemeral.reportMessage`; the kind carries
+    /// the dialog for the error tail (no MESSAGE_ID_REQUIRED band).
+    ReportEphemeralMessage {
+        dialog_id: crate::dialog_id::DialogId,
+    },
     /// `GetBlockedDialogsQuery` (DialogManager.cpp:728) — the kind
     /// carries the handler's `offset_`/`limit_` members for the
     /// `on_get_blocked_dialogs` intake.
@@ -2034,6 +2040,49 @@ pub fn can_report_dialog(td: &mut Td, dialog_id: DialogId) -> bool {
     }
 }
 
+/// `DialogManager::get_report_chat_result_object` (DialogManager.cpp
+/// 2869-2896, the d4f71645a extraction) — the ReportResult wire answer
+/// as the ReportChatResult object (the empty choose-option band answers
+/// Ok like the C++).
+pub fn get_report_chat_result_object(
+    result: tdmtproto::telegram_api::ReportResult,
+) -> crate::td_api::Object {
+    match result {
+        tdmtproto::telegram_api::ReportResult::reportResultReported(_) => {
+            crate::td_api::Object::reportChatResultOk(crate::td_api::reportChatResultOk)
+        }
+        tdmtproto::telegram_api::ReportResult::reportResultChooseOption(options) => {
+            if options.options.is_empty() {
+                return crate::td_api::Object::reportChatResultOk(
+                    crate::td_api::reportChatResultOk,
+                );
+            }
+            let report_options = options
+                .options
+                .into_iter()
+                .map(|option| crate::td_api::ReportOption {
+                    id: option.option,
+                    text: option.text,
+                })
+                .collect();
+            crate::td_api::Object::reportChatResultOptionRequired(
+                crate::td_api::reportChatResultOptionRequired {
+                    title: options.title,
+                    options: report_options,
+                },
+            )
+        }
+        tdmtproto::telegram_api::ReportResult::reportResultAddComment(comment) => {
+            crate::td_api::Object::reportChatResultTextRequired(
+                crate::td_api::reportChatResultTextRequired {
+                    option_id: comment.option,
+                    is_optional: comment.optional,
+                },
+            )
+        }
+    }
+}
+
 /// `DialogManager::report_dialog` (DialogManager.cpp:2824-2851) —
 /// `can_report_message` is `Ok` (no messages exist); the
 /// `ReportPeerQuery` send rides the dialog net handle.
@@ -2049,6 +2098,50 @@ pub fn report_dialog(
     if access.is_error() {
         promise.set_error(access.move_as_error());
         return;
+    }
+
+    // d4f71645a: a reported ephemeral message reroutes to
+    // ephemeral.reportMessage (checked before the action-bar probe —
+    // the memory probe over the loaded message; the db load is the
+    // dialog-db receive seam)
+    for &message_id in message_ids {
+        let mm_message_id = crate::messages_manager::MessageId::new(message_id.get());
+        if !mm_message_id.is_valid() {
+            continue;
+        }
+        let ephemeral_message_id = crate::messages_manager::get_ephemeral_message_id_of_message_id(
+            &td.messages_manager,
+            dialog_id,
+            mm_message_id,
+        );
+        if ephemeral_message_id.is_valid() {
+            if message_ids.len() != 1 {
+                promise.set_error(Status::error(
+                    400,
+                    "Ephemeral messages must be reported separately",
+                ));
+                return;
+            }
+            // `ReportEphemeralMessageQuery::send`
+            // (DialogManager.cpp:535-543) — the Read input peer (CHECKed
+            // in the C++; the access gate above guarantees it)
+            let input_peer = get_input_peer(td, dialog_id, AccessRights::Read)
+                .expect("the access gate guaranteed the peer");
+            td.dialog_manager.pending_report_peer.push(promise);
+            td.dialog_manager.send_dialog_net_query(
+                DialogNetKind::ReportEphemeralMessage { dialog_id },
+                tdmtproto::telegram_api::Function::ephemeral_reportMessage(
+                    tdmtproto::telegram_api::ephemeral_reportMessage {
+                        peer: Some(Box::new(input_peer)),
+                        id: ephemeral_message_id.get(),
+                        option: option_id.to_vec(),
+                        message: text.to_owned(),
+                    },
+                ),
+                "ephemeral.reportMessage",
+            );
+            return;
+        }
     }
 
     // messages_manager_->report_dialog_from_action_bar — {false, false}
@@ -6848,6 +6941,91 @@ mod tests {
             }
             _ => panic!("expected the access error"),
         }
+    }
+
+    /// d4f71645a: a reported ephemeral message reroutes reportChat to
+    /// `ephemeral.reportMessage` — one id at a time only.
+    #[test]
+    fn report_dialog_reroutes_ephemeral_messages() {
+        use crate::messages_manager::{EphemeralMessageId, MessageId as MmMessageId};
+
+        let mut td = test_td();
+        let _dir = init_td_db_for_test(&mut td, "report_ephemeral_reroute");
+        let user_id = crate::user_manager::UserId::new(3001);
+        let dialog_id = DialogId::from_user_id(user_id);
+        // seed the user with an access hash so the Read gate passes
+        let options = td.option_manager.as_mut().expect("user environment");
+        let mut env = UserEnv {
+            global: &mut td.global,
+            options,
+            auth_is_bot: td.auth_manager.is_bot(),
+        };
+        td.user_manager.on_get_user(
+            &mut env,
+            tdmtproto::telegram_api::User::user(tdmtproto::telegram_api::user {
+                id: user_id.get(),
+                flags: 1, // USER_ACCESS_HASH_MASK
+                access_hash: 123,
+                first_name: "Rep".to_string(),
+                ..Default::default()
+            }),
+            "test",
+        );
+        // a message with an ephemeral twin in the messages manager
+        let message_id =
+            MmMessageId::from_server_message_id(crate::dialog_id::ServerMessageId::new(5));
+        {
+            let d = td.messages_manager.add_dialog_for_new_message(dialog_id);
+            let mut m = Box::new(crate::messages_manager::Message::default());
+            m.message_id = message_id;
+            m.ephemeral_message_id = EphemeralMessageId::new(9);
+            d.messages.insert(message_id, m);
+        }
+        let report_id = crate::chat_manager::MessageId::new(message_id.get());
+        let plain_id = crate::chat_manager::MessageId::new(0);
+
+        // two ids with an ephemeral one — rejected
+        let (promise, slot) = {
+            let slot = Arc::new(Mutex::new(None::<Result<crate::td_api::Object>>));
+            let capture = Arc::clone(&slot);
+            let promise =
+                PromiseCreator::lambda_result(move |result: Result<crate::td_api::Object>| {
+                    *capture.lock().unwrap() = Some(result);
+                });
+            (promise, slot)
+        };
+        report_dialog(
+            &mut td,
+            dialog_id,
+            b"opt",
+            &[plain_id, report_id],
+            "",
+            promise,
+        );
+        match slot.lock().unwrap().take() {
+            Some(Result::Err(status)) => assert_eq!(
+                status.message(),
+                "Ephemeral messages must be reported separately"
+            ),
+            _ => panic!("expected the separate-report error"),
+        }
+
+        // the single ephemeral id parks at the ephemeral report query
+        let (promise, slot) = {
+            let slot = Arc::new(Mutex::new(None::<Result<crate::td_api::Object>>));
+            let capture = Arc::clone(&slot);
+            let promise =
+                PromiseCreator::lambda_result(move |result: Result<crate::td_api::Object>| {
+                    *capture.lock().unwrap() = Some(result);
+                });
+            (promise, slot)
+        };
+        report_dialog(&mut td, dialog_id, b"opt", &[report_id], "text", promise);
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "the promise parks at the net seam"
+        );
+        assert_eq!(td.dialog_manager.pending_report_peer.len(), 1);
     }
 
     #[test]

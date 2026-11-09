@@ -568,6 +568,14 @@ pub trait MessageQueryManagerEnv {
     fn is_test_dc(&self) -> bool {
         false
     }
+    /// `dialog_manager_->get_my_dialog_id` — the 1.8.70 upload-dialog
+    /// remap of the ephemeral edit (f2bbf2f7f: files can't be uploaded
+    /// to inaccessible chats, so they upload for the bot itself); the
+    /// default answers the invalid dialog (the offline stubs never take
+    /// the dedicated-channel band).
+    fn get_my_dialog_id(&self) -> DialogId {
+        DialogId::default()
+    }
     /// `td_->inline_queries_manager_->get_requested_dialog_type` — the
     /// keyboardButtonSourceWebApp resolution over the prepared-button
     /// map (real over the InlineQueriesManager in `Td`).
@@ -763,12 +771,18 @@ pub(crate) enum MessageQueryNetKind {
     /// `EditEphemeralMessageQuery` (MessageQueryManager.cpp:1444-1518) —
     /// `ephemeral.editMessage` (the text/caption/no-content legs; the
     /// media legs wait at the M.12 upload seams); the ok half re-enters
-    /// `on_get_updates` with the query-carried promise.
-    EditEphemeralMessage,
+    /// `on_get_updates` with the query-carried promise; the kind carries
+    /// the handler's `dialog_id_` (the dc124789b error head's send-fail
+    /// processing).
+    EditEphemeralMessage { dialog_id: DialogId },
     /// `DeleteEphemeralMessageQuery` (MessageQueryManager.cpp:1888-1926)
     /// — `ephemeral.deleteMessage`; the kind carries the handler's
-    /// `dialog_id_` (the error head).
-    DeleteEphemeralMessage { dialog_id: DialogId },
+    /// `dialog_id_`/`ephemeral_message_id_` (the error head's dialog
+    /// log + the on_failed_ephemeral_message_deletion callback).
+    DeleteEphemeralMessage {
+        dialog_id: DialogId,
+        ephemeral_message_id: EphemeralMessageId,
+    },
     /// `ReadMessagesContentsQuery` (MessageQueryManager.cpp:2210-2246) /
     /// `ReadChannelMessagesContentsQuery` (cpp:2248-2289) — one kind over
     /// the two wire forms (the dialog type picks at the send leg); the
@@ -3192,6 +3206,108 @@ impl MessageQueryManager {
         );
     }
 
+    /// `MessageQueryManager::process_send_message_fail_error`
+    /// (MessageQueryManager.cpp:4232-4294) — the send-fail error remap
+    /// ladder over the wire status: the 420→429 rename, the 400
+    /// message rewrites (with the content-type bands and the
+    /// bot/ephemeral PEER_ID_INVALID split) and the 403→400
+    /// write-forbidden fold; every other status passes through
+    /// unchanged. Moved out of MessagesManager and simplified to the
+    /// Status-in/Status-out shape upstream (050f319cd + f3dba9caf);
+    /// ported with the dc124789b ephemeral call sites.
+    pub fn process_send_message_fail_error(
+        error: tdutils::status::Status,
+        dialog_id: DialogId,
+        is_bot: bool,
+        is_ephemeral: bool,
+        content_type: crate::message_content::MessageContentType,
+    ) -> tdutils::status::Status {
+        use crate::dialog_id::DialogType;
+        use crate::message_content::MessageContentType;
+
+        let mut error_code = error.code();
+        let error_message = error.message();
+        match error_code {
+            420 => {
+                error_code = 429;
+                tdutils::log_error!("Receive error 420: {}", error_message);
+            }
+            429 => {
+                if !error_message.starts_with("Too Many Requests: retry after ") {
+                    tdutils::log_error!("Wrong error message: {}", error_message);
+                }
+            }
+            400 => {
+                let new_message = match error_message {
+                    "MESSAGE_TOO_LONG" => "Message is too long".to_owned(),
+                    "MEDIA_CAPTION_TOO_LONG" => "Message caption is too long".to_owned(),
+                    "INPUT_USER_DEACTIVATED" => {
+                        return tdutils::status::Status::error(403, "User is deactivated");
+                    }
+                    "USER_IS_BOT" => {
+                        if is_bot
+                            && (dialog_id.get_type() == DialogType::User
+                                || dialog_id.get_type() == DialogType::SecretChat)
+                        {
+                            return tdutils::status::Status::error(
+                                403,
+                                "The bot can't send messages to the bot",
+                            );
+                        }
+                        return error;
+                    }
+                    "PEER_ID_INVALID" => {
+                        if is_bot
+                            && !is_ephemeral
+                            && (dialog_id.get_type() == DialogType::User
+                                || dialog_id.get_type() == DialogType::SecretChat)
+                        {
+                            return tdutils::status::Status::error(
+                                403,
+                                "Bot can't initiate conversation with a user",
+                            );
+                        }
+                        return tdutils::status::Status::error(403, error_message);
+                    }
+                    "REPLY_TO_MONOFORUM_PEER_INVALID" => {
+                        "Wrong direct messages topic identifier specified".to_owned()
+                    }
+                    "CHAT_FORWARDS_RESTRICTED" => {
+                        "Message has protected content and can't be forwarded".to_owned()
+                    }
+                    "MEDIA_EMPTY" => match content_type {
+                        MessageContentType::Game => "Wrong game short name specified".to_owned(),
+                        MessageContentType::Invoice => {
+                            "Wrong invoice information specified".to_owned()
+                        }
+                        MessageContentType::Poll => "Wrong poll data specified".to_owned(),
+                        MessageContentType::Contact => "Wrong phone number specified".to_owned(),
+                        MessageContentType::Story => "Wrong story file specified".to_owned(),
+                        _ => "Wrong file identifier/HTTP URL specified".to_owned(),
+                    },
+                    "EXTENDED_MEDIA_INVALID" => "Invalid paid media file specified".to_owned(),
+                    "PHOTO_EXT_INVALID" => "Photo has unsupported extension. Use one of .jpg, \
+                        .jpeg, .gif, .png, .tif or .bmp"
+                        .to_owned(),
+                    _ => return error,
+                };
+                return tdutils::status::Status::error(error_code, &new_message);
+            }
+            403 => {
+                if error_message != "CHANNEL_PUBLIC_GROUP_NA"
+                    && error_message != "USER_IS_BLOCKED"
+                    && error_message != "USER_BOT_INVALID"
+                    && error_message != "USER_DELETED"
+                {
+                    return tdutils::status::Status::error(400, error_message);
+                }
+                return error;
+            }
+            _ => return error,
+        }
+        tdutils::status::Status::error(error_code, error_message)
+    }
+
     /// `edit_ephemeral_message` (MessageQueryManager.cpp:4131-4179).
     #[allow(clippy::too_many_arguments)]
     pub fn edit_ephemeral_message(
@@ -3207,7 +3323,13 @@ impl MessageQueryManager {
         let is_bot = env.auth_is_bot();
         assert!(is_bot);
 
-        if let Err(error) = env.check_dialog_access(
+        // the dedicated ephemeral-message channels are inaccessible, but
+        // ephemeral messages in them can be edited (8fa83fe8a)
+        if !crate::messages_manager::is_bot_ephemeral_message_channel(
+            is_bot,
+            env.is_test_dc(),
+            dialog_id,
+        ) && let Err(error) = env.check_dialog_access(
             dialog_id,
             false,
             crate::user_manager::AccessRights::Write,
@@ -3282,7 +3404,7 @@ impl MessageQueryManager {
         {
             promise.set_error(tdutils::status::Status::error(
                 400,
-                "Unsupported input message content type",
+                "Unallowed message content specified",
             ));
             return;
         }
@@ -3294,8 +3416,19 @@ impl MessageQueryManager {
             return;
         }
 
-        env.start_edit_ephemeral_message_upload(
+        // files can't be uploaded to inaccessible chats, so upload them
+        // for the bot itself (f2bbf2f7f)
+        let upload_dialog_id = if crate::messages_manager::is_bot_ephemeral_message_channel(
+            is_bot,
+            env.is_test_dc(),
             dialog_id,
+        ) {
+            env.get_my_dialog_id()
+        } else {
+            dialog_id
+        };
+        env.start_edit_ephemeral_message_upload(
+            upload_dialog_id,
             receiver_user_id,
             ephemeral_message_id,
             new_reply_markup,
@@ -3352,14 +3485,15 @@ impl MessageQueryManager {
                     return;
                 }
             };
-        let content_type = content.content.get_type();
-        if !crate::messages_manager::is_editable_media_message_content(content_type)
-            && content_type != crate::message_content::MessageContentType::RichText
-            && content_type != crate::message_content::MessageContentType::Text
-        {
+        // 1f10f02c5: the ephemeral-content allowlist replaces the
+        // editable-media + RichText/Text triple; 2d108dde5 renamed the
+        // error
+        if !crate::messages_manager::is_allowed_ephemeral_message_content(
+            content.content.get_type(),
+        ) {
             promise.set_error(tdutils::status::Status::error(
                 400,
-                "Unsupported input message content type",
+                "Unallowed message content specified",
             ));
             return;
         }
@@ -3400,7 +3534,13 @@ impl MessageQueryManager {
         let is_bot = env.auth_is_bot();
         assert!(is_bot);
 
-        if let Err(error) = env.check_dialog_access(
+        // the same dedicated-channel bypass as edit_ephemeral_message
+        // (8fa83fe8a)
+        if !crate::messages_manager::is_bot_ephemeral_message_channel(
+            is_bot,
+            env.is_test_dc(),
+            dialog_id,
+        ) && let Err(error) = env.check_dialog_access(
             dialog_id,
             false,
             crate::user_manager::AccessRights::Write,
@@ -5806,5 +5946,219 @@ mod tests {
             )),
             F::UnreadPollVote
         );
+    }
+
+    /// The send-fail error remap ladder (MessageQueryManager.cpp:4232-4294,
+    /// the dc124789b/050f319cd/f3dba9caf shape): the 420 rename, the 400
+    /// message rewrites with the content-type and bot/ephemeral bands,
+    /// the 403 fold and the passthrough.
+    #[test]
+    fn process_send_message_fail_error_table() {
+        use crate::dialog_id::DialogId;
+        use crate::message_content::MessageContentType as T;
+        use crate::user_manager::UserId;
+        let process = |code: i32, message: &str| {
+            MessageQueryManager::process_send_message_fail_error(
+                tdutils::status::Status::error(code, message),
+                DialogId::from_user_id(UserId::new(1)),
+                false,
+                false,
+                T::None,
+            )
+        };
+        let bot_process = |code: i32, message: &str, is_ephemeral: bool| {
+            MessageQueryManager::process_send_message_fail_error(
+                tdutils::status::Status::error(code, message),
+                DialogId::from_user_id(UserId::new(1)),
+                true,
+                is_ephemeral,
+                T::None,
+            )
+        };
+
+        // 420 becomes 429
+        let status = process(420, "SLOWMODE_WAIT_5");
+        assert_eq!((status.code(), status.message()), (429, "SLOWMODE_WAIT_5"));
+
+        // the plain 400 rewrites
+        let status = process(400, "MESSAGE_TOO_LONG");
+        assert_eq!(
+            (status.code(), status.message()),
+            (400, "Message is too long")
+        );
+        let status = process(400, "MEDIA_CAPTION_TOO_LONG");
+        assert_eq!(
+            (status.code(), status.message()),
+            (400, "Message caption is too long")
+        );
+        let status = process(400, "INPUT_USER_DEACTIVATED");
+        assert_eq!(
+            (status.code(), status.message()),
+            (403, "User is deactivated")
+        );
+        let status = process(400, "REPLY_TO_MONOFORUM_PEER_INVALID");
+        assert_eq!(
+            (status.code(), status.message()),
+            (400, "Wrong direct messages topic identifier specified")
+        );
+        let status = process(400, "CHAT_FORWARDS_RESTRICTED");
+        assert_eq!(
+            (status.code(), status.message()),
+            (400, "Message has protected content and can't be forwarded")
+        );
+        let status = process(400, "EXTENDED_MEDIA_INVALID");
+        assert_eq!(
+            (status.code(), status.message()),
+            (400, "Invalid paid media file specified")
+        );
+        let status = process(400, "PHOTO_EXT_INVALID");
+        assert_eq!(
+            (status.code(), status.message()),
+            (
+                400,
+                "Photo has unsupported extension. Use one of .jpg, .jpeg, .gif, .png, .tif or .bmp"
+            )
+        );
+
+        // the bot PEER_ID_INVALID/USER_IS_BOT bands in a user dialog
+        let status = bot_process(400, "USER_IS_BOT", false);
+        assert_eq!(
+            (status.code(), status.message()),
+            (403, "The bot can't send messages to the bot")
+        );
+        let status = bot_process(400, "PEER_ID_INVALID", false);
+        assert_eq!(
+            (status.code(), status.message()),
+            (403, "Bot can't initiate conversation with a user")
+        );
+        // ephemeral sends keep the plain 403 PEER_ID_INVALID
+        let status = bot_process(400, "PEER_ID_INVALID", true);
+        assert_eq!((status.code(), status.message()), (403, "PEER_ID_INVALID"));
+        // a user gets the 403 rename without the bot message
+        let status = process(400, "PEER_ID_INVALID");
+        assert_eq!((status.code(), status.message()), (403, "PEER_ID_INVALID"));
+
+        // the MEDIA_EMPTY content-type bands
+        let media_empty = |content_type| {
+            MessageQueryManager::process_send_message_fail_error(
+                tdutils::status::Status::error(400, "MEDIA_EMPTY"),
+                DialogId::from_user_id(UserId::new(1)),
+                false,
+                false,
+                content_type,
+            )
+        };
+        assert_eq!(
+            media_empty(T::Game).message(),
+            "Wrong game short name specified"
+        );
+        assert_eq!(
+            media_empty(T::Invoice).message(),
+            "Wrong invoice information specified"
+        );
+        assert_eq!(media_empty(T::Poll).message(), "Wrong poll data specified");
+        assert_eq!(
+            media_empty(T::Contact).message(),
+            "Wrong phone number specified"
+        );
+        assert_eq!(
+            media_empty(T::Story).message(),
+            "Wrong story file specified"
+        );
+        assert_eq!(
+            media_empty(T::Photo).message(),
+            "Wrong file identifier/HTTP URL specified"
+        );
+
+        // the 403 fold: a write-forbidden 403 becomes the 400 band
+        let status = process(403, "CHAT_WRITE_FORBIDDEN");
+        assert_eq!(
+            (status.code(), status.message()),
+            (400, "CHAT_WRITE_FORBIDDEN")
+        );
+        // the named 403 statuses pass through
+        let status = process(403, "USER_IS_BLOCKED");
+        assert_eq!((status.code(), status.message()), (403, "USER_IS_BLOCKED"));
+
+        // everything else passes through unchanged
+        let status = process(500, "Internal server error");
+        assert_eq!(
+            (status.code(), status.message()),
+            (500, "Internal server error")
+        );
+    }
+
+    /// 8fa83fe8a: the dedicated ephemeral-message channels are
+    /// inaccessible, but the ephemeral edit paths must pass them through
+    /// the access gate.
+    #[test]
+    fn edit_ephemeral_message_bypasses_the_access_gate_in_dedicated_channels() {
+        let mut manager = MessageQueryManager::new();
+        let dedicated = DialogId::from_channel_id(crate::chat_manager::ChannelId::new(3937063115));
+        let other_channel = DialogId::from_channel_id(crate::chat_manager::ChannelId::new(1234));
+        let mut env = RecordingEnv {
+            base: TestEnv {
+                is_bot: true,
+                ..TestEnv::default()
+            },
+            ..RecordingEnv::default()
+        };
+
+        // a non-dedicated channel keeps the access error
+        let (promise, cell) = record::<()>();
+        manager.edit_ephemeral_message(
+            &mut env,
+            other_channel,
+            UserId::new(1),
+            crate::messages_manager::EphemeralMessageId::new(5),
+            None,
+            None,
+            promise,
+        );
+        assert_eq!(recorded_error(&cell).1, "Chat not found");
+
+        // the dedicated channel bypasses it — the null-content leg parks
+        // at the net seam with no error
+        let (promise, cell) = record::<()>();
+        manager.edit_ephemeral_message(
+            &mut env,
+            dedicated,
+            UserId::new(1),
+            crate::messages_manager::EphemeralMessageId::new(5),
+            None,
+            None,
+            promise,
+        );
+        assert!(
+            cell.lock().unwrap().is_none(),
+            "the dedicated channel proceeds to the query seam"
+        );
+
+        // the caption variant carries the same bypass (the caption parse
+        // seam answers after the gate)
+        let (promise, cell) = record::<()>();
+        manager.edit_ephemeral_message_caption(
+            &mut env,
+            other_channel,
+            UserId::new(1),
+            crate::messages_manager::EphemeralMessageId::new(5),
+            None,
+            None,
+            false,
+            promise,
+        );
+        assert_eq!(recorded_error(&cell).1, "Chat not found");
+        let (promise, cell) = record::<()>();
+        manager.edit_ephemeral_message_caption(
+            &mut env,
+            dedicated,
+            UserId::new(1),
+            crate::messages_manager::EphemeralMessageId::new(5),
+            None,
+            None,
+            false,
+            promise,
+        );
+        assert_ne!(recorded_error(&cell).1, "Chat not found");
     }
 }
