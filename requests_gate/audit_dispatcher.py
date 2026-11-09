@@ -42,9 +42,12 @@ def main():
 
     failures = []
 
-    # arm bodies for the interim-with-stub check
+    # arm bodies for the interim-with-stub check. The lookbehind skips
+    # path-qualified mtproto constructor calls (tdmtproto::telegram_api::
+    # Function::messages_editMessage) — an arm is only an unqualified
+    # `Function::<name>` match/variant in the run_request chain.
     arm_spans = {}
-    for m in re.finditer(r"Function::(\w+)\s*(?:\(|=>)", src):
+    for m in re.finditer(r"(?<!:)Function::(\w+)\s*(?:\(|=>)", src):
         name = m.group(1)
         arm_spans.setdefault(name, m.start())
 
