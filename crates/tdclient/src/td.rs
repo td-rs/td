@@ -18343,7 +18343,21 @@ impl Td {
                         promise.set_error(query.error().clone());
                     } else {
                         match telegram_api::payments_PaymentResult::parse(query.ok()) {
-                            Ok(telegram_api::payments_PaymentResult::payments_paymentResult(_)) => {
+                            Ok(telegram_api::payments_PaymentResult::payments_paymentResult(
+                                result,
+                            )) => {
+                                // 6aa26a95f — process_updates_users_and_chats
+                                // over the payment updates before the promise
+                                if let Some(mut updates) = result.updates {
+                                    let mut sink = TdSink::default();
+                                    crate::updates_manager::process_updates_users_and_chats(
+                                        &mut sink,
+                                        &mut updates,
+                                    );
+                                    self.updates_manager.sink().users.append(&mut sink.users);
+                                    self.updates_manager.sink().chats.append(&mut sink.chats);
+                                    self.drain_sink();
+                                }
                                 promise.set_value(())
                             }
                             Ok(telegram_api::payments_PaymentResult::payments_paymentVerificationNeeded(
@@ -19620,7 +19634,9 @@ impl Td {
                 }
             }
             // `DeleteParticipantReactionQuery`
-            // (MessageQueryManager.cpp:2026-2040) — the same head gate.
+            // (MessageQueryManager.cpp:2026-2040) — the same head gate;
+            // 6aa26a95f: the Updates answer re-enters `on_get_updates`
+            // with the query-carried promise instead of dropping.
             MessageQueryNetKind::DeleteParticipantReaction {
                 dialog_id,
                 sender_dialog_id,
@@ -19630,7 +19646,16 @@ impl Td {
                 else {
                     return;
                 };
-                let result = unit_bool_result(&query, "messages.deleteParticipantReaction");
+                let result = if query.is_error() {
+                    tdutils::status::Result::Err(query.error().clone())
+                } else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => tdutils::status::Result::Ok(updates),
+                        Err(_) => tdutils::status::Result::Err(parse_error(
+                            "messages.deleteParticipantReaction",
+                        )),
+                    }
+                };
                 // cpp:2035-2039 — the same off-channel head gate
                 let head_status = match &result {
                     tdutils::status::Result::Err(status)
@@ -19649,7 +19674,10 @@ impl Td {
                     );
                 }
                 match result {
-                    tdutils::status::Result::Ok(()) => promise.set_value(()),
+                    tdutils::status::Result::Ok(updates) => self.um_send(UmMessage::OnGetUpdates {
+                        updates: Box::new(updates),
+                        promise,
+                    }),
                     tdutils::status::Result::Err(status) => {
                         // cpp:2039-2041 — MESSAGE_NOT_MODIFIED answers ok
                         if status.message() == "MESSAGE_NOT_MODIFIED" {
@@ -23929,9 +23957,10 @@ impl Td {
     }
 
     /// Route one quick-reply net answer by kind — the ok values drop
-    /// (`Promise<Unit>`); the delete-messages error tail logs the
-    /// deferred `reload_quick_reply_messages` re-entry (the messages
-    /// plane).
+    /// (`Promise<Unit>`), except the 6aa26a95f delete-messages band: its
+    /// Updates answer re-enters `on_get_updates` with the query-carried
+    /// promise; the delete-messages error tail logs the deferred
+    /// `reload_quick_reply_messages` re-entry (the messages plane).
     fn on_quick_reply_net_answer(&mut self, kind: QuickReplyNetKind, query: NetQuery) {
         if query.is_error() {
             let mut manager = std::mem::take(&mut self.quick_reply_manager);
@@ -23941,8 +23970,32 @@ impl Td {
         }
         // `fetch_result` only unwraps — the ok values drop; the parse
         // validates the constructor the C++ fetches.
+        if let QuickReplyNetKind::DeleteMessages { .. } = kind {
+            match telegram_api::Updates::parse(query.ok()) {
+                Ok(updates) => {
+                    let mut manager = std::mem::take(&mut self.quick_reply_manager);
+                    let promise = manager.take_net_promise(kind);
+                    self.quick_reply_manager = manager;
+                    if let Some(promise) = promise {
+                        self.um_send(UmMessage::OnGetUpdates {
+                            updates: Box::new(updates),
+                            promise,
+                        });
+                    }
+                }
+                Err(_) => {
+                    let mut manager = std::mem::take(&mut self.quick_reply_manager);
+                    manager.on_net_answer(
+                        kind,
+                        Err(Status::error(500, "Failed to parse the quick-reply answer")),
+                    );
+                    self.quick_reply_manager = manager;
+                }
+            }
+            return;
+        }
         let parsed = match kind {
-            QuickReplyNetKind::EditShortcut | QuickReplyNetKind::DeleteMessages { .. } => {
+            QuickReplyNetKind::EditShortcut => {
                 telegram_api::Updates::parse(query.ok())
                     .map(|_| ())
                     .map_err(|_| Status::error(500, "Failed to parse the quick-reply answer"))
@@ -23952,6 +24005,7 @@ impl Td {
                     .map(|_| ())
                     .ok_or_else(|| Status::error(500, "Failed to parse the quick-reply answer"))
             }
+            QuickReplyNetKind::DeleteMessages { .. } => unreachable!("handled above"),
         };
         let mut manager = std::mem::take(&mut self.quick_reply_manager);
         manager.on_net_answer(kind, parsed);
@@ -29027,6 +29081,8 @@ impl Td {
             // `GetSavedStarGiftQuery::on_result`/`on_error`
             // (StarGiftManager.cpp:1761-1784).
             StarGiftNetKind::GetSavedStarGift { dialog_id } => {
+                let mut users = Vec::new();
+                let mut chats = Vec::new();
                 let result = if query.is_error() {
                     let status = query.error().clone();
                     crate::dialog_manager::on_get_dialog_error(
@@ -29038,10 +29094,18 @@ impl Td {
                     Err(status)
                 } else {
                     match telegram_api::payments_SavedStarGifts::parse(query.ok()) {
-                        Ok(ptr) => Ok(ptr),
+                        Ok(mut ptr) => {
+                            // 6aa26a95f — on_get_users/on_get_chats before
+                            // the gifts walk
+                            users = std::mem::take(&mut ptr.users);
+                            chats = std::mem::take(&mut ptr.chats);
+                            Ok(ptr)
+                        }
                         Err(_) => Err(parse_error("payments.getSavedStarGift")),
                     }
                 };
+                self.intake_users(users, "GetSavedStarGiftQuery");
+                self.intake_chats(chats, "GetSavedStarGiftQuery");
                 self.with_star_gift_manager(|env, manager| {
                     manager.on_get_saved_star_gift(env, result)
                 });
@@ -76560,6 +76624,45 @@ mod tests {
             other => panic!("the error tail answers 400: {other:?}"),
         }
 
+        // 3.5 the delete-messages ok tail (6aa26a95f) — the Updates
+        //     answer re-enters `on_get_updates` carrying the promise; an
+        //     empty umbrella settles it ok.
+        {
+            let (mut manager, mut env) = quick_reply_env_split(&mut td);
+            manager.on_update_quick_reply_shortcut(&mut env, 2, "notes".to_string());
+            td.quick_reply_manager = manager;
+        }
+        let (promise, slot) = record_translation_unit();
+        {
+            let (mut manager, mut env) = quick_reply_env_split(&mut td);
+            manager.delete_quick_reply_shortcut_messages(&mut env, 2, &[100], promise);
+            td.quick_reply_manager = manager;
+        }
+        // (the empty umbrella's state reconciliation may queue its own
+        // query — pick the delete answer by constructor)
+        let sent = std::mem::take(&mut *rec.sent.lock())
+            .into_iter()
+            .find(|q| q.tl_constructor() == telegram_api::messages_deleteQuickReplyMessages::ID)
+            .expect("the delete-messages query rode the dispatcher");
+        let mut answer = Vec::new();
+        telegram_api::Updates::updates(telegram_api::updates {
+            updates: Vec::new(),
+            users: Vec::new(),
+            chats: Vec::new(),
+            seq: 0,
+            date: 0,
+        })
+        .store(&mut answer);
+        net_complete(sent, answer);
+        td.dispatch_completed_quick_reply_net();
+        assert!(
+            matches!(
+                slot.lock().unwrap().take(),
+                Some(tdutils::status::Result::Ok(()))
+            ),
+            "the promise settles through on_get_updates"
+        );
+
         // 4. reorderQuickReplies — answers Bool (the value drops).
         {
             let (mut manager, mut env) = quick_reply_env_split(&mut td);
@@ -76572,13 +76675,11 @@ mod tests {
             manager.reorder_quick_reply_shortcuts(&mut env, &[3, 2], promise);
             td.quick_reply_manager = manager;
         }
-        let sent = std::mem::take(&mut *rec.sent.lock());
-        assert_eq!(sent.len(), 1);
-        assert_eq!(
-            sent[0].tl_constructor(),
-            telegram_api::messages_reorderQuickReplies::ID
-        );
-        net_complete(sent.into_iter().next().unwrap(), bool_answer(true));
+        let sent = std::mem::take(&mut *rec.sent.lock())
+            .into_iter()
+            .find(|q| q.tl_constructor() == telegram_api::messages_reorderQuickReplies::ID)
+            .expect("the reorder query rode the dispatcher");
+        net_complete(sent, bool_answer(true));
         td.dispatch_completed_quick_reply_net();
         assert!(matches!(
             slot.lock().unwrap().take(),
