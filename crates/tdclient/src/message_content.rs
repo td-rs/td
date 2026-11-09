@@ -12653,10 +12653,11 @@ pub fn create_input_message_content(
             });
         }
         // The MessagesManager forward path expands inputMessageForwarded
-        // before this switch (MessagesManager.cpp:21746-21747); the C++
-        // default arm is UNREACHABLE().
+        // before this switch (MessagesManager.cpp:21746-21747); the arm
+        // itself rejects - c68cb22f4: must be processed by the caller if
+        // supported.
         td_api::InputMessageContent::inputMessageForwarded(_) => {
-            unreachable!("the C++ default arm is UNREACHABLE()");
+            return Err(Status::error(400, "Unsupported input message content type"));
         }
     }
 
