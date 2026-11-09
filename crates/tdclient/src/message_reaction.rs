@@ -481,12 +481,15 @@ impl Default for MessageReaction {
 /// `operator==` (MessageReaction.cpp:486-490) — `min_channels` is
 /// deliberately not compared.
 impl PartialEq for MessageReaction {
+    /// `operator==` (MessageReaction.cpp:480-485) — 7c9c98cd2 added the
+    /// min-channel registry to the comparison.
     fn eq(&self, other: &Self) -> bool {
         self.reaction_type == other.reaction_type
             && self.choose_count == other.choose_count
             && self.is_chosen == other.is_chosen
             && self.my_recent_chooser_dialog_id == other.my_recent_chooser_dialog_id
             && self.recent_chooser_dialog_ids == other.recent_chooser_dialog_ids
+            && self.recent_chooser_min_channels == other.recent_chooser_min_channels
     }
 }
 

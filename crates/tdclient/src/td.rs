@@ -24022,11 +24022,9 @@ impl Td {
             return;
         }
         let parsed = match kind {
-            QuickReplyNetKind::EditShortcut => {
-                telegram_api::Updates::parse(query.ok())
-                    .map(|_| ())
-                    .map_err(|_| Status::error(500, "Failed to parse the quick-reply answer"))
-            }
+            QuickReplyNetKind::EditShortcut => telegram_api::Updates::parse(query.ok())
+                .map(|_| ())
+                .map_err(|_| Status::error(500, "Failed to parse the quick-reply answer")),
             QuickReplyNetKind::DeleteShortcut | QuickReplyNetKind::Reorder => {
                 parse_wire_bool_value(query.ok())
                     .map(|_| ())

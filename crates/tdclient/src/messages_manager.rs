@@ -28790,10 +28790,15 @@ pub fn send_update_message_send_succeeded(
         // the StarManager pending refund seam
     }
     if !ctx.is_bot() {
-        manager.yet_unsent_message_full_id_to_persistent_message_id.insert(
-            MessageFullId::new(dialog_id, old_message_id),
-            (m.message_id, tdutils::time::now() + PERSISTENT_MESSAGE_ID_CACHE_TIME),
-        );
+        manager
+            .yet_unsent_message_full_id_to_persistent_message_id
+            .insert(
+                MessageFullId::new(dialog_id, old_message_id),
+                (
+                    m.message_id,
+                    tdutils::time::now() + PERSISTENT_MESSAGE_ID_CACHE_TIME,
+                ),
+            );
 
         let deleted = delete_message(
             global,
@@ -29824,10 +29829,15 @@ pub fn fail_send_message(
     }
     // `register_new_local_message_id` — the local-id registry seam
 
-    manager.yet_unsent_message_full_id_to_persistent_message_id.insert(
-        MessageFullId::new(dialog_id, old_message_id),
-        (m_message_id, tdutils::time::now() + PERSISTENT_MESSAGE_ID_CACHE_TIME),
-    );
+    manager
+        .yet_unsent_message_full_id_to_persistent_message_id
+        .insert(
+            MessageFullId::new(dialog_id, old_message_id),
+            (
+                m_message_id,
+                tdutils::time::now() + PERSISTENT_MESSAGE_ID_CACHE_TIME,
+            ),
+        );
     tracing::info!(
         "Send updateMessageSendFailed for {}:{}",
         dialog_id.get(),

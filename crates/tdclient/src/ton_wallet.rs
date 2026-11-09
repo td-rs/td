@@ -57,9 +57,7 @@ pub fn check_ton_address_allow_raw(address: &str) -> Result<()> {
 
 fn check_ton_address_impl(address: &str, allow_raw: bool) -> Result<()> {
     let error = |code: i32, msg: &str| Status::error(code, msg);
-    if allow_raw
-        && let Some(colon_pos) = address.find(':')
-    {
+    if allow_raw && let Some(colon_pos) = address.find(':') {
         // raw address "<workchain>:<64 hexadecimal digits>"
         if address[..colon_pos].parse::<i32>().is_err() {
             return Result::Err(error(400, "Invalid address workchain"));
@@ -2591,15 +2589,28 @@ mod tests {
         assert_eq!(raw_address.len(), "0:".len() + 64);
         assert!(check_ton_address_allow_raw(raw_address).is_ok());
         assert!(check_ton_address(raw_address).is_error());
-        assert!(check_ton_address_allow_raw("-1:8002f3ab9be0ac5d76e6e0a73e33c33e0e6f9edf1cbc3a71d24a0af1d6c1d70b").is_ok());
+        assert!(
+            check_ton_address_allow_raw(
+                "-1:8002f3ab9be0ac5d76e6e0a73e33c33e0e6f9edf1cbc3a71d24a0af1d6c1d70b"
+            )
+            .is_ok()
+        );
         // non-numeric workchain
-        assert!(check_ton_address_allow_raw("x:8002f3ab9be0ac5d76e6e0a73e33c33e0e6f9edf1cbc3a71d24a0af1d6c1d70b")
-            .is_error());
+        assert!(
+            check_ton_address_allow_raw(
+                "x:8002f3ab9be0ac5d76e6e0a73e33c33e0e6f9edf1cbc3a71d24a0af1d6c1d70b"
+            )
+            .is_error()
+        );
         // wrong account length
         assert!(check_ton_address_allow_raw("0:8002f3ab").is_error());
         // non-hex digit
-        assert!(check_ton_address_allow_raw("0:8002f3ab9be0ac5d76e6e0a73e33c33e0e6f9edf1cbc3a71d24a0af1d6c1d70g")
-            .is_error());
+        assert!(
+            check_ton_address_allow_raw(
+                "0:8002f3ab9be0ac5d76e6e0a73e33c33e0e6f9edf1cbc3a71d24a0af1d6c1d70g"
+            )
+            .is_error()
+        );
         // the user-friendly form still passes the allow_raw arm
         assert!(check_ton_address_allow_raw(&address).is_ok());
     }

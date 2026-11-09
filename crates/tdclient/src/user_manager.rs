@@ -14593,7 +14593,10 @@ impl UserManager {
                 };
                 self.user_full_contact_price.insert(
                     user_id.get(),
-                    (price, tdutils::time::now() + USER_FULL_CONTACT_PRICE_CACHE_TIME),
+                    (
+                        price,
+                        tdutils::time::now() + USER_FULL_CONTACT_PRICE_CACHE_TIME,
+                    ),
                 );
             }
         }
@@ -20983,7 +20986,7 @@ mod tests {
                 photos: vec![photo_with_id(31)],
                 count: 2,
                 offset: 0,
-            expires_at: f64::MAX,
+                expires_at: f64::MAX,
             },
         );
         assert!(!um.delete_my_profile_photo_from_cache(&mut temp.env(false), 99));
@@ -21014,7 +21017,7 @@ mod tests {
                 photos: vec![photo_with_id(41)],
                 count: 3,
                 offset: 1,
-            expires_at: f64::MAX,
+                expires_at: f64::MAX,
             },
         );
         um.users.get_mut(&7).unwrap().photo = as_profile_photo(&photo_with_id(41), false);
@@ -21031,7 +21034,7 @@ mod tests {
                 photos: vec![photo_with_id(51)],
                 count: 1,
                 offset: 0,
-            expires_at: f64::MAX,
+                expires_at: f64::MAX,
             },
         );
         assert!(!um.delete_my_profile_photo_from_cache(&mut temp.env(false), 99));
@@ -21061,7 +21064,7 @@ mod tests {
                 photos: vec![photo_with_id(31)],
                 count: 1,
                 offset: 0,
-            expires_at: f64::MAX,
+                expires_at: f64::MAX,
             },
         );
         let (promise, result) = promise_result();
@@ -21079,7 +21082,7 @@ mod tests {
                 photos: vec![photo_with_id(41)],
                 count: 3,
                 offset: 1,
-            expires_at: f64::MAX,
+                expires_at: f64::MAX,
             },
         );
         um.users.get_mut(&7).unwrap().photo = as_profile_photo(&photo_with_id(41), false);

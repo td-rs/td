@@ -18374,8 +18374,11 @@ fn run_misc_glue_requests(td: &mut Td, id: u64, function: Function) {
             );
             let promise = tdutils::promise::PromiseCreator::lambda_result(
                 move |result: tdutils::status::Result<String>| match result {
-                    tdutils::status::Result::Ok(phrase) => outbox
-                        .set_value(td_api::TonWalletSecretPhrase { secret_phrase: phrase }),
+                    tdutils::status::Result::Ok(phrase) => {
+                        outbox.set_value(td_api::TonWalletSecretPhrase {
+                            secret_phrase: phrase,
+                        })
+                    }
                     tdutils::status::Result::Err(status) => outbox.set_error(status),
                 },
             );

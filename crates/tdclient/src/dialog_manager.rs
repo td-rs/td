@@ -5658,7 +5658,9 @@ pub fn search_public_dialogs(
     }
 
     let type_num = type_filter as usize;
-    if let Some(found) = FoundDialogs::fresh_get(&td.dialog_manager.found_public_dialogs[type_num], query) {
+    if let Some(found) =
+        FoundDialogs::fresh_get(&td.dialog_manager.found_public_dialogs[type_num], query)
+    {
         let found = found.clone();
         promise.set_value(());
         return found;
@@ -5692,7 +5694,9 @@ pub fn search_dialogs_on_server(
     }
 
     let type_num = type_filter as usize;
-    if let Some(found) = FoundDialogs::fresh_get(&td.dialog_manager.found_on_server_dialogs[type_num], query) {
+    if let Some(found) =
+        FoundDialogs::fresh_get(&td.dialog_manager.found_on_server_dialogs[type_num], query)
+    {
         // messages_manager_->sort_dialogs_by_order — no order source in the
         // port, the truncation is the observable part (stub inventory).
         let found = found[..found.len().min(limit.max(0) as usize)].to_vec();
@@ -6151,12 +6155,10 @@ pub(crate) fn on_failed_public_dialogs_search(
     let mut manager = std::mem::take(&mut td.dialog_manager);
     // the negative cache — the empty entries make the next search a
     // local no-hit success
-    manager
-        .found_public_dialogs[type_num]
+    manager.found_public_dialogs[type_num]
         .entry(query.to_owned())
         .or_insert_with(|| FoundDialogs::fresh(Vec::new()));
-    manager
-        .found_on_server_dialogs[type_num]
+    manager.found_on_server_dialogs[type_num]
         .entry(query.to_owned())
         .or_insert_with(|| FoundDialogs::fresh(Vec::new()));
     td.dialog_manager = manager;
@@ -7685,9 +7687,9 @@ mod tests {
         let public_dialog = DialogId::from_user_id(crate::user_manager::UserId::new(43));
         let server_dialog = DialogId::from_user_id(crate::user_manager::UserId::new(42));
         assert_eq!(
-            td.dialog_manager.found_public_dialogs[0].get("query").map(
-                |found| &found.dialog_ids
-            ),
+            td.dialog_manager.found_public_dialogs[0]
+                .get("query")
+                .map(|found| &found.dialog_ids),
             Some(&vec![public_dialog])
         );
         assert_eq!(
