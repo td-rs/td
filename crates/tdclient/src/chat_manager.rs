@@ -5977,6 +5977,12 @@ impl ChatManager {
         self.channels.get(&channel_id.get())
     }
 
+    /// `get_channel_linked_community_id` (ChatManager.cpp:3117-3123).
+    pub fn get_channel_linked_community_id(&self, channel_id: ChannelId) -> CommunityId {
+        self.get_channel(channel_id)
+            .map_or_else(CommunityId::default, |channel| channel.linked_community_id)
+    }
+
     pub fn get_channel_mut(&mut self, channel_id: ChannelId) -> Option<&mut Channel> {
         self.channels.get_mut(&channel_id.get())
     }

@@ -33,14 +33,17 @@
 
 use std::collections::BTreeMap;
 
+use crate::community_id::CommunityId;
+use crate::dialog_id::DialogId;
+use crate::messages_manager::DialogNotificationSettings;
 use crate::notification_manager::NotificationManagerEnv;
 use crate::notification_settings::{
     NotificationSettingsScope, ReactionNotificationSettings, ScopeNotificationSettings,
     are_different_equivalent_notification_sounds, are_equivalent_notification_sounds,
     dup_notification_sound, get_input_notify_peer_for_scope,
-    get_notification_settings_scope_object, get_scope_notification_settings_from_td_api,
-    get_scope_notification_settings_from_telegram, get_scope_notification_settings_object,
-    is_notification_sound_default,
+    get_notification_settings_scope_object, get_notification_sound_ringtone_id,
+    get_scope_notification_settings_from_td_api, get_scope_notification_settings_from_telegram,
+    get_scope_notification_settings_object, is_notification_sound_default,
 };
 use crate::store_parse::{Parser, store_i32, store_log_event_version};
 use crate::td_api;
@@ -123,6 +126,35 @@ pub trait NotificationSettingsManagerEnv: NotificationManagerEnv {
     /// `td_->messages_manager_->reset_all_dialog_notification_settings` —
     /// seam until M.10.
     fn reset_all_dialog_notification_settings(&mut self) {}
+
+    /// `td_->dialog_manager_->get_dialog_notification_setting_scope` —
+    /// the dialog-default helper scope resolution (the #113 slice).
+    fn get_dialog_notification_setting_scope(
+        &mut self,
+        _dialog_id: DialogId,
+    ) -> NotificationSettingsScope {
+        NotificationSettingsScope::Private
+    }
+
+    /// `td_->dialog_manager_->get_dialog_linked_community_id` — the
+    /// community lookup behind the dialog-default helpers.
+    fn get_dialog_linked_community_id(&mut self, _dialog_id: DialogId) -> CommunityId {
+        CommunityId::default()
+    }
+
+    /// `td_->community_manager_->get_community_notification_settings` —
+    /// the community settings read (which triggers the settings query
+    /// while unsynchronized); the C++ pointer return becomes a clone.
+    fn community_notification_settings(
+        &mut self,
+        _community_id: CommunityId,
+    ) -> Option<DialogNotificationSettings> {
+        None
+    }
+
+    /// `td_->community_manager_->reset_all_community_notification_settings`
+    /// (8d2a35e05).
+    fn reset_all_community_notification_settings(&mut self) {}
 }
 
 /// The notification-settings-plane in-flight query kinds — the C++
@@ -408,40 +440,207 @@ impl NotificationSettingsManager {
         );
     }
 
-    /// `get_scope_mute_until` (NotificationSettingsManager.cpp:689-691).
-    pub fn get_scope_mute_until(&self, scope: NotificationSettingsScope) -> i32 {
+    /// `get_dialog_community_notification_settings` (f83b3b201) — the
+    /// linked community's settings for the dialog, `None` when the dialog
+    /// has no community or the settings are not synchronized yet (the
+    /// read triggers the community settings query).
+    pub fn get_dialog_community_notification_settings(
+        &self,
+        env: &mut impl NotificationSettingsManagerEnv,
+        dialog_id: DialogId,
+    ) -> Option<DialogNotificationSettings> {
+        let community_id = env.get_dialog_linked_community_id(dialog_id);
+        if !community_id.is_valid() {
+            return None;
+        }
+        env.community_notification_settings(community_id)
+    }
+
+    /// `get_dialog_default_mute_until` (ddbbcce8f, 5084a648d,
+    /// 0063421d6) — a community mute wins over the scope default.
+    pub fn get_dialog_default_mute_until(
+        &self,
+        env: &mut impl NotificationSettingsManagerEnv,
+        dialog_id: DialogId,
+    ) -> i32 {
+        let community_settings = self.get_dialog_community_notification_settings(env, dialog_id);
+        self.get_dialog_default_mute_until_with_community(
+            env,
+            dialog_id,
+            community_settings.as_ref(),
+        )
+    }
+
+    /// `get_dialog_default_mute_until(dialog_id, community_settings)`
+    /// (0063421d6) — the community-explicit form the default-changed
+    /// fan-out pairs old/new with.
+    pub fn get_dialog_default_mute_until_with_community(
+        &self,
+        env: &mut impl NotificationSettingsManagerEnv,
+        dialog_id: DialogId,
+        community_settings: Option<&DialogNotificationSettings>,
+    ) -> i32 {
+        if let Some(mute_until) = community_settings
+            .filter(|settings| !settings.use_default_mute_until)
+            .map(|settings| settings.mute_until)
+        {
+            return mute_until;
+        }
+        let scope = env.get_dialog_notification_setting_scope(dialog_id);
         self.get_scope(scope).mute_until
     }
 
-    /// `get_scope_mute_stories` (cpp:693-696).
-    pub fn get_scope_mute_stories(&self, scope: NotificationSettingsScope) -> (bool, bool) {
+    /// `get_dialog_default_disable_pinned_message_notifications`
+    /// (ddbbcce8f, 5084a648d, 0063421d6).
+    pub fn get_dialog_default_disable_pinned_message_notifications(
+        &self,
+        env: &mut impl NotificationSettingsManagerEnv,
+        dialog_id: DialogId,
+    ) -> bool {
+        let community_settings = self.get_dialog_community_notification_settings(env, dialog_id);
+        self.get_dialog_default_disable_pinned_message_notifications_with_community(
+            env,
+            dialog_id,
+            community_settings.as_ref(),
+        )
+    }
+
+    /// `get_dialog_default_disable_pinned_message_notifications(dialog_id,
+    /// community_settings)` (0063421d6).
+    pub fn get_dialog_default_disable_pinned_message_notifications_with_community(
+        &self,
+        env: &mut impl NotificationSettingsManagerEnv,
+        dialog_id: DialogId,
+        community_settings: Option<&DialogNotificationSettings>,
+    ) -> bool {
+        if let Some(disabled) = community_settings
+            .filter(|settings| !settings.use_default_disable_pinned_message_notifications)
+            .map(|settings| settings.disable_pinned_message_notifications)
+        {
+            return disabled;
+        }
+        let scope = env.get_dialog_notification_setting_scope(dialog_id);
+        self.get_scope(scope).disable_pinned_message_notifications
+    }
+
+    /// `get_dialog_default_disable_mention_notifications` (ddbbcce8f,
+    /// 5084a648d, 0063421d6).
+    pub fn get_dialog_default_disable_mention_notifications(
+        &self,
+        env: &mut impl NotificationSettingsManagerEnv,
+        dialog_id: DialogId,
+    ) -> bool {
+        let community_settings = self.get_dialog_community_notification_settings(env, dialog_id);
+        self.get_dialog_default_disable_mention_notifications_with_community(
+            env,
+            dialog_id,
+            community_settings.as_ref(),
+        )
+    }
+
+    /// `get_dialog_default_disable_mention_notifications(dialog_id,
+    /// community_settings)` (0063421d6).
+    pub fn get_dialog_default_disable_mention_notifications_with_community(
+        &self,
+        env: &mut impl NotificationSettingsManagerEnv,
+        dialog_id: DialogId,
+        community_settings: Option<&DialogNotificationSettings>,
+    ) -> bool {
+        if let Some(disabled) = community_settings
+            .filter(|settings| !settings.use_default_disable_mention_notifications)
+            .map(|settings| settings.disable_mention_notifications)
+        {
+            return disabled;
+        }
+        let scope = env.get_dialog_notification_setting_scope(dialog_id);
+        self.get_scope(scope).disable_mention_notifications
+    }
+
+    /// `get_dialog_default_show_preview` (ddbbcce8f, 5084a648d).
+    pub fn get_dialog_default_show_preview(
+        &self,
+        env: &mut impl NotificationSettingsManagerEnv,
+        dialog_id: DialogId,
+    ) -> bool {
+        if let Some(show_preview) = self
+            .get_dialog_community_notification_settings(env, dialog_id)
+            .filter(|settings| !settings.use_default_show_preview)
+            .map(|settings| settings.show_preview)
+        {
+            return show_preview;
+        }
+        let scope = env.get_dialog_notification_setting_scope(dialog_id);
+        self.get_scope(scope).show_preview
+    }
+
+    /// `get_dialog_default_notification_ringtone_id` (e67cb6662,
+    /// 5084a648d).
+    pub fn get_dialog_default_notification_ringtone_id(
+        &self,
+        env: &mut impl NotificationSettingsManagerEnv,
+        dialog_id: DialogId,
+    ) -> i64 {
+        if let Some(ringtone_id) = self
+            .get_dialog_community_notification_settings(env, dialog_id)
+            .filter(|settings| !is_notification_sound_default(&settings.sound))
+            .map(|settings| get_notification_sound_ringtone_id(&settings.sound))
+        {
+            return ringtone_id;
+        }
+        let scope = env.get_dialog_notification_setting_scope(dialog_id);
+        get_notification_sound_ringtone_id(&self.get_scope(scope).sound)
+    }
+
+    /// `get_dialog_default_mute_stories` (e67cb6662, 5084a648d).
+    pub fn get_dialog_default_mute_stories(
+        &self,
+        env: &mut impl NotificationSettingsManagerEnv,
+        dialog_id: DialogId,
+    ) -> (bool, bool) {
+        if let Some(mute_stories) = self
+            .get_dialog_community_notification_settings(env, dialog_id)
+            .filter(|settings| !settings.use_default_mute_stories)
+            .map(|settings| (false, settings.mute_stories))
+        {
+            return mute_stories;
+        }
+        let scope = env.get_dialog_notification_setting_scope(dialog_id);
         let settings = self.get_scope(scope);
         (settings.use_default_mute_stories, settings.mute_stories)
     }
 
-    /// `get_scope_notification_sound` (cpp:698-701).
-    pub fn get_scope_notification_sound(
+    /// `get_dialog_default_story_notification_ringtone_id` (e67cb6662,
+    /// 5084a648d).
+    pub fn get_dialog_default_story_notification_ringtone_id(
         &self,
-        scope: NotificationSettingsScope,
-    ) -> &Option<crate::notification_settings::NotificationSound> {
-        &self.get_scope(scope).sound
+        env: &mut impl NotificationSettingsManagerEnv,
+        dialog_id: DialogId,
+    ) -> i64 {
+        if let Some(ringtone_id) = self
+            .get_dialog_community_notification_settings(env, dialog_id)
+            .filter(|settings| !is_notification_sound_default(&settings.story_sound))
+            .map(|settings| get_notification_sound_ringtone_id(&settings.story_sound))
+        {
+            return ringtone_id;
+        }
+        let scope = env.get_dialog_notification_setting_scope(dialog_id);
+        get_notification_sound_ringtone_id(&self.get_scope(scope).story_sound)
     }
 
-    /// `get_scope_story_notification_sound` (cpp:703-706).
-    pub fn get_scope_story_notification_sound(
+    /// `get_dialog_default_hide_story_sender` (e67cb6662, 5084a648d).
+    pub fn get_dialog_default_hide_story_sender(
         &self,
-        scope: NotificationSettingsScope,
-    ) -> &Option<crate::notification_settings::NotificationSound> {
-        &self.get_scope(scope).story_sound
-    }
-
-    /// `get_scope_show_preview` (cpp:708-710).
-    pub fn get_scope_show_preview(&self, scope: NotificationSettingsScope) -> bool {
-        self.get_scope(scope).show_preview
-    }
-
-    /// `get_scope_hide_story_sender` (cpp:712-714).
-    pub fn get_scope_hide_story_sender(&self, scope: NotificationSettingsScope) -> bool {
+        env: &mut impl NotificationSettingsManagerEnv,
+        dialog_id: DialogId,
+    ) -> bool {
+        if let Some(hide_sender) = self
+            .get_dialog_community_notification_settings(env, dialog_id)
+            .filter(|settings| !settings.use_default_hide_story_sender)
+            .map(|settings| settings.hide_story_sender)
+        {
+            return hide_sender;
+        }
+        let scope = env.get_dialog_notification_setting_scope(dialog_id);
         self.get_scope(scope).hide_story_sender
     }
 
@@ -882,6 +1081,10 @@ impl NotificationSettingsManager {
         &mut self,
         env: &mut impl NotificationSettingsManagerEnv,
     ) {
+        // 8d2a35e05: the community settings reset first, then the dialog
+        // and scope resets.
+        env.reset_all_community_notification_settings();
+
         env.reset_all_dialog_notification_settings();
 
         self.reset_scope_notification_settings(env);
@@ -1041,6 +1244,13 @@ mod tests {
         next_log_event_id: u64,
         is_bot: bool,
         is_authorized: bool,
+        /// The dialog-default helper test plane: the dialog's scope, its
+        /// linked community and that community's settings.
+        dialog_scope: NotificationSettingsScope,
+        linked_community: CommunityId,
+        community_settings: Option<DialogNotificationSettings>,
+        /// The reset-order record.
+        reset_calls: Vec<&'static str>,
     }
 
     impl TestSettingsEnv {
@@ -1054,6 +1264,10 @@ mod tests {
                 next_log_event_id: 1,
                 is_bot: false,
                 is_authorized: true,
+                dialog_scope: NotificationSettingsScope::Private,
+                linked_community: CommunityId::default(),
+                community_settings: None,
+                reset_calls: Vec::new(),
             }
         }
 
@@ -1130,6 +1344,32 @@ mod tests {
             self.next_log_event_id += 1;
             self.binlog.push((id, handler_type, data.to_vec()));
             id
+        }
+
+        fn reset_all_dialog_notification_settings(&mut self) {
+            self.reset_calls.push("dialog");
+        }
+
+        fn get_dialog_notification_setting_scope(
+            &mut self,
+            _dialog_id: DialogId,
+        ) -> NotificationSettingsScope {
+            self.dialog_scope
+        }
+
+        fn get_dialog_linked_community_id(&mut self, _dialog_id: DialogId) -> CommunityId {
+            self.linked_community
+        }
+
+        fn community_notification_settings(
+            &mut self,
+            _community_id: CommunityId,
+        ) -> Option<DialogNotificationSettings> {
+            self.community_settings.clone()
+        }
+
+        fn reset_all_community_notification_settings(&mut self) {
+            self.reset_calls.push("community");
         }
     }
 
@@ -1254,7 +1494,9 @@ mod tests {
             "the unmute is scheduled 101 monotonic seconds out"
         );
         assert_eq!(
-            manager.get_scope_mute_until(NotificationSettingsScope::Private),
+            manager
+                .get_scope(NotificationSettingsScope::Private)
+                .mute_until,
             1_000_100
         );
     }
@@ -1277,7 +1519,9 @@ mod tests {
 
         // the scope became synchronized and muted-for-50
         assert_eq!(
-            manager.get_scope_mute_until(NotificationSettingsScope::Group),
+            manager
+                .get_scope(NotificationSettingsScope::Group)
+                .mute_until,
             1_000_050
         );
         assert!(manager.next_deadline().is_some());
@@ -1328,8 +1572,8 @@ mod tests {
             )
             .expect("ok");
         assert_eq!(
-            manager.get_scope_notification_sound(NotificationSettingsScope::Private),
-            &None
+            manager.get_scope(NotificationSettingsScope::Private).sound,
+            None
         );
 
         // a Local sound is "default", so it carries over a default request
@@ -1351,8 +1595,8 @@ mod tests {
             )
             .expect("ok");
         assert_eq!(
-            manager.get_scope_notification_sound(NotificationSettingsScope::Channel),
-            &Some(NotificationSound::Local {
+            manager.get_scope(NotificationSettingsScope::Channel).sound,
+            Some(NotificationSound::Local {
                 title: "t".to_owned(),
                 data: "t".to_owned()
             }),
@@ -1375,7 +1619,9 @@ mod tests {
         env.unix_time = 1_000_030;
         manager.tick_timeouts(&mut env);
         assert_eq!(
-            manager.get_scope_mute_until(NotificationSettingsScope::Private),
+            manager
+                .get_scope(NotificationSettingsScope::Private)
+                .mute_until,
             1_000_050
         );
 
@@ -1384,7 +1630,9 @@ mod tests {
         env.unix_time = 1_000_052;
         manager.tick_timeouts(&mut env);
         assert_eq!(
-            manager.get_scope_mute_until(NotificationSettingsScope::Private),
+            manager
+                .get_scope(NotificationSettingsScope::Private)
+                .mute_until,
             0
         );
         assert!(manager.next_deadline().is_none());
@@ -1446,10 +1694,16 @@ mod tests {
         manager.reset_all_notification_settings(&mut env);
 
         assert_eq!(
-            manager.get_scope_mute_until(NotificationSettingsScope::Private),
+            manager
+                .get_scope(NotificationSettingsScope::Private)
+                .mute_until,
             0
         );
-        assert!(manager.get_scope_show_preview(NotificationSettingsScope::Private));
+        assert!(
+            manager
+                .get_scope(NotificationSettingsScope::Private)
+                .show_preview
+        );
         assert_eq!(
             env.binlog.last().expect("set").1,
             RESET_ALL_NOTIFICATION_SETTINGS_ON_SERVER
@@ -1718,5 +1972,134 @@ mod tests {
             binlog_before + 3,
             "the replayed id parks without a new log event"
         );
+    }
+
+    #[test]
+    fn dialog_default_helpers_prefer_community_values() {
+        // 5084a648d: a community with a non-default value wins over the
+        // scope default for every helper.
+        let mut env = TestSettingsEnv::new();
+        env.dialog_scope = NotificationSettingsScope::Group;
+        env.linked_community = CommunityId::new(7);
+        let community = DialogNotificationSettings {
+            is_synchronized: true,
+            use_default_mute_until: false,
+            mute_until: 500,
+            use_default_show_preview: false,
+            show_preview: false,
+            use_default_mute_stories: false,
+            mute_stories: true,
+            sound: Some(NotificationSound::Ringtone { ringtone_id: 11 }),
+            story_sound: Some(NotificationSound::NoSound),
+            use_default_hide_story_sender: false,
+            hide_story_sender: true,
+            ..DialogNotificationSettings::default()
+        };
+        env.community_settings = Some(community);
+
+        let manager = NotificationSettingsManager::new();
+        let dialog_id = DialogId::default();
+        assert_eq!(
+            manager.get_dialog_default_mute_until(&mut env, dialog_id),
+            500
+        );
+        assert!(!manager.get_dialog_default_show_preview(&mut env, dialog_id));
+        assert_eq!(
+            manager.get_dialog_default_notification_ringtone_id(&mut env, dialog_id),
+            11
+        );
+        assert_eq!(
+            manager.get_dialog_default_mute_stories(&mut env, dialog_id),
+            (false, true)
+        );
+        assert_eq!(
+            manager.get_dialog_default_story_notification_ringtone_id(&mut env, dialog_id),
+            0,
+            "the community story sound (NoSound) wins"
+        );
+        assert!(manager.get_dialog_default_hide_story_sender(&mut env, dialog_id));
+
+        // the community-explicit overloads pair the same values without
+        // re-reading the community
+        let community_settings = env.community_settings.clone().unwrap();
+        assert_eq!(
+            manager.get_dialog_default_mute_until_with_community(
+                &mut env,
+                dialog_id,
+                Some(&community_settings)
+            ),
+            500
+        );
+        assert_eq!(
+            manager.get_dialog_default_show_preview(&mut env, dialog_id),
+            community_settings.show_preview
+        );
+    }
+
+    #[test]
+    fn dialog_default_helpers_fall_back_to_the_scope() {
+        // no community, and a community with default values, both read
+        // the scope settings.
+        let mut env = TestSettingsEnv::new();
+        env.dialog_scope = NotificationSettingsScope::Group;
+        let mut manager = NotificationSettingsManager::new();
+        // a future mute (the store form collapses expired mutes)
+        let scope_settings = ScopeNotificationSettings {
+            mute_until: 1_000_300,
+            show_preview: false,
+            sound: Some(NotificationSound::Ringtone { ringtone_id: 4 }),
+            is_synchronized: true,
+            ..ScopeNotificationSettings::default()
+        };
+        env.seed_scope_settings(NotificationSettingsScope::Group, &scope_settings);
+        manager.init(&mut env);
+        env.time = 0.0;
+        let dialog_id = DialogId::default();
+
+        // no linked community
+        assert_eq!(
+            manager.get_dialog_default_mute_until(&mut env, dialog_id),
+            1_000_300
+        );
+        assert!(!manager.get_dialog_default_show_preview(&mut env, dialog_id));
+        assert_eq!(
+            manager.get_dialog_default_notification_ringtone_id(&mut env, dialog_id),
+            4
+        );
+
+        // a linked community that stays at the defaults everywhere
+        env.linked_community = CommunityId::new(7);
+        env.community_settings = Some(DialogNotificationSettings::default());
+        assert_eq!(
+            manager.get_dialog_default_mute_until(&mut env, dialog_id),
+            1_000_300,
+            "the community use_default band falls through"
+        );
+        assert_eq!(
+            manager.get_dialog_default_mute_stories(&mut env, dialog_id),
+            (
+                scope_settings.use_default_mute_stories,
+                scope_settings.mute_stories
+            )
+        );
+
+        // an absent (unsynchronized) community falls through too
+        env.community_settings = None;
+        assert_eq!(
+            manager.get_dialog_default_mute_until(&mut env, dialog_id),
+            1_000_300
+        );
+    }
+
+    #[test]
+    fn reset_all_resets_the_community_settings_first() {
+        // 8d2a35e05: resetAllNotificationSettings resets the community
+        // settings before the dialog settings.
+        let mut env = TestSettingsEnv::new();
+        let mut manager = NotificationSettingsManager::new();
+        manager.init(&mut env);
+        env.time = 0.0;
+        manager.reset_all_notification_settings(&mut env);
+        assert_eq!(env.reset_calls, vec!["community", "dialog"]);
     }
 }

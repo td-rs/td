@@ -1011,6 +1011,16 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             {
+                // 8d2a35e05: the community settings reset first (the C++
+                // order inside
+                // NotificationSettingsManager::reset_all_notification_settings;
+                // the field-split NotificationEnv can't reach the
+                // community manager, so the Td-level arm drives it).
+                let (mut manager, mut env) = community_split(td);
+                manager.reset_all_community_notification_settings(&mut env);
+                td.community_manager = manager;
+            }
+            {
                 let mut env = NotificationEnv {
                     global: &mut td.global,
                     options: td.option_manager.as_mut(),
@@ -7067,6 +7077,24 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 &mut env,
                 CommunityId::new(request.community_id),
                 request.permissions.as_ref(),
+                promise,
+            );
+            td.community_manager = manager;
+        }
+        Function::setCommunityNotificationSettings(request) => {
+            // Requests.cpp:3483-3488 (99302f0e2) — CHECK_IS_USER, then
+            // CommunityManager::set_community_notification_settings (the
+            // account_updateNotifySettings send + the promise settle ride
+            // the net answer drain).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut manager, mut env) = community_split(td);
+            manager.set_community_notification_settings(
+                &mut env,
+                CommunityId::new(request.community_id),
+                request.notification_settings.as_ref(),
                 promise,
             );
             td.community_manager = manager;
@@ -19905,7 +19933,7 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 26, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            1039,
+            1040,
             "dispatched count"
         );
         // the 23383aef sync base (1.8.70): the 34 new scheme functions
@@ -19916,6 +19944,9 @@ mod request_census_tests {
         // follow-ups; the 7 changed functions keep their dispatched
         // arms with updated signatures. Census: 1,099 functions,
         // dispatched unmoved 1,039 / 0 + 34 = 34 interim, sync 26.
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 34, "interim count");
+        // The community notification-settings slice (#113) flipped
+        // setCommunityNotificationSettings: 1,039 + 1 = 1,040
+        // dispatched / 34 - 1 = 33 interim, sync unmoved 26.
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 33, "interim count");
     }
 }
