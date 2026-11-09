@@ -207,8 +207,9 @@ pub enum FileType {
     SelfDestructingVoiceNote = 25,
     LivePhoto = 26,
     SelfDestructingLivePhoto = 27,
-    Size = 28,
-    None = 29,
+    SpeechRecognitionAudio = 28,
+    Size = 29,
+    None = 30,
 }
 
 /// `td::FileDirType` (files/FileType.h:50).
@@ -255,8 +256,9 @@ impl FileType {
             25 => FileType::SelfDestructingVoiceNote,
             26 => FileType::LivePhoto,
             27 => FileType::SelfDestructingLivePhoto,
-            28 => FileType::Size,
-            29 => FileType::None,
+            28 => FileType::SpeechRecognitionAudio,
+            29 => FileType::Size,
+            30 => FileType::None,
             _ => unreachable!("Invalid FileType raw value {raw}"),
         }
     }
@@ -368,6 +370,11 @@ pub fn get_file_type_object(file_type: FileType) -> td_api::FileType {
                 td_api::fileTypeSelfDestructingLivePhotoVideo,
             )
         }
+        // the never-exposed speech-recognition temp type answers as the
+        // voice note it is (FileType.cpp:131-132)
+        FileType::SpeechRecognitionAudio => {
+            td_api::FileType::fileTypeVoiceNote(td_api::fileTypeVoiceNote)
+        }
         FileType::None => td_api::FileType::fileTypeNone(td_api::fileTypeNone),
         FileType::Size => unreachable!("FileType::Size in get_file_type_object"),
     }
@@ -380,6 +387,7 @@ pub fn get_main_file_type(file_type: FileType) -> FileType {
         FileType::SecureDecrypted => FileType::SecureEncrypted,
         FileType::DocumentAsFile => FileType::Document,
         FileType::CallLog => FileType::Document,
+        FileType::SpeechRecognitionAudio => FileType::VoiceNote,
         _ => file_type,
     }
 }
@@ -446,7 +454,8 @@ pub fn get_file_type_class(file_type: FileType) -> FileTypeClass {
         | FileType::SelfDestructingVideoNote
         | FileType::SelfDestructingVoiceNote
         | FileType::LivePhoto
-        | FileType::SelfDestructingLivePhoto => FileTypeClass::Document,
+        | FileType::SelfDestructingLivePhoto
+        | FileType::SpeechRecognitionAudio => FileTypeClass::Document,
         FileType::SecureDecrypted | FileType::SecureEncrypted => FileTypeClass::Secure,
         FileType::Encrypted => FileTypeClass::Encrypted,
         FileType::Temp => FileTypeClass::Temp,
@@ -500,7 +509,8 @@ pub fn is_file_big(file_type: FileType, expected_size: i64) -> bool {
         | FileType::CallLog
         | FileType::VideoStory
         | FileType::LivePhoto
-        | FileType::SelfDestructingLivePhoto => return false,
+        | FileType::SelfDestructingLivePhoto
+        | FileType::SpeechRecognitionAudio => return false,
         _ => {}
     }
     const SMALL_FILE_MAX_SIZE: i64 = 10 << 20;
@@ -603,6 +613,7 @@ pub fn can_reuse_remote_file(file_type: FileType) -> bool {
             | FileType::SelfDestructingVideoNote
             | FileType::SelfDestructingVoiceNote
             | FileType::SelfDestructingLivePhoto
+            | FileType::SpeechRecognitionAudio
     )
 }
 
@@ -679,6 +690,7 @@ impl fmt::Display for FileType {
             FileType::SelfDestructingVoiceNote => "SelfDestructingVoiceNote",
             FileType::LivePhoto => "LivePhotoVideo",
             FileType::SelfDestructingLivePhoto => "SelfDestructingLivePhotoVideo",
+            FileType::SpeechRecognitionAudio => "SpeechRecognitionAudio",
             FileType::Size | FileType::None => "<invalid>",
         };
         f.write_str(name)
@@ -11698,6 +11710,37 @@ mod tests {
         assert!(can_reuse_remote_file(FileType::Photo));
         assert!(!can_reuse_remote_file(FileType::Thumbnail));
         assert!(!can_reuse_remote_file(FileType::SelfDestructingVideo));
+
+        // the 1.8.70 speech-recognition temp type (the discriminants are
+        // the db-serialized values — they must match upstream exactly)
+        assert_eq!(FileType::SpeechRecognitionAudio as i32, 28);
+        assert_eq!(FileType::Size as i32, 29);
+        assert_eq!(FileType::None as i32, 30);
+        assert_eq!(FileType::from_raw(28), FileType::SpeechRecognitionAudio);
+        assert_eq!(FileType::from_raw(29), FileType::Size);
+        assert_eq!(FileType::from_raw(30), FileType::None);
+        assert_eq!(
+            get_main_file_type(FileType::SpeechRecognitionAudio),
+            FileType::VoiceNote
+        );
+        assert_eq!(
+            get_file_type_class(FileType::SpeechRecognitionAudio),
+            FileTypeClass::Document
+        );
+        assert_eq!(
+            get_file_type_name(FileType::SpeechRecognitionAudio),
+            "voice"
+        );
+        assert_eq!(
+            get_file_dir_type(FileType::SpeechRecognitionAudio),
+            FileDirType::Common
+        );
+        assert!(!is_file_big(FileType::SpeechRecognitionAudio, 1 << 40));
+        assert!(!can_reuse_remote_file(FileType::SpeechRecognitionAudio));
+        assert_eq!(
+            get_file_type_object(FileType::SpeechRecognitionAudio),
+            td_api::FileType::fileTypeVoiceNote(td_api::fileTypeVoiceNote)
+        );
     }
 
     #[test]
