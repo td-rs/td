@@ -422,6 +422,30 @@ mod tests {
         encode_decode(&vec![b'a'; 1_000_000]);
     }
 
+    /// Port of `TEST(Gzip, zlib)` (fb464979a) — both the zlib-format and
+    /// the gzip-format encodings of "abacaba" decode through the
+    /// auto-detecting reader.
+    #[test]
+    fn gzdecode_zlib_format() {
+        fn hex_decode(hex: &str) -> Vec<u8> {
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect()
+        }
+        assert_eq!(
+            gzdecode(&hex_decode("78da4b4c4a4c4e4c4a04000ab302ac")).as_slice(),
+            b"abacaba"
+        );
+        assert_eq!(
+            gzdecode(&hex_decode(
+                "1f8b080000000000020a4b4c4a4c4e4c4a040092c93b5c07000000"
+            ))
+            .as_slice(),
+            b"abacaba"
+        );
+    }
+
     /// Port of `TEST(Gzip, gzencode)` — size sweep (1 → 10^7 bytes) across
     /// the three string families, each within the C++ ratio budget
     /// `max(2, 100 / len)` (integer division).

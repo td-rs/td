@@ -145,10 +145,11 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                 value: request.x * request.x,
             }),
         ),
-        Function::testCallString(request) => td.send_result(
-            id,
-            Object::testString(td_api::TestString { value: request.x }),
-        ),
+        Function::testCallString(request) => {
+            // ad5b7f7c7 — CLEAN_INPUT_STRING(x)
+            let value = crate::misc::clean_input_string(&request.x).unwrap_or_default();
+            td.send_result(id, Object::testString(td_api::TestString { value }))
+        }
         Function::testCallBytes(request) => td.send_result(
             id,
             Object::testBytes(td_api::TestBytes { value: request.x }),
@@ -3623,16 +3624,18 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             );
         }
         Function::deletePollOption(request) => {
-            // Requests.cpp:8095-8100
+            // Requests.cpp:8095-8100 — ad5b7f7c7 adds
+            // CLEAN_INPUT_STRING(option_id)
             if !check_is_user(td, id) {
                 return;
             }
+            let option_id = crate::misc::clean_input_string(&request.option_id).unwrap_or_default();
             let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
             let (mut env, poll_manager) = crate::td::poll_env_split(td);
             poll_manager.delete_poll_option(
                 &mut env,
                 message_full_id(request.chat_id, request.message_id),
-                request.option_id,
+                option_id,
                 promise,
             );
         }
@@ -14482,11 +14485,13 @@ fn run_password_and_auth_requests(td: &mut Td, id: u64, function: Function) {
             }
         }
         Function::setAuthenticationPremiumPurchaseTransaction(request) => {
+            // ad5b7f7c7 — CLEAN_INPUT_STRING(currency)
+            let currency = crate::misc::clean_input_string(&request.currency).unwrap_or_default();
             match td.auth_manager.set_premium_purchase_transaction(
                 request.transaction.as_ref(),
                 request.is_restore,
                 request.premium_day_count,
-                &request.currency,
+                &currency,
                 request.amount,
             ) {
                 Ok(()) => {
