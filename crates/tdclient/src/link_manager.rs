@@ -2534,6 +2534,7 @@ fn get_link_info(env: &impl LinkEnv, link: &str) -> LinkInfo {
             "share",
             "socks",
             "web",
+            "webproxy",
             "a",
             "k",
             "z",
@@ -2808,6 +2809,31 @@ fn get_internal_link_message_draft(url: &str, text: &str) -> Option<InternalLink
         text: full_text,
         contains_link: contains_url,
     })
+}
+
+/// `LinkManager::get_internal_link_web_proxy` (LinkManager.cpp:3260-3275)
+/// — a port parameter is ignored, because web proxies always use 443; an
+/// unparseable address or secret degrades to the empty unsupported-proxy
+/// form like the C++.
+fn get_internal_link_web_proxy(address: &str, secret: &str) -> InternalLink {
+    use crate::connection_creator::Proxy;
+    if let Ok((host, path)) = Proxy::parse_web_proxy_address(address)
+        && let Ok(link_secret) = Proxy::get_web_proxy_link_secret(secret, !path.is_empty())
+    {
+        return InternalLink::Proxy {
+            server: host,
+            port: Proxy::WEB_PROXY_PORT,
+            r#type: Some(td_api::ProxyType::proxyTypeWeb(td_api::proxyTypeWeb {
+                path,
+                secret: String::from_utf8_lossy(&link_secret.get_encoded_secret()).into_owned(),
+            })),
+        };
+    }
+    InternalLink::Proxy {
+        server: String::new(),
+        port: 0,
+        r#type: None,
+    }
 }
 
 /// `LinkManager::get_internal_link_passport` (cpp:2955-2984).
@@ -3336,6 +3362,12 @@ fn parse_tg_link_query(
                 r#type: None,
             });
         }
+    } else if path.len() == 1 && path[0] == "webproxy" {
+        // webproxy?server=<host>[%2F<path>]&secret=<secret>
+        return Some(get_internal_link_web_proxy(
+            &get_arg("server"),
+            &get_arg("secret"),
+        ));
     } else if path.len() == 1 && path[0] == "privatepost" {
         // privatepost?channel=123456789&post=12345&single&thread=...
         if has_arg("channel") && has_arg("post") {
@@ -4318,6 +4350,12 @@ fn parse_t_me_link_query(
                 r#type: None,
             });
         }
+    } else if path[0] == "webproxy" {
+        // /webproxy?server=<host>[%2F<path>]&secret=<secret>
+        return Some(get_internal_link_web_proxy(
+            &get_arg("server"),
+            &get_arg("secret"),
+        ));
     } else if path[0] == "bg" {
         if path.len() >= 2 && !path[1].is_empty() {
             // /bg/<hex_color> / /bg/<hex_color>-<hex_color>?rotation=...
@@ -6244,6 +6282,7 @@ pub(crate) struct NetProxy {
     port: i32,
     user: String,
     password: String,
+    path: String,
     secret: tdmtproto::proxy_secret::ProxySecret,
 }
 
@@ -6254,6 +6293,7 @@ enum NetProxyType {
     HttpTcp,
     HttpCaching,
     Mtproto,
+    Web,
 }
 
 impl NetProxy {
@@ -6264,6 +6304,7 @@ impl NetProxy {
             port,
             user,
             password,
+            path: String::new(),
             secret: tdmtproto::proxy_secret::ProxySecret::default(),
         }
     }
@@ -6285,6 +6326,7 @@ impl NetProxy {
             port,
             user,
             password,
+            path: String::new(),
             secret: tdmtproto::proxy_secret::ProxySecret::default(),
         }
     }
@@ -6300,16 +6342,50 @@ impl NetProxy {
             port,
             user: String::new(),
             password: String::new(),
+            path: String::new(),
+            secret,
+        }
+    }
+
+    /// `Proxy::web` (net/Proxy.h:89-97) — the port is forced to 443.
+    fn new_web(
+        server: String,
+        path: String,
+        secret: tdmtproto::proxy_secret::ProxySecret,
+    ) -> NetProxy {
+        NetProxy {
+            r#type: NetProxyType::Web,
+            server,
+            port: crate::connection_creator::Proxy::WEB_PROXY_PORT,
+            user: String::new(),
+            password: String::new(),
+            path,
             secret,
         }
     }
 
     /// `Proxy::create_proxy(const td_api::proxy *)`
-    /// (net/Proxy.cpp:56-60, 15-54).
+    /// (net/Proxy.cpp:56-60, 15-54). The web arm shares the
+    /// connection-creator statics (the C++ single `Proxy::create_proxy`
+    /// ladder — the link plane reads only the accessors).
     fn create_proxy(proxy: &td_api::Proxy) -> std::result::Result<NetProxy, Status> {
+        use crate::connection_creator::Proxy as NetProxyHelpers;
         let Some(proxy_type) = proxy.r#type.as_ref() else {
             return Err(Status::error(400, "Proxy type must be non-empty"));
         };
+        if let td_api::ProxyType::proxyTypeWeb(type_web) = proxy_type {
+            if proxy.port != 0 && proxy.port != NetProxyHelpers::WEB_PROXY_PORT {
+                return Err(Status::error(400, "Web proxy port must be 443"));
+            }
+            let host = NetProxyHelpers::normalize_web_proxy_host(&proxy.server)
+                .map_err(|message| Status::error(400, &message))?;
+            if !NetProxyHelpers::is_valid_web_proxy_path(&type_web.path) {
+                return Err(Status::error(400, "Invalid web proxy path"));
+            }
+            let secret = NetProxyHelpers::get_web_proxy_secret(&type_web.secret)
+                .map_err(|message| Status::error(400, &message))?;
+            return Ok(NetProxy::new_web(host, type_web.path.clone(), secret));
+        }
         if proxy.server.is_empty() {
             return Err(Status::error(400, "Server name must be non-empty"));
         }
@@ -6353,13 +6429,10 @@ impl NetProxy {
                     secret,
                 ))
             }
-            // 1.8.70 web proxies (Proxy::web — port 443, the path in
-            // the server parameter, net/Proxy.cpp:183-193) need the
-            // NetProxy web transport — the web-proxy family follow-up
-            // (#114); the interim arm refuses like an unbuildable proxy.
+            // unreachable like the C++ switch's UNREACHABLE default — the
+            // web arm is handled before the validation ladder
             td_api::ProxyType::proxyTypeWeb(_) => {
-                let _ = proxy_type;
-                Err(Status::error(400, "Web proxies are not supported yet"))
+                unreachable!("the web arm is handled before the validation ladder")
             }
         }
     }
@@ -6367,6 +6440,37 @@ impl NetProxy {
     /// The encoded secret in its string form.
     fn get_encoded_secret(&self) -> String {
         String::from_utf8_lossy(&self.secret.get_encoded_secret()).into_owned()
+    }
+
+    /// `Proxy::get_web_proxy_address` (net/Proxy.cpp:144-151) — the
+    /// "host[/path]" form the link carries in the server parameter.
+    fn get_web_proxy_address(&self) -> String {
+        debug_assert!(
+            self.r#type == NetProxyType::Web,
+            "CHECK(type_ == Type::Web)"
+        );
+        if self.path.is_empty() {
+            return self.server.clone();
+        }
+        format!("{}/{}", self.server, self.path)
+    }
+
+    /// `Proxy::get_web_proxy_link_secret` (net/Proxy.cpp:147-153) — a
+    /// path-carrying proxy marks its link secret with the 0x70 byte so
+    /// path-unaware clients reject the link.
+    fn get_web_proxy_link_secret(&self) -> String {
+        debug_assert!(
+            self.r#type == NetProxyType::Web,
+            "CHECK(type_ == Type::Web)"
+        );
+        const WEB_PROXY_LINK_SECRET_MARKER: u8 = 0x70;
+        if self.path.is_empty() {
+            return String::from_utf8_lossy(&self.secret.get_encoded_secret()).into_owned();
+        }
+        let mut marked = vec![WEB_PROXY_LINK_SECRET_MARKER];
+        marked.extend_from_slice(self.secret.get_raw_secret());
+        String::from_utf8(tdmtproto::utils::base64url_encode(&marked))
+            .expect("base64url output is ASCII")
     }
 }
 
@@ -6392,6 +6496,15 @@ fn get_proxy_link(
         }
         NetProxyType::Mtproto => {
             url += "proxy";
+        }
+        NetProxyType::Web => {
+            // the port is always 443, and the path travels in the server
+            // parameter (LinkManager.cpp:4908-4912)
+            return Ok(format!(
+                "{url}webproxy?server={}&secret={}",
+                url_encode(&proxy.get_web_proxy_address()),
+                url_encode(&proxy.get_web_proxy_link_secret())
+            ));
         }
     }
     url += "?server=";
@@ -7531,5 +7644,204 @@ mod tests {
             Default::default(),
         );
         assert!(manager.pending.url_auth.is_empty(), "the CHECK band");
+    }
+
+    /// The upstream `test/link.cpp` web-proxy vectors (e52edfd8b,
+    /// `parse_internal_link_part3`) — the parsed form is asserted against
+    /// the C++ expectations verbatim, host normalization and the marked
+    /// 0x70 link-secret round-trip included.
+    #[test]
+    fn web_proxy_links_parse_like_the_cpp_reference() {
+        struct WebProxyEnv;
+        impl LinkEnv for WebProxyEnv {}
+        let mut env = WebProxyEnv;
+        let proxy_web = |server: &str, path: &str, secret: &str| InternalLink::Proxy {
+            server: server.to_owned(),
+            port: 443,
+            r#type: Some(td_api::ProxyType::proxyTypeWeb(td_api::proxyTypeWeb {
+                path: path.to_owned(),
+                secret: secret.to_owned(),
+            })),
+        };
+        let unsupported = || InternalLink::Proxy {
+            server: String::new(),
+            port: 0,
+            r#type: None,
+        };
+        let mut parse = |link: &str| {
+            parse_internal_link(&mut env, link, false).expect("the link must parse to a proxy form")
+        };
+
+        assert_eq!(
+            parse("t.me/webproxy?server=proxy.example.com&secret=8561944064fc730cbfa4473562d8ec59"),
+            proxy_web("proxy.example.com", "", "8561944064fc730cbfa4473562d8ec59")
+        );
+        // the port parameter is ignored, and the hex secret re-canonicalizes
+        assert_eq!(
+            parse(
+                "https://t.me/webproxy?server=proxy.example.com&port=80&secret=8561944064FC730CBFA4473562D8EC59"
+            ),
+            proxy_web("proxy.example.com", "", "8561944064fc730cbfa4473562d8ec59")
+        );
+        // scheme/trailing-dot normalization of the host; the dd-padded
+        // secret keeps its padding
+        assert_eq!(
+            parse(
+                "t.me/webproxy?server=HTTPS%3A%2F%2FProxy.Example.COM.&secret=dd8561944064fc730cbfa4473562d8ec59"
+            ),
+            proxy_web(
+                "proxy.example.com",
+                "",
+                "dd8561944064fc730cbfa4473562d8ec59"
+            )
+        );
+        // the punycode pass (idn_to_ascii) is part of the contract
+        assert_eq!(
+            parse(
+                "t.me/webproxy?server=%D0%BF%D1%80%D0%B8%D0%BC%D0%B5%D1%80.%D1%80%D1%84&secret=8561944064fc730cbfa4473562d8ec59"
+            ),
+            proxy_web(
+                "xn--e1afmkfd.xn--p1ai",
+                "",
+                "8561944064fc730cbfa4473562d8ec59"
+            )
+        );
+        assert_eq!(
+            parse(
+                "t.me/webproxy?server=%D0%9F%D1%80%D0%B8%D0%BC%D0%B5%D1%80.%D0%A0%D0%A4&secret=8561944064fc730cbfa4473562d8ec59"
+            ),
+            proxy_web(
+                "xn--e1afmkfd.xn--p1ai",
+                "",
+                "8561944064fc730cbfa4473562d8ec59"
+            )
+        );
+        // the %2F-encoded path and the 0x70-marked link secret
+        assert_eq!(
+            parse(
+                "t.me/webproxy?server=proxy.example.com%2Fdobry-cola-super-app&secret=cIVhlEBk_HMMv6RHNWLY7Fk"
+            ),
+            proxy_web(
+                "proxy.example.com",
+                "dobry-cola-super-app",
+                "8561944064fc730cbfa4473562d8ec59"
+            )
+        );
+        assert_eq!(
+            parse(
+                "t.me/webproxy?server=proxy.example.com%2Fa%2Fb_c&secret=cN2FYZRAZPxzDL-kRzVi2OxZ"
+            ),
+            proxy_web(
+                "proxy.example.com",
+                "a/b_c",
+                "dd8561944064fc730cbfa4473562d8ec59"
+            )
+        );
+        // a marked secret without a path falls back to the plain secret
+        assert_eq!(
+            parse("t.me/webproxy?server=proxy.example.com&secret=cIVhlEBk_HMMv6RHNWLY7Fk"),
+            proxy_web("proxy.example.com", "", "8561944064fc730cbfa4473562d8ec59")
+        );
+
+        // the unsupported band: a plain (unmarked) secret with a path,
+        // fake-TLS secrets, non-domain hosts, invalid paths, a missing
+        // secret
+        for link in [
+            "t.me/webproxy?server=proxy.example.com%2Fapp&secret=8561944064fc730cbfa4473562d8ec59",
+            "t.me/webproxy?server=proxy.example.com&secret=7tAAAAAAAAAAAAAAAAAAAAAAAAcuZ29vZ2xlLmNvbQ",
+            "t.me/webproxy?server=proxy.example.com&secret=de8561944064fc730cbfa4473562d8ec59",
+            "t.me/webproxy?server=1.2.3.4&secret=8561944064fc730cbfa4473562d8ec59",
+            "t.me/webproxy?server=proxy.0x7f&secret=8561944064fc730cbfa4473562d8ec59",
+            "t.me/webproxy?server=localhost&secret=8561944064fc730cbfa4473562d8ec59",
+            "t.me/webproxy?server=proxy.example.com%2F-app&secret=cIVhlEBk_HMMv6RHNWLY7Fk",
+            "t.me/webproxy?server=proxy.example.com%2Fa%2F%2Fb&secret=cIVhlEBk_HMMv6RHNWLY7Fk",
+            "t.me/webproxy?server=proxy.example.com%2Fa.b&secret=cIVhlEBk_HMMv6RHNWLY7Fk",
+            "t.me/webproxy?server=proxy.example.com",
+            "t.me/webproxy",
+        ] {
+            assert_eq!(
+                parse(link),
+                unsupported(),
+                "link must be unsupported: {link}"
+            );
+        }
+
+        // the tg forms ride the same helper
+        assert_eq!(
+            parse("tg:webproxy?server=proxy.example.com&secret=8561944064fc730cbfa4473562d8ec59"),
+            proxy_web("proxy.example.com", "", "8561944064fc730cbfa4473562d8ec59")
+        );
+        assert_eq!(
+            parse(
+                "tg://webproxy?server=proxy.example.com%2Fdobry-cola-super-app&secret=cIVhlEBk_HMMv6RHNWLY7Fk"
+            ),
+            proxy_web(
+                "proxy.example.com",
+                "dobry-cola-super-app",
+                "8561944064fc730cbfa4473562d8ec59"
+            )
+        );
+        // the tg unsupported forms (upstream test/link.cpp tail vectors)
+        assert_eq!(
+            parse(
+                "tg:webproxy?server=proxy.example.com%2Fapp&secret=8561944064fc730cbfa4473562d8ec59"
+            ),
+            unsupported(),
+            "a plain secret with a path is unsupported"
+        );
+        assert_eq!(parse("tg:webproxy"), unsupported());
+    }
+
+    /// `LinkManager::get_proxy_link`'s web arm (LinkManager.cpp:4908-4912)
+    /// — the link of a parsed web proxy regenerates the upstream bytes:
+    /// the path rides the server parameter, the secret stays marked, and
+    /// the whole round trip is byte-identical (upstream test/link.cpp
+    /// vectors).
+    #[test]
+    fn web_proxy_link_generation_round_trips_the_upstream_form() {
+        struct WebProxyEnv;
+        impl LinkEnv for WebProxyEnv {}
+        let mut env = WebProxyEnv;
+
+        for link in [
+            "tg://webproxy?server=proxy.example.com%2Fa%2Fb_c&secret=cN2FYZRAZPxzDL-kRzVi2OxZ",
+            "tg://webproxy?server=proxy.example.com&secret=8561944064fc730cbfa4473562d8ec59",
+        ] {
+            let Some(InternalLink::Proxy {
+                server,
+                port,
+                r#type,
+            }) = parse_internal_link(&mut env, link, false)
+            else {
+                panic!("the upstream link must parse: {link}");
+            };
+            let proxy = NetProxy::create_proxy(&td_api::Proxy {
+                server: server.clone(),
+                port,
+                r#type,
+            })
+            .expect("the parsed form must revalidate");
+            assert_eq!(
+                get_proxy_link(&env, &proxy, true).unwrap(),
+                link,
+                "the generated link must round-trip the parsed one"
+            );
+        }
+
+        // the HTTP proxies keep their no-public-links band
+        let http = NetProxy::create_proxy(&td_api::Proxy {
+            server: "proxy.example.com".to_owned(),
+            port: 8080,
+            r#type: Some(td_api::ProxyType::proxyTypeHttp(td_api::proxyTypeHttp {
+                username: String::new(),
+                password: String::new(),
+                http_only: false,
+            })),
+        })
+        .unwrap();
+        assert_eq!(
+            get_proxy_link(&env, &http, true).unwrap_err().message(),
+            "HTTP proxies have no public links"
+        );
     }
 }
