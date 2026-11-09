@@ -7679,7 +7679,7 @@ fn decode_html_entity(bytes: &[u8], pos: &mut usize) -> u32 {
     if at(*pos + 1) == b'#' {
         // numeric character reference
         end_pos += 1;
-        if at(*pos + 2) == b'x' {
+        if at(*pos + 2) == b'x' || at(*pos + 2) == b'X' {
             // hexadecimal numeric character reference
             end_pos += 1;
             while is_hex_digit(at(end_pos)) {
@@ -10407,6 +10407,13 @@ mod tests {
         assert_eq!(
             parse("&lt;&gt;&amp;&quot;&#65;&#x1F600;"),
             Ok(("<>&\"A\u{1F600}".to_owned(), Vec::new()))
+        );
+        // Both cases of the hexadecimal marker decode (upstream 1.8.70
+        // "Support uppercase X in hexadecimal HTML entities"; the C++
+        // parse_html vector verbatim).
+        assert_eq!(
+            parse("&#x41;&#X41;&#x1F600;&#X1f600;&#65;"),
+            Ok(("AA\u{1F600}\u{1F600}A".to_owned(), Vec::new()))
         );
         // An unterminated numeric entity overflows the C++ uint32
         // accumulator and is rejected without panicking (regression: the
