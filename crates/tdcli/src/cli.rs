@@ -5888,7 +5888,9 @@ impl CliClient {
             || op == "SearchP"
             || op == "SearchG"
             || op == "SearchC"
-            || op.starts_with("SearchC")
+            // 16c6ebcfb — SearchChatPhoto has its own arm below; the
+            // prefix match must not shadow it
+            || (op.starts_with("SearchC") && op != "SearchChatPhoto")
         {
             let (query, limit, filter, offset) = {
                 let (w0, rest0) = tokenizer::split(args, ' ');
