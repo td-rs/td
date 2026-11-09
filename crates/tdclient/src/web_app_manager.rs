@@ -410,6 +410,9 @@ impl MessageInputReplyTo {
                 monoforum_peer_id: None,
                 todo_item_id: 0,
                 poll_option: Vec::new(),
+                // The rich-quote wire plane (flags.8) rides the quotes
+                // family follow-up (#117).
+                quote_rich: Vec::new(),
             },
         ))
     }

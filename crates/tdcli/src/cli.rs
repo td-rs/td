@@ -251,6 +251,9 @@ pub struct CliClient {
     /// (cli.cpp:9154-9155; the `srsfi` writer is a chain-9 arm).
     reposted_story_chat_id: AtomicI64,
     reposted_story_id: AtomicI32,
+    /// `string story_music_` (cli.cpp:9156; the `ssmu` writer feeds
+    /// postStory's 1.8.70 music leg).
+    story_music: Mutex<String>,
     /// `int32 group_call_source_ = Random::fast(1, 1000000000)` (cli.cpp:9193).
     group_call_source: AtomicI32,
     /// `SuggestedPostPrice suggested_post_price_` — the raw spell
@@ -348,6 +351,7 @@ pub fn instance() -> &'static CliClient {
         upgraded_gift_attribute_ids: Mutex::new(Vec::new()),
         reposted_story_chat_id: AtomicI64::new(0),
         reposted_story_id: AtomicI32::new(0),
+        story_music: Mutex::new(String::new()),
         group_call_source: AtomicI32::new(random::fast(1, 1000000000)),
         suggested_post_price: Mutex::new(String::new()),
         suggested_post_send_date: AtomicI32::new(-1),
@@ -1332,7 +1336,7 @@ fn get_input_story_areas(areas: &str) -> Option<td_api::InputStoryAreas> {
         if area.is_empty() {
             continue;
         }
-        let position = td_api::StoryAreaPosition {
+        let position = td_api::AreaPosition {
             x_percentage: f64::from(random::fast(1, 99)),
             y_percentage: f64::from(random::fast(1, 99)),
             width_percentage: f64::from(random::fast(1, 99)),
@@ -1358,15 +1362,9 @@ fn get_input_story_areas(areas: &str) -> Option<td_api::InputStoryAreas> {
                     }),
                 },
             ))
-        } else if first == b'v' {
-            let (query_id, result_id) = tokenizer::split(rest, ':');
-            Some(td_api::InputStoryAreaType::inputStoryAreaTypeFoundVenue(
-                td_api::inputStoryAreaTypeFoundVenue {
-                    query_id: tokenizer::to_integer_i64(&query_id),
-                    result_id,
-                },
-            ))
         } else if first == b'p' {
+            // 1.8.70 dropped the 'v' found-venue form with the scheme
+            // type; 'p' (previous venue) is the only venue input left.
             let (venue_provider, venue_id) = tokenizer::split(rest, ':');
             Some(td_api::InputStoryAreaType::inputStoryAreaTypePreviousVenue(
                 td_api::inputStoryAreaTypePreviousVenue {
@@ -2603,7 +2601,7 @@ impl CliClient {
         let mut op_not_found_count = 0;
 
         // The 19 blocks, in cli.cpp order; the census fixture
-        // (`testdata/cli_census.txt`, 1294 arms) pins the per-block command
+        // (`testdata/cli_census.txt`, 1295 arms) pins the per-block command
         // inventory, and the slices fill them in: M.14.3 auth, M.14.4
         // messages/dialogs, M.14.5 files, M.14.6 misc/dev.
         if !self.op_block_auth(&op, &args) {
@@ -3613,12 +3611,11 @@ impl CliClient {
             }));
             true
         } else if op == "gugwu" {
-            let (received_gift_id, password) = tokenizer::split(args, ' ');
+            // 1.8.70 dropped the request password — the saved temporary
+            // password gates the wire query.
+            let (received_gift_id, _password) = tokenizer::split(args, ' ');
             self.send_request(Function::getUpgradedGiftWithdrawalUrl(
-                td_api::getUpgradedGiftWithdrawalUrl {
-                    received_gift_id,
-                    password,
-                },
+                td_api::getUpgradedGiftWithdrawalUrl { received_gift_id },
             ));
             true
         } else if op == "gugpa" {
@@ -3824,8 +3821,13 @@ impl CliClient {
                 user_ids: self.as_user_ids(args),
             }));
             true
-        } else if op == "gul" {
-            self.send_request(Function::getUserLink(td_api::getUserLink));
+        } else if op == "gul" || op == "gulf" || op == "gulfp" || op == "gulfr" || op == "gulfpr" {
+            // cpp:3723 — the fee/permanent/revoke op matrix.
+            self.send_request(Function::getUserLink(td_api::getUserLink {
+                remove_messages_fee: op != "gul",
+                return_permanent_link: op == "gulfp" || op == "gulfpr",
+                revoke_previous_links: op == "gulfr" || op == "gulfpr",
+            }));
             true
         } else if op == "subt" {
             self.send_request(Function::searchUserByToken(td_api::searchUserByToken {
@@ -4122,6 +4124,9 @@ impl CliClient {
                 } else {
                     Some(td_api::InputTextQuote {
                         text: Some(self.as_formatted_text(&quote)),
+                        // 1.8.70 rich-quote plane — the CLI keeps the
+                        // plain quote.
+                        rich_texts: Vec::new(),
                         position: self.reply_quote_position.load(Ordering::SeqCst),
                     })
                 }
@@ -4202,6 +4207,17 @@ impl CliClient {
             duration,
             title: "title".to_owned(),
             performer: "performer".to_owned(),
+        }
+    }
+
+    /// `get_story_music` (cli.cpp:1232-1237) — `None` with no `ssmu`
+    /// state.
+    fn get_story_music(&self) -> Option<td_api::InputAudio> {
+        let story_music = self.story_music.lock().unwrap();
+        if story_music.is_empty() {
+            None
+        } else {
+            Some(self.as_input_audio(&story_music, 0))
         }
     }
 
@@ -5872,7 +5888,9 @@ impl CliClient {
             || op == "SearchP"
             || op == "SearchG"
             || op == "SearchC"
-            || op.starts_with("SearchC")
+            // 16c6ebcfb — SearchChatPhoto has its own arm below; the
+            // prefix match must not shadow it
+            || (op.starts_with("SearchC") && op != "SearchChatPhoto")
         {
             let (query, limit, filter, offset) = {
                 let (w0, rest0) = tokenizer::split(args, ' ');
@@ -8690,6 +8708,9 @@ impl CliClient {
                         .collect(),
                     quote: Some(td_api::InputTextQuote {
                         text: Some(self.as_formatted_text(&quote)),
+                        // 1.8.70 rich-quote plane — the CLI keeps the
+                        // plain quote.
+                        rich_texts: Vec::new(),
                         position: tokenizer::to_integer_i32(&quote_position),
                     }),
                     paid_message_star_count: self.paid_message_star_count.load(Ordering::SeqCst),
@@ -10366,6 +10387,11 @@ impl CliClient {
             self.reposted_story_id
                 .store(as_story_id(&reposted_story_id), Ordering::SeqCst);
             true
+        } else if op == "ssmu" {
+            // cpp:6324 — the story-music state for postStory's 1.8.70
+            // music leg.
+            *self.story_music.lock().unwrap() = args.to_owned();
+            true
         } else if op == "psp" || op == "pspp" {
             let (chat_id, rest0) = tokenizer::split(args, ' ');
             let (photo, rest1) = tokenizer::split(&rest0, ' ');
@@ -10383,6 +10409,7 @@ impl CliClient {
                 )),
                 areas: get_input_story_areas(&areas),
                 caption: self.get_caption(),
+                music: self.get_story_music(),
                 privacy_settings: Some(self.get_story_privacy_settings(&rules)),
                 album_ids: to_integers_i32(&album_ids),
                 active_period: if tokenizer::to_integer_i32(&active_period) != 0 {
@@ -10416,6 +10443,7 @@ impl CliClient {
                 )),
                 areas: get_input_story_areas(&areas),
                 caption: self.get_caption(),
+                music: self.get_story_music(),
                 privacy_settings: Some(self.get_story_privacy_settings(&rules)),
                 album_ids: to_integers_i32(&album_ids),
                 active_period: if tokenizer::to_integer_i32(&active_period) != 0 {
@@ -12804,16 +12832,19 @@ impl CliClient {
             ));
             true
         } else if op == "tsgif" {
-            let (supergroup_id, is_forum, has_forum_tabs) = {
+            // cpp:8173-8176 — the 1.8.70 four-arg form.
+            let (supergroup_id, is_forum, has_forum_tabs, has_forum_sidebar) = {
                 let (w0, rest0) = tokenizer::split(args, ' ');
-                let (w1, w2) = tokenizer::split(&rest0, ' ');
-                (w0, w1, w2)
+                let (w1, rest1) = tokenizer::split(&rest0, ' ');
+                let (w2, w3) = tokenizer::split(&rest1, ' ');
+                (w0, w1, w2, w3)
             };
             self.send_request(Function::toggleSupergroupIsForum(
                 td_api::toggleSupergroupIsForum {
                     supergroup_id: self.as_supergroup_id(&supergroup_id),
                     is_forum: as_bool(&is_forum),
                     has_forum_tabs: as_bool(&has_forum_tabs),
+                    has_forum_sidebar: as_bool(&has_forum_sidebar),
                 },
             ));
             true
@@ -14611,6 +14642,8 @@ impl CliClient {
                 match_code,
                 allow_write_access: op == "aorw",
                 allow_phone_number_access: op == "aorp",
+                // cpp:8837 — the CLI passes no TON Connect data.
+                ton_connect_connect_data: None,
             }));
             true
         } else if op == "dor" {
@@ -14747,7 +14780,7 @@ impl CliClient {
                 },
             ));
             true
-        } else if op == "scns" || op == "ssns" || op == "sftns" {
+        } else if op == "scns" || op == "ssns" || op == "sftns" || op == "scons" {
             let (scope, rest0) = tokenizer::split(args, ' ');
             let (mute_for, rest1) = tokenizer::split(&rest0, ' ');
             let (sound_id, rest2) = tokenizer::split(&rest1, ' ');
@@ -14807,6 +14840,15 @@ impl CliClient {
                     self.send_request(Function::setChatNotificationSettings(
                         td_api::setChatNotificationSettings {
                             chat_id: self.as_chat_id(&scope),
+                            notification_settings: Some(settings),
+                        },
+                    ));
+                } else if op == "scons" {
+                    // cli.cpp:8938-8940 (99302f0e2) — the community form
+                    // over the raw id (as_community_id).
+                    self.send_request(Function::setCommunityNotificationSettings(
+                        td_api::setCommunityNotificationSettings {
+                            community_id: tokenizer::to_integer_i64(trim_td(&scope)),
                             notification_settings: Some(settings),
                         },
                     ));
@@ -15820,7 +15862,7 @@ mod tests {
         drop(guard);
     }
 
-    /// The M.14.2 census gate: the fixture pins all 1294 command arms of the
+    /// The M.14.2 census gate: the fixture pins all 1295 command arms of the
     /// C++ `on_cmd` (regenerate with
     /// `conformance/cli_gate/extract_cli_census.sh`); every arm whose slice
     /// has landed must be routed by the dispatcher, every not-yet-ported arm
@@ -15831,7 +15873,7 @@ mod tests {
         const CENSUS: &str = include_str!("../testdata/cli_census.txt");
         assert_eq!(
             CENSUS.lines().count(),
-            1294,
+            1295,
             "the C++ tree changed — regenerate the census with \
              conformance/cli_gate/extract_cli_census.sh"
         );
@@ -16637,6 +16679,7 @@ mod tests {
             ("gctps", 9),
             ("cps", 9),
             ("srsfi", 9),
+            ("ssmu", 9),
             ("psp", 9),
             ("pspp", 9),
             ("psv", 9),
@@ -17019,6 +17062,7 @@ mod tests {
             ("gsns", 17),
             ("scns", 17),
             ("ssns", 17),
+            ("scons", 17),
             ("sftns", 17),
             ("srns", 17),
             ("rans", 17),
@@ -17284,6 +17328,7 @@ mod tests {
             upgraded_gift_attribute_ids: Mutex::new(Vec::new()),
             reposted_story_chat_id: AtomicI64::new(0),
             reposted_story_id: AtomicI32::new(0),
+            story_music: Mutex::new(String::new()),
             group_call_source: AtomicI32::new(random::fast(1, 1000000000)),
             suggested_post_price: Mutex::new(String::new()),
             suggested_post_send_date: AtomicI32::new(-1),

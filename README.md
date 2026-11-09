@@ -5,7 +5,7 @@ A from-scratch [Rust](https://www.rust-lang.org) rewrite of
 is a **drop-in replacement for TDLib**: it exports exactly the same
 14-function C JSON interface under the same names, ships byte-identical
 copies of the official headers, and answers the same JSON — so existing
-TDLib applications and bindings work unmodified. Tracks TDLib **1.8.68**.
+TDLib applications and bindings work unmodified. Tracks TDLib **1.8.70**.
 
 ## Status
 
@@ -24,7 +24,7 @@ Implemented and verified:
   WebSocket for the browser.
 - SQLCipher-encrypted storage (vendored, compiled from source), the actor
   runtime, file downloads, notifications, secret chats.
-- All td_api requests of the 1.8.68 scheme are dispatched to handlers
+- All td_api requests of the 1.8.70 scheme are dispatched to handlers
   (audited by `requests_gate/`).
 - Live validation against production Telegram servers: login,
   configuration, message round-trips, file transfers.
@@ -99,7 +99,7 @@ int main(void) {
 
     /* asynchronous request — the answer arrives via receive */
     td_json_client_send(client, "{\"@type\":\"getOption\",\"name\":\"version\"}");
-    const char *answer = td_json_client_receive(client, 10.0); /* 1.8.68 */
+    const char *answer = td_json_client_receive(client, 10.0); /* 1.8.70 */
 
     td_json_client_destroy(client);
 }

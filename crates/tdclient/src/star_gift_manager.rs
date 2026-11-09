@@ -1447,6 +1447,11 @@ impl StarGift {
         }
     }
 
+    /// `StarGift::can_be_deleted` (StarGift.h:117-119).
+    pub fn can_be_deleted(&self) -> bool {
+        !self.is_unique && self.availability_total == 0
+    }
+
     /// `StarGift::is_valid` (StarGift.h:91-94).
     pub fn is_valid(&self) -> bool {
         self.id != 0
@@ -1592,6 +1597,17 @@ impl StarGift {
             owner_address: self.owner_address.clone(),
             owner_name: self.owner_name.clone(),
             gift_address: self.gift_address.clone(),
+            // `can_be_ton_wallet_card_background(slug)`
+            // (StarGift.cpp:237-243) — the slug truncated at the last
+            // '-' against the '\xFF'-separated server option.
+            can_be_ton_wallet_card_background: {
+                let mut slug = self.slug.as_str();
+                if let Some(pos) = slug.rfind('-') {
+                    slug = &slug[..pos];
+                }
+                let backgrounds = env.get_option_string("ton_wallet_card_background_gifts", "");
+                !backgrounds.is_empty() && backgrounds.split('\u{FF}').any(|part| part == slug)
+            },
             model: Some(self.model.get_upgraded_gift_model_object(env)),
             symbol: Some(self.pattern.get_upgraded_gift_symbol_object(env)),
             backdrop: Some(self.backdrop.get_upgraded_gift_backdrop_object()),
@@ -2028,6 +2044,9 @@ pub struct UserStarGift {
     is_pinned: bool,
     can_upgrade: bool,
     can_transfer: bool,
+    // 1.8.70 (UserStarGift.cpp:71-75) — the locally-computed delete
+    // right.
+    can_delete: bool,
     was_refunded: bool,
     is_upgrade_separate: bool,
 }
@@ -2111,6 +2130,19 @@ impl UserStarGift {
         } else if gift.saved_id != 0 {
             result.star_gift_id = StarGiftId::from_dialog(dialog_id, gift.saved_id);
         }
+        // `can_delete_` (UserStarGift.cpp:71-75) — a deletable gift not
+        // being converted/refunded, owned by me, a bot in the user chat,
+        // or the channel creator.
+        if result.star_gift_id.is_valid()
+            && result.gift.can_be_deleted()
+            && !result.was_refunded
+            && result.convert_star_count == 0
+        {
+            result.can_delete = is_me
+                || (is_user && env.is_bot())
+                || (dialog_id.get_type() == DialogType::Channel
+                    && env.is_channel_creator(dialog_id.get_channel_id()));
+        }
         if result.sender_dialog_id != DialogId::default() && !result.sender_dialog_id.is_valid() {
             tdutils::log_error!("Receive an invalid sender of the gift");
             result.sender_dialog_id = DialogId::default();
@@ -2156,6 +2188,7 @@ impl UserStarGift {
             is_pinned: self.is_pinned,
             can_be_upgraded: self.can_upgrade,
             can_be_transferred: self.can_transfer,
+            can_be_deleted: self.can_delete,
             was_refunded: self.was_refunded,
             date: self.date,
             gift: Some(self.gift.get_sent_gift_object(env)),
@@ -2923,6 +2956,13 @@ pub trait StarGiftEnv {
     /// can_post_messages()`.
     fn can_channel_post_messages(&mut self, channel_id: ChannelId) -> bool;
 
+    /// `td_->chat_manager_->get_channel_status(channel_id).is_creator()`
+    /// (UserStarGift.cpp:74 — the 1.8.70 can_delete leg).
+    fn is_channel_creator(&mut self, channel_id: ChannelId) -> bool {
+        let _ = channel_id;
+        false
+    }
+
     /// `td_->chat_manager_->on_update_channel_gift_count(channel_id, count,
     /// is_relax)`.
     fn on_update_channel_gift_count(&mut self, channel_id: ChannelId, count: i32, is_relax: bool);
@@ -3032,6 +3072,13 @@ pub trait StarGiftEnv {
     }
 
     // -- PasswordManager --
+
+    /// `PasswordManager::get_temp_password_state_sync` (StarGiftManager
+    /// calls, cpp:3310) — `None` while no valid temporary password is
+    /// saved ([blocked: the password plane] in the inert envs).
+    fn get_temp_password(&self) -> Option<String> {
+        None
+    }
 
     /// `send_closure(td_->password_manager_,
     /// &PasswordManager::get_input_check_password_srp, password, ...)`;
@@ -5773,29 +5820,27 @@ impl StarGiftManager {
     }
 
     /// `StarGiftManager::get_star_gift_withdrawal_url`
-    /// (StarGiftManager.cpp:3188-3206) — the srp callback hop collapses
-    /// into the seam answer.
+    /// (StarGiftManager.cpp:3307-3316) — the saved temporary password
+    /// gates the flow (no srp round-trip anymore); the tmp_password
+    /// rides the wire bytes field.
     pub fn get_star_gift_withdrawal_url(
         &mut self,
         env: &mut impl StarGiftEnv,
         star_gift_id: StarGiftId,
-        password: &str,
         mut promise: Promise<String>,
     ) {
         if !star_gift_id.is_valid() {
             return promise.set_error(Status::error(400, "Invalid gift identifier specified"));
         }
-        if password.is_empty() {
-            return promise.set_error(Status::error(400, "PASSWORD_HASH_INVALID"));
-        }
-        let Some(input_check_password) = env.get_input_check_password_srp(password) else {
-            // the parked PasswordManager callback — the promise rides the
-            // seam until the password plane lands
-            self.pending.star_gift_withdrawal_url.push(promise);
-            return;
+        // `PasswordManager::get_temp_password_state_sync` (cpp:3310-3313).
+        let Some(temp_password) = env.get_temp_password() else {
+            return promise.set_error(Status::error(
+                400,
+                "Temporary password required to withdraw the gift",
+            ));
         };
         // `GetStarGiftWithdrawalUrlQuery::send`
-        // (StarGiftManager.cpp:1930-1938) — the null-input band is the
+        // (StarGiftManager.cpp:1961-1969) — the null-input band is the
         // synchronous on_error ("Gift not found").
         let input_gift = star_gift_id.get_input_saved_star_gift(env);
         let kind = StarGiftNetKind::GetStarGiftWithdrawalUrl;
@@ -5808,8 +5853,9 @@ impl StarGiftManager {
             kind,
             telegram_api::Function::payments_getStarGiftWithdrawalUrl(
                 telegram_api::payments_getStarGiftWithdrawalUrl {
+                    flags: 0,
                     stargift: Some(input_gift),
-                    password: Some(input_check_password),
+                    tmp_password: temp_password.into_bytes(),
                 },
             ),
             "payments.getStarGiftWithdrawalUrl",
@@ -8500,25 +8546,26 @@ mod tests {
         let mut env = TestEnv::default();
         let mut manager = StarGiftManager::new();
 
-        // the password-plane park (the srp seam answers nothing) — the
-        // promise rides the family queue
+        // 1.8.70: the saved temporary password gates the flow — the
+        // inert TestEnv carries none, so the slug band answers the
+        // synchronous 400 before any promise parks
         let (promise, recorded) = recording_promise();
-        manager.get_star_gift_withdrawal_url(
-            &mut env,
-            StarGiftId::from_slug("name"),
-            "pass",
-            promise,
+        manager.get_star_gift_withdrawal_url(&mut env, StarGiftId::from_slug("name"), promise);
+        assert_eq!(
+            recorded.value().expect("answered").unwrap_err().message(),
+            "Temporary password required to withdraw the gift"
         );
-        assert!(recorded.value().is_none());
 
-        // the answer half settles the parked promise with the url
+        // the answer half settles a parked promise with the url
+        let (parked, parked_recorded) = recording_promise();
+        manager.pending.star_gift_withdrawal_url.push(parked);
         manager.on_get_star_gift_withdrawal_url(Result::Ok(
             telegram_api::payments_StarGiftWithdrawalUrl {
                 url: "https://fragment.io/withdraw".to_owned(),
             },
         ));
         assert_eq!(
-            recorded.value().expect("answered").expect("ok"),
+            parked_recorded.value().expect("answered").expect("ok"),
             "https://fragment.io/withdraw"
         );
 
@@ -8650,30 +8697,21 @@ mod tests {
 
         // an invalid identifier
         let (promise, recorded) = recording_promise();
-        manager.get_star_gift_withdrawal_url(&mut env, StarGiftId::default(), "pass", promise);
+        manager.get_star_gift_withdrawal_url(&mut env, StarGiftId::default(), promise);
         assert_eq!(
             recorded.value().expect("answered").unwrap_err().message(),
             "Invalid gift identifier specified"
         );
 
-        // the empty password
+        // 1.8.70: no saved temporary password (the inert TestEnv) — the
+        // gate answers before the family queue
         let (promise, recorded) = recording_promise();
-        manager.get_star_gift_withdrawal_url(&mut env, StarGiftId::from_slug("name"), "", promise);
+        manager.get_star_gift_withdrawal_url(&mut env, StarGiftId::from_slug("name"), promise);
         assert_eq!(
             recorded.value().expect("answered").unwrap_err().message(),
-            "PASSWORD_HASH_INVALID"
+            "Temporary password required to withdraw the gift"
         );
-
-        // the parked password plane keeps the promise
-        let (promise, recorded) = recording_promise();
-        manager.get_star_gift_withdrawal_url(
-            &mut env,
-            StarGiftId::from_slug("name"),
-            "pass",
-            promise,
-        );
-        assert!(recorded.value().is_none());
-        assert_eq!(manager.pending.star_gift_withdrawal_url.len(), 1);
+        assert_eq!(manager.pending.star_gift_withdrawal_url.len(), 0);
 
         // the price update parks (the slug gift resolves its input form)
         let (promise, recorded) = recording_promise();

@@ -55,7 +55,7 @@ cargo test --workspace --locked
 ## Conformance / oracles
 
 - Differential gates: `conformance/*/verify.sh <path-to-td-checkout>`, pinned
-  to upstream commit `c15d3f5a5de6e3ba5839822c451152e5e18bb700` (see
+  to upstream commit `23383aef218a3123f02b744bfa91bde21056a814` (see
   `.github/workflows/main.yml`). They need a C++ td build (cmake, gperf,
   php) — slow, so they run in Main CI, not PR CI.
 - Live-session recording requires the `TD_BOT_TOKEN` / `TD_BOT_USERNAME` /

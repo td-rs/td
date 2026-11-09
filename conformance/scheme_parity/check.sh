@@ -10,7 +10,7 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 RS_ROOT="$SCRIPT_DIR/../.."
 SCHEMES="td_api.tl telegram_api.tl secret_api.tl e2e_api.tl mtproto_api.tl"
-PINNED_COMMIT=c15d3f5a5de6e3ba5839822c451152e5e18bb700
+PINNED_COMMIT=23383aef218a3123f02b744bfa91bde21056a814
 
 echo "== local drift check: schemes vs the S03 sha256 pin =="
 cd "$RS_ROOT/crates/tl-codegen/scheme"

@@ -823,7 +823,7 @@ mod tests {
             .expect("the getOption answer");
         assert_eq!(
             answer.object.as_ref().unwrap().to_json(),
-            r#"{"@type":"optionValueString","value":"1.8.68"}"#
+            r#"{"@type":"optionValueString","value":"1.8.70"}"#
         );
     }
 
@@ -924,7 +924,7 @@ mod tests {
                 .object
                 .unwrap()
                 .to_json(),
-            r#"{"@type":"optionValueString","value":"1.8.68"}"#
+            r#"{"@type":"optionValueString","value":"1.8.70"}"#
         );
         // Drop is `~Client::Impl`: close the Td, drain its close notification.
     }
@@ -969,7 +969,7 @@ mod tests {
             if response.request_id == 11 {
                 assert_eq!(
                     object.to_json(),
-                    r#"{"@type":"optionValueString","value":"1.8.68"}"#
+                    r#"{"@type":"optionValueString","value":"1.8.70"}"#
                 );
                 assert_eq!(response.client_id, first);
                 seen_first = true;

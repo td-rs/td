@@ -45,8 +45,12 @@ use crate::manager_option_states::{AgeVerificationParameters, ManagerUpdate};
 use crate::option_manager::OptionManager;
 use crate::td_api;
 
-/// `ConfigManager::AppConfig::CURRENT_VERSION` (ConfigManager.h:77).
-pub const APP_CONFIG_CURRENT_VERSION: i32 = 135;
+/// `ConfigManager::AppConfig::CURRENT_VERSION` (ConfigManager.h:77) —
+/// the Rust ladder tracks the C++ per-change bumps of this range
+/// (b9e0ad058 → 136, 57fdba1d6 → 137, 22c39447e → 138; the C++ numbers
+/// 143–145 diverge — the 1.8.68 sync base entered the range at 135 vs
+/// the C++ 142, a recorded alignment gap).
+pub const APP_CONFIG_CURRENT_VERSION: i32 = 138;
 
 /// The pending-request bookkeeping every result handler returns: the Td
 /// actor completes the requests, applies the premium-options refresh and
@@ -1109,14 +1113,8 @@ impl ConfigManager {
         } else {
             options.set_option_string("animation_search_bot_username", &config.gif_search_username);
         }
-        if !options.have_option("venue_search_bot_username") {
-            if config.venue_search_username.is_empty() {
-                options.set_option_empty("venue_search_bot_username");
-            } else {
-                options
-                    .set_option_string("venue_search_bot_username", &config.venue_search_username);
-            }
-        }
+        // the "venue_search_bot_username" block left with the option
+        // itself (upstream 57fdba1d6)
         if config.img_search_username.is_empty() {
             options.set_option_empty("photo_search_bot_username");
         } else {
@@ -1700,6 +1698,10 @@ impl ConfigManager {
                 "gift_premium_from_input_field",
             ),
             ("settings_display_passkeys", "can_use_login_passkey"),
+            (
+                "stargifts_craft_minted_first_source",
+                "can_craft_from_withdrawn_first_gift",
+            ),
             ("stars_gifts_enabled", "can_gift_stars"),
             ("stars_paid_messages_available", "can_enable_paid_messages"),
             ("story_weather_preload", "can_preload_weather"),
@@ -1962,7 +1964,6 @@ impl ConfigManager {
             ("music_search_username", "audio_search_bot_username"),
             ("phone_country_iso2", ""),
             ("premium_manage_subscription_url", ""),
-            ("stories_venue_search_username", "venue_search_bot_username"),
             ("ton_blockchain_explorer_url", ""),
             ("ton_proxy_address", ""),
             ("ton_topup_url", "gram_top_up_url"),
@@ -1981,6 +1982,7 @@ impl ConfigManager {
             "message_animated_emoji_max",
             "qr_login_camera",
             "qr_login_code",
+            "round_video_recorder_2_allowed",
             "stargifts_blocked",
             "starref_connect_allowed",
             "starref_program_allowed",
@@ -1989,6 +1991,7 @@ impl ConfigManager {
             "stickers_emoji_cache_time",
             "stories_export_nopublic_link",
             "stories_posting",
+            "stories_venue_search_username",
             "story_expire_period",
             "test",
             "upload_max_fileparts_default",
@@ -2033,6 +2036,7 @@ impl ConfigManager {
         let mut gift_craft_probabilities = String::new();
         let mut wallet_gasless_daily_transfers = 0i64;
         let mut bot_allowed_suffixes: Vec<String> = Vec::new();
+        let mut wallet_card_background_gifts: Vec<String> = Vec::new();
         let mut actions = ConfigActions::default();
 
         if let telegram_api::JSONValue::jsonObject(object) = config.as_ref() {
@@ -2615,6 +2619,27 @@ impl ConfigManager {
                         }
                         continue;
                     }
+                    // the wallet card background gift names
+                    // (ConfigManager.cpp:2069-2084, upstream b9e0ad058)
+                    "wallet_card_bg_gifts" => {
+                        if let Some(telegram_api::JSONValue::jsonArray(array)) = value {
+                            for gift in &array.value {
+                                let gift_name = get_json_value_string(gift, key);
+                                if !gift_name.is_empty() && !gift_name.contains('\u{ff}') {
+                                    wallet_card_background_gifts.push(gift_name);
+                                } else {
+                                    tdutils::log_error!(
+                                        "Receive an invalid wallet card background gift name"
+                                    );
+                                }
+                            }
+                        } else {
+                            tdutils::log_error!(
+                                "Receive unexpected wallet_card_bg_gifts {value:?}"
+                            );
+                        }
+                        continue;
+                    }
                     "ton_stakedice_stake_suggested_amounts" => {
                         if let Some(telegram_api::JSONValue::jsonArray(array)) = value {
                             for amount in &array.value {
@@ -2774,6 +2799,17 @@ impl ConfigManager {
         }
 
         options.set_option_string("bot_allowed_suffixes", &implode(&bot_allowed_suffixes, ' '));
+
+        // the \xff-joined gift names (ConfigManager.cpp:2155-2160,
+        // upstream b9e0ad058)
+        if wallet_card_background_gifts.is_empty() {
+            options.set_option_empty("ton_wallet_card_background_gifts");
+        } else {
+            options.set_option_string(
+                "ton_wallet_card_background_gifts",
+                &implode(&wallet_card_background_gifts, '\u{ff}'),
+            );
+        }
         options.set_option_integer(
             "ton_wallet_gasless_transfer_daily_count",
             wallet_gasless_daily_transfers,
@@ -2930,12 +2966,22 @@ mod tests {
         ))
     }
 
+    fn json_array(values: Vec<telegram_api::JSONValue>) -> Box<telegram_api::JSONValue> {
+        Box::new(telegram_api::JSONValue::jsonArray(
+            telegram_api::jsonArray {
+                value: values.into_iter().map(Box::new).collect(),
+            },
+        ))
+    }
+
     fn test_config() -> telegram_api::Config {
         telegram_api::Config {
             flags: 0,
             default_p2p_contacts: false,
             preload_featured_stickers: false,
             revoke_pm_inbox: true,
+            // 1.8.70: the fpnv flag defaults off in the fixture.
+            fpnv_allowed: false,
             blocked_mode: true,
             force_try_ipv6: false,
             date: 1000,
@@ -3118,9 +3164,11 @@ mod tests {
             options.get_option_string("animation_search_bot_username", ""),
             "gif"
         );
+        // the venue option left with the 1.8.70 removal (57fdba1d6):
+        // the config field stays on the wire but sets nothing
         assert_eq!(
             options.get_option_string("venue_search_bot_username", ""),
-            "foursquare"
+            ""
         );
         assert_eq!(options.get_option_string("default_reaction", ""), "👍");
         // The outdated options are erased.
@@ -3225,8 +3273,9 @@ mod tests {
     /// The golden snapshot for `test_config()` from the main DC: every
     /// option the C++ table sets (ConfigManager.cpp:1193-1285), in the
     /// store's coded form. The dc_options/autologin_token fan-outs
-    /// (M.3.9.1) set no options.
-    const MAIN_DC_SET: [(&str, &str); 33] = [
+    /// (M.3.9.1) set no options; the venue option left with the 1.8.70
+    /// removal (57fdba1d6).
+    const MAIN_DC_SET: [(&str, &str); 32] = [
         ("recent_stickers_limit", "I30"),
         ("channels_read_media_period", "I604800"),
         ("test_mode", "Bfalse"),
@@ -3253,7 +3302,6 @@ mod tests {
         ("message_text_length_max", "I4096"),
         ("message_caption_length_max", "I1024"),
         ("animation_search_bot_username", "Sgif"),
-        ("venue_search_bot_username", "Sfoursquare"),
         ("photo_search_bot_username", "Sbing"),
         ("online_update_period_ms", "I120000"),
         ("online_cloud_timeout_ms", "I300000"),
@@ -3264,8 +3312,9 @@ mod tests {
 
     /// From a non-main DC the main-DC-only options are skipped
     /// (ConfigManager.cpp:1217-1243, 1280-1285); the guarded options
-    /// still land because they were unset.
-    const OTHER_DC_SET: [(&str, &str); 22] = [
+    /// still land because they were unset; the venue option left with
+    /// the 1.8.70 removal (57fdba1d6).
+    const OTHER_DC_SET: [(&str, &str); 21] = [
         ("recent_stickers_limit", "I30"),
         ("channels_read_media_period", "I604800"),
         ("test_mode", "Bfalse"),
@@ -3282,7 +3331,6 @@ mod tests {
         ("message_text_length_max", "I4096"),
         ("message_caption_length_max", "I1024"),
         ("animation_search_bot_username", "Sgif"),
-        ("venue_search_bot_username", "Sfoursquare"),
         ("photo_search_bot_username", "Sbing"),
         ("online_update_period_ms", "I120000"),
         ("online_cloud_timeout_ms", "I300000"),
@@ -3363,8 +3411,10 @@ mod tests {
 
     #[test]
     fn process_config_guards_preexisting_options() {
-        // Main DC: a pre-set venue bot name and the need-sync flag
-        // survive the config; expect_blocking is overwritten.
+        // Main DC: a pre-set venue bot name (now trivially surviving —
+        // the 1.8.70 removal stopped the config writing the option at
+        // all, 57fdba1d6) and the need-sync flag survive the config;
+        // expect_blocking is overwritten.
         let mut pmc = TempPmc::new("guards-main");
         let mut main_options = options();
         main_options.set_option_string("venue_search_bot_username", "custom");
@@ -3598,6 +3648,80 @@ mod tests {
             options.get_option_string("emoji_sounds", ""),
             "⌚,123:456:QmFzZTY0,⌚\u{FE0F},-9223372036854775808:456:QmFzZTY0"
         );
+    }
+
+    /// The 1.8.70 option keys: the wallet card background gifts
+    /// (b9e0ad058, the \xff-joined names with the invalid dropped), the
+    /// craft-from-withdrawn bool (22c39447e), and the two newly ignored
+    /// keys (fa9538d5e, 57fdba1d6) that set nothing.
+    #[test]
+    fn the_1870_option_keys_process_like_the_cpp() {
+        let mut pmc = TempPmc::new("wallet-card-gifts");
+        let mut options = options();
+        let mut manager = ConfigManager::new(b"");
+        manager.get_app_config(7, false, false);
+        let config = json_object(vec![
+            (
+                "wallet_card_bg_gifts".to_string(),
+                json_array(vec![
+                    *json_string("first_gift"),
+                    // an empty name and a \xff carrier are rejected
+                    *json_string(""),
+                    *json_string("bad\u{ff}name"),
+                    *json_string("second_gift"),
+                ]),
+            ),
+            (
+                "stargifts_craft_minted_first_source".to_string(),
+                json_bool(true),
+            ),
+            (
+                "round_video_recorder_2_allowed".to_string(),
+                json_bool(true),
+            ),
+            (
+                "stories_venue_search_username".to_string(),
+                json_string("someone"),
+            ),
+        ]);
+        manager.on_get_app_config_result(
+            &mut pmc,
+            Ok(AppConfigQueryResult::Config { hash: 1, config }),
+            false,
+            &mut options,
+            false,
+            false,
+        );
+        assert_eq!(
+            options.get_option_string("ton_wallet_card_background_gifts", ""),
+            "first_gift\u{ff}second_gift"
+        );
+        assert!(options.get_option_boolean("can_craft_from_withdrawn_first_gift", false));
+        assert!(
+            !options.have_option("round_video_recorder_2_allowed"),
+            "the ignored key sets nothing"
+        );
+        assert!(
+            !options.have_option("venue_search_bot_username"),
+            "the venue key no longer maps to the removed option"
+        );
+
+        // an empty array clears the option (the set_option_empty band)
+        let mut manager = ConfigManager::new(b"");
+        manager.get_app_config(7, false, false);
+        let config = json_object(vec![(
+            "wallet_card_bg_gifts".to_string(),
+            json_array(vec![]),
+        )]);
+        manager.on_get_app_config_result(
+            &mut pmc,
+            Ok(AppConfigQueryResult::Config { hash: 2, config }),
+            false,
+            &mut options,
+            false,
+            false,
+        );
+        assert!(!options.have_option("ton_wallet_card_background_gifts"));
     }
 
     #[test]

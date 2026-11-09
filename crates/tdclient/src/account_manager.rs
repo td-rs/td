@@ -30,6 +30,34 @@ pub const RESET_WEB_AUTHORIZATION_ON_SERVER: i32 = 0x506;
 pub const RESET_WEB_AUTHORIZATIONS_ON_SERVER: i32 = 0x507;
 pub const INVALIDATE_SIGN_IN_CODES_ON_SERVER: i32 = 0x508;
 
+/// `get_user_link_expires_in` (AccountManager.cpp:571-576) — the zero
+/// guard first (plain links answer 0), then the max(…, 1) clamp.
+pub(crate) fn get_user_link_expires_in(expire_date: i32, unix_time: i32) -> i32 {
+    if expire_date == 0 {
+        return 0;
+    }
+    (expire_date - unix_time).max(1)
+}
+
+/// `are_all_users_allowed` (AccountManager.cpp:1385-1400) — any allow-all
+/// rule allows every user; a restrict rule stops the walk (the allow
+/// rules below it cannot widen it back).
+pub(crate) fn are_all_users_allowed(rules: &td_api::UserPrivacySettingRules) -> bool {
+    use td_api::UserPrivacySettingRule as R;
+    for rule in &rules.rules {
+        match rule {
+            R::userPrivacySettingRuleAllowAll(_) => return true,
+            R::userPrivacySettingRuleRestrictAll(_)
+            | R::userPrivacySettingRuleRestrictContacts(_)
+            | R::userPrivacySettingRuleRestrictBots(_)
+            | R::userPrivacySettingRuleRestrictUsers(_)
+            | R::userPrivacySettingRuleRestrictChatMembers(_) => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// The `G()`/`td_` surface of the manager.
 pub trait AccountManagerEnv {
     fn close_flag(&self) -> bool;
@@ -67,6 +95,24 @@ pub trait AccountManagerEnv {
     /// `get_user_link` username arm.
     fn get_my_first_username(&mut self) -> String {
         String::new()
+    }
+
+    /// `LinkManager::get_internal_link(internalLinkTypeUserPhoneNumber
+    /// (…), false)` — the phone-number arm of
+    /// `on_get_find_by_phone_number_privacy`. The net-inert default
+    /// builds the plain `+<phone_number>` form over the canonical t-me
+    /// prefix (the Td env routes through the link manager).
+    fn get_phone_number_user_link(
+        &mut self,
+        phone_number: &str,
+        unpaid_messages_token: &str,
+    ) -> std::result::Result<String, tdutils::status::Status> {
+        let query = if unpaid_messages_token.is_empty() {
+            String::new()
+        } else {
+            format!("?free={unpaid_messages_token}")
+        };
+        Ok(format!("https://t.me/+{phone_number}{query}"))
     }
 
     // ---- the query seams (the net-inert defaults; the Td env
@@ -122,6 +168,13 @@ pub trait AccountManagerEnv {
     }
     fn send_export_contact_token_query(&mut self) {
         tdutils::log_info!("Send contacts.exportContactToken — [net-inert]");
+    }
+    /// `ExportNoPaidMessagesTokenQuery::send` (AccountManager.cpp:1365)
+    /// — `contacts.exportNoPaidMessagesToken(revoke, temporary)`.
+    fn send_export_no_paid_messages_token_query(&mut self, revoke: bool, temporary: bool) {
+        tdutils::log_info!(
+            "Send contacts.exportNoPaidMessagesToken(revoke = {revoke}, temporary = {temporary}) — [net-inert]"
+        );
     }
 
     fn send_set_account_ttl_query(&mut self, account_ttl: i32) {
@@ -483,8 +536,23 @@ pub struct AccountManager {
     /// The `GetAccountTtlQuery` promise lot.
     pub(crate) pending_account_ttl: Vec<Promise<td_api::AccountTtl>>,
     /// The `ExportContactTokenQuery` promise lot (the token arm of
-    /// `get_user_link`).
-    pub(crate) pending_user_link: Vec<Promise<td_api::UserLink>>,
+    /// `get_user_link`) — each entry carries its unpaid-messages token
+    /// and expiry for the answer rewrite (the C++ ResultHandler fields,
+    /// AccountManager.cpp:578-616).
+    pub(crate) pending_user_link: Vec<(String, i32, Promise<td_api::UserLink>)>,
+    /// The phone-number privacy lot of `create_user_link` — the
+    /// `(token, expiry, promise)` triples awaiting the
+    /// `userPrivacySettingAllowFindingByPhoneNumber` answer (the C++
+    /// `PrivacyManager::get_privacy` chain, cpp:1401-1420).
+    pub(crate) pending_phone_privacy_link: Vec<(String, i32, Promise<td_api::UserLink>)>,
+    /// The pending phone-number-privacy lookups — the drive marker the
+    /// pump consumes (one `get_privacy` serves the whole FIFO lot, the
+    /// C++ promise-dedup shape).
+    pub(crate) phone_privacy_requests: usize,
+    /// The `ExportNoPaidMessagesTokenQuery` promise lot (the
+    /// `remove_messages_fee` arm of `get_user_link`; the resolved lot
+    /// re-enters through `create_user_link`).
+    pub(crate) pending_no_paid_token_link: Vec<Promise<td_api::UserLink>>,
     /// The `td_api::Sessions`-typed promises parked at the
     /// GetAuthorizations seam.
     pub parked_sessions_promises: Vec<Promise<td_api::Sessions>>,
@@ -810,28 +878,108 @@ impl AccountManager {
         env.send_get_account_ttl_query();
     }
 
-    /// `get_user_link` (cpp:1205-1253) — the get_me chain collapses into
-    /// the direct username check (the M.4 `get_me` is sync): the username
-    /// form answers the public link directly, the empty username parks at
-    /// the ExportContactToken query.
+    /// `get_user_link` (cpp:1335-1356) — the `remove_messages_fee=false`
+    /// form answers the plain public link directly; the fee form exports
+    /// the no-paid-messages token first, then re-enters through
+    /// `create_user_link`. The `return_permanent_link` flag only rides
+    /// the wire query's `temporary` bit (inverted).
     pub fn get_user_link(
         &mut self,
         env: &mut impl AccountManagerEnv,
+        remove_messages_fee: bool,
+        return_permanent_link: bool,
+        revoke_previous_links: bool,
+        promise: Promise<td_api::UserLink>,
+    ) {
+        if !remove_messages_fee {
+            return self.create_user_link(env, String::new(), 0, promise);
+        }
+        self.pending_no_paid_token_link.push(promise);
+        env.send_export_no_paid_messages_token_query(revoke_previous_links, !return_permanent_link);
+    }
+
+    /// `create_user_link` (cpp:1372-1398) — the username form answers the
+    /// public link (`?free=` query when a token exists) with
+    /// `can_get_permanent_link = true`; the empty username parks at the
+    /// phone-number/ExportContactToken path.
+    pub fn create_user_link(
+        &mut self,
+        env: &mut impl AccountManagerEnv,
+        unpaid_messages_token: String,
+        unpaid_messages_token_expire_date: i32,
         mut promise: Promise<td_api::UserLink>,
     ) {
         let username = env.get_my_first_username();
         if !username.is_empty() {
             // `LinkManager::get_public_dialog_link(username, "", false,
-            // false)` — the t_me_url prefix.
+            // unpaid_messages_token, false)` — the t_me_url prefix plus
+            // the `?free=` query (get_dialog_link_query rewrites the
+            // leading separator).
             let base = env.get_option_string("t_me_url", "https://t.me/");
             let mut url = base;
             if !url.ends_with('/') {
                 url.push('/');
             }
             url.push_str(&username);
-            return promise.set_value(td_api::UserLink { url, expires_in: 0 });
+            if !unpaid_messages_token.is_empty() {
+                url.push_str("?free=");
+                url.push_str(&unpaid_messages_token);
+            }
+            return promise.set_value(td_api::UserLink {
+                url,
+                expires_in: get_user_link_expires_in(
+                    unpaid_messages_token_expire_date,
+                    env.unix_time(),
+                ),
+                can_get_permanent_link: true,
+            });
         }
-        self.pending_user_link.push(promise);
+        // The phone-number privacy arm (cpp:1401-1420): the promise parks
+        // with its token/expiry pair, and the `get_privacy` drive rides
+        // the pump (the C++ PrivacyManager::get_privacy call).
+        self.pending_phone_privacy_link.push((
+            unpaid_messages_token,
+            unpaid_messages_token_expire_date,
+            promise,
+        ));
+        self.phone_privacy_requests += 1;
+    }
+
+    /// `AccountManager::on_get_find_by_phone_number_privacy`
+    /// (AccountManager.cpp:1385-1427) — an all-users-allowed privacy
+    /// answers the `+<phone_number>` link directly; everything else
+    /// falls through to the contact-token export carrying the token.
+    pub(crate) fn on_get_find_by_phone_number_privacy(
+        &mut self,
+        env: &mut impl AccountManagerEnv,
+        r_rules: tdutils::status::Result<td_api::UserPrivacySettingRules>,
+        unpaid_messages_token: String,
+        unpaid_messages_token_expire_date: i32,
+        mut promise: Promise<td_api::UserLink>,
+    ) {
+        if let tdutils::status::Result::Ok(rules) = r_rules
+            && are_all_users_allowed(&rules)
+        {
+            let phone_number = env.get_option_string("my_phone_number", "");
+            if !phone_number.is_empty()
+                && let Ok(url) =
+                    env.get_phone_number_user_link(&phone_number, &unpaid_messages_token)
+            {
+                return promise.set_value(td_api::UserLink {
+                    url,
+                    expires_in: get_user_link_expires_in(
+                        unpaid_messages_token_expire_date,
+                        env.unix_time(),
+                    ),
+                    can_get_permanent_link: true,
+                });
+            }
+        }
+        self.pending_user_link.push((
+            unpaid_messages_token,
+            unpaid_messages_token_expire_date,
+            promise,
+        ));
         env.send_export_contact_token_query();
     }
 
@@ -1577,5 +1725,141 @@ mod tests {
                 .is_some()
         );
         assert!(manager.pending_set_authorization_ttl.is_empty());
+    }
+
+    /// The `getUserLink` phone-number arm (AccountManager.cpp:1372-1427):
+    /// the username miss parks at the phone-number privacy lot, the
+    /// allow-all rules answer the `+<phone>` link with
+    /// `can_get_permanent_link = true`, and everything else falls through
+    /// to the ExportContactToken seam carrying the token pair.
+    #[test]
+    fn get_user_link_parks_at_the_phone_privacy_and_answers_both_arms() {
+        let rules = |rule| td_api::UserPrivacySettingRules { rules: vec![rule] };
+        let allow_all = || {
+            tdutils::status::Result::Ok(rules(
+                td_api::UserPrivacySettingRule::userPrivacySettingRuleAllowAll(
+                    td_api::userPrivacySettingRuleAllowAll,
+                ),
+            ))
+        };
+        let restrict_all = || {
+            tdutils::status::Result::Ok(rules(
+                td_api::UserPrivacySettingRule::userPrivacySettingRuleRestrictAll(
+                    td_api::userPrivacySettingRuleRestrictAll,
+                ),
+            ))
+        };
+        let record = || {
+            let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let capture = slot.clone();
+            let promise = tdutils::promise::PromiseCreator::lambda_result(move |r| {
+                *capture.lock().unwrap() = Some(r)
+            });
+            (promise, slot)
+        };
+
+        // 1. the username miss parks the (token, expiry, promise) triple
+        //    and marks the privacy drive.
+        let mut env = TestEnv::new();
+        let mut manager = AccountManager::default();
+        let (promise, slot) = record();
+        manager.create_user_link(&mut env, "tok".to_string(), 1100, promise);
+        assert_eq!(manager.pending_phone_privacy_link.len(), 1);
+        assert_eq!(manager.phone_privacy_requests, 1);
+        assert_eq!(&manager.pending_phone_privacy_link[0].0, "tok");
+        assert_eq!(manager.pending_phone_privacy_link[0].1, 1100);
+        assert!((*slot.lock().unwrap()).is_none());
+        assert!(env.queries.is_empty(), "no query fires before the drive");
+
+        // 2. the allow-all arm answers the +phone link (the expires
+        //    clamp rides the token expiry; unix_time = 1000).
+        env.option_strings
+            .insert("my_phone_number".to_string(), "12345678".to_string());
+        let (token, expire_date, promise) = manager.pending_phone_privacy_link.remove(0);
+        manager.on_get_find_by_phone_number_privacy(
+            &mut env,
+            allow_all(),
+            token,
+            expire_date,
+            promise,
+        );
+        match (*slot.lock().unwrap()).take() {
+            Some(tdutils::status::Result::Ok(link)) => {
+                assert_eq!(link.url, "https://t.me/+12345678?free=tok");
+                assert_eq!(link.expires_in, 100);
+                assert!(link.can_get_permanent_link);
+            }
+            other => panic!("unexpected phone-link result: {other:?}"),
+        }
+        assert!(manager.pending_user_link.is_empty());
+
+        // 3. a restrict rule (or an error) falls through to the
+        //    ExportContactToken seam with the token pair.
+        let (promise, slot) = record();
+        manager.on_get_find_by_phone_number_privacy(
+            &mut env,
+            restrict_all(),
+            "tok".to_string(),
+            1200,
+            promise,
+        );
+        assert!((*slot.lock().unwrap()).is_none());
+        assert_eq!(env.queries, vec!["exportContactToken".to_string()]);
+        assert_eq!(manager.pending_user_link.len(), 1);
+        assert_eq!(&manager.pending_user_link[0].0, "tok");
+        assert_eq!(manager.pending_user_link[0].1, 1200);
+
+        // an errored privacy read takes the same fall-through.
+        let (promise, _) = record();
+        manager.on_get_find_by_phone_number_privacy(
+            &mut env,
+            tdutils::status::Result::Err(tdutils::status::Status::error(400, "closed")),
+            String::new(),
+            0,
+            promise,
+        );
+        assert_eq!(manager.pending_user_link.len(), 2);
+    }
+
+    /// `are_all_users_allowed` (AccountManager.cpp:1385-1400) — the
+    /// allow-all rule wins wherever it appears before a restrict rule;
+    /// the allow-users/contacts/bots-only forms never allow everyone.
+    #[test]
+    fn are_all_users_allowed_matches_the_cpp_walk() {
+        let rules =
+            |rules: Vec<td_api::UserPrivacySettingRule>| td_api::UserPrivacySettingRules { rules };
+        let allow_all = td_api::UserPrivacySettingRule::userPrivacySettingRuleAllowAll(
+            td_api::userPrivacySettingRuleAllowAll,
+        );
+        let allow_users = td_api::UserPrivacySettingRule::userPrivacySettingRuleAllowUsers(
+            td_api::userPrivacySettingRuleAllowUsers { user_ids: vec![1] },
+        );
+        let restrict_all = td_api::UserPrivacySettingRule::userPrivacySettingRuleRestrictAll(
+            td_api::userPrivacySettingRuleRestrictAll,
+        );
+        assert!(are_all_users_allowed(&rules(vec![allow_all.clone()])));
+        assert!(are_all_users_allowed(&rules(vec![
+            allow_users.clone(),
+            allow_all
+        ])));
+        assert!(!are_all_users_allowed(&rules(vec![
+            restrict_all.clone(),
+            td_api::UserPrivacySettingRule::userPrivacySettingRuleAllowAll(
+                td_api::userPrivacySettingRuleAllowAll
+            )
+        ])));
+        assert!(!are_all_users_allowed(&rules(vec![allow_users])));
+        assert!(!are_all_users_allowed(&rules(vec![restrict_all])));
+        assert!(!are_all_users_allowed(&rules(Vec::new())));
+    }
+
+    /// `get_user_link_expires_in` (cpp:571-576) — the zero guard first,
+    /// then the max(…, 1) clamp.
+    #[test]
+    fn get_user_link_expires_in_clamps_like_the_cpp() {
+        assert_eq!(get_user_link_expires_in(0, 1000), 0);
+        assert_eq!(get_user_link_expires_in(1001, 1000), 1);
+        assert_eq!(get_user_link_expires_in(1500, 1000), 500);
+        assert_eq!(get_user_link_expires_in(999, 1000), 1);
     }
 }

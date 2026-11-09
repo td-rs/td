@@ -4286,6 +4286,7 @@ pub struct Channel {
     pub is_gigagroup: bool,
     pub is_forum: bool,
     pub is_forum_tabs: bool,
+    pub is_forum_sidebar: bool,
     pub is_monoforum: bool,
     pub is_admined_monoforum: bool,
     pub is_verified: bool,
@@ -4373,6 +4374,7 @@ impl Channel {
             is_gigagroup: false,
             is_forum: false,
             is_forum_tabs: false,
+            is_forum_sidebar: false,
             is_monoforum: false,
             is_admined_monoforum: false,
             is_verified: false,
@@ -4493,6 +4495,10 @@ impl Channel {
                     self.is_admined_monoforum,
                     self.has_live_story,
                     has_linked_community_id,
+                    // 1.8.70: appended after has_linked_community_id
+                    // (ChatManager.cpp STORE_FLAG order) — the shared
+                    // binlog layout stays byte-compatible.
+                    self.is_forum_sidebar,
                 ],
             );
         }
@@ -4630,10 +4636,12 @@ impl Channel {
             is_admined_monoforum,
             has_live_story,
             has_linked_community_id,
+            // 1.8.70: appended last (ChatManager.cpp PARSE_FLAG order).
+            is_forum_sidebar,
         ] = if has_flags2 {
             parser.parse_flags()?
         } else {
-            [false; 22]
+            [false; 23]
         };
         if has_photo {
             return Err("Channel photo needs the FileManager format (Files step)");
@@ -4662,6 +4670,7 @@ impl Channel {
         channel.is_forum_tabs = is_forum_tabs;
         channel.is_admined_monoforum = is_admined_monoforum;
         channel.has_live_story = has_live_story;
+        channel.is_forum_sidebar = is_forum_sidebar;
 
         if use_new_rights {
             channel.status = DialogParticipantStatus::parse_impl(parser)?;
@@ -5966,6 +5975,12 @@ impl ChatManager {
     /// `get_channel` (ChatManager.cpp:8879-8885).
     pub fn get_channel(&self, channel_id: ChannelId) -> Option<&Channel> {
         self.channels.get(&channel_id.get())
+    }
+
+    /// `get_channel_linked_community_id` (ChatManager.cpp:3117-3123).
+    pub fn get_channel_linked_community_id(&self, channel_id: ChannelId) -> CommunityId {
+        self.get_channel(channel_id)
+            .map_or_else(CommunityId::default, |channel| channel.linked_community_id)
     }
 
     pub fn get_channel_mut(&mut self, channel_id: ChannelId) -> Option<&mut Channel> {
@@ -10477,11 +10492,20 @@ impl ChatManager {
         }
     }
 
-    /// `on_update_channel_is_forum` (ChatManager.cpp:7838-7848).
-    fn on_update_channel_is_forum(c: &mut Channel, is_forum: bool, is_forum_tabs: bool) {
-        if c.is_forum != is_forum || c.is_forum_tabs != is_forum_tabs {
+    /// `on_update_channel_is_forum` (ChatManager.cpp:7885-7898).
+    fn on_update_channel_is_forum(
+        c: &mut Channel,
+        is_forum: bool,
+        is_forum_tabs: bool,
+        is_forum_sidebar: bool,
+    ) {
+        if c.is_forum != is_forum
+            || c.is_forum_tabs != is_forum_tabs
+            || c.is_forum_sidebar != is_forum_sidebar
+        {
             c.is_forum = is_forum;
             c.is_forum_tabs = is_forum_tabs;
+            c.is_forum_sidebar = is_forum_sidebar;
             c.is_is_forum_changed = true;
             c.is_changed = true;
         }
@@ -10641,6 +10665,7 @@ impl ChatManager {
         let is_gigagroup = channel.gigagroup;
         let is_forum = channel.forum;
         let is_forum_tabs = channel.forum_tabs;
+        let is_forum_sidebar = channel.forum_sidebar;
         let is_monoforum = channel.monoforum;
         let have_participant_count = channel.flags & (1 << 17) != 0;
         let mut participant_count = channel.participants_count;
@@ -10682,9 +10707,19 @@ impl ChatManager {
             );
         }
         let mut is_forum_tabs = is_forum_tabs;
+        let mut is_forum_sidebar = is_forum_sidebar;
+        // cpp:9410-9414 — the server always sets forum_tabs together
+        // with forum_sidebar.
+        if is_forum_sidebar && !is_forum_tabs {
+            tdutils::log_error!(
+                "Receive forum sidebar without forum tabs in {channel_id:?} from {source}"
+            );
+            is_forum_tabs = true;
+        }
         if is_forum_tabs && !is_forum {
             tdutils::log_error!("Receive forum tabs in non-forum {channel_id:?} from {source}");
             is_forum_tabs = false;
+            is_forum_sidebar = false;
         }
         let mut sign_messages = sign_messages_initial;
         let mut is_slow_mode_enabled = is_slow_mode_enabled_initial;
@@ -10720,6 +10755,7 @@ impl ChatManager {
             is_gigagroup = false;
             is_forum = false;
             is_forum_tabs = false;
+            is_forum_sidebar = false;
             is_monoforum = false;
             paid_message_star_count = 0;
         }
@@ -10772,7 +10808,7 @@ impl ChatManager {
                 let c = self.get_channel_mut(channel_id).expect("known min channel");
                 Self::on_update_channel_has_location(c, channel.has_geo);
                 Self::on_update_channel_noforwards(c, channel.noforwards);
-                Self::on_update_channel_is_forum(c, is_forum, is_forum_tabs);
+                Self::on_update_channel_is_forum(c, is_forum, is_forum_tabs, is_forum_sidebar);
                 let emoji_status = EmojiStatus::get_emoji_status(
                     std::mem::take(&mut channel.emoji_status).unwrap_or_default(),
                 );
@@ -11071,7 +11107,12 @@ impl ChatManager {
         }
         Self::on_update_channel_has_location(self.add_channel(channel_id), channel.has_geo);
         Self::on_update_channel_noforwards(self.add_channel(channel_id), channel.noforwards);
-        Self::on_update_channel_is_forum(self.add_channel(channel_id), is_forum, is_forum_tabs);
+        Self::on_update_channel_is_forum(
+            self.add_channel(channel_id),
+            is_forum,
+            is_forum_tabs,
+            is_forum_sidebar,
+        );
         {
             let emoji_status = EmojiStatus::get_emoji_status(
                 std::mem::take(&mut channel.emoji_status).unwrap_or_default(),
@@ -13656,21 +13697,39 @@ impl ChatManager {
         }
     }
 
-    /// `toggle_channel_is_forum` (ChatManager.cpp:3648-3664) — the no-op
-    /// equal-state early-OK resolves without a query; the
+    /// `toggle_channel_is_forum` (ChatManager.cpp:3665-3690) — the sidebar
+    /// invariants (sidebar forces tabs; both drop with the forum), the
+    /// no-op equal-state early-OK resolves without a query; the
     /// `ToggleForumQuery` send rides the `net` handle.
     pub fn toggle_channel_is_forum(
         &mut self,
         env: &mut UserEnv,
         channel_id: ChannelId,
         is_forum: bool,
-        is_forum_tabs: bool,
+        mut is_forum_tabs: bool,
+        mut is_forum_sidebar: bool,
         mut promise: Promise<()>,
     ) {
         let Some(c) = self.get_channel(channel_id) else {
             return promise.set_error(Status::error(400, "Supergroup not found"));
         };
-        if c.is_forum == is_forum && c.is_forum_tabs == is_forum_tabs {
+        if !is_forum {
+            is_forum_tabs = false;
+            is_forum_sidebar = false;
+        } else if is_forum_sidebar {
+            if is_forum_tabs {
+                return promise.set_error(Status::error(
+                    400,
+                    "Forum tabs and sidebar can't be enabled simultaneously",
+                ));
+            }
+            // the server always sets forum_tabs together with forum_sidebar
+            is_forum_tabs = true;
+        }
+        if c.is_forum == is_forum
+            && c.is_forum_tabs == is_forum_tabs
+            && c.is_forum_sidebar == is_forum_sidebar
+        {
             return promise.set_value(());
         }
         if !c.status.is_creator() {
@@ -13685,8 +13744,8 @@ impl ChatManager {
                 "Forums can be enabled in supergroups only",
             ));
         }
-        // `ToggleForumQuery::send` (cpp:984-991) — the tabs bit rides
-        // `is_forum && is_forum_tabs`.
+        // `ToggleForumQuery::send` (cpp:982-988) — the tabs/sidebar bits
+        // ride `is_forum && …`.
         let input_channel = self
             .get_input_channel(env, channel_id)
             .expect("the flow read the channel record");
@@ -13697,6 +13756,7 @@ impl ChatManager {
                 channel: Some(input_channel),
                 enabled: is_forum,
                 tabs: is_forum && is_forum_tabs,
+                sidebar: is_forum && is_forum_sidebar,
             }),
             "channels.toggleForum",
         );
@@ -16793,6 +16853,7 @@ impl ChatManager {
                 verification_status: Some(td_api::VerificationStatus::default()),
                 has_direct_messages_group: false,
                 has_forum_tabs: false,
+                has_forum_sidebar: false,
                 restriction_info: Some(td_api::RestrictionInfo::default()),
                 paid_message_star_count: 0,
                 active_story_state: Some(td_api::ActiveStoryState::default()),
@@ -16901,7 +16962,10 @@ impl ChatManager {
                 Self::get_channel_verification_status_object(c).unwrap_or_default(),
             ),
             has_direct_messages_group: c.broadcast_messages_allowed,
-            has_forum_tabs: c.is_forum_tabs,
+            // cpp:9967 — `is_forum_tabs && !is_forum_sidebar`,
+            // `is_forum_sidebar`.
+            has_forum_tabs: c.is_forum_tabs && !c.is_forum_sidebar,
+            has_forum_sidebar: c.is_forum_sidebar,
             restriction_info: Some(
                 get_restriction_info_object(
                     &restriction_reasons,
@@ -17176,6 +17240,10 @@ impl ChatManager {
             bot_commands,
             bot_verification,
             main_profile_tab: Some(get_profile_tab_object(channel_full.main_profile_tab)),
+            // The ProfileShareTheme plane (channelFull share_theme,
+            // ChatManager.cpp:10014) rides the profile-themes family
+            // follow-up.
+            share_theme: None,
             upgraded_from_basic_group_id: migrated_from_basic_group_id,
             upgraded_from_max_message_id: channel_full.migrated_from_max_message_id.get(),
         }

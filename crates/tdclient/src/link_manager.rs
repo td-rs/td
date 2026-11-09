@@ -414,6 +414,12 @@ fn is_valid_user_token(token: &str) -> bool {
     !token.is_empty() && tdutils::utf8::check_utf8(token.as_bytes())
 }
 
+/// `is_valid_unpaid_messages_token` (LinkManager.cpp:66-68) — at most
+/// 64 base64url characters.
+fn is_valid_unpaid_messages_token(token: &str) -> bool {
+    !token.is_empty() && token.len() <= 64 && crate::misc::is_base64url_characters(token.as_bytes())
+}
+
 /// `is_valid_login_code` (cpp:126-128).
 fn is_valid_login_code(code: &str) -> bool {
     !code.is_empty() && tdutils::utf8::check_utf8(code.as_bytes())
@@ -641,6 +647,39 @@ fn get_url_query_draft_text(url_query: &tdutils::http_url::HttpUrlQuery) -> Stri
     } else {
         text.to_owned()
     }
+}
+
+/// `get_url_query_unpaid_messages_token` (LinkManager.cpp:462-468) — the
+/// `free=` argument keeps only the valid token forms.
+fn get_url_query_unpaid_messages_token(url_query: &tdutils::http_url::HttpUrlQuery) -> String {
+    let token = url_query.get_arg("free").unwrap_or("");
+    if !is_valid_unpaid_messages_token(token) {
+        return String::new();
+    }
+    token.to_owned()
+}
+
+/// `get_dialog_link_query` (LinkManager.cpp:470-481) — the shared
+/// `&`-prefixed query of the dialog links; the external callers rewrite
+/// the leading separator to `?`.
+fn get_dialog_link_query(
+    draft_text: &str,
+    open_profile: bool,
+    unpaid_messages_token: &str,
+) -> String {
+    let mut query = String::new();
+    if !draft_text.is_empty() {
+        query.push_str("&text=");
+        query.push_str(&url_encode(draft_text));
+    }
+    if open_profile {
+        query.push_str("&profile");
+    }
+    if !unpaid_messages_token.is_empty() {
+        query.push_str("&free=");
+        query.push_str(unpaid_messages_token);
+    }
+    query
 }
 
 /// `get_referral_program_start_parameter_prefixes` (cpp:391-396). The
@@ -1065,6 +1104,9 @@ pub enum InternalLink {
         dialog_username: String,
         draft_text: String,
         open_profile: bool,
+        /// The `?free=` URL-query token (`get_url_query_unpaid_
+        /// messages_token`, LinkManager.cpp:462-468).
+        unpaid_messages_token: String,
     },
     /// `InternalLinkQrCodeAuthentication`.
     QrCodeAuthentication,
@@ -1126,9 +1168,13 @@ pub enum InternalLink {
         phone_number: String,
         draft_text: String,
         open_profile: bool,
+        unpaid_messages_token: String,
     },
     /// `InternalLinkUserToken`.
-    UserToken { token: String },
+    UserToken {
+        token: String,
+        unpaid_messages_token: String,
+    },
     /// `InternalLinkVideoChat`.
     VideoChat {
         dialog_username: String,
@@ -1181,11 +1227,13 @@ impl InternalLink {
         phone_number: &str,
         draft_text: String,
         open_profile: bool,
+        unpaid_messages_token: String,
     ) -> InternalLink {
         InternalLink::UserPhoneNumber {
             phone_number: format!("+{phone_number}"),
             draft_text,
             open_profile,
+            unpaid_messages_token,
         }
     }
 
@@ -1534,6 +1582,15 @@ impl InternalLink {
                         td_api::ProxyType::proxyTypeHttp(_) => {
                             unreachable!("proxyTypeHttp cannot appear in a parsed proxy link")
                         }
+                        // 1.8.70 proxyTypeWeb — the parsed link form
+                        // round-trips like the socks/mtproto forms
+                        // (LinkManager.cpp:1229-1232).
+                        td_api::ProxyType::proxyTypeWeb(type_web) => {
+                            td_api::ProxyType::proxyTypeWeb(td_api::proxyTypeWeb {
+                                path: type_web.path.clone(),
+                                secret: type_web.secret.clone(),
+                            })
+                        }
                     };
                     td_api::Proxy {
                         server: server.clone(),
@@ -1549,11 +1606,13 @@ impl InternalLink {
                 dialog_username,
                 draft_text,
                 open_profile,
+                unpaid_messages_token,
             } => td_api::InternalLinkType::internalLinkTypePublicChat(
                 td_api::internalLinkTypePublicChat {
                     chat_username: dialog_username.clone(),
                     draft_text: draft_text.clone(),
                     open_profile: *open_profile,
+                    unpaid_messages_token: unpaid_messages_token.clone(),
                 },
             ),
             InternalLink::QrCodeAuthentication => {
@@ -1725,20 +1784,24 @@ impl InternalLink {
                 phone_number,
                 draft_text,
                 open_profile,
+                unpaid_messages_token,
             } => td_api::InternalLinkType::internalLinkTypeUserPhoneNumber(
                 td_api::internalLinkTypeUserPhoneNumber {
                     phone_number: phone_number.clone(),
                     draft_text: draft_text.clone(),
                     open_profile: *open_profile,
+                    unpaid_messages_token: unpaid_messages_token.clone(),
                 },
             ),
-            InternalLink::UserToken { token } => {
-                td_api::InternalLinkType::internalLinkTypeUserToken(
-                    td_api::internalLinkTypeUserToken {
-                        token: token.clone(),
-                    },
-                )
-            }
+            InternalLink::UserToken {
+                token,
+                unpaid_messages_token,
+            } => td_api::InternalLinkType::internalLinkTypeUserToken(
+                td_api::internalLinkTypeUserToken {
+                    token: token.clone(),
+                    unpaid_messages_token: unpaid_messages_token.clone(),
+                },
+            ),
             InternalLink::VideoChat {
                 dialog_username,
                 invite_hash,
@@ -2513,6 +2576,7 @@ fn get_link_info(env: &impl LinkEnv, link: &str) -> LinkInfo {
             "share",
             "socks",
             "web",
+            "webproxy",
             "a",
             "k",
             "z",
@@ -2711,6 +2775,34 @@ fn get_ton_connect_connect_request_object(
     })
 }
 
+/// `get_ton_connect_query_from_startapp` (LinkManager.cpp:243-262,
+/// extracted by e3f0a2489): the `tonconnect-` startapp payload decodes
+/// `__`→`=`, `--`→`%`, `-`→`&` into the `?`-rooted connect query; a
+/// non-tonconnect startapp answers the empty query.
+fn get_ton_connect_query_from_startapp(startapp: &str) -> String {
+    let Some(stripped) = startapp.strip_prefix("tonconnect-") else {
+        return String::new();
+    };
+    let mut connect_query: Vec<u8> = b"?".to_vec();
+    let bytes = stripped.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'_' && i + 1 < bytes.len() && bytes[i + 1] == b'_' {
+            i += 1;
+            connect_query.push(b'=');
+        } else if bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            i += 1;
+            connect_query.push(b'%');
+        } else if bytes[i] == b'-' {
+            connect_query.push(b'&');
+        } else {
+            connect_query.push(bytes[i]);
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&connect_query).into_owned()
+}
+
 /// `get_internal_link_ton_connect` (LinkManager.cpp:3157-3172).
 fn get_internal_link_ton_connect(query: &str, check_path: bool) -> Option<InternalLink> {
     let url_query = parse_url_query(query);
@@ -2787,6 +2879,31 @@ fn get_internal_link_message_draft(url: &str, text: &str) -> Option<InternalLink
         text: full_text,
         contains_link: contains_url,
     })
+}
+
+/// `LinkManager::get_internal_link_web_proxy` (LinkManager.cpp:3260-3275)
+/// — a port parameter is ignored, because web proxies always use 443; an
+/// unparseable address or secret degrades to the empty unsupported-proxy
+/// form like the C++.
+fn get_internal_link_web_proxy(address: &str, secret: &str) -> InternalLink {
+    use crate::connection_creator::Proxy;
+    if let Ok((host, path)) = Proxy::parse_web_proxy_address(address)
+        && let Ok(link_secret) = Proxy::get_web_proxy_link_secret(secret, !path.is_empty())
+    {
+        return InternalLink::Proxy {
+            server: host,
+            port: Proxy::WEB_PROXY_PORT,
+            r#type: Some(td_api::ProxyType::proxyTypeWeb(td_api::proxyTypeWeb {
+                path,
+                secret: String::from_utf8_lossy(&link_secret.get_encoded_secret()).into_owned(),
+            })),
+        };
+    }
+    InternalLink::Proxy {
+        server: String::new(),
+        port: 0,
+        r#type: None,
+    }
 }
 
 /// `LinkManager::get_internal_link_passport` (cpp:2955-2984).
@@ -2869,6 +2986,16 @@ fn parse_tg_link_query(
                 copy_arg(&mut copied, &url_query, &mut is_first_arg, "domain");
                 copy_arg(&mut copied, &url_query, &mut is_first_arg, "startapp");
                 return Some(InternalLink::Oauth { url: copied });
+            }
+            if username == "sendgrams" && has_arg("startapp") {
+                // e3f0a2489 — tg://resolve?domain=sendgrams&startapp=
+                // tonconnect-... is the TON Connect link too
+                if let Some(link) = get_internal_link_ton_connect(
+                    &get_ton_connect_query_from_startapp(&get_arg("startapp")),
+                    true,
+                ) {
+                    return Some(link);
+                }
             }
             for (key, value) in &url_query.args {
                 if (key == "voicechat" || key == "videochat" || key == "livestream")
@@ -2978,6 +3105,7 @@ fn parse_tg_link_query(
                             dialog_username: username,
                             draft_text: String::new(),
                             open_profile: false,
+                            unpaid_messages_token: String::new(),
                         }),
                         value.clone(),
                         url_query.get_arg("startattach").unwrap_or(""),
@@ -3022,10 +3150,12 @@ fn parse_tg_link_query(
                 }
             }
             // resolve?domain=<username>
+            // resolve?domain=<username>&free=<token>
             return Some(InternalLink::PublicDialog {
                 dialog_username: username,
                 draft_text: get_url_query_draft_text(&url_query),
-                open_profile: has_arg("profile"),
+                open_profile: url_query.has_arg("profile"),
+                unpaid_messages_token: get_url_query_unpaid_messages_token(&url_query),
             });
         } else {
             let phone_number_str = get_arg("phone");
@@ -3042,16 +3172,19 @@ fn parse_tg_link_query(
                             phone_number,
                             String::new(),
                             false,
+                            String::new(),
                         )),
                         attach,
                         url_query.get_arg("startattach").unwrap_or(""),
                     ));
                 }
                 // resolve?phone=12345
+                // resolve?phone=12345&free=<token>
                 return Some(InternalLink::new_user_phone_number(
                     phone_number,
                     get_url_query_draft_text(&url_query),
-                    has_arg("profile"),
+                    url_query.has_arg("profile"),
+                    get_url_query_unpaid_messages_token(&url_query),
                 ));
             }
         }
@@ -3065,9 +3198,13 @@ fn parse_tg_link_query(
         }
     } else if path.len() == 1 && path[0] == "contact" {
         // contact?token=<token>
+        // contact?token=<token>&free=<token>
         let token = get_arg("token");
         if is_valid_user_token(&token) {
-            return Some(InternalLink::UserToken { token });
+            return Some(InternalLink::UserToken {
+                token,
+                unpaid_messages_token: get_url_query_unpaid_messages_token(&url_query),
+            });
         }
     } else if !path.is_empty() && path[0] == "contacts" {
         // contacts[/section]
@@ -3315,6 +3452,12 @@ fn parse_tg_link_query(
                 r#type: None,
             });
         }
+    } else if path.len() == 1 && path[0] == "webproxy" {
+        // webproxy?server=<host>[%2F<path>]&secret=<secret>
+        return Some(get_internal_link_web_proxy(
+            &get_arg("server"),
+            &get_arg("secret"),
+        ));
     } else if path.len() == 1 && path[0] == "privatepost" {
         // privatepost?channel=123456789&post=12345&single&thread=...
         if has_arg("channel") && has_arg("post") {
@@ -4131,22 +4274,26 @@ fn parse_t_me_link_query(
             let attach = get_arg("attach");
             if crate::misc::is_valid_username(&attach) {
                 // /+<phone_number>?attach=<bot_username>
+                // /+<phone_number>?attach=<bot_username>&startattach=<start_parameter>
                 return Some(InternalLink::new_attach_menu_bot(
                     None,
                     Some(InternalLink::new_user_phone_number(
                         &invite_hash,
                         String::new(),
                         false,
+                        String::new(),
                     )),
                     attach,
                     url_query.get_arg("startattach").unwrap_or(""),
                 ));
             }
             // /+<phone_number>
+            // /+<phone_number>?free=<token>
             return Some(InternalLink::new_user_phone_number(
                 &invite_hash,
                 get_url_query_draft_text(&url_query),
-                has_arg("profile"),
+                url_query.has_arg("profile"),
+                get_url_query_unpaid_messages_token(&url_query),
             ));
         } else if !invite_hash.is_empty() && is_base64url_characters(invite_hash.as_bytes()) {
             // /+<link>
@@ -4169,8 +4316,10 @@ fn parse_t_me_link_query(
     } else if path[0] == "contact" {
         if path.len() >= 2 && is_valid_user_token(&path[1]) {
             // /contact/<token>
+            // /contact/<token>?free=<token>
             return Some(InternalLink::UserToken {
                 token: path[1].clone(),
+                unpaid_messages_token: get_url_query_unpaid_messages_token(&url_query),
             });
         }
     } else if path[0] == "addstickers" || path[0] == "addemoji" {
@@ -4211,30 +4360,13 @@ fn parse_t_me_link_query(
         }
     } else if path[0] == "sendgrams" {
         // /sendgrams?to=<receiver>&amount=<amount>
-        // /sendgrams?startapp=tonconnect-... (23d3991c4)
-        let startapp = get_arg("startapp");
-        if let Some(stripped) = startapp.strip_prefix("tonconnect-") {
-            let mut connect_query: Vec<u8> = b"?".to_vec();
-            let bytes = stripped.as_bytes();
-            let mut i = 0usize;
-            while i < bytes.len() {
-                if bytes[i] == b'_' && i + 1 < bytes.len() && bytes[i + 1] == b'_' {
-                    i += 1;
-                    connect_query.push(b'=');
-                } else if bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
-                    i += 1;
-                    connect_query.push(b'%');
-                } else if bytes[i] == b'-' {
-                    connect_query.push(b'&');
-                } else {
-                    connect_query.push(bytes[i]);
-                }
-                i += 1;
-            }
-            let connect_query = String::from_utf8_lossy(&connect_query).into_owned();
-            if let Some(link) = get_internal_link_ton_connect(&connect_query, true) {
-                return Some(link);
-            }
+        // /sendgrams?startapp=tonconnect-... (23d3991c4; the decode moved
+        // into get_ton_connect_query_from_startapp with e3f0a2489)
+        if let Some(link) = get_internal_link_ton_connect(
+            &get_ton_connect_query_from_startapp(&get_arg("startapp")),
+            true,
+        ) {
+            return Some(link);
         }
         let receiver = get_arg("to");
         let amount = get_arg("amount");
@@ -4297,6 +4429,12 @@ fn parse_t_me_link_query(
                 r#type: None,
             });
         }
+    } else if path[0] == "webproxy" {
+        // /webproxy?server=<host>[%2F<path>]&secret=<secret>
+        return Some(get_internal_link_web_proxy(
+            &get_arg("server"),
+            &get_arg("secret"),
+        ));
     } else if path[0] == "bg" {
         if path.len() >= 2 && !path[1].is_empty() {
             // /bg/<hex_color> / /bg/<hex_color>-<hex_color>?rotation=...
@@ -4561,6 +4699,7 @@ fn parse_t_me_link_query(
                         dialog_username: username,
                         draft_text: String::new(),
                         open_profile: false,
+                        unpaid_messages_token: String::new(),
                     }),
                     value.clone(),
                     url_query.get_arg("startattach").unwrap_or(""),
@@ -4584,10 +4723,12 @@ fn parse_t_me_link_query(
         }
 
         // /<username>
+        // /<username>?free=<token>
         return Some(InternalLink::PublicDialog {
             dialog_username: username,
             draft_text: get_url_query_draft_text(&url_query),
-            open_profile: has_arg("profile"),
+            open_profile: url_query.has_arg("profile"),
+            unpaid_messages_token: get_url_query_unpaid_messages_token(&url_query),
         });
     }
     None
@@ -5445,11 +5586,20 @@ fn get_internal_link_impl(
             if !tdutils::utf8::check_utf8(link.draft_text.as_bytes()) {
                 return Err(Status::error(400, "Draft text must be encoded in UTF-8"));
             }
+            if !link.unpaid_messages_token.is_empty()
+                && !is_valid_unpaid_messages_token(&link.unpaid_messages_token)
+            {
+                return Err(Status::error(
+                    400,
+                    "Invalid unpaid messages token specified",
+                ));
+            }
             Ok(get_public_dialog_link(
                 env,
                 &link.chat_username,
                 &link.draft_text,
                 link.open_profile,
+                &link.unpaid_messages_token,
                 is_internal,
             ))
         }
@@ -5752,43 +5902,56 @@ fn get_internal_link_impl(
             if !tdutils::utf8::check_utf8(link.draft_text.as_bytes()) {
                 return Err(Status::error(400, "Draft text must be encoded in UTF-8"));
             }
+            if !link.unpaid_messages_token.is_empty()
+                && !is_valid_unpaid_messages_token(&link.unpaid_messages_token)
+            {
+                return Err(Status::error(
+                    400,
+                    "Invalid unpaid messages token specified",
+                ));
+            }
+            let mut query = get_dialog_link_query(
+                &link.draft_text,
+                link.open_profile,
+                &link.unpaid_messages_token,
+            );
             if is_internal {
-                Ok(format!(
-                    "tg://resolve?phone=+{phone_number}{}{}{}",
-                    if link.draft_text.is_empty() {
-                        ""
-                    } else {
-                        "&text="
-                    },
-                    url_encode(&link.draft_text),
-                    if link.open_profile { "&profile" } else { "" }
-                ))
+                Ok(format!("tg://resolve?phone=+{phone_number}{query}"))
             } else {
-                let has_draft = !link.draft_text.is_empty();
-                Ok(format!(
-                    "{}+{phone_number}{}{}{}",
-                    get_t_me_url(env),
-                    if has_draft { "?text=" } else { "" },
-                    url_encode(&link.draft_text),
-                    if link.open_profile {
-                        if has_draft { "&profile" } else { "?profile" }
-                    } else {
-                        ""
-                    }
-                ))
+                if !query.is_empty() {
+                    query.replace_range(0..1, "?");
+                }
+                Ok(format!("{}+{phone_number}{query}", get_t_me_url(env)))
             }
         }
         T::internalLinkTypeUserToken(link) => {
             if !is_valid_user_token(&link.token) {
                 return Err(Status::error(400, "Invalid user token specified"));
             }
+            if !link.unpaid_messages_token.is_empty()
+                && !is_valid_unpaid_messages_token(&link.unpaid_messages_token)
+            {
+                return Err(Status::error(
+                    400,
+                    "Invalid unpaid messages token specified",
+                ));
+            }
+            let mut query = get_dialog_link_query("", false, &link.unpaid_messages_token);
             if is_internal {
-                Ok(format!("tg://contact?token={}", url_encode(&link.token)))
-            } else {
                 Ok(format!(
-                    "{}contact/{}",
+                    "tg://contact?token={}{}",
+                    url_encode(&link.token),
+                    query
+                ))
+            } else {
+                if !query.is_empty() {
+                    query.replace_range(0..1, "?");
+                }
+                Ok(format!(
+                    "{}contact/{}{}",
                     get_t_me_url(env),
-                    url_encode(&link.token)
+                    url_encode(&link.token),
+                    query
                 ))
             }
         }
@@ -6011,39 +6174,23 @@ fn get_settings_link(section: &td_api::SettingsSection) -> std::result::Result<S
     })
 }
 
-/// `LinkManager::get_public_dialog_link` (cpp:4340-4348).
+/// `LinkManager::get_public_dialog_link` (cpp:4881-4892).
 fn get_public_dialog_link(
     env: &impl LinkEnv,
     username: &str,
     draft_text: &str,
     open_profile: bool,
+    unpaid_messages_token: &str,
     is_internal: bool,
 ) -> String {
+    let mut query = get_dialog_link_query(draft_text, open_profile, unpaid_messages_token);
     if is_internal {
-        format!(
-            "tg://resolve?domain={}{}{}{}",
-            url_encode(username),
-            if draft_text.is_empty() { "" } else { "&text=" },
-            url_encode(draft_text),
-            if open_profile { "&profile" } else { "" }
-        )
+        format!("tg://resolve?domain={}{}", url_encode(username), query)
     } else {
-        format!(
-            "{}{}{}{}{}",
-            get_t_me_url(env),
-            url_encode(username),
-            if draft_text.is_empty() { "" } else { "?text=" },
-            url_encode(draft_text),
-            if open_profile {
-                if draft_text.is_empty() {
-                    "?profile"
-                } else {
-                    "&profile"
-                }
-            } else {
-                ""
-            }
-        )
+        if !query.is_empty() {
+            query.replace_range(0..1, "?");
+        }
+        format!("{}{}{}", get_t_me_url(env), url_encode(username), query)
     }
 }
 
@@ -6223,6 +6370,7 @@ pub(crate) struct NetProxy {
     port: i32,
     user: String,
     password: String,
+    path: String,
     secret: tdmtproto::proxy_secret::ProxySecret,
 }
 
@@ -6233,6 +6381,7 @@ enum NetProxyType {
     HttpTcp,
     HttpCaching,
     Mtproto,
+    Web,
 }
 
 impl NetProxy {
@@ -6243,6 +6392,7 @@ impl NetProxy {
             port,
             user,
             password,
+            path: String::new(),
             secret: tdmtproto::proxy_secret::ProxySecret::default(),
         }
     }
@@ -6264,6 +6414,7 @@ impl NetProxy {
             port,
             user,
             password,
+            path: String::new(),
             secret: tdmtproto::proxy_secret::ProxySecret::default(),
         }
     }
@@ -6279,16 +6430,50 @@ impl NetProxy {
             port,
             user: String::new(),
             password: String::new(),
+            path: String::new(),
+            secret,
+        }
+    }
+
+    /// `Proxy::web` (net/Proxy.h:89-97) — the port is forced to 443.
+    fn new_web(
+        server: String,
+        path: String,
+        secret: tdmtproto::proxy_secret::ProxySecret,
+    ) -> NetProxy {
+        NetProxy {
+            r#type: NetProxyType::Web,
+            server,
+            port: crate::connection_creator::Proxy::WEB_PROXY_PORT,
+            user: String::new(),
+            password: String::new(),
+            path,
             secret,
         }
     }
 
     /// `Proxy::create_proxy(const td_api::proxy *)`
-    /// (net/Proxy.cpp:56-60, 15-54).
+    /// (net/Proxy.cpp:56-60, 15-54). The web arm shares the
+    /// connection-creator statics (the C++ single `Proxy::create_proxy`
+    /// ladder — the link plane reads only the accessors).
     fn create_proxy(proxy: &td_api::Proxy) -> std::result::Result<NetProxy, Status> {
+        use crate::connection_creator::Proxy as NetProxyHelpers;
         let Some(proxy_type) = proxy.r#type.as_ref() else {
             return Err(Status::error(400, "Proxy type must be non-empty"));
         };
+        if let td_api::ProxyType::proxyTypeWeb(type_web) = proxy_type {
+            if proxy.port != 0 && proxy.port != NetProxyHelpers::WEB_PROXY_PORT {
+                return Err(Status::error(400, "Web proxy port must be 443"));
+            }
+            let host = NetProxyHelpers::normalize_web_proxy_host(&proxy.server)
+                .map_err(|message| Status::error(400, &message))?;
+            if !NetProxyHelpers::is_valid_web_proxy_path(&type_web.path) {
+                return Err(Status::error(400, "Invalid web proxy path"));
+            }
+            let secret = NetProxyHelpers::get_web_proxy_secret(&type_web.secret)
+                .map_err(|message| Status::error(400, &message))?;
+            return Ok(NetProxy::new_web(host, type_web.path.clone(), secret));
+        }
         if proxy.server.is_empty() {
             return Err(Status::error(400, "Server name must be non-empty"));
         }
@@ -6332,12 +6517,48 @@ impl NetProxy {
                     secret,
                 ))
             }
+            // unreachable like the C++ switch's UNREACHABLE default — the
+            // web arm is handled before the validation ladder
+            td_api::ProxyType::proxyTypeWeb(_) => {
+                unreachable!("the web arm is handled before the validation ladder")
+            }
         }
     }
 
     /// The encoded secret in its string form.
     fn get_encoded_secret(&self) -> String {
         String::from_utf8_lossy(&self.secret.get_encoded_secret()).into_owned()
+    }
+
+    /// `Proxy::get_web_proxy_address` (net/Proxy.cpp:144-151) — the
+    /// "host[/path]" form the link carries in the server parameter.
+    fn get_web_proxy_address(&self) -> String {
+        debug_assert!(
+            self.r#type == NetProxyType::Web,
+            "CHECK(type_ == Type::Web)"
+        );
+        if self.path.is_empty() {
+            return self.server.clone();
+        }
+        format!("{}/{}", self.server, self.path)
+    }
+
+    /// `Proxy::get_web_proxy_link_secret` (net/Proxy.cpp:147-153) — a
+    /// path-carrying proxy marks its link secret with the 0x70 byte so
+    /// path-unaware clients reject the link.
+    fn get_web_proxy_link_secret(&self) -> String {
+        debug_assert!(
+            self.r#type == NetProxyType::Web,
+            "CHECK(type_ == Type::Web)"
+        );
+        const WEB_PROXY_LINK_SECRET_MARKER: u8 = 0x70;
+        if self.path.is_empty() {
+            return String::from_utf8_lossy(&self.secret.get_encoded_secret()).into_owned();
+        }
+        let mut marked = vec![WEB_PROXY_LINK_SECRET_MARKER];
+        marked.extend_from_slice(self.secret.get_raw_secret());
+        String::from_utf8(tdmtproto::utils::base64url_encode(&marked))
+            .expect("base64url output is ASCII")
     }
 }
 
@@ -6363,6 +6584,15 @@ fn get_proxy_link(
         }
         NetProxyType::Mtproto => {
             url += "proxy";
+        }
+        NetProxyType::Web => {
+            // the port is always 443, and the path travels in the server
+            // parameter (LinkManager.cpp:4908-4912)
+            return Ok(format!(
+                "{url}webproxy?server={}&secret={}",
+                url_encode(&proxy.get_web_proxy_address()),
+                url_encode(&proxy.get_web_proxy_link_secret())
+            ));
         }
     }
     url += "?server=";
@@ -7325,6 +7555,49 @@ impl LinkManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The e3f0a2489 upstream vector (`test/link.cpp`): the
+    /// tg://resolve?domain=sendgrams&startapp=tonconnect-... form parses
+    /// into the TON Connect link exactly like the t.me path.
+    #[test]
+    fn tg_sendgrams_startapp_parses_like_ton_connect() {
+        struct SendgramsEnv;
+        impl LinkEnv for SendgramsEnv {}
+        let mut env = SendgramsEnv;
+        let link = parse_internal_link(
+                &mut env,
+                "tg:resolve/\
+    ?domain=sendgrams&startapp=tonconnect-v__2-id__c745acd825f83bf7ef88d671ea69c90fd1c7e71f78b1079ec8ad3c231fed7a65-\
+    trace--5Fid__01a0b488--2D27a9--2D7419--2D89bc--2D169fc31ba6fd-r__--7B--22manifestUrl--22--3A--22https--3A--2F--\
+    2Ftonconnect--2Dsdk--2Ddemo--2Ddapp--2Evercel--2Eapp--2Ftonconnect--2Dmanifest--2Ejson--22--2C--22items--22--3A-\
+    -5B--7B--22name--22--3A--22ton--5Faddr--22--7D--5D--7D-ret__none",
+                false,
+            )
+            .expect("the tg sendgrams startapp link parses");
+        match link {
+            InternalLink::TonConnect {
+                version,
+                dapp_client_id,
+                connect_request,
+                return_strategy,
+                rpc_request,
+                trace_id,
+            } => {
+                assert_eq!(version, 2);
+                assert_eq!(
+                    dapp_client_id,
+                    "c745acd825f83bf7ef88d671ea69c90fd1c7e71f78b1079ec8ad3c231fed7a65"
+                );
+                assert_eq!(return_strategy, "none");
+                assert_eq!(rpc_request, "");
+                assert_eq!(trace_id, "01a0b488-27a9-7419-89bc-169fc31ba6fd");
+                assert_eq!(
+                    connect_request,
+                    "{\"manifestUrl\":\"https://tonconnect-sdk-demo-dapp.vercel.app/tonconnect-manifest.json\",\"items\":[{\"name\":\"ton_addr\"}]}"
+                );
+            }
+            other => panic!("the TON Connect link: {other:?}"),
+        }
+    }
 
     /// The `start_up` line (LinkManager.cpp:1901): the token starts
     /// empty and its update time a year in the past — the autologin url
@@ -7502,5 +7775,413 @@ mod tests {
             Default::default(),
         );
         assert!(manager.pending.url_auth.is_empty(), "the CHECK band");
+    }
+
+    /// The upstream `test/link.cpp` web-proxy vectors (e52edfd8b,
+    /// `parse_internal_link_part3`) — the parsed form is asserted against
+    /// the C++ expectations verbatim, host normalization and the marked
+    /// 0x70 link-secret round-trip included.
+    #[test]
+    fn web_proxy_links_parse_like_the_cpp_reference() {
+        struct WebProxyEnv;
+        impl LinkEnv for WebProxyEnv {}
+        let mut env = WebProxyEnv;
+        let proxy_web = |server: &str, path: &str, secret: &str| InternalLink::Proxy {
+            server: server.to_owned(),
+            port: 443,
+            r#type: Some(td_api::ProxyType::proxyTypeWeb(td_api::proxyTypeWeb {
+                path: path.to_owned(),
+                secret: secret.to_owned(),
+            })),
+        };
+        let unsupported = || InternalLink::Proxy {
+            server: String::new(),
+            port: 0,
+            r#type: None,
+        };
+        let mut parse = |link: &str| {
+            parse_internal_link(&mut env, link, false).expect("the link must parse to a proxy form")
+        };
+
+        assert_eq!(
+            parse("t.me/webproxy?server=proxy.example.com&secret=8561944064fc730cbfa4473562d8ec59"),
+            proxy_web("proxy.example.com", "", "8561944064fc730cbfa4473562d8ec59")
+        );
+        // the port parameter is ignored, and the hex secret re-canonicalizes
+        assert_eq!(
+            parse(
+                "https://t.me/webproxy?server=proxy.example.com&port=80&secret=8561944064FC730CBFA4473562D8EC59"
+            ),
+            proxy_web("proxy.example.com", "", "8561944064fc730cbfa4473562d8ec59")
+        );
+        // scheme/trailing-dot normalization of the host; the dd-padded
+        // secret keeps its padding
+        assert_eq!(
+            parse(
+                "t.me/webproxy?server=HTTPS%3A%2F%2FProxy.Example.COM.&secret=dd8561944064fc730cbfa4473562d8ec59"
+            ),
+            proxy_web(
+                "proxy.example.com",
+                "",
+                "dd8561944064fc730cbfa4473562d8ec59"
+            )
+        );
+        // the punycode pass (idn_to_ascii) is part of the contract
+        assert_eq!(
+            parse(
+                "t.me/webproxy?server=%D0%BF%D1%80%D0%B8%D0%BC%D0%B5%D1%80.%D1%80%D1%84&secret=8561944064fc730cbfa4473562d8ec59"
+            ),
+            proxy_web(
+                "xn--e1afmkfd.xn--p1ai",
+                "",
+                "8561944064fc730cbfa4473562d8ec59"
+            )
+        );
+        assert_eq!(
+            parse(
+                "t.me/webproxy?server=%D0%9F%D1%80%D0%B8%D0%BC%D0%B5%D1%80.%D0%A0%D0%A4&secret=8561944064fc730cbfa4473562d8ec59"
+            ),
+            proxy_web(
+                "xn--e1afmkfd.xn--p1ai",
+                "",
+                "8561944064fc730cbfa4473562d8ec59"
+            )
+        );
+        // the %2F-encoded path and the 0x70-marked link secret
+        assert_eq!(
+            parse(
+                "t.me/webproxy?server=proxy.example.com%2Fdobry-cola-super-app&secret=cIVhlEBk_HMMv6RHNWLY7Fk"
+            ),
+            proxy_web(
+                "proxy.example.com",
+                "dobry-cola-super-app",
+                "8561944064fc730cbfa4473562d8ec59"
+            )
+        );
+        assert_eq!(
+            parse(
+                "t.me/webproxy?server=proxy.example.com%2Fa%2Fb_c&secret=cN2FYZRAZPxzDL-kRzVi2OxZ"
+            ),
+            proxy_web(
+                "proxy.example.com",
+                "a/b_c",
+                "dd8561944064fc730cbfa4473562d8ec59"
+            )
+        );
+        // a marked secret without a path falls back to the plain secret
+        assert_eq!(
+            parse("t.me/webproxy?server=proxy.example.com&secret=cIVhlEBk_HMMv6RHNWLY7Fk"),
+            proxy_web("proxy.example.com", "", "8561944064fc730cbfa4473562d8ec59")
+        );
+
+        // the unsupported band: a plain (unmarked) secret with a path,
+        // fake-TLS secrets, non-domain hosts, invalid paths, a missing
+        // secret
+        for link in [
+            "t.me/webproxy?server=proxy.example.com%2Fapp&secret=8561944064fc730cbfa4473562d8ec59",
+            "t.me/webproxy?server=proxy.example.com&secret=7tAAAAAAAAAAAAAAAAAAAAAAAAcuZ29vZ2xlLmNvbQ",
+            "t.me/webproxy?server=proxy.example.com&secret=de8561944064fc730cbfa4473562d8ec59",
+            "t.me/webproxy?server=1.2.3.4&secret=8561944064fc730cbfa4473562d8ec59",
+            "t.me/webproxy?server=proxy.0x7f&secret=8561944064fc730cbfa4473562d8ec59",
+            "t.me/webproxy?server=localhost&secret=8561944064fc730cbfa4473562d8ec59",
+            "t.me/webproxy?server=proxy.example.com%2F-app&secret=cIVhlEBk_HMMv6RHNWLY7Fk",
+            "t.me/webproxy?server=proxy.example.com%2Fa%2F%2Fb&secret=cIVhlEBk_HMMv6RHNWLY7Fk",
+            "t.me/webproxy?server=proxy.example.com%2Fa.b&secret=cIVhlEBk_HMMv6RHNWLY7Fk",
+            "t.me/webproxy?server=proxy.example.com",
+            "t.me/webproxy",
+        ] {
+            assert_eq!(
+                parse(link),
+                unsupported(),
+                "link must be unsupported: {link}"
+            );
+        }
+
+        // the tg forms ride the same helper
+        assert_eq!(
+            parse("tg:webproxy?server=proxy.example.com&secret=8561944064fc730cbfa4473562d8ec59"),
+            proxy_web("proxy.example.com", "", "8561944064fc730cbfa4473562d8ec59")
+        );
+        assert_eq!(
+            parse(
+                "tg://webproxy?server=proxy.example.com%2Fdobry-cola-super-app&secret=cIVhlEBk_HMMv6RHNWLY7Fk"
+            ),
+            proxy_web(
+                "proxy.example.com",
+                "dobry-cola-super-app",
+                "8561944064fc730cbfa4473562d8ec59"
+            )
+        );
+        // the tg unsupported forms (upstream test/link.cpp tail vectors)
+        assert_eq!(
+            parse(
+                "tg:webproxy?server=proxy.example.com%2Fapp&secret=8561944064fc730cbfa4473562d8ec59"
+            ),
+            unsupported(),
+            "a plain secret with a path is unsupported"
+        );
+        assert_eq!(parse("tg:webproxy"), unsupported());
+    }
+
+    /// `LinkManager::get_proxy_link`'s web arm (LinkManager.cpp:4908-4912)
+    /// — the link of a parsed web proxy regenerates the upstream bytes:
+    /// the path rides the server parameter, the secret stays marked, and
+    /// the whole round trip is byte-identical (upstream test/link.cpp
+    /// vectors).
+    #[test]
+    fn web_proxy_link_generation_round_trips_the_upstream_form() {
+        struct WebProxyEnv;
+        impl LinkEnv for WebProxyEnv {}
+        let mut env = WebProxyEnv;
+
+        for link in [
+            "tg://webproxy?server=proxy.example.com%2Fa%2Fb_c&secret=cN2FYZRAZPxzDL-kRzVi2OxZ",
+            "tg://webproxy?server=proxy.example.com&secret=8561944064fc730cbfa4473562d8ec59",
+        ] {
+            let Some(InternalLink::Proxy {
+                server,
+                port,
+                r#type,
+            }) = parse_internal_link(&mut env, link, false)
+            else {
+                panic!("the upstream link must parse: {link}");
+            };
+            let proxy = NetProxy::create_proxy(&td_api::Proxy {
+                server: server.clone(),
+                port,
+                r#type,
+            })
+            .expect("the parsed form must revalidate");
+            assert_eq!(
+                get_proxy_link(&env, &proxy, true).unwrap(),
+                link,
+                "the generated link must round-trip the parsed one"
+            );
+        }
+
+        // the HTTP proxies keep their no-public-links band
+        let http = NetProxy::create_proxy(&td_api::Proxy {
+            server: "proxy.example.com".to_owned(),
+            port: 8080,
+            r#type: Some(td_api::ProxyType::proxyTypeHttp(td_api::proxyTypeHttp {
+                username: String::new(),
+                password: String::new(),
+                http_only: false,
+            })),
+        })
+        .unwrap();
+        assert_eq!(
+            get_proxy_link(&env, &http, true).unwrap_err().message(),
+            "HTTP proxies have no public links"
+        );
+    }
+
+    /// The `free=` unpaid-messages-token vectors (upstream 869e6e6c5 +
+    /// c6f5bdb50, test/link.cpp) — the token parses on every
+    /// dialog/user/token link form and drops on the invalid shapes
+    /// (empty, a space, over 64 characters).
+    #[test]
+    fn unpaid_messages_tokens_parse_on_every_dialog_link_form() {
+        struct FreeLinkEnv;
+        impl LinkEnv for FreeLinkEnv {}
+        let mut env = FreeLinkEnv;
+        let mut parse = |link: &str| parse_internal_link(&mut env, link, false);
+
+        let public_chat =
+            |draft: &str, open_profile: bool, free: &str| InternalLink::PublicDialog {
+                dialog_username: "username".to_owned(),
+                draft_text: draft.to_owned(),
+                open_profile,
+                unpaid_messages_token: free.to_owned(),
+            };
+        let user_phone =
+            |draft: &str, open_profile: bool, free: &str| InternalLink::UserPhoneNumber {
+                phone_number: "+123456".to_owned(),
+                draft_text: draft.to_owned(),
+                open_profile,
+                unpaid_messages_token: free.to_owned(),
+            };
+        let user_token = |token: &str, free: &str| InternalLink::UserToken {
+            token: token.to_owned(),
+            unpaid_messages_token: free.to_owned(),
+        };
+
+        // tg:resolve?domain= + free
+        assert_eq!(
+            parse("tg:resolve?domain=username&free=AbCd-_0123456789").unwrap(),
+            public_chat("", false, "AbCd-_0123456789")
+        );
+        assert_eq!(
+            parse("tg:resolve?domain=username&free=abc&profile&text=@asd").unwrap(),
+            public_chat(" @asd", true, "abc")
+        );
+        for link in [
+            "tg:resolve?domain=username&free=",
+            "tg:resolve?domain=username&free=a%20b",
+            "tg:resolve?domain=username&free=a+b",
+        ] {
+            assert_eq!(parse(link).unwrap(), public_chat("", false, ""), "{link}");
+        }
+
+        // tg:resolve?phone= + free
+        assert_eq!(
+            parse("tg:resolve?phone=123456&free=AbCd-_0123456789").unwrap(),
+            user_phone("", false, "AbCd-_0123456789")
+        );
+        assert_eq!(
+            parse("tg:resolve?phone=123456&free=abc&profile&text=@asd").unwrap(),
+            user_phone(" @asd", true, "abc")
+        );
+        assert_eq!(
+            parse("tg:resolve?phone=123456&free=a%20b").unwrap(),
+            user_phone("", false, "")
+        );
+
+        // tg:contact?token= + free — the token travels either way around
+        assert_eq!(
+            parse("tg:contact?token=123456&free=AbCd-_0123456789").unwrap(),
+            user_token("123456", "AbCd-_0123456789")
+        );
+        assert_eq!(
+            parse("tg:contact?free=abc&token=123456").unwrap(),
+            user_token("123456", "abc")
+        );
+        assert_eq!(
+            parse("tg:contact?token=123456&free=").unwrap(),
+            user_token("123456", "")
+        );
+        assert_eq!(
+            parse("tg:contact?token=123456&free=a%20b").unwrap(),
+            user_token("123456", "")
+        );
+
+        // the t.me forms: /<username>, /+<phone>, /contact/<token> — the
+        // 64-byte token stays, the 65-byte one drops
+        assert_eq!(
+            parse("t.me/username?free=AbCd-_0123456789").unwrap(),
+            public_chat("", false, "AbCd-_0123456789")
+        );
+        assert_eq!(
+            parse("t.me/username?text=@asd&free=abc&profile").unwrap(),
+            public_chat(" @asd", true, "abc")
+        );
+        assert_eq!(
+            parse("t.me/username?free=a%20b").unwrap(),
+            public_chat("", false, "")
+        );
+        // the 64-byte token stays, the 65-byte one drops
+        assert_eq!(
+            parse("t.me/username?free=0123456789012345678901234567890123456789012345678901234567890123")
+                .unwrap(),
+            public_chat(
+                "",
+                false,
+                "0123456789012345678901234567890123456789012345678901234567890123"
+            )
+        );
+        assert_eq!(
+            parse("t.me/username?free=01234567890123456789012345678901234567890123456789012345678901234")
+                .unwrap(),
+            public_chat("", false, "")
+        );
+        assert_eq!(
+            parse("t.me/+123456?free=AbCd-_0123456789").unwrap(),
+            user_phone("", false, "AbCd-_0123456789")
+        );
+        assert_eq!(
+            parse("t.me/+123456?free=abc&profile&text=@asd").unwrap(),
+            user_phone(" @asd", true, "abc")
+        );
+        assert_eq!(
+            parse("t.me/+123456?free=a%20b").unwrap(),
+            user_phone("", false, "")
+        );
+        assert_eq!(
+            parse("t.me/contact/123456?free=AbCd-_0123456789").unwrap(),
+            user_token("123456", "AbCd-_0123456789")
+        );
+        assert_eq!(
+            parse("t.me/contact/123456/?free=abc").unwrap(),
+            user_token("123456", "abc")
+        );
+        assert_eq!(
+            parse("t.me/contact/123456?free=a%20b").unwrap(),
+            user_token("123456", "")
+        );
+    }
+
+    /// The `free=` query generation (`get_dialog_link_query`,
+    /// LinkManager.cpp:470-481): every dialog-link builder appends the
+    /// unpaid-messages token after text/profile, and the invalid token
+    /// forms answer the C++ 400 band.
+    #[test]
+    fn unpaid_messages_tokens_generate_the_free_query() {
+        struct FreeLinkEnv;
+        impl LinkEnv for FreeLinkEnv {}
+        let mut env = FreeLinkEnv;
+        let phone = td_api::InternalLinkType::internalLinkTypeUserPhoneNumber(
+            td_api::internalLinkTypeUserPhoneNumber {
+                phone_number: "+123456".to_owned(),
+                draft_text: String::new(),
+                open_profile: false,
+                unpaid_messages_token: "abc".to_owned(),
+            },
+        );
+        assert_eq!(
+            get_internal_link(&mut env, Some(&phone), false).unwrap(),
+            "https://t.me/+123456?free=abc"
+        );
+        assert_eq!(
+            get_internal_link(&mut env, Some(&phone), true).unwrap(),
+            "tg://resolve?phone=+123456&free=abc"
+        );
+
+        let token = td_api::InternalLinkType::internalLinkTypeUserToken(
+            td_api::internalLinkTypeUserToken {
+                token: "123456".to_owned(),
+                unpaid_messages_token: "abc".to_owned(),
+            },
+        );
+        assert_eq!(
+            get_internal_link(&mut env, Some(&token), false).unwrap(),
+            "https://t.me/contact/123456?free=abc"
+        );
+        assert_eq!(
+            get_internal_link(&mut env, Some(&token), true).unwrap(),
+            "tg://contact?token=123456&free=abc"
+        );
+
+        let chat = td_api::InternalLinkType::internalLinkTypePublicChat(
+            td_api::internalLinkTypePublicChat {
+                chat_username: "username".to_owned(),
+                draft_text: "@asd".to_owned(),
+                open_profile: true,
+                unpaid_messages_token: "abc".to_owned(),
+            },
+        );
+        assert_eq!(
+            get_internal_link(&mut env, Some(&chat), false).unwrap(),
+            "https://t.me/username?text=%40asd&profile&free=abc"
+        );
+        assert_eq!(
+            get_internal_link(&mut env, Some(&chat), true).unwrap(),
+            "tg://resolve?domain=username&text=%40asd&profile&free=abc"
+        );
+
+        // the invalid-token 400 band (LinkManager.cpp:4425-4428)
+        let bad = td_api::InternalLinkType::internalLinkTypeUserPhoneNumber(
+            td_api::internalLinkTypeUserPhoneNumber {
+                phone_number: "+123456".to_owned(),
+                draft_text: String::new(),
+                open_profile: false,
+                unpaid_messages_token: "a b".to_owned(),
+            },
+        );
+        assert_eq!(
+            get_internal_link(&mut env, Some(&bad), false)
+                .unwrap_err()
+                .message(),
+            "Invalid unpaid messages token specified"
+        );
     }
 }

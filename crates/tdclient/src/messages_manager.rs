@@ -1468,6 +1468,11 @@ impl NotificationGroupInfo {
 /// 18th entry of the database serializer version enum.
 pub const ADD_NOTIFICATION_GROUP_INFO_MAX_REMOVED_MESSAGE_ID: i32 = 18;
 
+/// `MessagesManager::PERSISTENT_MESSAGE_ID_CACHE_TIME`
+/// (MessagesManager.h, 09e41c5a8) — the yet-unsent → persistent-id
+/// rewrite registry drops entries not written to within the hour.
+const PERSISTENT_MESSAGE_ID_CACHE_TIME: f64 = 3600.0;
+
 /// `td::InputDialogId` (InputDialogId.{h,cpp}) — a dialog id paired with the
 /// access hash needed to address it from the client.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -3389,41 +3394,11 @@ impl MessageReplyInfo {
     }
 }
 
-/// `td::NotificationSoundType` (NotificationSoundType.h:13).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(i32)]
-pub enum NotificationSoundType {
-    #[default]
-    None = 0,
-    Local = 1,
-    Ringtone = 2,
-}
-
-/// `td::NotificationSound` (NotificationSound.h) — the virtual-base class
-/// hierarchy (NotificationSound.cpp:14-44: None/Local/Ringtone) flattened
-/// into an enum; the store/parse format lands with the notification-settings
-/// slice.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum NotificationSound {
-    /// `NotificationSoundNone`
-    #[default]
-    None,
-    /// `NotificationSoundLocal`
-    Local(String),
-    /// `NotificationSoundRingtone` — a ringtone document id
-    Ringtone(i64),
-}
-
-impl NotificationSound {
-    /// The `NotificationSound::get_type` overloads of the three subclasses.
-    pub fn get_type(&self) -> NotificationSoundType {
-        match self {
-            NotificationSound::None => NotificationSoundType::None,
-            NotificationSound::Local(_) => NotificationSoundType::Local,
-            NotificationSound::Ringtone(_) => NotificationSoundType::Ringtone,
-        }
-    }
-}
+// The M.10 foundation carried a local `NotificationSound`/
+// `NotificationSoundType` twin; the community notification-settings slice
+// (#113) unifies the two planes on the M.13S value type, exactly like the
+// C++ single `td::NotificationSound`.
+pub use crate::notification_settings::NotificationSound;
 
 /// `td::DialogNotificationSettings` (DialogNotificationSettings.h) — the
 /// per-dialog notification settings with the C++ in-class defaults; the
@@ -3471,6 +3446,304 @@ impl Default for DialogNotificationSettings {
             disable_mention_notifications: false,
         }
     }
+}
+
+impl DialogNotificationSettings {
+    /// `DialogNotificationSettings::get_input_peer_notify_settings`
+    /// (DialogNotificationSettings.cpp:11-33) — the
+    /// `account_updateNotifySettings` value form; the flag bits are the
+    /// `peerNotifySettings` masks (show_previews `0`, silent `1`,
+    /// mute_until `2`, sound `3`, stories_muted `6`,
+    /// stories_hide_sender `7`, stories_sound `8`).
+    pub fn get_input_peer_notify_settings(&self) -> telegram_api::InputPeerNotifySettings {
+        let mut flags = 0;
+        if !self.use_default_mute_until {
+            flags |= 1 << 2;
+        }
+        if !self.use_default_show_preview {
+            flags |= 1 << 0;
+        }
+        if !self.use_default_mute_stories {
+            flags |= 1 << 6;
+        }
+        if !self.use_default_hide_story_sender {
+            flags |= 1 << 7;
+        }
+        if self.silent_send_message {
+            flags |= 1 << 1;
+        }
+        telegram_api::InputPeerNotifySettings {
+            flags,
+            show_previews: self.show_preview,
+            silent: self.silent_send_message,
+            mute_until: self.mute_until,
+            sound: crate::notification_settings::get_input_notification_sound(&self.sound, false),
+            stories_muted: self.mute_stories,
+            stories_hide_sender: self.hide_story_sender,
+            stories_sound: crate::notification_settings::get_input_notification_sound(
+                &self.story_sound,
+                false,
+            ),
+        }
+    }
+
+    /// `DialogNotificationSettings::fix_mute_until(bool)`
+    /// (DialogNotificationSettings.cpp:56-60, b1afb1e44) — a bot, a
+    /// default mute and an expired mute all read as "not muted". The
+    /// `G()->unix_time()` read rides the parameter (the port's clock is
+    /// injected).
+    pub fn fix_mute_until(&mut self, is_bot: bool, unix_time: i32) {
+        if is_bot || self.use_default_mute_until || self.mute_until <= unix_time {
+            self.mute_until = 0;
+        }
+    }
+}
+
+/// `get_chat_notification_settings_object`
+/// (DialogNotificationSettings.cpp:73-84) — the td_api form; `mute_for` is
+/// the clamped remaining time and `show_story_poster` is the inverted
+/// `hide_story_sender`.
+pub fn get_chat_notification_settings_object(
+    notification_settings: &DialogNotificationSettings,
+    unix_time: i32,
+) -> td_api::ChatNotificationSettings {
+    use crate::notification_settings::{
+        get_notification_sound_ringtone_id, is_notification_sound_default,
+    };
+    td_api::ChatNotificationSettings {
+        use_default_mute_for: notification_settings.use_default_mute_until,
+        mute_for: std::cmp::max(0, notification_settings.mute_until - unix_time),
+        use_default_sound: is_notification_sound_default(&notification_settings.sound),
+        sound_id: get_notification_sound_ringtone_id(&notification_settings.sound),
+        use_default_show_preview: notification_settings.use_default_show_preview,
+        show_preview: notification_settings.show_preview,
+        use_default_mute_stories: notification_settings.use_default_mute_stories,
+        mute_stories: notification_settings.mute_stories,
+        use_default_story_sound: is_notification_sound_default(&notification_settings.story_sound),
+        story_sound_id: get_notification_sound_ringtone_id(&notification_settings.story_sound),
+        use_default_show_story_poster: notification_settings.use_default_hide_story_sender,
+        show_story_poster: !notification_settings.hide_story_sender,
+        use_default_disable_pinned_message_notifications: notification_settings
+            .use_default_disable_pinned_message_notifications,
+        disable_pinned_message_notifications: notification_settings
+            .disable_pinned_message_notifications,
+        use_default_disable_mention_notifications: notification_settings
+            .use_default_disable_mention_notifications,
+        disable_mention_notifications: notification_settings.disable_mention_notifications,
+    }
+}
+
+/// `get_mute_until` (DialogNotificationSettings.cpp:86-97) — the
+/// `mute_for` → absolute `mute_until` lift; everything past the precise
+/// window pins to `i32::MAX`.
+fn get_mute_until(mute_for: i32, unix_time: i32) -> i32 {
+    if mute_for <= 0 {
+        return 0;
+    }
+    const MAX_PRECISE_MUTE_FOR: i32 = 366 * 86400;
+    if mute_for > MAX_PRECISE_MUTE_FOR || mute_for >= i32::MAX - unix_time {
+        return i32::MAX;
+    }
+    mute_for + unix_time
+}
+
+/// `get_dialog_notification_settings(td_api::chatNotificationSettings &&,
+/// const DialogNotificationSettings *)`
+/// (DialogNotificationSettings.cpp:99-127) — the request-side intake; the
+/// local-only fields (`silent_send_message` and the sound inheritance)
+/// survive from the old settings.
+pub fn get_dialog_notification_settings_from_td_api(
+    notification_settings: Option<&td_api::ChatNotificationSettings>,
+    old_settings: &DialogNotificationSettings,
+    unix_time: i32,
+) -> Result<DialogNotificationSettings, Status> {
+    use crate::notification_settings::{
+        dup_notification_sound, get_notification_sound_from_id, is_notification_sound_default,
+    };
+    let Some(notification_settings) = notification_settings else {
+        return Err(Status::error(
+            400,
+            "New notification settings must be non-empty",
+        ));
+    };
+
+    let mute_until = if notification_settings.use_default_mute_for {
+        0
+    } else {
+        get_mute_until(notification_settings.mute_for, unix_time)
+    };
+    let mut notification_sound = get_notification_sound_from_id(
+        notification_settings.use_default_sound,
+        notification_settings.sound_id,
+    );
+    if is_notification_sound_default(&old_settings.sound)
+        && is_notification_sound_default(&notification_sound)
+    {
+        notification_sound = dup_notification_sound(&old_settings.sound);
+    }
+    let mut story_notification_sound = get_notification_sound_from_id(
+        notification_settings.use_default_story_sound,
+        notification_settings.story_sound_id,
+    );
+    if is_notification_sound_default(&old_settings.story_sound)
+        && is_notification_sound_default(&story_notification_sound)
+    {
+        story_notification_sound = dup_notification_sound(&old_settings.story_sound);
+    }
+    Ok(DialogNotificationSettings {
+        use_default_mute_until: notification_settings.use_default_mute_for,
+        mute_until,
+        sound: notification_sound,
+        use_default_show_preview: notification_settings.use_default_show_preview,
+        show_preview: notification_settings.show_preview,
+        use_default_mute_stories: notification_settings.use_default_mute_stories,
+        mute_stories: notification_settings.mute_stories,
+        story_sound: story_notification_sound,
+        use_default_hide_story_sender: notification_settings.use_default_show_story_poster,
+        hide_story_sender: !notification_settings.show_story_poster,
+        silent_send_message: old_settings.silent_send_message,
+        use_default_disable_pinned_message_notifications: notification_settings
+            .use_default_disable_pinned_message_notifications,
+        disable_pinned_message_notifications: notification_settings
+            .disable_pinned_message_notifications,
+        use_default_disable_mention_notifications: notification_settings
+            .use_default_disable_mention_notifications,
+        disable_mention_notifications: notification_settings.disable_mention_notifications,
+        // The C++ 15-argument constructor marks every converted settings
+        // object as synchronized.
+        is_synchronized: true,
+    })
+}
+
+/// `get_dialog_notification_settings(peerNotifySettings &&, const
+/// DialogNotificationSettings *)`
+/// (DialogNotificationSettings.cpp:141-185) — the wire intake; the local
+/// pinned/mention fields survive from the old settings and an absent
+/// settings object means "not yet synchronized".
+pub fn get_dialog_notification_settings_from_telegram(
+    settings: Option<&telegram_api::PeerNotifySettings>,
+    old_settings: Option<&DialogNotificationSettings>,
+    unix_time: i32,
+) -> DialogNotificationSettings {
+    use crate::notification_settings::get_notification_sound_from_peer_settings;
+    let (old_use_default_disable_pinned, old_disable_pinned) = old_settings
+        .map(|s| {
+            (
+                s.use_default_disable_pinned_message_notifications,
+                s.disable_pinned_message_notifications,
+            )
+        })
+        .unwrap_or((true, false));
+    let (old_use_default_disable_mention, old_disable_mention) = old_settings
+        .map(|s| {
+            (
+                s.use_default_disable_mention_notifications,
+                s.disable_mention_notifications,
+            )
+        })
+        .unwrap_or((true, false));
+
+    let Some(settings) = settings else {
+        return DialogNotificationSettings {
+            use_default_disable_pinned_message_notifications: old_use_default_disable_pinned,
+            disable_pinned_message_notifications: old_disable_pinned,
+            use_default_disable_mention_notifications: old_use_default_disable_mention,
+            disable_mention_notifications: old_disable_mention,
+            ..DialogNotificationSettings::default()
+        };
+    };
+
+    // The flag bits are the peerNotifySettings masks (show_previews `0`,
+    // mute_until `2`, stories_muted `6`, stories_hide_sender `7`).
+    let use_default_mute_until = settings.flags & (1 << 2) == 0;
+    let use_default_show_preview = settings.flags & (1 << 0) == 0;
+    let use_default_mute_stories = settings.flags & (1 << 6) == 0;
+    let use_default_hide_story_sender = settings.flags & (1 << 7) == 0;
+    let mute_until = if use_default_mute_until || settings.mute_until <= unix_time {
+        0
+    } else {
+        settings.mute_until
+    };
+    DialogNotificationSettings {
+        use_default_mute_until,
+        mute_until,
+        sound: get_notification_sound_from_peer_settings(settings, false),
+        use_default_show_preview,
+        show_preview: settings.show_previews,
+        use_default_mute_stories,
+        mute_stories: settings.stories_muted,
+        story_sound: get_notification_sound_from_peer_settings(settings, true),
+        use_default_hide_story_sender,
+        hide_story_sender: settings.stories_hide_sender,
+        silent_send_message: settings.silent,
+        use_default_disable_pinned_message_notifications: old_use_default_disable_pinned,
+        disable_pinned_message_notifications: old_disable_pinned,
+        use_default_disable_mention_notifications: old_use_default_disable_mention,
+        disable_mention_notifications: old_disable_mention,
+        // The C++ 15-argument constructor marks every converted settings
+        // object as synchronized; only the absent-settings default stays
+        // unsynchronized.
+        is_synchronized: true,
+    }
+}
+
+/// `NeedUpdateDialogNotificationSettings`
+/// (DialogNotificationSettings.h:88-95) — the three-way update verdict.
+#[derive(Default, Debug, PartialEq, Eq)]
+pub struct NeedUpdateDialogNotificationSettings {
+    /// The server-visible settings changed.
+    pub need_update_server: bool,
+    /// The local pinned/mention settings changed.
+    pub need_update_local: bool,
+    /// The stored settings changed at all (incl. synchronization and
+    /// equivalent-but-different sounds).
+    pub are_changed: bool,
+}
+
+/// `need_update_dialog_notification_settings`
+/// (DialogNotificationSettings.cpp:201-218).
+pub fn need_update_dialog_notification_settings(
+    current_settings: &DialogNotificationSettings,
+    new_settings: &DialogNotificationSettings,
+) -> NeedUpdateDialogNotificationSettings {
+    use crate::notification_settings::{
+        are_different_equivalent_notification_sounds, are_equivalent_notification_sounds,
+    };
+    let mut result = NeedUpdateDialogNotificationSettings::default();
+    result.need_update_server = current_settings.mute_until != new_settings.mute_until
+        || !are_equivalent_notification_sounds(&current_settings.sound, &new_settings.sound)
+        || !are_equivalent_notification_sounds(
+            &current_settings.story_sound,
+            &new_settings.story_sound,
+        )
+        || current_settings.show_preview != new_settings.show_preview
+        || current_settings.mute_stories != new_settings.mute_stories
+        || current_settings.hide_story_sender != new_settings.hide_story_sender
+        || current_settings.use_default_mute_until != new_settings.use_default_mute_until
+        || current_settings.use_default_show_preview != new_settings.use_default_show_preview
+        || current_settings.use_default_mute_stories != new_settings.use_default_mute_stories
+        || current_settings.use_default_hide_story_sender
+            != new_settings.use_default_hide_story_sender;
+    result.need_update_local = current_settings.use_default_disable_pinned_message_notifications
+        != new_settings.use_default_disable_pinned_message_notifications
+        || current_settings.disable_pinned_message_notifications
+            != new_settings.disable_pinned_message_notifications
+        || current_settings.use_default_disable_mention_notifications
+            != new_settings.use_default_disable_mention_notifications
+        || current_settings.disable_mention_notifications
+            != new_settings.disable_mention_notifications;
+    result.are_changed = result.need_update_server
+        || result.need_update_local
+        || current_settings.is_synchronized != new_settings.is_synchronized
+        || are_different_equivalent_notification_sounds(
+            &current_settings.sound,
+            &new_settings.sound,
+        )
+        || are_different_equivalent_notification_sounds(
+            &current_settings.story_sound,
+            &new_settings.story_sound,
+        );
+    result
 }
 
 /// `td::DialogActionBar` (DialogActionBar.h) — the peer-report/join-request
@@ -4729,24 +5002,94 @@ pub struct LogEventIdWithGeneration {
     pub generation: u64,
 }
 
-/// `td::MessageQuote` (MessageQuote.h) — the text quote a reply points at.
-/// The wire/td_api constructors and `search_quote` land with their slices;
-/// the ctor keeps `max(0, position)` and the `remove_unallowed_quote_entities`
-/// call for them.
+/// `td::MessageQuote` (MessageQuote.h) — the text quote a reply points at;
+/// the 1.8.70 quotes plane adds the rich-message parts (upstream
+/// 4e1635ac8/1631ed57b). `search_quote` lands with its slice.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MessageQuote {
     pub text: FormattedText,
+    /// `rich_texts_` (MessageQuote.h:26, upstream 4e1635ac8) — the quote
+    /// parts chosen from a rich message, in their appearance order.
+    pub rich_texts: Vec<crate::webpage::RichText>,
     pub position: i32,
     pub is_manual: bool,
 }
 
+/// `get_quote_rich_texts` (MessageQuote.cpp:30-41) — the wire rich-quote
+/// intake: every rich text is stripped of the unallowed quote entities
+/// (upstream fd3863de4 logs the strip) and the emptied ones drop; the
+/// documents map stays empty like the C++ (icons are stripped anyway).
+fn get_quote_rich_texts(
+    rich_text_ptrs: &[Box<telegram_api::RichText>],
+) -> Vec<crate::webpage::RichText> {
+    let documents = std::collections::HashMap::new();
+    let mut result = Vec::new();
+    for rich_text_ptr in rich_text_ptrs {
+        let mut rich_text =
+            crate::webpage::get_rich_text_from_telegram((**rich_text_ptr).clone(), &documents);
+        if rich_text.remove_unallowed_quote_entities() {
+            log_error!("Receive a rich quote with unexpected entities");
+        }
+        if !rich_text.empty() {
+            result.push(rich_text);
+        }
+    }
+    result
+}
+
 impl MessageQuote {
-    /// `MessageQuote::MessageQuote(Td *, messageReplyHeader)` (MessageQuote.cpp:40-52).
+    /// `MessageQuote::MessageQuote(FormattedText &&, vector<RichText> &&,
+    /// int32, bool)` (MessageQuote.h:49-52) — the stripping ctor every
+    /// local construction goes through: the text entities and the rich
+    /// texts both lose the unallowed quote formatting, and the position
+    /// clamps non-negative.
+    pub fn new_stripped(
+        text: FormattedText,
+        rich_texts: Vec<crate::webpage::RichText>,
+        position: i32,
+        is_manual: bool,
+    ) -> MessageQuote {
+        let mut text = text;
+        crate::message_entity::remove_unallowed_quote_entities(&mut text);
+        let mut rich_texts = rich_texts;
+        MessageQuote::remove_unallowed_quote_entities_from_rich_texts(&mut rich_texts);
+        MessageQuote {
+            text,
+            rich_texts,
+            position: position.max(0),
+            is_manual,
+        }
+    }
+
+    /// `MessageQuote::remove_unallowed_quote_entities_from_rich_texts`
+    /// (MessageQuote.cpp:117-127, upstream fd3863de4) — strips every rich
+    /// text and drops the emptied ones; answers whether anything changed.
+    pub fn remove_unallowed_quote_entities_from_rich_texts(
+        rich_texts: &mut Vec<crate::webpage::RichText>,
+    ) -> bool {
+        let mut is_changed = false;
+        for rich_text in rich_texts.iter_mut() {
+            if rich_text.remove_unallowed_quote_entities() {
+                is_changed = true;
+            }
+        }
+        let before = rich_texts.len();
+        rich_texts.retain(|rich_text| !rich_text.empty());
+        if rich_texts.len() != before {
+            is_changed = true;
+        }
+        is_changed
+    }
+
+    /// `MessageQuote::MessageQuote(Td *, messageReplyHeader)` (MessageQuote.cpp:40-52)
+    /// — the wire intake reads `quote_rich_` first (upstream 4e1635ac8):
+    /// a header with only rich quote parts still yields a quote.
     pub fn from_reply_header<U: crate::message_entity::UserManagerLike + ?Sized>(
         user_manager: Option<&mut U>,
         reply_header: &telegram_api::messageReplyHeader,
     ) -> MessageQuote {
-        if reply_header.quote_text.is_empty() {
+        let rich_texts = get_quote_rich_texts(&reply_header.quote_rich);
+        if reply_header.quote_text.is_empty() && rich_texts.is_empty() {
             return MessageQuote::default();
         }
         let mut text = crate::message_entity::get_formatted_text(
@@ -4762,19 +5105,21 @@ impl MessageQuote {
         }
         MessageQuote {
             text,
+            rich_texts,
             position: reply_header.quote_offset.max(0),
             is_manual: reply_header.quote,
         }
     }
 
-    /// `MessageQuote::is_empty` (MessageQuote.h).
+    /// `MessageQuote::is_empty` (MessageQuote.h:62-64, upstream
+    /// 4e1635ac8) — a rich-only quote is not empty.
     pub fn is_empty(&self) -> bool {
-        self.text.text.is_empty()
+        self.text.text.is_empty() && self.rich_texts.is_empty()
     }
 
-    /// `MessageQuote::get_text_quote_object` (MessageQuote.cpp:139-145).
     /// `MessageQuote::get_input_text_quote_object`
-    /// (MessageQuote.cpp:129-137).
+    /// (MessageQuote.cpp:216-224) — the draft-side object; the rich texts
+    /// ride the object context (upstream 1631ed57b).
     pub fn get_input_text_quote_object<U: crate::message_entity::UserManagerLike + ?Sized>(
         &self,
         user_manager: Option<&mut U>,
@@ -4789,10 +5134,13 @@ impl MessageQuote {
                 true,
                 -1,
             )),
+            rich_texts: crate::webpage::get_quote_rich_texts_object(&self.rich_texts),
             position: self.position,
         })
     }
 
+    /// `MessageQuote::get_text_quote_object` (MessageQuote.cpp:226-231) —
+    /// the received-quote object with the rich texts (upstream 4e1635ac8).
     pub fn get_text_quote_object<U: crate::message_entity::UserManagerLike + ?Sized>(
         &self,
         user_manager: Option<&mut U>,
@@ -4807,39 +5155,194 @@ impl MessageQuote {
                 true,
                 -1,
             )),
+            rich_texts: crate::webpage::get_quote_rich_texts_object(&self.rich_texts),
             position: self.position,
             is_manual: self.is_manual,
         })
     }
 
-    /// `MessageQuote::store` (MessageQuote.hpp:16-33).
+    /// `MessageQuote::store` (MessageQuote.hpp:16-43, upstream
+    /// 4e1635ac8) — the fourth flag bit gates the rich texts.
     pub fn store(&self, out: &mut Vec<u8>) {
         let has_text = !self.text.text.is_empty();
         let has_position = self.position != 0;
-        store_flags(out, [has_text, has_position, self.is_manual]);
+        let has_rich_texts = !self.rich_texts.is_empty();
+        store_flags(
+            out,
+            [has_text, has_position, self.is_manual, has_rich_texts],
+        );
         if has_text {
             self.text.store(out);
         }
         if has_position {
             store_i32(out, self.position);
         }
+        if has_rich_texts {
+            crate::webpage::store_quote_rich_texts(&self.rich_texts, out);
+        }
     }
 
-    /// `MessageQuote::parse` (MessageQuote.hpp:35-56) — the text is passed
-    /// through `remove_unallowed_quote_entities` like the C++.
+    /// `MessageQuote::parse` (MessageQuote.hpp:45-73) — the text is passed
+    /// through `remove_unallowed_quote_entities` like the C++, and so are
+    /// the rich texts (upstream fd3863de4).
     pub fn parse_from(parser: &mut Parser) -> Result<MessageQuote, &'static str> {
-        let [has_text, has_position, is_manual] = parser.parse_flags::<3>()?;
+        let [has_text, has_position, is_manual, has_rich_texts] = parser.parse_flags::<4>()?;
         let mut text = FormattedText::default();
         if has_text {
             text = FormattedText::parse(parser)?;
             crate::message_entity::remove_unallowed_quote_entities(&mut text);
         }
         let position = if has_position { parser.i32_()? } else { 0 };
+        let mut rich_texts = Vec::new();
+        if has_rich_texts {
+            rich_texts = crate::webpage::parse_quote_rich_texts(parser)?;
+            MessageQuote::remove_unallowed_quote_entities_from_rich_texts(&mut rich_texts);
+        }
         Ok(MessageQuote {
             text,
+            rich_texts,
             position,
             is_manual,
         })
+    }
+
+    /// `MessageQuote::get_text_size` (MessageQuote.cpp:179-185, upstream
+    /// 334b39f98) — the plain-text bytes plus the quote texts of the rich
+    /// parts, the size the quote-changed warning compares against.
+    pub fn get_text_size(&self) -> usize {
+        let mut size = self.text.text.len();
+        for rich_text in &self.rich_texts {
+            size += rich_text.get_quote_text().len();
+        }
+        size
+    }
+
+    /// `MessageQuote::need_quote_changed_warning` (MessageQuote.cpp:187-201)
+    /// — 1 when the change is impossible (warn), -1 when an automatic
+    /// quote legitimately changed (the original message was edited), 0
+    /// when no warning is needed. The 1.8.70 quotes plane feeds the rich
+    /// texts into both the equality and the position check (upstream
+    /// 4e1635ac8 + 334b39f98).
+    pub fn need_quote_changed_warning(old_quote: &MessageQuote, new_quote: &MessageQuote) -> i32 {
+        if old_quote.position != new_quote.position
+            && old_quote.position.max(new_quote.position)
+                < i32::try_from(old_quote.get_text_size().min(new_quote.get_text_size()))
+                    .unwrap_or(i32::MAX)
+        {
+            // quote position can't change
+            return 1;
+        }
+        if old_quote.is_manual != new_quote.is_manual {
+            // quote manual property can't change
+            return 1;
+        }
+        if old_quote.text != new_quote.text || old_quote.rich_texts != new_quote.rich_texts {
+            if old_quote.is_manual {
+                return 1;
+            }
+            // automatic quote can change if the original message was edited
+            return -1;
+        }
+        0
+    }
+
+    /// `MessageQuote::create_automatic_quote(Td *, FormattedText &&)`
+    /// (MessageQuote.cpp:96-101) — the truncated automatic quote of a
+    /// plain-text reply; the option read (`message_reply_quote_length_max`)
+    /// arrives as a parameter for the seam callers.
+    pub fn create_automatic_quote(text: FormattedText, quote_length_max: usize) -> MessageQuote {
+        let mut text = text;
+        crate::message_entity::truncate_formatted_text(&mut text, quote_length_max);
+        // the C++ hands the truncated text to the stripping ctor
+        MessageQuote::new_stripped(text, Vec::new(), 0, false)
+    }
+
+    /// `MessageQuote::create_automatic_quote(Td *, const RichMessage &)`
+    /// (MessageQuote.cpp:103-130, upstream dbeb09f45) — the automatic
+    /// quote of a rich-message reply: at most 32 rich parts, total quote
+    /// text within the length cap, each part shaped whole through
+    /// `get_quote_fragment`. The C++ walks the RichMessage; the port
+    /// walks its page blocks (`RichMessage::for_each_quote_text` is the
+    /// blocks walker — RichMessage itself rides Wave-2 WebPages).
+    pub fn create_automatic_quote_from_page_blocks(
+        page_blocks: &[crate::webpage::WebPageBlock],
+        quote_length_max: usize,
+    ) -> MessageQuote {
+        const MAX_QUOTE_RICH_TEXTS: usize = 32; // server-side limit
+        let mut rich_texts = Vec::new();
+        let mut length = 0usize;
+        let mut is_finished = false;
+        crate::webpage::for_each_web_page_blocks_quote_text(page_blocks, &mut |rich_text| {
+            if is_finished {
+                return;
+            }
+            if rich_texts.len() >= MAX_QUOTE_RICH_TEXTS || length >= quote_length_max {
+                is_finished = true;
+                return;
+            }
+            let text = rich_text.get_quote_text();
+            if text.is_empty() {
+                return;
+            }
+            let mut end = tdutils::utf8::utf8_length(&text);
+            if length + end > quote_length_max {
+                end = quote_length_max - length;
+                is_finished = true;
+            }
+            let fragment = rich_text.get_quote_fragment(0, end);
+            if fragment.empty() {
+                return;
+            }
+            length += tdutils::utf8::utf8_length(&fragment.get_quote_text());
+            rich_texts.push(fragment);
+        });
+        // the C++ hands the parts to the stripping ctor (a no-op after
+        // get_quote_fragment's own strip, kept for the exact call shape)
+        MessageQuote::new_stripped(FormattedText::default(), rich_texts, 0, false)
+    }
+
+    /// `MessageQuote::update_input_reply_to_message` (MessageQuote.cpp:203-214)
+    /// — writes the quote onto the send-wire reply header: the text arm
+    /// or the rich arm (upstream 4e1635ac8/1631ed57b), then the position.
+    /// The C++ 1.8.70 store auto-flags the string/vector fields; the
+    /// Rust wire store writes the flags verbatim, so the bits are set
+    /// here exactly when the fields are non-empty (bit 2 text, bit 3
+    /// entities, bit 4 offset, bit 8 rich — telegram_api.tl
+    /// inputReplyToMessage).
+    pub fn update_input_reply_to_message<U: crate::message_entity::UserManagerLike + ?Sized>(
+        &self,
+        user_manager: Option<&mut U>,
+        input_reply_to_message: &mut telegram_api::inputReplyToMessage,
+    ) {
+        if self.is_empty() {
+            return;
+        }
+        assert!(self.is_manual, "the C++ CHECKs is_manual_");
+        if self.rich_texts.is_empty() {
+            input_reply_to_message.quote_text = self.text.text.clone();
+            input_reply_to_message.quote_entities =
+                crate::message_entity::get_input_message_entities(
+                    user_manager,
+                    &self.text.entities,
+                    "update_input_reply_to_message",
+                );
+            if !input_reply_to_message.quote_text.is_empty() {
+                input_reply_to_message.flags |= 1 << 2;
+            }
+            if !input_reply_to_message.quote_entities.is_empty() {
+                input_reply_to_message.flags |= 1 << 3;
+            }
+        } else {
+            input_reply_to_message.quote_rich =
+                crate::webpage::get_quote_rich_texts_input(&self.rich_texts);
+            if !input_reply_to_message.quote_rich.is_empty() {
+                input_reply_to_message.flags |= 1 << 8;
+            }
+        }
+        if self.position != 0 {
+            input_reply_to_message.flags |= 1 << 4;
+            input_reply_to_message.quote_offset = self.position;
+        }
     }
 }
 
@@ -5679,11 +6182,12 @@ impl RepliedMessageInfo {
         if has_quote {
             result.quote = MessageQuote::parse_from(parser)?;
         } else if let Some(text) = quote_legacy {
-            result.quote = MessageQuote {
+            result.quote = MessageQuote::new_stripped(
                 text,
-                position: quote_position_legacy,
-                is_manual: is_quote_manual_legacy,
-            };
+                Vec::new(),
+                quote_position_legacy,
+                is_quote_manual_legacy,
+            );
         }
         if has_todo_item_id {
             result.todo_item_id = parser.i32_()?;
@@ -5866,11 +6370,10 @@ impl MessageInputReplyTo {
         if has_quote {
             result.quote = MessageQuote::parse_from(parser)?;
         } else if let Some(text) = quote_legacy {
-            result.quote = MessageQuote {
-                text,
-                position: quote_position_legacy,
-                is_manual: false,
-            };
+            // the C++ delegating ctor defaults is_manual to true
+            // (MessageInputReplyTo.hpp:105)
+            result.quote =
+                MessageQuote::new_stripped(text, Vec::new(), quote_position_legacy, true);
         }
         if has_todo_item_id {
             result.todo_item_id = parser.i32_()?;
@@ -8825,12 +9328,15 @@ pub struct MessagesManager {
     pub(crate) being_sent_messages: HashMap<i64, MessageFullId>,
     /// `yet_unsent_message_full_id_to_persistent_message_id_`
     /// (MessagesManager.h:3324) — the yet-unsent → server-id rewrite
-    /// registry. M.10.8 lands the read side (`get_persistent_message_id`);
-    /// the writes ride `on_message_sent`/`updateMessageID` (M.10.9), so the
-    /// map stays empty until that slice.
+    /// registry, with the 09e41c5a8 idle expiry
+    /// (`PERSISTENT_MESSAGE_ID_CACHE_TIME`, 1 hour from the write; the
+    /// read never extends the life). M.10.8 lands the read side
+    /// (`get_persistent_message_id`); the writes ride
+    /// `on_message_sent`/`updateMessageID` (M.10.9), so the map stays
+    /// empty until that slice.
     #[allow(dead_code)]
     pub(crate) yet_unsent_message_full_id_to_persistent_message_id:
-        HashMap<MessageFullId, MessageId>,
+        HashMap<MessageFullId, (MessageId, f64)>,
     // `being_readded_message_full_id_` — the delete/files path reads it
     #[allow(dead_code)]
     pub(crate) being_readded_message_full_id: MessageFullId,
@@ -11351,6 +11857,11 @@ fn add_message_quote_dependencies(dependencies: &mut Dependencies, quote: &Messa
             dependencies.add_user(entity.user_id);
         }
     }
+    // `MessageQuote::add_dependencies` rich half (MessageQuote.cpp:224-229,
+    // upstream 4e1635ac8): the rich texts walk their own user/button ids.
+    for rich_text in &quote.rich_texts {
+        rich_text.add_dependencies(dependencies);
+    }
 }
 
 /// `MessageForwardInfo::add_dependencies` (MessageForwardInfo.cpp:210-215).
@@ -11430,7 +11941,7 @@ const HIDDEN_AUTHOR_DIALOG_ID: i64 = 2666000;
 
 /// `MTPROTO_LAYER` (Version.h:13) — the layer constant the legacy flag
 /// encodes.
-const MTPROTO_LAYER: i32 = 230;
+const MTPROTO_LAYER: i32 = 233;
 
 /// `SavedMessagesTopicId::SavedMessagesTopicId(DialogId, const
 /// MessageForwardInfo *, DialogId)` (SavedMessagesTopicId.cpp:22-58) — the
@@ -13140,8 +13651,9 @@ pub fn update_message(
         need_send_update = true;
     }
 
-    if old_message.edit_date > 0 {
-        // inline keyboard can be edited
+    if old_message.edit_date > 0 || is_ephemeral_message(old_message) {
+        // inline keyboard can be edited; ephemeral messages have no edit
+        // date, but can be edited too (a89b35d6b)
         let reply_markup_changed = (old_message.reply_markup.is_none())
             != (new_message.reply_markup.is_none())
             || (old_message.reply_markup.is_some()
@@ -13230,7 +13742,14 @@ pub fn update_message(
         "update_message",
     );
 
+    // `if (is_edited && (!td_->auth_manager_->is_bot() ||
+    // is_ephemeral_message(old_message)))`
+    // (MessagesManager.cpp:32946-32949) — bots receive updateMessageEdited
+    // for other messages from on_message_edited; the emission itself is
+    // the Td update-plane seam, the gate rides the outcome (dd40b4679).
     outcome.is_edited = is_edited;
+    outcome.send_update_message_edited =
+        is_edited && (!ctx.is_bot() || is_ephemeral_message(old_message));
     outcome.need_send_update = need_send_update;
     outcome
 }
@@ -13276,8 +13795,13 @@ fn on_message_changed(
 /// plane (the Td wiring) consumes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UpdateMessageEditOutcome {
-    /// `is_edited` — `updateMessageEdited` must be sent for a non-bot.
+    /// `is_edited` — the edit-date/edited-schedule/reply-markup
+    /// transitions flagged the message as edited.
     pub is_edited: bool,
+    /// `updateMessageEdited` must be sent — `is_edited && (!is_bot ||
+    /// is_ephemeral_message)` (dd40b4679: bots receive it for other
+    /// messages from on_message_edited).
+    pub send_update_message_edited: bool,
     /// `need_send_update` — the message object changed for the app.
     pub need_send_update: bool,
     /// `is_content_changed` — the content object itself was replaced.
@@ -14034,6 +14558,25 @@ pub fn get_required_paid_message_star_count(error_code: i32, error_message: &str
 /// `MessagesManager::is_ephemeral_message` (MessagesManager.cpp:23395-23397).
 pub fn is_ephemeral_message(m: &Message) -> bool {
     m.receiver_user_id.is_valid()
+}
+
+/// `MessagesManager::is_bot_ephemeral_message_channel`
+/// (MessagesManager.cpp:23511-23521, the 171762277 shape) — bots can
+/// receive ephemeral messages in the channels without being their
+/// members; the two hard-coded channel ids per DC kind.
+pub fn is_bot_ephemeral_message_channel(
+    is_bot: bool,
+    is_test_dc: bool,
+    dialog_id: DialogId,
+) -> bool {
+    if !is_bot || dialog_id.get_type() != DialogType::Channel {
+        return false;
+    }
+    let channel_id = dialog_id.get_channel_id().get();
+    if is_test_dc {
+        return channel_id == 8000042883 || channel_id == 8001701879;
+    }
+    channel_id == 3937063115 || channel_id == 4412713723
 }
 
 /// `MessagesManager::is_message_forward` (MessagesManager.cpp:23411-23413).
@@ -17574,7 +18117,22 @@ pub fn on_get_dialogs(
                 }
                 log_error!("Receive unexpected {folder:?}");
             }
-            telegram_api::Dialog::dialogCommunity(_) => {}
+            telegram_api::Dialog::dialogCommunity(dialog_community) => {
+                // 99302f0e2 (MessagesManager.cpp:12727-12737): the
+                // community notify settings piggybacked on the getDialogs
+                // answer route into the community manager.
+                let community_id =
+                    crate::community_id::CommunityId::new(dialog_community.community_id);
+                if community_id.is_valid() {
+                    ctx.community_on_update_notify_settings(
+                        community_id,
+                        dialog_community.notify_settings.as_ref(),
+                        "on_get_dialogs",
+                    );
+                } else {
+                    log_error!("Receive {dialog_community:?}");
+                }
+            }
         }
     }
 
@@ -21030,7 +21588,10 @@ pub fn get_message_properties_request(
     let can_mark_tasks_as_done = can_mark_message_tasks_as_done(ctx, dialog_id, m);
     let can_recognize_speech = can_recognize_message_speech(dialog_id, m);
     let can_report_chat = if ephemeral_message_id.is_valid() {
-        false
+        // ephemeral messages are reportable by users for incoming
+        // messages (d4f71645a); the report reroutes through
+        // ephemeral.reportMessage
+        !is_bot && !m.is_outgoing
     } else {
         can_report_dialog && can_report_message(message_id).is_ok()
     };
@@ -21170,6 +21731,24 @@ fn get_message_ephemeral_message_id(m: &Message) -> EphemeralMessageId {
         Some(ephemeral_message) => ephemeral_message.ephemeral_message_id,
         None => m.ephemeral_message_id,
     }
+}
+
+/// `MessagesManager::get_ephemeral_message_id_of_message_id`
+/// (MessagesManager.cpp:4199-4201) — the reverse lookup over the loaded
+/// message; `get_message_force`'s db load is the dialog-db receive seam
+/// (the memory probe answers here).
+pub fn get_ephemeral_message_id_of_message_id(
+    manager: &MessagesManager,
+    dialog_id: DialogId,
+    message_id: MessageId,
+) -> EphemeralMessageId {
+    manager
+        .get_dialog(dialog_id)
+        .and_then(|d| get_message_in_dialog(d, message_id))
+        .map_or_else(
+            EphemeralMessageId::default,
+            get_message_ephemeral_message_id,
+        )
 }
 
 /// `MessagesManager::can_share_message_in_story`
@@ -22933,11 +23512,12 @@ pub fn get_persistent_message_id(
     if message_id.is_yet_unsent() {
         // it is possible that user tries to do something with an already sent
         // message by its temporary identifier; use the real message then
-        if let Some(persistent) = manager
+        if let Some(&(persistent, expires_at)) = manager
             .yet_unsent_message_full_id_to_persistent_message_id
             .get(&MessageFullId::new(d.dialog_id, message_id))
+            && expires_at > tdutils::time::now()
         {
-            return *persistent;
+            return persistent;
         }
     }
     message_id
@@ -24053,6 +24633,7 @@ pub fn create_message_to_send(
     is_copy: bool,
     send_as_dialog_id: DialogId,
     is_quick_reply_message: bool,
+    is_ephemeral: bool,
 ) -> Box<Message> {
     let is_scheduled = options.schedule_date != 0;
     let dialog_id = d.dialog_id;
@@ -24114,7 +24695,10 @@ pub fn create_message_to_send(
         ..Message::default()
     });
     let is_channel_post = ctx.is_broadcast_channel_dialog(dialog_id);
-    if !is_channel_post
+    if is_ephemeral {
+        // ephemeral messages are always sent by the user itself
+        message.sender_user_id = my_id;
+    } else if !is_channel_post
         || (!is_scheduled && ctx.get_channel_sign_messages(dialog_id.get_channel_id()))
     {
         if message_topic.is_monoforum() {
@@ -24154,7 +24738,10 @@ pub fn create_message_to_send(
     } else {
         message.sender_dialog_id = dialog_id;
     }
-    if is_channel_post && !is_scheduled && ctx.get_channel_sign_messages(dialog_id.get_channel_id())
+    if is_channel_post
+        && !is_scheduled
+        && !is_ephemeral
+        && ctx.get_channel_sign_messages(dialog_id.get_channel_id())
     {
         let show_message_sender = ctx.get_channel_show_message_sender(dialog_id.get_channel_id());
         if message.sender_dialog_id != dialog_id || !message.has_explicit_sender {
@@ -24201,13 +24788,14 @@ pub fn create_message_to_send(
     message.noforwards = options.protect_content;
     message.allow_paid = options.allow_paid;
     message.paid_message_star_count = options.paid_message_star_count;
-    message.view_count = if is_channel_post && !is_scheduled {
+    message.view_count = if is_channel_post && !is_scheduled && !is_ephemeral {
         1
     } else {
         0
     };
     message.forward_count = 0;
     if !suppress_reply_info
+        && !is_ephemeral
         && !is_scheduled
         && dialog_type == DialogType::Channel
         && !ctx.is_bot()
@@ -24229,7 +24817,11 @@ pub fn create_message_to_send(
             }
         }
     }
-    if message.sender_user_id == my_id && dialog_type == DialogType::Channel && !is_channel_post {
+    if message.sender_user_id == my_id
+        && dialog_type == DialogType::Channel
+        && !is_channel_post
+        && !is_ephemeral
+    {
         message.sender_boost_count = ctx.get_channel_my_boost_count(dialog_id.get_channel_id());
         // m->sender_rank = get_my_rank — the DialogManager seam (21058)
     }
@@ -24379,9 +24971,102 @@ pub fn can_reply_to_message_in_another_dialog(
         }) && dialog_id.get_type() == DialogType::Channel)
 }
 
+/// The `RichText::get_rich_text` user-check env for the quote intake —
+/// the C++ passes the whole Td, but the td_api rich-text conversion only
+/// consults the user manager (the MentionName `get_input_user`
+/// validation); every other env arm is unreachable for quote rich texts
+/// (the quote strip removes each env-armed node kind).
+struct QuoteRichTextIntakeEnv<'a> {
+    content_context: &'a dyn crate::message_content::MessageContentContext,
+}
+
+impl crate::photo::PhotoStoreEnv for QuoteRichTextIntakeEnv<'_> {
+    fn store_file_id(&mut self, _file_id: FileId, _out: &mut Vec<u8>) {}
+    fn parse_file_id(&mut self, _parser: &mut Parser<'_>) -> Result<FileId, &'static str> {
+        Ok(FileId::default())
+    }
+}
+
+impl crate::webpage::WebPageBlockEnv for QuoteRichTextIntakeEnv<'_> {
+    fn get_document_object(&self, _file_id: FileId) -> Option<td_api::Document> {
+        None
+    }
+    fn get_animation_object(&self, _file_id: FileId) -> Option<td_api::Animation> {
+        None
+    }
+    fn get_audio_object(&self, _file_id: FileId) -> Option<td_api::Audio> {
+        None
+    }
+    fn get_video_object(&self, _file_id: FileId) -> Option<td_api::Video> {
+        None
+    }
+    fn get_video_note_object(&self, _file_id: FileId) -> Option<td_api::VideoNote> {
+        None
+    }
+    fn get_voice_note_object(&self, _file_id: FileId) -> Option<td_api::VoiceNote> {
+        None
+    }
+    fn get_accent_color_id_object(
+        &self,
+        _accent_color_id: crate::peer_color::AccentColorId,
+        _fallback: crate::peer_color::AccentColorId,
+    ) -> Option<i32> {
+        None
+    }
+    fn get_chat_photo_info_object(
+        &self,
+        _photo: &crate::photo::DialogPhoto,
+    ) -> Option<td_api::ChatPhotoInfo> {
+        None
+    }
+    fn get_instant_view_link(&self, _url: &str, _rhash: &str) -> String {
+        String::new()
+    }
+    fn get_instant_view_link_rhash(&self, _real_url: &str) -> String {
+        String::new()
+    }
+    fn get_instant_view_link_url(&self, _real_url: &str) -> String {
+        String::new()
+    }
+    fn as_input_document(
+        &mut self,
+        _file_id: FileId,
+    ) -> Option<(i64, tdmtproto::telegram_api::InputDocument)> {
+        None
+    }
+    fn as_input_photo(
+        &mut self,
+        _file_id: FileId,
+    ) -> Option<(i64, tdmtproto::telegram_api::InputPhoto)> {
+        None
+    }
+    fn ensure_input_user(
+        &mut self,
+        user_id: crate::user_manager::UserId,
+    ) -> Result<(), tdutils::status::Status> {
+        self.content_context.ensure_input_user(user_id)
+    }
+    fn get_user_id_object(&mut self, user_id: crate::user_manager::UserId, source: &str) -> i64 {
+        self.content_context.get_user_id_object(user_id, source)
+    }
+    fn is_my_user_bot(&self) -> bool {
+        false
+    }
+    fn on_get_page_block_channel(
+        &mut self,
+        _channel: tdmtproto::telegram_api::channel,
+    ) -> Option<crate::webpage::ChatLinkInfo> {
+        None
+    }
+}
+
 /// `MessageQuote::MessageQuote(Td *, td_api::InputTextQuote)`
-/// (MessageQuote.cpp:54-70) — the input quote parse behind the
-/// `inputMessageReplyToMessage`/`...ExternalMessage` arms.
+/// (MessageQuote.cpp:75-113) — the input quote parse behind the
+/// `inputMessageReplyToMessage`/`...ExternalMessage` arms. The rich arm
+/// (upstream 1631ed57b) shapes every part through
+/// `get_quote_fragment(0, 1e9)` — quoting it whole — and any conversion
+/// error clears the quote; a rich quote keeps `is_manual` (the C++ ctor
+/// never assigns it, and `update_input_reply_to_message` CHECKs it).
 fn get_message_quote_from_input(
     ctx: &mut dyn SendMessageContext,
     quote: Option<td_api::InputTextQuote>,
@@ -24389,6 +25074,37 @@ fn get_message_quote_from_input(
     let Some(quote) = quote else {
         return MessageQuote::default();
     };
+    if !quote.rich_texts.is_empty() {
+        let mut rich_texts = Vec::new();
+        for rich_text_object in quote.rich_texts {
+            let mut env = QuoteRichTextIntakeEnv {
+                content_context: ctx.content_context(),
+            };
+            let rich_text =
+                match crate::webpage::get_rich_text_from_td_api(&mut env, Some(rich_text_object)) {
+                    Ok(rich_text) => rich_text,
+                    Err(_) => return MessageQuote::default(),
+                };
+            let rich_text = rich_text.get_quote_fragment(0, 1_000_000_000);
+            if !rich_text.empty() {
+                rich_texts.push(rich_text);
+            }
+        }
+        if rich_texts.is_empty() {
+            return MessageQuote::default();
+        }
+        let mut position = quote.position;
+        if !(0..=1_000_000).contains(&position) {
+            // some unreasonably big bound
+            position = 0;
+        }
+        return MessageQuote {
+            rich_texts,
+            position,
+            is_manual: true,
+            ..MessageQuote::default()
+        };
+    }
     let mut ltrim_count = 0i32;
     let my_dialog_id = ctx.get_my_dialog_id();
     let always_parse_markdown = ctx
@@ -24432,7 +25148,8 @@ fn get_message_quote_from_input(
     MessageQuote {
         text,
         position,
-        is_manual: false,
+        is_manual: true,
+        ..MessageQuote::default()
     }
 }
 
@@ -24518,6 +25235,7 @@ pub fn get_message_to_send(
     is_copy: bool,
     send_as_dialog_id: DialogId,
     is_quick_reply_message: bool,
+    is_ephemeral: bool,
 ) -> MessageFullId {
     let message = {
         let d = manager
@@ -24538,6 +25256,7 @@ pub fn get_message_to_send(
             is_copy,
             send_as_dialog_id,
             is_quick_reply_message,
+            is_ephemeral,
         )
     };
     let message_id = message.message_id;
@@ -24551,7 +25270,12 @@ pub fn get_message_to_send(
     message.random_id = random_id;
 
     assert!(
-        ctx.have_input_peer_read(dialog_id, true),
+        ctx.have_input_peer_read(dialog_id, true)
+            || is_bot_ephemeral_message_channel(
+                MessageObjectContext::is_bot(ctx),
+                ctx.is_test_dc(),
+                dialog_id
+            ),
         "have_input_peer(Read) failed for {dialog_id:?} in get_message_to_send"
     );
     let mut need_update = false;
@@ -24806,7 +25530,13 @@ pub fn create_message_input_reply_to_full(
             }
             MessageInputReplyTo {
                 message_id: m.message_id,
-                ephemeral_message_id: m.ephemeral_message_id,
+                // ephemeral messages reply to the ephemeral message, which
+                // replaced the message, if any (c64674d70)
+                ephemeral_message_id: if for_ephemeral_message {
+                    get_message_ephemeral_message_id(m)
+                } else {
+                    EphemeralMessageId::default()
+                },
                 dialog_id: DialogId::default(),
                 quote: get_message_quote_from_input(ctx, reply_to_message.quote),
                 todo_item_id: checklist_task_id,
@@ -25710,6 +26440,7 @@ pub fn send_message_group(
             false,
             DialogId::default(),
             false,
+            false,
         );
         let message_id = message_full_id.get_message_id();
 
@@ -25841,6 +26572,7 @@ pub fn send_ton_wallet_transfer(
         DialogId::default(),
         false,
         DialogId::default(),
+        false,
         false,
     )
     .get_message_id();
@@ -26107,6 +26839,7 @@ pub fn send_message(
         message_content.via_bot_user_id.is_valid(),
         DialogId::default(),
         false,
+        false,
     );
     let message_id = message_full_id.get_message_id();
 
@@ -26227,6 +26960,12 @@ pub fn on_message_media_uploaded(
         panic!("on_message_media_uploaded without the message");
     };
     let is_edit = message_id.is_any_server();
+    if !ctx.have_input_peer_read(dialog_id, true)
+        && !is_bot_ephemeral_message_channel(ctx.is_bot(), ctx.is_test_dc(), dialog_id)
+    {
+        // the message should be deleted soon (7122a0962)
+        return MediaUploadedAction::Dropped;
+    }
     if (!is_edit && m.media_album_id != 0) || media_pos != -1 {
         // `get_message_content_input_media` + `is_uploaded_input_media` —
         // the ready-input decision is the M.9/M.12 file-view seam; the
@@ -26244,6 +26983,9 @@ pub fn on_message_media_uploaded(
 /// effects).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MediaUploadedAction {
+    /// the C++ early return — the dialog is inaccessible (and not a
+    /// dedicated ephemeral-message channel), the message is dropped.
+    Dropped,
     /// `UploadMediaQuery` — the net seam.
     UploadMedia { media_album_id: i64, media_pos: i32 },
     /// `do_send_message_media` — the single-message wire send (net seam).
@@ -26284,7 +27026,9 @@ pub fn on_upload_message_media_file_error(
     if is_edit && m.edit_generation != edit_generation {
         return DoSendAction::None;
     }
-    if !ctx.have_input_peer_read(dialog_id, true) {
+    if !ctx.have_input_peer_read(dialog_id, true)
+        && !is_bot_ephemeral_message_channel(ctx.is_bot(), ctx.is_test_dc(), dialog_id)
+    {
         // the message should be deleted soon
         return DoSendAction::None;
     }
@@ -26313,7 +27057,9 @@ pub fn on_upload_message_media_fail(
     if is_edit && m.edit_generation != edit_generation {
         return UploadFinishedAction::None;
     }
-    if !ctx.have_input_peer_read(dialog_id, true) {
+    if !ctx.have_input_peer_read(dialog_id, true)
+        && !is_bot_ephemeral_message_channel(ctx.is_bot(), ctx.is_test_dc(), dialog_id)
+    {
         return UploadFinishedAction::None;
     }
     assert!(dialog_id.get_type() != DialogType::SecretChat);
@@ -26592,7 +27338,9 @@ pub fn continue_send_message(
         global.td_db().binlog().erase(log_event_id);
         return None;
     }
-    if !ctx.have_input_peer_read(dialog_id, true) {
+    if !ctx.have_input_peer_read(dialog_id, true)
+        && !is_bot_ephemeral_message_channel(ctx.is_bot(), ctx.is_test_dc(), dialog_id)
+    {
         global.td_db().binlog().erase(log_event_id);
         return None;
     }
@@ -27646,6 +28394,14 @@ pub fn do_delete_message(
     }
 
     if let Some(result) = &result {
+        if !only_from_memory || !global.use_message_database() {
+            // unloaded messages can be loaded again from the database
+            // (454670882)
+            let ephemeral_message_id = get_message_ephemeral_message_id(result);
+            if let Some(d) = manager.get_dialog_mut(dialog_id) {
+                unregister_dialog_ephemeral_message(d, ephemeral_message_id);
+            }
+        }
         on_message_deleted(manager, dialog_id, result, is_permanently_deleted, source);
     }
 
@@ -27800,10 +28556,9 @@ pub fn on_message_deleted(
         }
         DialogType::SecretChat | DialogType::None => {}
     }
-    {
-        let d = manager.get_dialog_mut(dialog_id).unwrap();
-        unregister_dialog_ephemeral_message(d, m.ephemeral_message_id);
-    }
+    // `unregister_dialog_ephemeral_message` moved to do_delete_message
+    // (454670882): on_message_deleted also runs for unloaded messages,
+    // whose ephemeral ids must stay registered
     // `ttl_unregister_message`/`ttl_period_unregister_message` — the ttl
     // scheduler seam
     // `unregister_message_content`/`unregister_message_reply` — the M.9.12
@@ -27814,6 +28569,27 @@ pub fn on_message_deleted(
     let _ = source;
 
     manager.added_message_count -= 1;
+}
+
+/// `MessagesManager::on_failed_ephemeral_message_deletion`
+/// (MessagesManager.cpp:8686-8698, the 8831a356c shape) — a failed
+/// `ephemeral.deleteMessage` un-marks the id as deleted: the message
+/// can't be reloaded from the server, but it can be received again.
+pub fn on_failed_ephemeral_message_deletion(
+    manager: &mut MessagesManager,
+    close_flag: bool,
+    dialog_id: DialogId,
+    ephemeral_message_id: EphemeralMessageId,
+) {
+    if close_flag {
+        return;
+    }
+    if let Some(d) = manager.get_dialog_mut(dialog_id) {
+        // the message can't be reloaded from the server, but it can be
+        // received again
+        d.deleted_ephemeral_message_ids
+            .remove(&ephemeral_message_id);
+    }
 }
 
 /// `MessagesManager::try_add_active_live_location`
@@ -28016,7 +28792,13 @@ pub fn send_update_message_send_succeeded(
     if !ctx.is_bot() {
         manager
             .yet_unsent_message_full_id_to_persistent_message_id
-            .insert(MessageFullId::new(dialog_id, old_message_id), m.message_id);
+            .insert(
+                MessageFullId::new(dialog_id, old_message_id),
+                (
+                    m.message_id,
+                    tdutils::time::now() + PERSISTENT_MESSAGE_ID_CACHE_TIME,
+                ),
+            );
 
         let deleted = delete_message(
             global,
@@ -28846,6 +29628,36 @@ pub fn on_send_message_fail(
         return;
     }
 
+    // `MessageQueryManager::process_send_message_fail_error`
+    // (MessagesManager.cpp:28338-28341, the f3dba9caf call shape over the
+    // 050f319cd move) — the error remap ladder runs before the fail; the
+    // QUOTE_TEXT_INVALID/REPLY_MESSAGE_ID_INVALID reload legs and the
+    // payment/guest reloads behind it are net seams.
+    let m = manager.get_dialog(dialog_id).and_then(|d| {
+        d.messages.get(&message_id).or_else(|| {
+            d.scheduled_messages
+                .as_ref()
+                .and_then(|s| s.scheduled_messages.get(&message_id))
+        })
+    });
+    let (error_code, error_message) = match m {
+        Some(m) => {
+            let processed =
+                crate::message_query_manager::MessageQueryManager::process_send_message_fail_error(
+                    tdutils::status::Status::error(error_code, error_message),
+                    dialog_id,
+                    ctx.is_bot(),
+                    is_ephemeral_message(m),
+                    m.content
+                        .as_ref()
+                        .expect("message without content")
+                        .get_type(),
+                );
+            (processed.code(), processed.message().to_owned())
+        }
+        None => (error_code, error_message.to_string()),
+    };
+
     let reactions_ctx = MessageObjectReactionsContext { ctx };
     fail_send_message(
         global,
@@ -28855,7 +29667,7 @@ pub fn on_send_message_fail(
         &reactions_ctx,
         message_full_id,
         error_code,
-        error_message,
+        &error_message,
     );
 }
 
@@ -29019,7 +29831,13 @@ pub fn fail_send_message(
 
     manager
         .yet_unsent_message_full_id_to_persistent_message_id
-        .insert(MessageFullId::new(dialog_id, old_message_id), m_message_id);
+        .insert(
+            MessageFullId::new(dialog_id, old_message_id),
+            (
+                m_message_id,
+                tdutils::time::now() + PERSISTENT_MESSAGE_ID_CACHE_TIME,
+            ),
+        );
     tracing::info!(
         "Send updateMessageSendFailed for {}:{}",
         dialog_id.get(),
@@ -29594,7 +30412,10 @@ pub fn on_get_message_full(
     // the is_sent_message count updates ride the container registries
     // (try_add_active_live_location lands with the live-location plane)
 
-    if dialog_id.get_type() == DialogType::Channel && !state.have_input_peer(dialog_id, false) {
+    if dialog_id.get_type() == DialogType::Channel
+        && !state.have_input_peer(dialog_id, false)
+        && !is_bot_ephemeral_message_channel(ctx.is_bot(), ctx.is_test_dc(), dialog_id)
+    {
         let mut dummy = false;
         let deleted = delete_message(
             global,
@@ -31017,6 +31838,28 @@ pub fn is_editable_media_message_content(content_type: MessageContentType) -> bo
     )
 }
 
+/// `is_allowed_ephemeral_message_content` (MessageContentType.cpp:377-396)
+/// (the 1.8.70 shape: the Widget case the range briefly added is gone
+/// again, 741042993).
+pub fn is_allowed_ephemeral_message_content(content_type: MessageContentType) -> bool {
+    matches!(
+        content_type,
+        MessageContentType::Animation
+            | MessageContentType::Audio
+            | MessageContentType::Contact
+            | MessageContentType::Document
+            | MessageContentType::Location
+            | MessageContentType::Photo
+            | MessageContentType::RichText
+            | MessageContentType::Sticker
+            | MessageContentType::Text
+            | MessageContentType::Venue
+            | MessageContentType::Video
+            | MessageContentType::VideoNote
+            | MessageContentType::VoiceNote
+    )
+}
+
 /// `DEFAULT_EDIT_TIME_LIMIT` (MessagesManager.cpp:23268).
 pub const DEFAULT_EDIT_TIME_LIMIT: i64 = 2 * 86400;
 
@@ -31648,6 +32491,16 @@ pub trait MmRequestContext:
     /// read-date privacy read (the properties/read-date planes).
     fn get_user_read_dates_private(&mut self, _user_id: UserId) -> bool {
         false
+    }
+
+    /// `CommunityManager::on_update_community_notify_settings`
+    /// (99302f0e2) — the `on_get_dialogs` `dialogCommunity` intake.
+    fn community_on_update_notify_settings(
+        &mut self,
+        _community_id: crate::community_id::CommunityId,
+        _peer_notify_settings: Option<&telegram_api::PeerNotifySettings>,
+        _source: &str,
+    ) {
     }
 
     /// `ChatManager::get_channel_effective_has_hidden_participants`.
@@ -37280,6 +38133,40 @@ mod tests {
         (dialog_id, d)
     }
 
+    /// 8831a356c: the failed-deletion callback un-marks the id so the
+    /// ephemeral message can be received again.
+    #[test]
+    fn on_failed_ephemeral_message_deletion_unmarks_the_id() {
+        let mut manager = MessagesManager::default();
+        let (dialog_id, mut d) = channel_dialog(100);
+        let ephemeral_message_id = EphemeralMessageId::new(7);
+        d.deleted_ephemeral_message_ids.insert(ephemeral_message_id);
+        manager.dialogs.insert(dialog_id, d);
+
+        // close flag suppresses the repair
+        on_failed_ephemeral_message_deletion(&mut manager, true, dialog_id, ephemeral_message_id);
+        assert!(
+            manager.dialogs[&dialog_id]
+                .deleted_ephemeral_message_ids
+                .contains(&ephemeral_message_id)
+        );
+
+        on_failed_ephemeral_message_deletion(&mut manager, false, dialog_id, ephemeral_message_id);
+        assert!(
+            !manager.dialogs[&dialog_id]
+                .deleted_ephemeral_message_ids
+                .contains(&ephemeral_message_id)
+        );
+
+        // unknown dialog — a silent no-op like the C++
+        on_failed_ephemeral_message_deletion(
+            &mut manager,
+            false,
+            DialogId::from_user_id(UserId::new(999)),
+            ephemeral_message_id,
+        );
+    }
+
     fn some_reactions_input(emoji: &str) -> Option<td_api::ChatAvailableReactions> {
         Some(td_api::ChatAvailableReactions::chatAvailableReactionsSome(
             td_api::chatAvailableReactionsSome {
@@ -37715,22 +38602,6 @@ mod tests {
     }
 
     #[test]
-    fn notification_sound_types() {
-        assert_eq!(
-            NotificationSound::default().get_type(),
-            NotificationSoundType::None
-        );
-        assert_eq!(
-            NotificationSound::Local("classic".to_string()).get_type(),
-            NotificationSoundType::Local
-        );
-        assert_eq!(
-            NotificationSound::Ringtone(77).get_type(),
-            NotificationSoundType::Ringtone
-        );
-    }
-
-    #[test]
     fn dialog_notification_settings_defaults() {
         let settings = DialogNotificationSettings::default();
         assert_eq!(settings.mute_until, 0);
@@ -37749,6 +38620,260 @@ mod tests {
         assert!(!settings.disable_pinned_message_notifications);
         assert!(settings.use_default_disable_mention_notifications);
         assert!(!settings.disable_mention_notifications);
+    }
+
+    #[test]
+    fn fix_mute_until_bands() {
+        // b1afb1e44: a bot, a default mute and an expired mute all clear.
+        let mut bot = DialogNotificationSettings {
+            use_default_mute_until: false,
+            mute_until: i32::MAX,
+            ..DialogNotificationSettings::default()
+        };
+        bot.fix_mute_until(true, 100);
+        assert_eq!(bot.mute_until, 0);
+
+        let mut default = DialogNotificationSettings {
+            mute_until: 500,
+            ..DialogNotificationSettings::default()
+        };
+        default.fix_mute_until(false, 100);
+        assert_eq!(default.mute_until, 0, "use_default_mute_until clears");
+
+        let mut expired = DialogNotificationSettings {
+            use_default_mute_until: false,
+            mute_until: 100,
+            ..DialogNotificationSettings::default()
+        };
+        expired.fix_mute_until(false, 100);
+        assert_eq!(expired.mute_until, 0, "mute_until == now clears");
+
+        let mut live = DialogNotificationSettings {
+            use_default_mute_until: false,
+            mute_until: 101,
+            ..DialogNotificationSettings::default()
+        };
+        live.fix_mute_until(false, 100);
+        assert_eq!(live.mute_until, 101, "a future mute survives");
+    }
+
+    #[test]
+    fn chat_notification_settings_object_bands() {
+        // get_chat_notification_settings_object: the remaining-mute clamp
+        // and the inverted story-poster field.
+        let settings = DialogNotificationSettings {
+            use_default_mute_until: false,
+            mute_until: 1_000,
+            sound: Some(NotificationSound::Ringtone { ringtone_id: 7 }),
+            story_sound: Some(NotificationSound::NoSound),
+            use_default_hide_story_sender: false,
+            hide_story_sender: true,
+            ..DialogNotificationSettings::default()
+        };
+        let object = get_chat_notification_settings_object(&settings, 400);
+        assert_eq!(object.mute_for, 600);
+        assert!(!object.use_default_mute_for);
+        assert!(!object.use_default_sound);
+        assert_eq!(object.sound_id, 7);
+        assert!(!object.use_default_story_sound);
+        assert_eq!(object.story_sound_id, 0);
+        assert!(!object.use_default_show_story_poster);
+        assert!(!object.show_story_poster);
+
+        // an expired mute clamps to 0 instead of going negative
+        let mut expired = settings.clone();
+        expired.mute_until = 100;
+        assert_eq!(
+            get_chat_notification_settings_object(&expired, 400).mute_for,
+            0
+        );
+    }
+
+    #[test]
+    fn dialog_notification_settings_from_td_api_bands() {
+        let old = DialogNotificationSettings::default();
+
+        // null settings → the 400
+        assert!(get_dialog_notification_settings_from_td_api(None, &old, 100).is_err());
+
+        // the mute_for ladder: <= 0 → 0, the precise window → the lift,
+        // past it → i32::MAX
+        let request = |mute_for: i32| td_api::ChatNotificationSettings {
+            use_default_mute_for: false,
+            mute_for,
+            ..make_chat_notification_settings_request()
+        };
+        let lifted =
+            get_dialog_notification_settings_from_td_api(Some(&request(60)), &old, 100).unwrap();
+        assert_eq!(lifted.mute_until, 160);
+        assert!(lifted.is_synchronized);
+        assert_eq!(
+            get_dialog_notification_settings_from_td_api(Some(&request(0)), &old, 100)
+                .unwrap()
+                .mute_until,
+            0
+        );
+        assert_eq!(
+            get_dialog_notification_settings_from_td_api(
+                Some(&request(366 * 86400 + 1)),
+                &old,
+                100
+            )
+            .unwrap()
+            .mute_until,
+            i32::MAX
+        );
+
+        // a non-default sound survives; a default request sound inherits
+        // the old (default) sound; silent survives from the old settings
+        let mut with_sound = make_chat_notification_settings_request();
+        with_sound.use_default_sound = false;
+        with_sound.sound_id = 5;
+        let converted =
+            get_dialog_notification_settings_from_td_api(Some(&with_sound), &old, 100).unwrap();
+        assert_eq!(
+            converted.sound,
+            Some(NotificationSound::Ringtone { ringtone_id: 5 })
+        );
+        assert!(!converted.silent_send_message);
+
+        // show_story_poster inverts into hide_story_sender
+        let mut poster = make_chat_notification_settings_request();
+        poster.use_default_show_story_poster = false;
+        poster.show_story_poster = false;
+        let converted =
+            get_dialog_notification_settings_from_td_api(Some(&poster), &old, 100).unwrap();
+        assert!(converted.hide_story_sender);
+        assert!(!converted.use_default_hide_story_sender);
+    }
+
+    fn make_chat_notification_settings_request() -> td_api::ChatNotificationSettings {
+        td_api::ChatNotificationSettings {
+            use_default_mute_for: true,
+            mute_for: 0,
+            use_default_sound: true,
+            sound_id: 0,
+            use_default_show_preview: true,
+            show_preview: true,
+            use_default_mute_stories: true,
+            mute_stories: false,
+            use_default_story_sound: true,
+            story_sound_id: 0,
+            use_default_show_story_poster: true,
+            show_story_poster: true,
+            use_default_disable_pinned_message_notifications: true,
+            disable_pinned_message_notifications: false,
+            use_default_disable_mention_notifications: true,
+            disable_mention_notifications: false,
+        }
+    }
+
+    #[test]
+    fn dialog_notification_settings_from_telegram_bands() {
+        // absent settings → the unsynchronized default with the local
+        // pinned/mention fields preserved from the old settings
+        let old = DialogNotificationSettings {
+            use_default_disable_pinned_message_notifications: false,
+            disable_pinned_message_notifications: true,
+            ..DialogNotificationSettings::default()
+        };
+        let absent = get_dialog_notification_settings_from_telegram(None, Some(&old), 100);
+        assert!(!absent.is_synchronized);
+        assert!(!absent.use_default_disable_pinned_message_notifications);
+        assert!(absent.disable_pinned_message_notifications);
+
+        // present settings: the flag bits drive the use_default band, an
+        // expired mute clears, and the object is synchronized
+        let wire = telegram_api::PeerNotifySettings {
+            flags: (1 << 0) | (1 << 2),
+            show_previews: false,
+            silent: true,
+            mute_until: 90,
+            ios_sound: None,
+            android_sound: None,
+            other_sound: None,
+            stories_muted: true,
+            stories_hide_sender: false,
+            stories_ios_sound: None,
+            stories_android_sound: None,
+            stories_other_sound: None,
+        };
+        let converted =
+            get_dialog_notification_settings_from_telegram(Some(&wire), Some(&old), 100);
+        assert!(converted.is_synchronized);
+        assert!(!converted.use_default_mute_until);
+        assert_eq!(converted.mute_until, 0, "the expired wire mute clears");
+        assert!(!converted.use_default_show_preview);
+        assert!(!converted.show_preview);
+        assert!(converted.use_default_mute_stories);
+        assert!(converted.mute_stories);
+        assert!(converted.silent_send_message);
+
+        let mut future = wire.clone();
+        future.mute_until = 300;
+        let converted = get_dialog_notification_settings_from_telegram(Some(&future), None, 100);
+        assert_eq!(converted.mute_until, 300);
+        // no old settings → the local defaults
+        assert!(converted.use_default_disable_pinned_message_notifications);
+    }
+
+    #[test]
+    fn need_update_dialog_notification_settings_bands() {
+        let base = DialogNotificationSettings::default();
+
+        // the local band: a pinned change needs a local update only
+        let mut local = base.clone();
+        local.disable_pinned_message_notifications = true;
+        let verdict = need_update_dialog_notification_settings(&base, &local);
+        assert!(verdict.need_update_local);
+        assert!(!verdict.need_update_server);
+        assert!(verdict.are_changed);
+
+        // the synchronization band counts as changed without either band
+        let mut synced = base.clone();
+        synced.is_synchronized = true;
+        let verdict = need_update_dialog_notification_settings(&base, &synced);
+        assert!(!verdict.need_update_server);
+        assert!(!verdict.need_update_local);
+        assert!(verdict.are_changed);
+
+        // the server band
+        let mut server = base.clone();
+        server.use_default_mute_until = false;
+        server.mute_until = 500;
+        let verdict = need_update_dialog_notification_settings(&base, &server);
+        assert!(verdict.need_update_server);
+        assert!(verdict.are_changed);
+
+        // equivalent-but-different Local sounds count as changed only
+        let with_local = DialogNotificationSettings {
+            sound: Some(NotificationSound::Local {
+                title: "a".to_owned(),
+                data: String::new(),
+            }),
+            ..base.clone()
+        };
+        let with_other_local = DialogNotificationSettings {
+            sound: Some(NotificationSound::Local {
+                title: "b".to_owned(),
+                data: String::new(),
+            }),
+            ..base.clone()
+        };
+        let verdict = need_update_dialog_notification_settings(&with_local, &with_other_local);
+        assert!(!verdict.need_update_server);
+        assert!(verdict.are_changed);
+
+        // identical settings need nothing
+        let verdict = need_update_dialog_notification_settings(&base, &base.clone());
+        assert_eq!(
+            verdict,
+            NeedUpdateDialogNotificationSettings {
+                need_update_server: false,
+                need_update_local: false,
+                are_changed: false
+            }
+        );
     }
 
     #[test]
@@ -39231,6 +40356,7 @@ mod tests {
                     text: "quote".to_string(),
                     entities: Vec::new(),
                 },
+                rich_texts: Vec::new(),
                 position: 3,
                 is_manual: true,
             },
@@ -39244,6 +40370,404 @@ mod tests {
             RepliedMessageInfo::parse_from(&mut parser, &mut NoStorage).unwrap(),
             info
         );
+    }
+
+    /// The wire rich-quote intake (upstream 4e1635ac8 + fd3863de4) —
+    /// `quote_rich` alone yields a quote, the unallowed formatting is
+    /// stripped at intake, and a rich-only emptied header stays empty.
+    #[test]
+    fn message_quote_wire_rich_intake() {
+        let wire_bold = Box::new(telegram_api::RichText::textBold(telegram_api::textBold {
+            text: Some(Box::new(telegram_api::RichText::textPlain(
+                telegram_api::textPlain {
+                    text: "Q".to_owned(),
+                },
+            ))),
+        }));
+        let header = telegram_api::messageReplyHeader {
+            quote_rich: vec![wire_bold],
+            ..telegram_api::messageReplyHeader::default()
+        };
+        let quote = MessageQuote::from_reply_header::<()>(None, &header);
+        assert!(!quote.is_empty());
+        assert!(quote.text.text.is_empty());
+        assert_eq!(quote.rich_texts.len(), 1);
+        assert_eq!(quote.rich_texts[0].get_quote_text(), "Q");
+        // the header's `quote` flag (manual) and offset carry over
+        let header = telegram_api::messageReplyHeader {
+            quote_rich: vec![Box::new(telegram_api::RichText::textMath(
+                telegram_api::textMath {
+                    source: "x+1".to_owned(),
+                },
+            ))],
+            quote_text: "x+1".to_owned(),
+            quote: true,
+            quote_offset: -3,
+            ..telegram_api::messageReplyHeader::default()
+        };
+        let quote = MessageQuote::from_reply_header::<()>(None, &header);
+        assert_eq!(quote.text.text, "x+1");
+        assert_eq!(quote.position, 0); // max(0, -3)
+        assert!(quote.is_manual);
+        assert_eq!(quote.rich_texts[0].get_quote_text(), "x+1");
+
+        // a wire icon (textImage) without a document empties out and the
+        // header's quote stays empty.
+        let header = telegram_api::messageReplyHeader {
+            quote_rich: vec![Box::new(telegram_api::RichText::textImage(
+                telegram_api::textImage {
+                    document_id: 999,
+                    w: 1,
+                    h: 1,
+                },
+            ))],
+            ..telegram_api::messageReplyHeader::default()
+        };
+        assert!(MessageQuote::from_reply_header::<()>(None, &header).is_empty());
+
+        // an Url-node rich quote is stripped to its plain text
+        let header = telegram_api::messageReplyHeader {
+            quote_rich: vec![Box::new(telegram_api::RichText::textUrl(
+                telegram_api::textUrl {
+                    text: Some(Box::new(telegram_api::RichText::textPlain(
+                        telegram_api::textPlain {
+                            text: "link".to_owned(),
+                        },
+                    ))),
+                    url: "https://example.com".to_owned(),
+                    webpage_id: 0,
+                },
+            ))],
+            ..telegram_api::messageReplyHeader::default()
+        };
+        let quote = MessageQuote::from_reply_header::<()>(None, &header);
+        assert!(!quote.is_empty());
+        // the Url formatting is dropped: only the plain text survives
+        assert_eq!(quote.rich_texts.len(), 1);
+        assert_eq!(quote.rich_texts[0].get_quote_text(), "link");
+    }
+
+    /// The stripping ctor + rich-text binlog round-trip (upstream
+    /// 4e1635ac8 flag bit, fd3863de4 parse strip) — and the legacy
+    /// three-flag rows still parse.
+    #[test]
+    fn message_quote_store_parse_rich_texts() {
+        let rich_texts = vec![crate::webpage::RichText::create_math("a^2".to_owned())];
+        let quote = MessageQuote::new_stripped(
+            FormattedText {
+                text: "q".to_owned(),
+                entities: Vec::new(),
+            },
+            rich_texts,
+            7,
+            true,
+        );
+        let mut bytes = Vec::new();
+        quote.store(&mut bytes);
+        let mut parser = Parser::new(&bytes);
+        assert_eq!(MessageQuote::parse_from(&mut parser).unwrap(), quote);
+
+        // a rich-only quote round-trips too (no text flag, no position)
+        let quote = MessageQuote {
+            rich_texts: vec![crate::webpage::RichText::create_plain("r".to_owned())],
+            is_manual: false,
+            ..MessageQuote::default()
+        };
+        let mut bytes = Vec::new();
+        quote.store(&mut bytes);
+        let mut parser = Parser::new(&bytes);
+        assert_eq!(MessageQuote::parse_from(&mut parser).unwrap(), quote);
+
+        // the pre-1.8.70 three-flag rows parse with no rich texts
+        let mut bytes = Vec::new();
+        store_flags(&mut bytes, [true, false, true]);
+        FormattedText {
+            text: "old".to_owned(),
+            entities: Vec::new(),
+        }
+        .store(&mut bytes);
+        let mut parser = Parser::new(&bytes);
+        let parsed = MessageQuote::parse_from(&mut parser).unwrap();
+        assert_eq!(parsed.text.text, "old");
+        assert!(parsed.rich_texts.is_empty());
+        assert!(parsed.is_manual);
+
+        // the stripping ctor: an unallowed text entity and an unallowed
+        // rich node both lose their formatting, and the position clamps
+        let quote = MessageQuote::new_stripped(
+            FormattedText {
+                text: "ab".to_owned(),
+                entities: vec![crate::message_entity::MessageEntity {
+                    r#type: Some(crate::message_entity::Type::Url),
+                    offset: 0,
+                    length: 2,
+                    ..crate::message_entity::MessageEntity::default()
+                }],
+            },
+            Vec::new(),
+            -1,
+            true,
+        );
+        assert!(quote.text.entities.is_empty());
+        assert_eq!(quote.position, 0);
+    }
+
+    /// The received/draft quote objects carry the rich texts (upstream
+    /// 4e1635ac8 + 1631ed57b) — a rich-only quote answers objects too.
+    #[test]
+    fn message_quote_objects_carry_rich_texts() {
+        let quote = MessageQuote {
+            text: FormattedText {
+                text: "q".to_owned(),
+                entities: Vec::new(),
+            },
+            rich_texts: vec![crate::webpage::RichText::create_plain("r".to_owned())],
+            position: 4,
+            is_manual: true,
+        };
+        let td_api::TextQuote {
+            text,
+            rich_texts,
+            position,
+            is_manual,
+        } = quote.get_text_quote_object::<()>(None).unwrap();
+        assert_eq!(text.unwrap().text, "q");
+        assert_eq!(rich_texts.len(), 1);
+        assert!(matches!(
+            rich_texts[0].as_ref(),
+            td_api::RichText::richTextPlain(t) if t.text == "r"
+        ));
+        assert_eq!(position, 4);
+        assert!(is_manual);
+
+        // a rich-only quote: not empty, the text object answers the empty
+        // formatted text, and the input (draft) object mirrors the shape
+        let quote = MessageQuote {
+            rich_texts: vec![crate::webpage::RichText::create_math("x".to_owned())],
+            is_manual: true,
+            ..MessageQuote::default()
+        };
+        assert!(!quote.is_empty());
+        let object = quote.get_text_quote_object::<()>(None).unwrap();
+        assert!(object.text.unwrap().text.is_empty());
+        assert!(matches!(
+            object.rich_texts[0].as_ref(),
+            td_api::RichText::richTextMathematicalExpression(t) if t.expression == "x"
+        ));
+        let input = quote.get_input_text_quote_object::<()>(None).unwrap();
+        assert_eq!(input.rich_texts.len(), 1);
+        assert_eq!(input.position, 0);
+
+        // an empty quote answers no objects at all
+        assert!(
+            MessageQuote::default()
+                .get_text_quote_object::<()>(None)
+                .is_none()
+        );
+        assert!(
+            MessageQuote::default()
+                .get_input_text_quote_object::<()>(None)
+                .is_none()
+        );
+    }
+
+    /// `create_automatic_quote` (upstream dbeb09f45) — the plain-text
+    /// truncation and the rich-message walk over page blocks (32-part
+    /// cap, total length cap, whole-part shaping).
+    #[test]
+    fn message_quote_create_automatic_quote() {
+        // the text variant truncates to the option cap
+        let quote = MessageQuote::create_automatic_quote(
+            FormattedText {
+                text: "hello rich world".to_owned(),
+                entities: Vec::new(),
+            },
+            5,
+        );
+        assert_eq!(quote.text.text, "hello");
+        assert!(!quote.is_manual);
+        assert_eq!(quote.position, 0);
+        assert!(quote.rich_texts.is_empty());
+
+        // the rich variant: the first part fills the cap and finishes the
+        // walk (the math block after it is not quoted)
+        let blocks = vec![
+            crate::webpage::WebPageBlock::Paragraph(crate::webpage::RichText::create_plain(
+                "hello world".to_owned(),
+            )),
+            crate::webpage::WebPageBlock::Math {
+                source: "x^2".to_owned(),
+            },
+        ];
+        let quote = MessageQuote::create_automatic_quote_from_page_blocks(&blocks, 8);
+        assert!(!quote.is_empty());
+        assert!(quote.text.text.is_empty());
+        assert_eq!(quote.rich_texts.len(), 1);
+        assert_eq!(quote.rich_texts[0].get_quote_text(), "hello wo");
+        assert!(!quote.is_manual);
+
+        // a wide cap quotes every part whole, in the walk order
+        let quote = MessageQuote::create_automatic_quote_from_page_blocks(&blocks, 100);
+        assert_eq!(quote.rich_texts.len(), 2);
+        assert_eq!(quote.rich_texts[0].get_quote_text(), "hello world");
+        assert_eq!(quote.rich_texts[1].get_quote_text(), "x^2");
+
+        // the 32-part server-side cap
+        let blocks: Vec<crate::webpage::WebPageBlock> = (0..33)
+            .map(|i| {
+                crate::webpage::WebPageBlock::Paragraph(crate::webpage::RichText::create_plain(
+                    i.to_string(),
+                ))
+            })
+            .collect();
+        let quote = MessageQuote::create_automatic_quote_from_page_blocks(&blocks, 1000);
+        assert_eq!(quote.rich_texts.len(), 32);
+
+        // a math part longer than the whole cap is cut by code points —
+        // an empty fragment (window 0..0 for a spent cap) never lands
+        let blocks = vec![crate::webpage::WebPageBlock::Math {
+            source: "abc".to_owned(),
+        }];
+        let quote = MessageQuote::create_automatic_quote_from_page_blocks(&blocks, 0);
+        assert!(quote.is_empty());
+    }
+
+    /// `need_quote_changed_warning` + `get_text_size` (upstream
+    /// 334b39f98 on top of 4e1635ac8) — the tri-state answer.
+    #[test]
+    fn message_quote_need_quote_changed_warning() {
+        let manual = |text: &str| MessageQuote {
+            text: FormattedText {
+                text: text.to_owned(),
+                entities: Vec::new(),
+            },
+            is_manual: true,
+            ..MessageQuote::default()
+        };
+        let automatic = |text: &str| MessageQuote {
+            text: FormattedText {
+                text: text.to_owned(),
+                entities: Vec::new(),
+            },
+            is_manual: false,
+            ..MessageQuote::default()
+        };
+
+        // identical quotes need no warning
+        assert_eq!(
+            MessageQuote::need_quote_changed_warning(&manual("a"), &manual("a")),
+            0
+        );
+
+        // the position can't move past the quote size: max(position) must
+        // stay under the smaller quote-text byte size
+        let mut moved = manual("abcde");
+        moved.position = 3; // 3 < 5
+        assert_eq!(
+            MessageQuote::need_quote_changed_warning(&manual("abcde"), &moved),
+            1
+        );
+        // a move to exactly the size falls through to the equality checks
+        let mut moved = manual("abcde");
+        moved.position = 5; // 5 < 5 is false
+        assert_eq!(
+            MessageQuote::need_quote_changed_warning(&manual("abcde"), &moved),
+            0
+        );
+
+        // the manual property can't change
+        assert_eq!(
+            MessageQuote::need_quote_changed_warning(&manual("a"), &automatic("a")),
+            1
+        );
+
+        // a changed manual quote warns; a changed automatic quote is an
+        // edit of the original message
+        assert_eq!(
+            MessageQuote::need_quote_changed_warning(&manual("a"), &manual("b")),
+            1
+        );
+        assert_eq!(
+            MessageQuote::need_quote_changed_warning(&automatic("a"), &automatic("b")),
+            -1
+        );
+
+        // the rich texts count into both the equality and the size: an
+        // automatic rich-only quote changing parts is an edit, and the
+        // position bound sums the quote-text bytes
+        let rich = |parts: usize| MessageQuote {
+            rich_texts: (0..parts)
+                .map(|_| crate::webpage::RichText::create_plain("ab".to_owned()))
+                .collect(),
+            is_manual: false,
+            ..MessageQuote::default()
+        };
+        assert_eq!(rich(1).get_text_size(), 2);
+        assert_eq!(rich(2).get_text_size(), 4);
+        assert_eq!(
+            MessageQuote::need_quote_changed_warning(&rich(1), &rich(2)),
+            -1
+        );
+        let mut moved = rich(1);
+        moved.position = 1; // 1 < the 2-byte quote text
+        assert_eq!(
+            MessageQuote::need_quote_changed_warning(&rich(1), &moved),
+            1
+        );
+    }
+
+    /// `update_input_reply_to_message` (upstream 4e1635ac8/1631ed57b) —
+    /// the quote fields and flag bits written onto the send-wire reply.
+    #[test]
+    fn message_quote_update_input_reply_to_message() {
+        // an empty quote leaves the wire reply untouched
+        let mut wire = telegram_api::inputReplyToMessage::default();
+        MessageQuote::default().update_input_reply_to_message::<()>(None, &mut wire);
+        assert_eq!(wire.flags, 0);
+
+        // the text arm: quote text + entities + offset, bits 2/3/4
+        let quote = MessageQuote {
+            text: FormattedText {
+                text: "ab".to_owned(),
+                entities: vec![crate::message_entity::MessageEntity {
+                    r#type: Some(crate::message_entity::Type::Bold),
+                    offset: 0,
+                    length: 2,
+                    ..crate::message_entity::MessageEntity::default()
+                }],
+            },
+            position: 5,
+            is_manual: true,
+            ..MessageQuote::default()
+        };
+        let mut wire = telegram_api::inputReplyToMessage::default();
+        quote.update_input_reply_to_message::<()>(None, &mut wire);
+        assert_eq!(wire.quote_text, "ab");
+        assert_eq!(wire.quote_entities.len(), 1);
+        assert!(matches!(
+            wire.quote_entities[0],
+            telegram_api::MessageEntity::messageEntityBold(_)
+        ));
+        assert_eq!(wire.quote_offset, 5);
+        assert_eq!(wire.flags, (1 << 2) | (1 << 3) | (1 << 4));
+        assert!(wire.quote_rich.is_empty());
+
+        // the rich arm: bit 8 and the wire rich texts, no text fields
+        let quote = MessageQuote {
+            rich_texts: vec![crate::webpage::RichText::create_math("x".to_owned())],
+            position: 0,
+            is_manual: true,
+            ..MessageQuote::default()
+        };
+        let mut wire = telegram_api::inputReplyToMessage::default();
+        quote.update_input_reply_to_message::<()>(None, &mut wire);
+        assert!(wire.quote_text.is_empty());
+        assert_eq!(wire.flags, 1 << 8);
+        assert_eq!(wire.quote_rich.len(), 1);
+        assert!(matches!(
+            wire.quote_rich[0].as_ref(),
+            telegram_api::RichText::textMath(t) if t.source == "x"
+        ));
     }
 
     #[test]
@@ -39382,6 +40906,7 @@ mod tests {
                     text: "q".to_string(),
                     entities: Vec::new(),
                 },
+                rich_texts: Vec::new(),
                 position: 0,
                 is_manual: false,
             },
@@ -41021,6 +42546,171 @@ mod tests {
                 assert_eq!(text.text.text, "v2");
             }
             other => panic!("wrong content arm: {other:?}"),
+        }
+    }
+
+    /// a89b35d6b: ephemeral messages have no edit date, but their inline
+    /// keyboard can be edited
+    #[test]
+    fn ephemeral_reply_markup_edits_without_an_edit_date() {
+        let dialog_id = DialogId::from_user_id(UserId::new(2000));
+        let build = |reply_markup: Option<Box<crate::reply_markup::ReplyMarkup>>| {
+            let mut m = Box::new(Message::default());
+            m.message_id = MessageId::from_server_message_id(ServerMessageId::new(400));
+            m.date = 1700000100;
+            m.edit_date = 0;
+            m.receiver_user_id = UserId::new(7);
+            m.reply_markup = reply_markup;
+            m.content = Some(crate::message_content::MessageContent::Text(
+                crate::message_content::MessageText::default(),
+            ));
+            m
+        };
+        let mut ctx = TestObjectContext::default();
+        let mut manager = MessagesManager::default();
+        let global = crate::global::Global::new();
+        let time = crate::user_manager::TimeCtx::from_global(&global);
+
+        let mut old_message = build(None);
+        let mut new_message = build(Some(Box::new(crate::reply_markup::ReplyMarkup::default())));
+        let outcome = update_message(
+            &mut ctx,
+            &global,
+            &time,
+            &mut manager,
+            dialog_id,
+            &mut old_message,
+            &mut new_message,
+            false,
+            "test",
+        );
+        assert!(
+            outcome.is_edited,
+            "the reply markup change edits the message"
+        );
+        assert!(
+            old_message.reply_markup.is_some(),
+            "the new keyboard is applied without an edit date"
+        );
+    }
+
+    /// dd40b4679: the updateMessageEdited emission gate — a bot gets it
+    /// for ephemeral messages; for other messages bots receive it from
+    /// on_message_edited instead.
+    #[test]
+    fn update_message_edited_gate_covers_bot_ephemeral_messages() {
+        let dialog_id = DialogId::from_user_id(UserId::new(2000));
+        let build = |ephemeral: bool| {
+            let mut m = Box::new(Message::default());
+            m.message_id = MessageId::from_server_message_id(ServerMessageId::new(400));
+            m.date = 1700000100;
+            if ephemeral {
+                m.receiver_user_id = UserId::new(7);
+            }
+            m.content = Some(crate::message_content::MessageContent::Text(
+                crate::message_content::MessageText::default(),
+            ));
+            m
+        };
+        let mut manager = MessagesManager::default();
+        let global = crate::global::Global::new();
+        let time = crate::user_manager::TimeCtx::from_global(&global);
+
+        // a bot + an ephemeral message: the gate opens
+        let mut ctx = TestObjectContext {
+            is_bot: true,
+            ..TestObjectContext::default()
+        };
+        let mut old_message = build(true);
+        let mut new_message = build(true);
+        new_message.edit_date = 1700000500;
+        let outcome = update_message(
+            &mut ctx,
+            &global,
+            &time,
+            &mut manager,
+            dialog_id,
+            &mut old_message,
+            &mut new_message,
+            true,
+            "test",
+        );
+        assert!(outcome.is_edited);
+        assert!(
+            outcome.send_update_message_edited,
+            "bots receive updateMessageEdited for ephemeral messages"
+        );
+
+        // a bot + a regular message: on_message_edited owns the emission
+        let mut old_message = build(false);
+        let mut new_message = build(false);
+        new_message.edit_date = 1700000500;
+        let outcome = update_message(
+            &mut ctx,
+            &global,
+            &time,
+            &mut manager,
+            dialog_id,
+            &mut old_message,
+            &mut new_message,
+            true,
+            "test",
+        );
+        assert!(outcome.is_edited);
+        assert!(!outcome.send_update_message_edited);
+
+        // a user: the gate opens for any edited message
+        let mut ctx = TestObjectContext::default();
+        let mut old_message = build(false);
+        let mut new_message = build(false);
+        new_message.edit_date = 1700000500;
+        let outcome = update_message(
+            &mut ctx,
+            &global,
+            &time,
+            &mut manager,
+            dialog_id,
+            &mut old_message,
+            &mut new_message,
+            true,
+            "test",
+        );
+        assert!(outcome.send_update_message_edited);
+    }
+
+    /// 1f10f02c5/741042993: the ephemeral-content allowlist — the media
+    /// basics, the RichText/Text pair, the contact/location/venue trio;
+    /// no widget case exists in the port's content types.
+    #[test]
+    fn is_allowed_ephemeral_message_content_table() {
+        use crate::message_content::MessageContentType as T;
+        for allowed in [
+            T::Animation,
+            T::Audio,
+            T::Contact,
+            T::Document,
+            T::Location,
+            T::Photo,
+            T::RichText,
+            T::Sticker,
+            T::Text,
+            T::Venue,
+            T::Video,
+            T::VideoNote,
+            T::VoiceNote,
+        ] {
+            assert!(is_allowed_ephemeral_message_content(allowed), "{allowed:?}");
+        }
+        for denied in [
+            T::None,
+            T::Poll,
+            T::Game,
+            T::Invoice,
+            T::Story,
+            T::PaidMedia,
+            T::ToDoList,
+        ] {
+            assert!(!is_allowed_ephemeral_message_content(denied), "{denied:?}");
         }
     }
 
@@ -43200,7 +44890,10 @@ mod tests {
             .yet_unsent_message_full_id_to_persistent_message_id
             .insert(
                 MessageFullId::new(dialog_id, m10_8_yet_unsent(3)),
-                MessageId::from_server_message_id(ServerMessageId::new(500)),
+                (
+                    MessageId::from_server_message_id(ServerMessageId::new(500)),
+                    f64::MAX,
+                ),
             );
         let d = manager.get_dialog(dialog_id).unwrap();
         assert_eq!(
@@ -43251,6 +44944,7 @@ mod tests {
             false,
             DialogId::default(),
             false,
+            false,
         );
         assert_eq!(m.sender_user_id, my_id);
         assert_eq!(m.sender_dialog_id, DialogId::default());
@@ -43284,6 +44978,7 @@ mod tests {
             DialogId::default(),
             false,
             DialogId::default(),
+            false,
             false,
         );
         assert!(!m.is_outgoing, "the Saved Messages chat is not outgoing");
@@ -43321,6 +45016,7 @@ mod tests {
             DialogId::default(),
             false,
             DialogId::default(),
+            false,
             false,
         );
         assert!(m.is_outgoing, "scheduled messages are outgoing");
@@ -43362,6 +45058,7 @@ mod tests {
             DialogId::default(),
             false,
             DialogId::default(),
+            false,
             false,
         );
         assert!(m.is_channel_post);
@@ -43405,6 +45102,7 @@ mod tests {
             false,
             DialogId::default(),
             false,
+            false,
         );
         assert_eq!(m.sender_dialog_id, dialog_id);
         assert_eq!(m.author_signature, "anon");
@@ -43431,6 +45129,7 @@ mod tests {
             false,
             send_as_user,
             false,
+            false,
         );
         assert_eq!(m.sender_user_id, send_as_user.get_user_id());
         assert!(
@@ -43456,6 +45155,7 @@ mod tests {
             DialogId::default(),
             false,
             DialogId::default(),
+            false,
             false,
         );
         assert_eq!(m.sender_dialog_id, default_send_as);
@@ -43485,6 +45185,7 @@ mod tests {
             DialogId::default(),
             false,
             DialogId::default(),
+            false,
             false,
         );
         assert_eq!(
@@ -43518,6 +45219,7 @@ mod tests {
             false,
             DialogId::default(),
             false,
+            false,
         );
         assert!(m.disable_notification, "the explicit flag passes through");
 
@@ -43538,6 +45240,7 @@ mod tests {
             DialogId::default(),
             false,
             DialogId::default(),
+            false,
             false,
         );
         assert!(
@@ -43566,6 +45269,7 @@ mod tests {
             false,
             DialogId::default(),
             false,
+            false,
         );
         assert!(
             !m.disable_notification,
@@ -43593,6 +45297,7 @@ mod tests {
             false,
             DialogId::default(),
             false,
+            false,
         );
         assert_eq!(m.ttl, MessageSelfDestructType::with_ttl(60, false));
 
@@ -43619,6 +45324,7 @@ mod tests {
             DialogId::default(),
             false,
             DialogId::default(),
+            false,
             false,
         );
         assert_eq!(
@@ -43653,6 +45359,7 @@ mod tests {
             false,
             DialogId::default(),
             false,
+            false,
         );
         assert!(
             m.reply_info.is_comment,
@@ -43682,6 +45389,7 @@ mod tests {
             DialogId::default(),
             false,
             DialogId::default(),
+            false,
             false,
         );
         assert!(!m.reply_info.is_comment);
@@ -43713,6 +45421,7 @@ mod tests {
             false,
             DialogId::default(),
             false,
+            false,
         );
         assert_eq!(
             m.reply_to_random_id, 4242,
@@ -43724,6 +45433,171 @@ mod tests {
             "the replied message's thread is inherited"
         );
         assert!(m.is_topic_message);
+    }
+
+    /// 9227dec40: local ephemeral messages are always sent by the user
+    /// itself — no channel-post signature, no view count, no boost count.
+    #[test]
+    fn m10_8_ephemeral_local_message_shape() {
+        let dialog_id = DialogId::from_channel_id(ChannelId::new(100));
+        let mut ctx = SendTestContext::default();
+        ctx.broadcast_dialogs.insert(dialog_id);
+        ctx.sign_messages = true;
+        ctx.channel_boost_count = 5;
+        let my_id = ctx.content_context().get_my_id();
+
+        let mut d = Box::new(Dialog::default());
+        d.dialog_id = dialog_id;
+
+        // a plain channel post in a signing channel: the author signature
+        // is set and the view count starts at 1
+        let m = create_message_to_send(
+            &ctx,
+            &mut d,
+            &MessageTopic::default(),
+            MessageInputReplyTo::default(),
+            &m10_8_send_options(),
+            m10_8_text_content("post"),
+            false,
+            false,
+            None,
+            DialogId::default(),
+            false,
+            DialogId::default(),
+            false,
+            false,
+        );
+        assert!(!m.author_signature.is_empty());
+        assert_eq!(m.view_count, 1);
+
+        // the ephemeral twin: sent by the user itself, unsigned, no views
+        let m = create_message_to_send(
+            &ctx,
+            &mut d,
+            &MessageTopic::default(),
+            MessageInputReplyTo::default(),
+            &m10_8_send_options(),
+            m10_8_text_content("ephemeral"),
+            false,
+            false,
+            None,
+            DialogId::default(),
+            false,
+            DialogId::default(),
+            false,
+            true,
+        );
+        assert_eq!(m.sender_user_id, my_id);
+        assert_eq!(m.sender_dialog_id, DialogId::default());
+        assert!(m.author_signature.is_empty());
+        assert_eq!(m.view_count, 0);
+
+        // a non-broadcast channel: the boost count is skipped for
+        // ephemeral messages
+        let dialog_id = DialogId::from_channel_id(ChannelId::new(101));
+        let mut d = Box::new(Dialog::default());
+        d.dialog_id = dialog_id;
+        let m = create_message_to_send(
+            &ctx,
+            &mut d,
+            &MessageTopic::default(),
+            MessageInputReplyTo::default(),
+            &m10_8_send_options(),
+            m10_8_text_content("ephemeral"),
+            false,
+            false,
+            None,
+            DialogId::default(),
+            false,
+            DialogId::default(),
+            false,
+            true,
+        );
+        assert_eq!(m.sender_boost_count, 0, "ephemeral sends take no boost");
+        let m = create_message_to_send(
+            &ctx,
+            &mut d,
+            &MessageTopic::default(),
+            MessageInputReplyTo::default(),
+            &m10_8_send_options(),
+            m10_8_text_content("plain"),
+            false,
+            false,
+            None,
+            DialogId::default(),
+            false,
+            DialogId::default(),
+            false,
+            false,
+        );
+        assert_eq!(m.sender_boost_count, 5);
+    }
+
+    /// c64674d70: only ephemeral replies carry the replied message's
+    /// ephemeral id; a normal reply to a message with an ephemeral twin
+    /// drops it.
+    #[test]
+    fn m10_8_ephemeral_reply_carries_the_id_only_for_ephemeral_replies() {
+        let dialog_id = DialogId::from_user_id(UserId::new(2));
+        let mut manager = MessagesManager::default();
+        let mut ctx = SendTestContext::default();
+        ctx.inner.is_bot = false;
+
+        let target_id = MessageId::from_server_message_id(ServerMessageId::new(100));
+        let mut target = Box::new(Message::default());
+        target.message_id = target_id;
+        target.sender_user_id = dialog_id.get_user_id();
+        target.ephemeral_message_id = EphemeralMessageId::new(9);
+        target.content = Some(m10_8_text_content("target"));
+        {
+            let d = manager.add_dialog_for_new_message(dialog_id);
+            d.last_new_message_id = target_id;
+            d.messages.insert(target_id, target);
+        }
+
+        let reply_to = || {
+            td_api::InputMessageReplyTo::inputMessageReplyToMessage(
+                td_api::inputMessageReplyToMessage {
+                    message_id: target_id.get(),
+                    quote: None,
+                    checklist_task_id: 0,
+                    poll_option_id: String::new(),
+                },
+            )
+        };
+
+        // a normal reply drops the ephemeral id
+        let input_reply_to = create_message_input_reply_to(
+            &mut ctx,
+            &manager,
+            dialog_id,
+            &MessageTopic::default(),
+            Some(reply_to()),
+            false,
+        );
+        assert_eq!(input_reply_to.message_id, target_id);
+        assert!(
+            !input_reply_to.ephemeral_message_id.is_valid(),
+            "a normal reply carries no ephemeral id"
+        );
+
+        // an ephemeral reply resolves it through the getter
+        let d = manager.get_dialog(dialog_id).unwrap();
+        let input_reply_to = create_message_input_reply_to_full(
+            &mut ctx,
+            &manager,
+            d,
+            &MessageTopic::default(),
+            Some(reply_to()),
+            false,
+            true,
+        );
+        assert_eq!(input_reply_to.message_id, target_id);
+        assert_eq!(
+            input_reply_to.ephemeral_message_id,
+            EphemeralMessageId::new(9),
+            "the ephemeral reply answers to the ephemeral message"
+        );
     }
 
     /// The reply-plumbing table (MessagesManager.cpp:21149-21314 + 21133): the
@@ -44112,7 +45986,7 @@ mod tests {
             .yet_unsent_message_full_id_to_persistent_message_id
             .insert(
                 MessageFullId::new(dialog_id, m10_8_yet_unsent(3)),
-                target_id,
+                (target_id, f64::MAX),
             );
         let d = manager.get_dialog(dialog_id).unwrap();
         assert_eq!(
@@ -44238,6 +46112,7 @@ mod tests {
                     DialogId::default(),
                     false,
                     DialogId::default(),
+                    false,
                     false,
                 );
                 // begin_send_message reads the message through the manager;
@@ -46548,6 +48423,31 @@ mod tests {
             // The ephemeral split runs through the properties ladder; the
             // ephemeral helper pins the actual-content form.
             assert!(!is_ephemeral_message(&m));
+        }
+
+        #[test]
+        fn bot_ephemeral_message_channel_table() {
+            // 171762277: the dedicated-channel table per DC kind — only a
+            // bot in exactly the hard-coded channels matches.
+            let prod = DialogId::from_channel_id(crate::chat_manager::ChannelId::new(3937063115));
+            let prod2 = DialogId::from_channel_id(crate::chat_manager::ChannelId::new(4412713723));
+            let test = DialogId::from_channel_id(crate::chat_manager::ChannelId::new(8000042883));
+            let test2 = DialogId::from_channel_id(crate::chat_manager::ChannelId::new(8001701879));
+            let other = DialogId::from_channel_id(crate::chat_manager::ChannelId::new(1234));
+            assert!(is_bot_ephemeral_message_channel(true, false, prod));
+            assert!(is_bot_ephemeral_message_channel(true, false, prod2));
+            assert!(is_bot_ephemeral_message_channel(true, true, test));
+            assert!(is_bot_ephemeral_message_channel(true, true, test2));
+            assert!(!is_bot_ephemeral_message_channel(true, false, test));
+            assert!(!is_bot_ephemeral_message_channel(true, true, prod));
+            assert!(!is_bot_ephemeral_message_channel(true, false, other));
+            // not a bot / not a channel
+            assert!(!is_bot_ephemeral_message_channel(false, false, prod));
+            assert!(!is_bot_ephemeral_message_channel(
+                true,
+                false,
+                DialogId::from_user_id(crate::user_manager::UserId::new(42))
+            ));
         }
     }
 

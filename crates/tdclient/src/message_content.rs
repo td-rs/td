@@ -1980,44 +1980,9 @@ impl ToDoCompletion {
     }
 }
 
-/// `td::CommunityId` (CommunityId.h) — the id of a (newer-tree) community;
-/// `0` is the unset default and the only invalid value.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct CommunityId(i64);
-
-impl CommunityId {
-    pub fn new(id: i64) -> CommunityId {
-        CommunityId(id)
-    }
-
-    /// `CommunityId::is_valid` (CommunityId.h).
-    pub fn is_valid(self) -> bool {
-        self.0 > 0
-    }
-
-    pub fn get(self) -> i64 {
-        self.0
-    }
-
-    /// `CommunityId::get_fake_dialog_id` (CommunityId.h) — the community
-    /// reuses the channel dialog-id band.
-    pub fn get_fake_dialog_id(self) -> DialogId {
-        DialogId::from_channel_id(ChannelId::new(self.0))
-    }
-
-    /// `CommunityId::store` — raw `store_long`.
-    pub fn store(self, out: &mut Vec<u8>) {
-        store_i64(out, self.0);
-    }
-
-    /// `CommunityId::parse` — raw `fetch_long`.
-    pub fn parse_value(input: &[u8]) -> Result<CommunityId, &'static str> {
-        let mut parser = Parser::new(input);
-        let id = parser.i64_()?;
-        parser.fetch_end()?;
-        Ok(CommunityId(id))
-    }
-}
+/// `td::CommunityId` (CommunityId.h) — the local twin unified on the
+/// canonical module by the community notification-settings slice (#113).
+pub use crate::community_id::CommunityId;
 
 /// `td::SharedDialog` (SharedDialog.h:21-60) — a dialog shared through a
 /// `messageActionRequestedDialog`; `first_name`/`last_name`/`username`/
@@ -12158,6 +12123,24 @@ pub fn create_input_message_content(
     let is_bot = td.is_bot();
     let is_secret = dialog_id.get_type() == DialogType::SecretChat;
     match input_message_content {
+        // 1.8.70 widgets (MessageContent.cpp:5475-5519) — the bot gate
+        // and the shared-widget id gate port now; the MessageWidget
+        // content kind rides the widgets family follow-up.
+        td_api::InputMessageContent::inputMessageWidget(_) => {
+            if !is_bot {
+                return Err(Status::error(400, "Only bots can send widget messages"));
+            }
+            return Err(Status::error(500, "Widgets are not supported yet"));
+        }
+        td_api::InputMessageContent::inputMessageSharedWidget(input_widget) => {
+            if !is_bot {
+                return Err(Status::error(400, "Only bots can send widget messages"));
+            }
+            if input_widget.widget_id == 0 {
+                return Err(Status::error(400, "Invalid widget identifier specified"));
+            }
+            return Err(Status::error(500, "Widgets are not supported yet"));
+        }
         td_api::InputMessageContent::inputMessageText(_) => {
             let input_message_text =
                 process_input_message_text(td, dialog_id, input_message_content, is_bot, false)?;
@@ -12670,10 +12653,11 @@ pub fn create_input_message_content(
             });
         }
         // The MessagesManager forward path expands inputMessageForwarded
-        // before this switch (MessagesManager.cpp:21746-21747); the C++
-        // default arm is UNREACHABLE().
+        // before this switch (MessagesManager.cpp:21746-21747); the arm
+        // itself rejects - c68cb22f4: must be processed by the caller if
+        // supported.
         td_api::InputMessageContent::inputMessageForwarded(_) => {
-            unreachable!("the C++ default arm is UNREACHABLE()");
+            return Err(Status::error(400, "Unsupported input message content type"));
         }
     }
 
@@ -18620,6 +18604,13 @@ pub fn get_action_message_content(
                 from_user_id,
             })
         }
+        // 1.8.70 (MessageContent.cpp:11858-11859) — the C++ answers the
+        // new MessageUnpaidMessagesAllowedByLink content; its content
+        // kind rides the unpaid-messages family follow-up, so the interim
+        // arm answers the C++ `break` tail (the empty-text fallback).
+        telegram_api::MessageAction::messageActionNoPaidMessagesTokenUsed(_) => {
+            fallback_action_message_content()
+        }
         telegram_api::MessageAction::messageActionGroupCallScheduled(action) => {
             if action.schedule_date <= 0 {
                 tdutils::log_error!("Receive wrong schedule_date = {}", action.schedule_date);
@@ -20853,8 +20844,9 @@ mod tests {
 
         let mut bytes = Vec::new();
         CommunityId::new(123456789).store(&mut bytes);
+        let mut parser = crate::store_parse::Parser::new(&bytes);
         assert_eq!(
-            CommunityId::parse_value(&bytes).unwrap(),
+            CommunityId::parse_from(&mut parser).unwrap(),
             CommunityId::new(123456789)
         );
     }

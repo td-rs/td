@@ -145,10 +145,11 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                 value: request.x * request.x,
             }),
         ),
-        Function::testCallString(request) => td.send_result(
-            id,
-            Object::testString(td_api::TestString { value: request.x }),
-        ),
+        Function::testCallString(request) => {
+            // ad5b7f7c7 — CLEAN_INPUT_STRING(x)
+            let value = crate::misc::clean_input_string(&request.x).unwrap_or_default();
+            td.send_result(id, Object::testString(td_api::TestString { value }))
+        }
         Function::testCallBytes(request) => td.send_result(
             id,
             Object::testBytes(td_api::TestBytes { value: request.x }),
@@ -1009,6 +1010,16 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             // waiting for the (net-blocked) ResetNotifySettingsQuery
             if !check_is_user(td, id) {
                 return;
+            }
+            {
+                // 8d2a35e05: the community settings reset first (the C++
+                // order inside
+                // NotificationSettingsManager::reset_all_notification_settings;
+                // the field-split NotificationEnv can't reach the
+                // community manager, so the Td-level arm drives it).
+                let (mut manager, mut env) = community_split(td);
+                manager.reset_all_community_notification_settings(&mut env);
+                td.community_manager = manager;
             }
             {
                 let mut env = NotificationEnv {
@@ -3613,16 +3624,18 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             );
         }
         Function::deletePollOption(request) => {
-            // Requests.cpp:8095-8100
+            // Requests.cpp:8095-8100 — ad5b7f7c7 adds
+            // CLEAN_INPUT_STRING(option_id)
             if !check_is_user(td, id) {
                 return;
             }
+            let option_id = crate::misc::clean_input_string(&request.option_id).unwrap_or_default();
             let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
             let (mut env, poll_manager) = crate::td::poll_env_split(td);
             poll_manager.delete_poll_option(
                 &mut env,
                 message_full_id(request.chat_id, request.message_id),
-                request.option_id,
+                option_id,
                 promise,
             );
         }
@@ -5245,6 +5258,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 ChannelId::new(request.supergroup_id),
                 request.is_forum,
                 request.has_forum_tabs,
+                request.has_forum_sidebar,
                 promise,
             );
         }
@@ -6717,7 +6731,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             );
             td.suggested_action_manager = manager;
         }
-        Function::getUserLink(_) => {
+        Function::getUserLink(request) => {
             if !check_is_user(td, id) {
                 return;
             }
@@ -6735,7 +6749,13 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 updates: &mut td.account_updates,
                 net,
             };
-            td.account_manager.get_user_link(&mut env, promise);
+            td.account_manager.get_user_link(
+                &mut env,
+                request.remove_messages_fee,
+                request.return_permanent_link,
+                request.revoke_previous_links,
+                promise,
+            );
         }
         Function::getActiveSessions(_) => {
             if !check_is_user(td, id) {
@@ -7060,6 +7080,24 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 &mut env,
                 CommunityId::new(request.community_id),
                 request.permissions.as_ref(),
+                promise,
+            );
+            td.community_manager = manager;
+        }
+        Function::setCommunityNotificationSettings(request) => {
+            // Requests.cpp:3483-3488 (99302f0e2) — CHECK_IS_USER, then
+            // CommunityManager::set_community_notification_settings (the
+            // account_updateNotifySettings send + the promise settle ride
+            // the net answer drain).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut manager, mut env) = community_split(td);
+            manager.set_community_notification_settings(
+                &mut env,
+                CommunityId::new(request.community_id),
+                request.notification_settings.as_ref(),
                 promise,
             );
             td.community_manager = manager;
@@ -8522,6 +8560,7 @@ macro_rules! star_gift_env {
             user_manager: &mut $td.user_manager,
             chat_manager: &mut $td.chat_manager,
             my_dialog_id,
+            temp_password: $td.password_manager.get_temp_password(),
             updates: &mut $td.notification_updates,
         }
     }};
@@ -9051,9 +9090,8 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
 
         // getUpgradedGift (Requests.cpp:8644-8649)
         Function::getUpgradedGift(request) => {
-            if !check_is_user(td, id) {
-                return;
-            }
+            // f8595a08f — the CHECK_IS_USER gate leaves (bots may read
+            // an upgraded gift)
             let Some(name) = clean_or_utf8_error(td, id, &request.name) else {
                 return;
             };
@@ -9080,21 +9118,19 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
                 .get_upgraded_gift_value_info(&mut env, &name, promise);
         }
 
-        // getUpgradedGiftWithdrawalUrl (Requests.cpp:8658-8662)
+        // getUpgradedGiftWithdrawalUrl (Requests.cpp:8658-8662) — the
+        // request password is gone; the saved temporary password gates
+        // the wire query (StarGiftManager.cpp:3307-3316).
         Function::getUpgradedGiftWithdrawalUrl(request) => {
             if !check_is_user(td, id) {
                 return;
             }
-            let Some(password) = clean_or_utf8_error(td, id, &request.password) else {
-                return;
-            };
             let promise = td
                 .deferred_promise::<String, _>(id, |url| Object::httpUrl(td_api::HttpUrl { url }));
             let mut env = star_gift_env!(td);
             td.star_gift_manager.get_star_gift_withdrawal_url(
                 &mut env,
                 StarGiftId::from_string(&request.received_gift_id),
-                &password,
                 promise,
             );
         }
@@ -14448,11 +14484,13 @@ fn run_password_and_auth_requests(td: &mut Td, id: u64, function: Function) {
             }
         }
         Function::setAuthenticationPremiumPurchaseTransaction(request) => {
+            // ad5b7f7c7 — CLEAN_INPUT_STRING(currency)
+            let currency = crate::misc::clean_input_string(&request.currency).unwrap_or_default();
             match td.auth_manager.set_premium_purchase_transaction(
                 request.transaction.as_ref(),
                 request.is_restore,
                 request.premium_day_count,
-                &request.currency,
+                &currency,
                 request.amount,
             ) {
                 Ok(()) => {
@@ -18320,20 +18358,25 @@ fn run_misc_glue_requests(td: &mut Td, id: u64, function: Function) {
             td.ton_wallet_manager = manager;
         }
         Function::getTonWalletSecretPhrase(request) => {
-            // Requests.cpp:8002-8008 — CREATE_TEXT_REQUEST_PROMISE.
+            // Requests.cpp:8002-8008 — CREATE_REQUEST_PROMISE over the
+            // tonWalletSecretPhrase object (662c027f2; the 1.8.68 arm
+            // answered td_api::text).
             if !check_is_user(td, id) {
                 return;
             }
             let Some(password) = crate::misc::clean_input_string(&request.password) else {
                 return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
             };
-            // CREATE_TEXT_REQUEST_PROMISE — the string answer maps to the
-            // td_api::text object.
-            let mut outbox = td.deferred_promise::<td_api::Text, _>(id, Object::text);
+            let mut outbox = td.deferred_promise::<td_api::TonWalletSecretPhrase, _>(
+                id,
+                Object::tonWalletSecretPhrase,
+            );
             let promise = tdutils::promise::PromiseCreator::lambda_result(
                 move |result: tdutils::status::Result<String>| match result {
                     tdutils::status::Result::Ok(phrase) => {
-                        outbox.set_value(td_api::Text { text: phrase })
+                        outbox.set_value(td_api::TonWalletSecretPhrase {
+                            secret_phrase: phrase,
+                        })
                     }
                     tdutils::status::Result::Err(status) => outbox.set_error(status),
                 },
@@ -19899,15 +19942,20 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 26, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            1039,
+            1040,
             "dispatched count"
         );
-        // the c15d3f5a sync: the TonWalletManager plane landed over the
-        // tde2e keychain subset — the TON wallet / TonConnect / On-ramp
-        // surface (38 arms incl. getTonWalletNfts and dismissWebToken)
-        // went dispatched with the community write family before it; the
-        // census closes: 1001 + 38 = 1039 dispatched / 0 interim, sync
-        // unmoved 26.
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 0, "interim count");
+        // the 23383aef sync base (1.8.70): the 34 new scheme functions
+        // (widgets ×9, communities ×8, TON wallet cards, speech
+        // recognition, profile share themes, text fixes, web-proxy
+        // carrier …) enter as interim arms — the catch-all
+        // NOT_IMPLEMENTED_YET placeholder — pending their family
+        // follow-ups; the 7 changed functions keep their dispatched
+        // arms with updated signatures. Census: 1,099 functions,
+        // dispatched unmoved 1,039 / 0 + 34 = 34 interim, sync 26.
+        // The community notification-settings slice (#113) flipped
+        // setCommunityNotificationSettings: 1,039 + 1 = 1,040
+        // dispatched / 34 - 1 = 33 interim, sync unmoved 26.
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 33, "interim count");
     }
 }

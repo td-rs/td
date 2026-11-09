@@ -223,6 +223,17 @@ impl QuickReplyManager {
     /// `reload_quick_reply_messages(shortcut_id)` (cpp:234), which
     /// rides the messages plane — it parks as a logged note until that
     /// plane lands.
+    /// Pop the promise parked for the kind's flow (the 6aa26a95f
+    /// delete-messages re-entry — the promise rides `on_get_updates`
+    /// instead of the plain ok/error answer).
+    pub(crate) fn take_net_promise(&mut self, kind: QuickReplyNetKind) -> Option<Promise<()>> {
+        let index = self
+            .net_promises
+            .iter()
+            .position(|(pending, _)| pending.same_flow(kind))?;
+        Some(self.net_promises.remove(index).1)
+    }
+
     pub(crate) fn on_net_answer(&mut self, kind: QuickReplyNetKind, result: Result<(), Status>) {
         let Some(index) = self
             .net_promises

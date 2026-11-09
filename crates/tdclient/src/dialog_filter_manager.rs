@@ -329,6 +329,28 @@ impl DialogFilter {
         self.excluded_dialog_ids.contains(&dialog_id)
     }
 
+    /// `DialogFilter::remove_dialog_id` (DialogFilter.cpp, ea2241d48's
+    /// caller) — the dialog leaves all three lists.
+    pub fn remove_dialog_id(&mut self, dialog_id: DialogId) {
+        self.pinned_dialog_ids.retain(|&id| id != dialog_id);
+        self.included_dialog_ids.retain(|&id| id != dialog_id);
+        self.excluded_dialog_ids.retain(|&id| id != dialog_id);
+    }
+
+    /// `DialogFilter::is_empty(false)` (DialogFilter.cpp:443-457) — no
+    /// include rule and no chosen dialogs.
+    pub fn is_empty_local(&self) -> bool {
+        if self.include_contacts
+            || self.include_non_contacts
+            || self.include_bots
+            || self.include_groups
+            || self.include_channels
+        {
+            return false;
+        }
+        self.pinned_dialog_ids.is_empty() && self.included_dialog_ids.is_empty()
+    }
+
     pub fn update_from(&mut self, old: &DialogFilter) {
         self.has_my_invites = old.has_my_invites;
     }
@@ -1031,6 +1053,78 @@ impl DialogFilterManager {
         env.send_add_dialog_filter_new_chats(dialog_filter_id, dialog_ids);
         promise.set_value(());
     }
+
+    /// `DialogFilterManager::delete_dialogs_from_filter`
+    /// (DialogFilterManager.cpp:1723-1746) — the ea2241d48 reduced port:
+    /// the filter clone drops the dialogs, an emptied filter deletes,
+    /// a changed one re-lands in place with the server-update seam (the
+    /// C++ do_edit_dialog_filter's save/synchronize halves ride the
+    /// db/sync planes that stay seams in the walking skeleton).
+    fn delete_dialogs_from_filter(
+        &mut self,
+        env: &mut dyn DialogFilterManagerEnv,
+        dialog_filter_id: DialogFilterId,
+        dialog_ids: &[DialogId],
+    ) {
+        if dialog_ids.is_empty() {
+            return;
+        }
+        let Some(dialog_filter) = self.get_dialog_filter(dialog_filter_id) else {
+            return;
+        };
+        let mut new_dialog_filter = dialog_filter.clone();
+        for &dialog_id in dialog_ids {
+            new_dialog_filter.remove_dialog_id(dialog_id);
+        }
+        if new_dialog_filter.is_empty_local() {
+            self.delete_dialog_filter(env, dialog_filter_id, Vec::new(), Promise::default());
+            return;
+        }
+        if new_dialog_filter != *dialog_filter {
+            if let Some(slot) = self.get_dialog_filter_mut(dialog_filter_id) {
+                *slot = new_dialog_filter;
+            }
+            env.send_update_dialog_filter_on_server(dialog_filter_id);
+        }
+    }
+
+    /// `DialogFilterManager::remove_community_from_dialog_filters`
+    /// (DialogFilterManager.cpp, ea2241d48) — the community must have
+    /// been removed on the server too: the server filters drop the fake
+    /// dialog id, the local filters lose it through
+    /// delete_dialogs_from_filter.
+    pub fn remove_community_from_dialog_filters(
+        &mut self,
+        env: &mut dyn DialogFilterManagerEnv,
+        community_id: crate::community_id::CommunityId,
+    ) {
+        if env.is_bot() || !self.is_update_chat_folders_sent {
+            return;
+        }
+        let dialog_id = community_id.get_fake_dialog_id();
+        let mut is_server_changed = false;
+        for dialog_filter in &mut self.server_dialog_filters {
+            if dialog_filter.is_dialog_included(dialog_id) {
+                dialog_filter.remove_dialog_id(dialog_id);
+                is_server_changed = true;
+            }
+        }
+        let dialog_filter_ids: Vec<DialogFilterId> = self
+            .dialog_filters
+            .iter()
+            .filter(|dialog_filter| dialog_filter.is_dialog_included(dialog_id))
+            .map(|dialog_filter| dialog_filter.dialog_filter_id)
+            .collect();
+        for dialog_filter_id in &dialog_filter_ids {
+            self.delete_dialogs_from_filter(env, *dialog_filter_id, &[dialog_id]);
+        }
+        if is_server_changed && dialog_filter_ids.is_empty() {
+            // save_dialog_filters + need_synchronize_dialog_filters/
+            // synchronize_dialog_filters — the db/sync planes stay seams
+            // (the walking-skeleton dialog-filter port records them)
+            tdutils::log_info!("Save dialog filters after community removal — [db/sync seam]");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1195,6 +1289,47 @@ mod tests {
         }
     }
 
+    /// ea2241d48 — expanding a community's chats removes the community
+    /// fake dialog from the server filters and the local filters (an
+    /// emptied local filter deletes; a kept one re-lands without the
+    /// community).
+    #[test]
+    fn remove_community_from_dialog_filters_drops_the_fake_dialog() {
+        let mut manager = DialogFilterManager::new();
+        let community_id = crate::community_id::CommunityId::new(7);
+        let fake = community_id.get_fake_dialog_id();
+        let keep = DialogId::new(42);
+
+        let mut folder = sample_chat_folder("Comm");
+        folder.included_chat_ids = vec![fake.get(), keep.get()];
+        let local = DialogFilter::create(DialogFilterId::new(2), folder, 100).unwrap();
+
+        let mut folder = sample_chat_folder("Empty");
+        folder.included_chat_ids = vec![fake.get()];
+        let emptied = DialogFilter::create(DialogFilterId::new(3), folder, 100).unwrap();
+
+        let mut folder = sample_chat_folder("Srv");
+        folder.included_chat_ids = vec![fake.get(), keep.get()];
+        let server = DialogFilter::create(DialogFilterId::new(2), folder, 100).unwrap();
+
+        manager.dialog_filters = vec![local, emptied];
+        manager.server_dialog_filters = vec![server];
+
+        let mut env = MockEnv::new();
+        manager.remove_community_from_dialog_filters(&mut env, community_id);
+
+        // the server filter dropped the fake dialog (kept the other)
+        assert_eq!(manager.server_dialog_filters.len(), 1);
+        assert!(!manager.server_dialog_filters[0].is_dialog_included(fake));
+        assert!(manager.server_dialog_filters[0].is_dialog_included(keep));
+
+        // the kept local filter lost the community; the emptied one is
+        // gone (delete_dialogs_from_filter's is_empty band)
+        assert_eq!(manager.dialog_filters.len(), 1);
+        assert_eq!(manager.dialog_filters[0].dialog_filter_id.get(), 2);
+        assert!(!manager.dialog_filters[0].is_dialog_included(fake));
+        assert!(manager.dialog_filters[0].is_dialog_included(keep));
+    }
     #[test]
     fn test_dialog_filter_id_properties() {
         assert_eq!(DialogFilterId::min().get(), 2);

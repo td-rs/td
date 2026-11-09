@@ -2,6 +2,7 @@ on_update_read_channel_outbox	live	`channel_reads_outbox` -> `apply_read_channel
 on_update_dialog_is_marked_as_unread	live	`set_dialog_is_marked_as_unread` via the TdSink `on_update_dialog_is_marked_as_unread` override (UpdatesManager.cpp:4096-4106)
 on_update_dialog_draft_message	seam	the update wrapper is the full draft machine (get_dialog_force + reply-id resolution + the repair query, MessagesManager.cpp:28430) over the ported update_dialog_draft_message core; lands with the M.10.14 tail + net
 on_update_read_channel_inbox	seam	needs the on_read_channel_inbox pts/pending machine + repair_channel_server_unread_count (MessagesManager.cpp:3688); the outbox twin is live
+on_update_dialog_community_notification_settings	seam	the #113 state machine reaches the fan-out boundary (do_update_community_notification_settings fires the on_community_dialogs_notification_settings_changed env seam over the CommunityManager.cpp:1723-1726 loop); needs the messages notification plane — on_dialog_default_notification_settings_changed (MessagesManager.cpp:6178) is unported
 on_update_channel_too_long	drop	[blocked: net] the get-difference repair pump rides the M.7.12-15 net step (schedule_get_difference)
 on_update_channel_max_unavailable_message_id	drop	[blocked: net] the channel-pts repair plane queues on the net step
 on_updated_dialog_folder_id	drop	[blocked: M.10.12 tail] the dialog folder-id flag plane (set_dialog_folder_id) is unported
@@ -25,6 +26,7 @@ on_update_dialog_is_forum	drop	[blocked: M.40 Forums] set_dialog_is_forum unport
 on_update_dialog_is_pinned	drop	[blocked: M.10.12 tail] the dialog order/pinned flag plane is unported
 on_update_dialog_is_translatable	drop	[blocked: M.10.12 tail] set_dialog_is_translatable unported
 on_update_dialog_last_pinned_message_id	drop	[blocked: M.10.14 pinned tail] set_dialog_last_pinned_message_id unported
+on_update_dialog_linked_community_id	drop	[blocked: M.13 tail] the messages notification-behavior plane is unported — the whole body is on_dialog_default_notification_settings_changed (MessagesManager.cpp:6178), which has no target; the #113 resolvers (get_dialog_linked_community_id, get_dialog_community_notification_settings) landed
 on_update_dialog_message_ttl	drop	[blocked: M.10.7 tail] the dialog ttl flag plane is unported
 on_update_dialog_notify_settings	drop	[blocked: M.13 tail] the per-dialog notification-settings intake lands with the M.13 difference hooks
 on_update_dialog_pending_join_requests	drop	[blocked: M.5/ChatManager tail] the pending join-requests counter plane is unported
@@ -39,6 +41,7 @@ on_update_message_forward_count	drop	[blocked: M.18 tail] the forward-count inte
 on_update_message_interaction_info	drop	[blocked: M.18 tail] the interaction-info plane is unported
 on_update_message_reactions	drop	[blocked: M.16 tail] the reactions intake (on_get_message_reactions) is unported; the M.16 value plane landed
 on_update_message_view_count	drop	[blocked: M.18 tail] the view-count plane is unported
+on_update_message_widget_data	drop	[blocked: Widgets] the widget-content apply walk (update_message_content_widget_data + the messageWidget content type) is unported and the process_pts_update sink collects nothing; the updateMessageWidgetData pts plane landed (ed8c44e17)
 on_update_notification_scope_is_muted	drop	[blocked: M.13 tail] the scope-mute flag plane is unported
 on_update_pinned_dialogs	drop	[blocked: M.10.12 tail] the pinned-dialogs order machine is unported
 on_update_poll_has_unread_votes	drop	[blocked: M.19 tail] the poll unread-votes plane is unported

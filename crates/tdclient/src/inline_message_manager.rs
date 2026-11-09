@@ -447,7 +447,8 @@ impl InlineMessageManager {
             }
         };
         if !piece.is_editable_media {
-            promise.set_error(Status::error(400, "Unsupported input message content type"));
+            // 2d108dde5 renamed the error
+            promise.set_error(Status::error(400, "Unallowed message content specified"));
             return;
         }
         if piece.has_ttl {

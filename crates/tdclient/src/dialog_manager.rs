@@ -64,6 +64,7 @@ use tdutils::status::{Result, Status};
 use tdutils::time;
 
 use crate::chat_manager::ChannelType;
+use crate::community_id::CommunityId;
 use crate::dialog_id::DialogId;
 use crate::misc::{clean_username, get_valid_short_usernames};
 use crate::td::Td;
@@ -658,6 +659,24 @@ pub fn get_dialog_notification_setting_scope(
     }
 }
 
+/// `DialogManager::get_dialog_linked_community_id`
+/// (DialogManager.cpp:1774-1786, the #113 slice) — the user/channel
+/// linked-community lookup behind the dialog-default notification
+/// helpers.
+pub fn get_dialog_linked_community_id(td: &Td, dialog_id: DialogId) -> CommunityId {
+    match dialog_id.get_type() {
+        crate::dialog_id::DialogType::User => td
+            .user_manager
+            .get_user_linked_community_id(dialog_id.get_user_id()),
+        crate::dialog_id::DialogType::Channel => td
+            .chat_manager
+            .get_channel_linked_community_id(dialog_id.get_channel_id()),
+        crate::dialog_id::DialogType::Chat
+        | crate::dialog_id::DialogType::SecretChat
+        | crate::dialog_id::DialogType::None => CommunityId::default(),
+    }
+}
+
 /// `DialogManager::is_anonymous_administrator` (DialogManager.cpp:1917-1940);
 /// the channel-state reads are stubbed to the unloaded results (stub
 /// inventory), so only the broadcast/admined-monoforum and bot branches can
@@ -1095,6 +1114,40 @@ pub struct ResolvedUsername {
 #[allow(dead_code)]
 const USERNAME_CACHE_EXPIRE_TIME: i64 = 86400;
 
+/// `DialogManager::SEARCH_PUBLIC_DIALOGS_CACHE_TIME` (DialogManager.h,
+/// d3811ddfa) — the found-dialogs caches drop entries not written to
+/// within the hour (the `ExpiringFlatHashMap` write-refresh/idle-expiry
+/// pair; reads never extend the life).
+const SEARCH_PUBLIC_DIALOGS_CACHE_TIME: f64 = 3600.0;
+
+/// `using FoundDialogs = ExpiringFlatHashMap<string, vector<DialogId>>`
+/// (DialogManager.h, d3811ddfa) — one found-dialogs cache entry: the ids
+/// and the moment the entry goes stale.
+pub struct FoundDialogs {
+    pub(crate) dialog_ids: Vec<DialogId>,
+    pub(crate) expires_at: f64,
+}
+
+impl FoundDialogs {
+    /// The fresh-entry shape (`operator[]`/insert with the access clock
+    /// bumped).
+    fn fresh(dialog_ids: Vec<DialogId>) -> FoundDialogs {
+        FoundDialogs {
+            dialog_ids,
+            expires_at: tdutils::time::now() + SEARCH_PUBLIC_DIALOGS_CACHE_TIME,
+        }
+    }
+
+    /// The `get()` read — `None` when missing or stale.
+    fn fresh_get<'a>(
+        map: &'a HashMap<String, FoundDialogs>,
+        query: &str,
+    ) -> Option<&'a Vec<DialogId>> {
+        let entry = map.get(query)?;
+        (entry.expires_at > tdutils::time::now()).then_some(&entry.dialog_ids)
+    }
+}
+
 /// `DialogManager::MIN_SEARCH_PUBLIC_DIALOG_PREFIX_LEN` (DialogManager.h:337)
 /// — the server-side prefix limit.
 const MIN_SEARCH_PUBLIC_DIALOG_PREFIX_LEN: usize = 4;
@@ -1160,6 +1213,12 @@ pub(crate) enum DialogNetKind {
     /// `ReportPeerQuery` (DialogManager.cpp:478) — the kind carries the
     /// dialog for the error tail.
     ReportPeer {
+        dialog_id: crate::dialog_id::DialogId,
+    },
+    /// `ReportEphemeralMessageQuery` (DialogManager.cpp:526-555, the
+    /// d4f71645a shape) — `ephemeral.reportMessage`; the kind carries
+    /// the dialog for the error tail (no MESSAGE_ID_REQUIRED band).
+    ReportEphemeralMessage {
         dialog_id: crate::dialog_id::DialogId,
     },
     /// `GetBlockedDialogsQuery` (DialogManager.cpp:728) — the kind
@@ -1257,8 +1316,8 @@ pub struct DialogManager {
     /// `found_public_dialogs_` / `found_on_server_dialogs_` (DialogManager.h)
     /// — the searchPublicChatsByUsername caches, indexed by the
     /// `DialogTypeFilter` number (the C++ `static_cast<int32>`).
-    pub(crate) found_public_dialogs: [HashMap<String, Vec<DialogId>>; 3],
-    pub(crate) found_on_server_dialogs: [HashMap<String, Vec<DialogId>>; 3],
+    pub(crate) found_public_dialogs: [HashMap<String, FoundDialogs>; 3],
+    pub(crate) found_on_server_dialogs: [HashMap<String, FoundDialogs>; 3],
     /// `reload_video_chat_on_search_usernames_` (DialogManager.h).
     pub(crate) reload_video_chat_on_search_usernames: std::collections::BTreeSet<String>,
     /// The net dispatch surface — the `td_` back-pointer the C++ manager
@@ -2034,6 +2093,49 @@ pub fn can_report_dialog(td: &mut Td, dialog_id: DialogId) -> bool {
     }
 }
 
+/// `DialogManager::get_report_chat_result_object` (DialogManager.cpp
+/// 2869-2896, the d4f71645a extraction) — the ReportResult wire answer
+/// as the ReportChatResult object (the empty choose-option band answers
+/// Ok like the C++).
+pub fn get_report_chat_result_object(
+    result: tdmtproto::telegram_api::ReportResult,
+) -> crate::td_api::Object {
+    match result {
+        tdmtproto::telegram_api::ReportResult::reportResultReported(_) => {
+            crate::td_api::Object::reportChatResultOk(crate::td_api::reportChatResultOk)
+        }
+        tdmtproto::telegram_api::ReportResult::reportResultChooseOption(options) => {
+            if options.options.is_empty() {
+                return crate::td_api::Object::reportChatResultOk(
+                    crate::td_api::reportChatResultOk,
+                );
+            }
+            let report_options = options
+                .options
+                .into_iter()
+                .map(|option| crate::td_api::ReportOption {
+                    id: option.option,
+                    text: option.text,
+                })
+                .collect();
+            crate::td_api::Object::reportChatResultOptionRequired(
+                crate::td_api::reportChatResultOptionRequired {
+                    title: options.title,
+                    options: report_options,
+                },
+            )
+        }
+        tdmtproto::telegram_api::ReportResult::reportResultAddComment(comment) => {
+            crate::td_api::Object::reportChatResultTextRequired(
+                crate::td_api::reportChatResultTextRequired {
+                    option_id: comment.option,
+                    is_optional: comment.optional,
+                },
+            )
+        }
+    }
+}
+
 /// `DialogManager::report_dialog` (DialogManager.cpp:2824-2851) —
 /// `can_report_message` is `Ok` (no messages exist); the
 /// `ReportPeerQuery` send rides the dialog net handle.
@@ -2049,6 +2151,50 @@ pub fn report_dialog(
     if access.is_error() {
         promise.set_error(access.move_as_error());
         return;
+    }
+
+    // d4f71645a: a reported ephemeral message reroutes to
+    // ephemeral.reportMessage (checked before the action-bar probe —
+    // the memory probe over the loaded message; the db load is the
+    // dialog-db receive seam)
+    for &message_id in message_ids {
+        let mm_message_id = crate::messages_manager::MessageId::new(message_id.get());
+        if !mm_message_id.is_valid() {
+            continue;
+        }
+        let ephemeral_message_id = crate::messages_manager::get_ephemeral_message_id_of_message_id(
+            &td.messages_manager,
+            dialog_id,
+            mm_message_id,
+        );
+        if ephemeral_message_id.is_valid() {
+            if message_ids.len() != 1 {
+                promise.set_error(Status::error(
+                    400,
+                    "Ephemeral messages must be reported separately",
+                ));
+                return;
+            }
+            // `ReportEphemeralMessageQuery::send`
+            // (DialogManager.cpp:535-543) — the Read input peer (CHECKed
+            // in the C++; the access gate above guarantees it)
+            let input_peer = get_input_peer(td, dialog_id, AccessRights::Read)
+                .expect("the access gate guaranteed the peer");
+            td.dialog_manager.pending_report_peer.push(promise);
+            td.dialog_manager.send_dialog_net_query(
+                DialogNetKind::ReportEphemeralMessage { dialog_id },
+                tdmtproto::telegram_api::Function::ephemeral_reportMessage(
+                    tdmtproto::telegram_api::ephemeral_reportMessage {
+                        peer: Some(Box::new(input_peer)),
+                        id: ephemeral_message_id.get(),
+                        option: option_id.to_vec(),
+                        message: text.to_owned(),
+                    },
+                ),
+                "ephemeral.reportMessage",
+            );
+            return;
+        }
     }
 
     // messages_manager_->report_dialog_from_action_bar — {false, false}
@@ -5512,7 +5658,9 @@ pub fn search_public_dialogs(
     }
 
     let type_num = type_filter as usize;
-    if let Some(found) = td.dialog_manager.found_public_dialogs[type_num].get(query) {
+    if let Some(found) =
+        FoundDialogs::fresh_get(&td.dialog_manager.found_public_dialogs[type_num], query)
+    {
         let found = found.clone();
         promise.set_value(());
         return found;
@@ -5546,7 +5694,9 @@ pub fn search_dialogs_on_server(
     }
 
     let type_num = type_filter as usize;
-    if let Some(found) = td.dialog_manager.found_on_server_dialogs[type_num].get(query) {
+    if let Some(found) =
+        FoundDialogs::fresh_get(&td.dialog_manager.found_on_server_dialogs[type_num], query)
+    {
         // messages_manager_->sort_dialogs_by_order — no order source in the
         // port, the truncation is the observable part (stub inventory).
         let found = found[..found.len().min(limit.max(0) as usize)].to_vec();
@@ -5964,10 +6114,14 @@ pub(crate) fn on_get_public_dialogs_search_result(
         }
     }
     let mut manager = std::mem::take(&mut td.dialog_manager);
-    manager.found_public_dialogs[type_num]
-        .insert(query.to_owned(), get_peers_dialog_ids(td, &peers, false));
-    manager.found_on_server_dialogs[type_num]
-        .insert(query.to_owned(), get_peers_dialog_ids(td, &my_peers, false));
+    manager.found_public_dialogs[type_num].insert(
+        query.to_owned(),
+        FoundDialogs::fresh(get_peers_dialog_ids(td, &peers, false)),
+    );
+    manager.found_on_server_dialogs[type_num].insert(
+        query.to_owned(),
+        FoundDialogs::fresh(get_peers_dialog_ids(td, &my_peers, false)),
+    );
     td.dialog_manager = manager;
     drain_search_dialogs_requests(td);
     drain_search_public_chat_requests(td);
@@ -6003,10 +6157,10 @@ pub(crate) fn on_failed_public_dialogs_search(
     // local no-hit success
     manager.found_public_dialogs[type_num]
         .entry(query.to_owned())
-        .or_default();
+        .or_insert_with(|| FoundDialogs::fresh(Vec::new()));
     manager.found_on_server_dialogs[type_num]
         .entry(query.to_owned())
-        .or_default();
+        .or_insert_with(|| FoundDialogs::fresh(Vec::new()));
     td.dialog_manager = manager;
     drain_search_dialogs_requests(td);
     drain_search_public_chat_requests(td);
@@ -6850,6 +7004,91 @@ mod tests {
         }
     }
 
+    /// d4f71645a: a reported ephemeral message reroutes reportChat to
+    /// `ephemeral.reportMessage` — one id at a time only.
+    #[test]
+    fn report_dialog_reroutes_ephemeral_messages() {
+        use crate::messages_manager::{EphemeralMessageId, MessageId as MmMessageId};
+
+        let mut td = test_td();
+        let _dir = init_td_db_for_test(&mut td, "report_ephemeral_reroute");
+        let user_id = crate::user_manager::UserId::new(3001);
+        let dialog_id = DialogId::from_user_id(user_id);
+        // seed the user with an access hash so the Read gate passes
+        let options = td.option_manager.as_mut().expect("user environment");
+        let mut env = UserEnv {
+            global: &mut td.global,
+            options,
+            auth_is_bot: td.auth_manager.is_bot(),
+        };
+        td.user_manager.on_get_user(
+            &mut env,
+            tdmtproto::telegram_api::User::user(tdmtproto::telegram_api::user {
+                id: user_id.get(),
+                flags: 1, // USER_ACCESS_HASH_MASK
+                access_hash: 123,
+                first_name: "Rep".to_string(),
+                ..Default::default()
+            }),
+            "test",
+        );
+        // a message with an ephemeral twin in the messages manager
+        let message_id =
+            MmMessageId::from_server_message_id(crate::dialog_id::ServerMessageId::new(5));
+        {
+            let d = td.messages_manager.add_dialog_for_new_message(dialog_id);
+            let mut m = Box::new(crate::messages_manager::Message::default());
+            m.message_id = message_id;
+            m.ephemeral_message_id = EphemeralMessageId::new(9);
+            d.messages.insert(message_id, m);
+        }
+        let report_id = crate::chat_manager::MessageId::new(message_id.get());
+        let plain_id = crate::chat_manager::MessageId::new(0);
+
+        // two ids with an ephemeral one — rejected
+        let (promise, slot) = {
+            let slot = Arc::new(Mutex::new(None::<Result<crate::td_api::Object>>));
+            let capture = Arc::clone(&slot);
+            let promise =
+                PromiseCreator::lambda_result(move |result: Result<crate::td_api::Object>| {
+                    *capture.lock().unwrap() = Some(result);
+                });
+            (promise, slot)
+        };
+        report_dialog(
+            &mut td,
+            dialog_id,
+            b"opt",
+            &[plain_id, report_id],
+            "",
+            promise,
+        );
+        match slot.lock().unwrap().take() {
+            Some(Result::Err(status)) => assert_eq!(
+                status.message(),
+                "Ephemeral messages must be reported separately"
+            ),
+            _ => panic!("expected the separate-report error"),
+        }
+
+        // the single ephemeral id parks at the ephemeral report query
+        let (promise, slot) = {
+            let slot = Arc::new(Mutex::new(None::<Result<crate::td_api::Object>>));
+            let capture = Arc::clone(&slot);
+            let promise =
+                PromiseCreator::lambda_result(move |result: Result<crate::td_api::Object>| {
+                    *capture.lock().unwrap() = Some(result);
+                });
+            (promise, slot)
+        };
+        report_dialog(&mut td, dialog_id, b"opt", &[report_id], "text", promise);
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "the promise parks at the net seam"
+        );
+        assert_eq!(td.dialog_manager.pending_report_peer.len(), 1);
+    }
+
     #[test]
     fn get_blocked_dialogs_validates_arguments() {
         let mut td = test_td();
@@ -7448,11 +7687,15 @@ mod tests {
         let public_dialog = DialogId::from_user_id(crate::user_manager::UserId::new(43));
         let server_dialog = DialogId::from_user_id(crate::user_manager::UserId::new(42));
         assert_eq!(
-            td.dialog_manager.found_public_dialogs[0].get("query"),
+            td.dialog_manager.found_public_dialogs[0]
+                .get("query")
+                .map(|found| &found.dialog_ids),
             Some(&vec![public_dialog])
         );
         assert_eq!(
-            td.dialog_manager.found_on_server_dialogs[0].get("query"),
+            td.dialog_manager.found_on_server_dialogs[0]
+                .get("query")
+                .map(|found| &found.dialog_ids),
             Some(&vec![server_dialog])
         );
 
@@ -7461,6 +7704,22 @@ mod tests {
         let found = search_public_dialogs(&mut td, "query", None, promise);
         assert_eq!(found, vec![public_dialog]);
         assert!(matches!(slot.lock().unwrap().take(), Some(Result::Ok(()))));
+
+        // d3811ddfa — a stale entry answers as a miss (the query re-sends)
+        td.dialog_manager.found_public_dialogs[0]
+            .get_mut("query")
+            .unwrap()
+            .expires_at = 0.0;
+        let (promise, slot) = capture_unit_promise();
+        let found = search_public_dialogs(&mut td, "query", None, promise);
+        assert!(found.is_empty());
+        assert!(slot.lock().unwrap().take().is_none());
+        assert_eq!(
+            td.dialog_manager.search_public_dialogs_queries[0]
+                .get("query")
+                .map(Vec::len),
+            Some(1)
+        );
 
         // the failed search parks, fails its promise, and leaves the
         // negative cache (the next search answers locally, empty)

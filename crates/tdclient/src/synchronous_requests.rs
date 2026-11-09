@@ -759,7 +759,7 @@ mod tests {
         let response = run_request(function);
         assert_eq!(
             response.to_json(),
-            r#"{"@type":"optionValueString","value":"1.8.68"}"#
+            r#"{"@type":"optionValueString","value":"1.8.70"}"#
         );
     }
 
@@ -1003,10 +1003,10 @@ mod tests {
         let function = Function::getCountryFlagEmoji(td_api::getCountryFlagEmoji {
             country_code: "FT".to_string(),
         });
-        // the pirate flag special case
+        // the gem stone special case (4a85043f5 replaced the pirate flag)
         assert_eq!(
             run_request(function).to_json(),
-            "{\"@type\":\"text\",\"text\":\"\\ud83c\\udff4\\u200d\\u2620\\ufe0f\"}"
+            "{\"@type\":\"text\",\"text\":\"\\ud83d\\udc8e\"}"
         );
         let function = Function::getCountryFlagEmoji(td_api::getCountryFlagEmoji {
             country_code: "USA".to_string(),
@@ -1030,7 +1030,7 @@ mod tests {
             "{\"@type\":\"phoneNumberInfo\",\"country\":{\"@type\":\"countryInfo\",\"country_code\":\"US\",\"name\":\"USA\",\"english_name\":\"USA\",\"flag_emoji\":\"\\ud83c\\uddfa\\ud83c\\uddf8\",\"is_hidden\":false,\"calling_codes\":[\"1\"]},\"country_calling_code\":\"1\",\"formatted_phone_number\":\"999 123 4567\",\"is_anonymous\":false}"
         );
         // the missing-language "en" fallback + the fragment country
-        // (the FT flag rides the pirate-flag special case); non-ASCII
+        // (the FT flag rides the gem-stone special case, 4a85043f5); non-ASCII
         // answers ride the JsonString \uXXXX escaping like every other
         // response string (the #72 fix)
         let function = Function::getPhoneNumberInfoSync(td_api::getPhoneNumberInfoSync {
@@ -1039,7 +1039,7 @@ mod tests {
         });
         assert_eq!(
             run_request(function).to_json(),
-            "{\"@type\":\"phoneNumberInfo\",\"country\":{\"@type\":\"countryInfo\",\"country_code\":\"FT\",\"name\":\"Anonymous Numbers\",\"english_name\":\"Anonymous Numbers\",\"flag_emoji\":\"\\ud83c\\udff4\\u200d\\u2620\\ufe0f\",\"is_hidden\":true,\"calling_codes\":[\"888\"]},\"country_calling_code\":\"888\",\"formatted_phone_number\":\"1234 5678\",\"is_anonymous\":true}"
+            "{\"@type\":\"phoneNumberInfo\",\"country\":{\"@type\":\"countryInfo\",\"country_code\":\"FT\",\"name\":\"Anonymous Numbers\",\"english_name\":\"Anonymous Numbers\",\"flag_emoji\":\"\\ud83d\\udc8e\",\"is_hidden\":true,\"calling_codes\":[\"888\"]},\"country_calling_code\":\"888\",\"formatted_phone_number\":\"1234 5678\",\"is_anonymous\":true}"
         );
     }
 

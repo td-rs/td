@@ -391,8 +391,8 @@ impl ConnectionCreator {
         let active_is_mtproto = self
             .proxies
             .get(&self.active_proxy_id)
-            .is_some_and(|(proxy, _)| proxy.type_ == ProxyType::Mtproto);
-        let new_is_mtproto = self.proxies[&proxy_id].0.type_ == ProxyType::Mtproto;
+            .is_some_and(|(proxy, _)| proxy.use_mtproto_transport_proxy());
+        let new_is_mtproto = self.proxies[&proxy_id].0.use_mtproto_transport_proxy();
         if (self.active_proxy_id != 0 && active_is_mtproto) || new_is_mtproto {
             env.update_mtproto_header(Some(&self.proxies[&proxy_id].0));
         }
@@ -412,7 +412,10 @@ impl ConnectionCreator {
         }
         debug_assert!(self.proxies.contains_key(&self.active_proxy_id));
 
-        if self.proxies[&self.active_proxy_id].0.type_ == ProxyType::Mtproto {
+        if self.proxies[&self.active_proxy_id]
+            .0
+            .use_mtproto_transport_proxy()
+        {
             env.update_mtproto_header(None);
         }
 
@@ -637,6 +640,7 @@ pub(crate) enum ProxyType {
     Mtproto = 2,
     HttpTcp = 3,
     HttpCaching = 4,
+    Web = 5,
 }
 
 /// `Proxy` (net/Proxy.h) — the td_api-level proxy record with the exact
@@ -648,6 +652,7 @@ pub(crate) struct Proxy {
     pub port: i32,
     pub user: String,
     pub password: String,
+    pub path: String,
     pub secret: ProxySecret,
 }
 
@@ -674,6 +679,20 @@ impl Proxy {
         let Some(proxy_type) = proxy_type else {
             return Err("Proxy type must be non-empty".to_string());
         };
+        // `Proxy::create_proxy` (net/Proxy.cpp:159-173) — the web arm rides
+        // before the server/port validation ladder: the port must be 0 (the
+        // forced 443 convention) or exactly the web-proxy port.
+        if let td_api::ProxyType::proxyTypeWeb(type_web) = proxy_type {
+            if port != 0 && port != Self::WEB_PROXY_PORT {
+                return Err("Web proxy port must be 443".to_string());
+            }
+            let host = Self::normalize_web_proxy_host(server)?;
+            if !Self::is_valid_web_proxy_path(&type_web.path) {
+                return Err("Invalid web proxy path".to_string());
+            }
+            let secret = Self::get_web_proxy_secret(&type_web.secret)?;
+            return Ok(Self::web(host, type_web.path.clone(), secret));
+        }
         if server.is_empty() {
             return Err("Server name must be non-empty".to_string());
         }
@@ -694,6 +713,7 @@ impl Proxy {
                 port,
                 user: type_.username.clone(),
                 password: type_.password.clone(),
+                path: String::new(),
                 secret: ProxySecret::default(),
             }),
             td_api::ProxyType::proxyTypeHttp(type_) => {
@@ -708,6 +728,7 @@ impl Proxy {
                     port,
                     user: type_.username.clone(),
                     password: type_.password.clone(),
+                    path: String::new(),
                     secret: ProxySecret::default(),
                 })
             }
@@ -724,10 +745,202 @@ impl Proxy {
                     port,
                     user: String::new(),
                     password: String::new(),
+                    path: String::new(),
                     secret,
                 })
             }
+            // `Proxy::create_proxy`'s UNREACHABLE default (net/Proxy.cpp:
+            // 206-208) — the web arm is handled before the validation
+            // ladder; the flattened td_api keeps every ProxyType variant
+            // matched at compile time.
+            td_api::ProxyType::proxyTypeWeb(_) => {
+                unreachable!("the web arm is handled before the validation ladder")
+            }
         }
+    }
+
+    /// `Proxy::WEB_PROXY_PORT` (net/Proxy.h:87).
+    pub(crate) const WEB_PROXY_PORT: i32 = 443;
+
+    /// `Proxy::web` (net/Proxy.h:89-97) — the port is forced to 443.
+    fn web(server: String, path: String, secret: ProxySecret) -> Proxy {
+        Proxy {
+            type_: ProxyType::Web,
+            server,
+            port: Self::WEB_PROXY_PORT,
+            path,
+            secret,
+            ..Proxy::default()
+        }
+    }
+
+    /// `Proxy::use_mtproto_transport_proxy` (net/Proxy.h:145-147) — an
+    /// MTProto proxy, which is reached directly or through a web proxy
+    /// relay.
+    fn use_mtproto_transport_proxy(&self) -> bool {
+        self.type_ == ProxyType::Mtproto || self.type_ == ProxyType::Web
+    }
+
+    /// `Proxy::normalize_web_proxy_host` (net/Proxy.cpp:16-72) — the
+    /// canonical lower-case ASCII host; the WHATWG "ends in a number"
+    /// rule keeps IPv4 shorthand hosts out.
+    pub(crate) fn normalize_web_proxy_host(server: &str) -> Result<String, String> {
+        const INVALID_HOST: &str = "Invalid web proxy server";
+        if !check_utf8(server.as_bytes()) {
+            return Err(INVALID_HOST.to_string());
+        }
+        let host = ascii_trim(server);
+        const SCHEME: &str = "https://";
+        let mut host = host.as_bytes();
+        if host.len() >= SCHEME.len()
+            && host[..SCHEME.len()].eq_ignore_ascii_case(SCHEME.as_bytes())
+        {
+            host = &host[SCHEME.len()..];
+        }
+        if host.last() == Some(&b'.') {
+            host = &host[..host.len() - 1];
+        }
+        if host.is_empty() || host.len() > 253 * 4 {
+            return Err(INVALID_HOST.to_string());
+        }
+        let host = String::from_utf8_lossy(host);
+        // only the Windows idn_to_ascii case-folds, but the host is a part
+        // of the capability, so it must not depend on the OS — the
+        // lower-case form rides in before the punycode pass like the C++
+        // `idn_to_ascii(utf8_to_lower(host))`.
+        let lowered = host.to_lowercase();
+        let result = tdnet::dns::idn_to_ascii(&lowered).map_err(|_| INVALID_HOST.to_string())?;
+        let result = result.to_lowercase();
+        if result.len() > 253 {
+            return Err(INVALID_HOST.to_string());
+        }
+        // `td::full_split(result, '.')` — an empty label fails the same
+        // loop as an over-long one.
+        let labels: Vec<&str> = result.split('.').collect();
+        if labels.len() < 2 {
+            return Err(INVALID_HOST.to_string());
+        }
+        for label in &labels {
+            if label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+            {
+                return Err(INVALID_HOST.to_string());
+            }
+            for &c in label.as_bytes() {
+                if !c.is_ascii_alphanumeric() && c != b'-' {
+                    return Err(INVALID_HOST.to_string());
+                }
+            }
+        }
+
+        // the WHATWG URL "ends in a number" rule: such a host is an IPv4
+        // address, possibly in a shorthand like 127.1 or 0x7f.1
+        let mut last_label = labels[labels.len() - 1];
+        let is_hex = last_label.starts_with("0x");
+        if is_hex {
+            last_label = &last_label[2..];
+        }
+        let is_number = last_label.bytes().all(|c| {
+            if is_hex {
+                c.is_ascii_hexdigit()
+            } else {
+                c.is_ascii_digit()
+            }
+        });
+        if is_number {
+            return Err("Web proxy server must be a domain name".to_string());
+        }
+        Ok(result)
+    }
+
+    /// `Proxy::is_valid_web_proxy_path` (net/Proxy.cpp:74-98).
+    pub(crate) fn is_valid_web_proxy_path(path: &str) -> bool {
+        if path.len() > 128 {
+            return false;
+        }
+        let mut is_segment_start = true;
+        for &c in path.as_bytes() {
+            if c == b'/' {
+                if is_segment_start {
+                    return false;
+                }
+                is_segment_start = true;
+                continue;
+            }
+            if !c.is_ascii_alphanumeric() && (is_segment_start || (c != b'-' && c != b'_')) {
+                return false;
+            }
+            is_segment_start = false;
+        }
+        path.is_empty() || !is_segment_start
+    }
+
+    /// `Proxy::parse_web_proxy_address` (net/Proxy.cpp:100-118) — returns
+    /// the canonical host and path of a web proxy address "host[/path]".
+    pub(crate) fn parse_web_proxy_address(address: &str) -> Result<(String, String), String> {
+        let address = ascii_trim(address);
+        const SCHEME: &str = "https://";
+        let mut address = address.as_bytes();
+        if address.len() >= SCHEME.len()
+            && address[..SCHEME.len()].eq_ignore_ascii_case(SCHEME.as_bytes())
+        {
+            address = &address[SCHEME.len()..];
+        }
+        let (host, path) = match address.iter().position(|&c| c == b'/') {
+            Some(slash_pos) => (&address[..slash_pos], &address[slash_pos + 1..]),
+            None => (address, &b""[..]),
+        };
+        let normalized_host = Self::normalize_web_proxy_host(&String::from_utf8_lossy(host))?;
+        let path = String::from_utf8_lossy(path);
+        if !Self::is_valid_web_proxy_path(&path) {
+            return Err("Invalid web proxy path".to_string());
+        }
+        Ok((normalized_host, path.into_owned()))
+    }
+
+    /// `Proxy::get_web_proxy_secret` (net/Proxy.cpp:120-128) — the relay
+    /// forwards raw obfuscated bytes, so a fake-TLS secret would make the
+    /// MTProxy wait for a TLS handshake that never comes.
+    pub(crate) fn get_web_proxy_secret(encoded_secret: &str) -> Result<ProxySecret, String> {
+        let secret = match ProxySecret::from_link(encoded_secret.as_bytes(), false) {
+            tdutils::status::Result::Ok(secret) => secret,
+            tdutils::status::Result::Err(status) => {
+                return Err(status.message().to_string());
+            }
+        };
+        if secret.emulate_tls() {
+            return Err("Web proxies don't support fake TLS secrets".to_string());
+        }
+        Ok(secret)
+    }
+
+    /// `Proxy::get_web_proxy_link_secret` (net/Proxy.cpp:130-145) — a link
+    /// secret of a web proxy with a path is marked with the 0x70 byte, so
+    /// that clients without path support reject the link.
+    pub(crate) fn get_web_proxy_link_secret(
+        link_secret: &str,
+        has_path: bool,
+    ) -> Result<ProxySecret, String> {
+        // 0xdd must never be used as the marker: older clients read a
+        // 17-byte secret starting with it as a valid one
+        const WEB_PROXY_LINK_SECRET_MARKER: u8 = 0x70;
+        if let tdutils::status::Result::Ok(marked) =
+            tdmtproto::utils::base64url_decode(link_secret.as_bytes())
+            && marked.len() >= 17
+            && marked[0] == WEB_PROXY_LINK_SECRET_MARKER
+            && tdmtproto::utils::base64url_encode(&marked) == link_secret.as_bytes()
+            && let tdutils::status::Result::Ok(secret) =
+                ProxySecret::from_binary(&marked[1..], false)
+            && !secret.emulate_tls()
+        {
+            return Ok(secret);
+        }
+        if has_path {
+            return Err("Wrong proxy secret".to_string());
+        }
+        Self::get_web_proxy_secret(link_secret)
     }
 
     /// `Proxy::get_proxy_object` (Proxy.cpp:58-78).
@@ -748,6 +961,10 @@ impl Proxy {
                 http_only: true,
             }),
             ProxyType::Mtproto => td_api::ProxyType::proxyTypeMtproto(td_api::proxyTypeMtproto {
+                secret: String::from_utf8_lossy(&self.secret.get_encoded_secret()).into_owned(),
+            }),
+            ProxyType::Web => td_api::ProxyType::proxyTypeWeb(td_api::proxyTypeWeb {
+                path: self.path.clone(),
                 secret: String::from_utf8_lossy(&self.secret.get_encoded_secret()).into_owned(),
             }),
             ProxyType::None => unreachable!("the C++ UNREACHABLE default"),
@@ -779,6 +996,15 @@ impl Proxy {
                     &String::from_utf8_lossy(&self.secret.get_encoded_secret()),
                 );
             }
+            ProxyType::Web => {
+                store_string(&mut out, &self.server);
+                store_i32(&mut out, self.port);
+                store_string(
+                    &mut out,
+                    &String::from_utf8_lossy(&self.secret.get_encoded_secret()),
+                );
+                store_string(&mut out, &self.path);
+            }
             ProxyType::None => {}
         }
         out
@@ -807,6 +1033,18 @@ impl Proxy {
                     }
                 };
             }
+            ProxyType::Web => {
+                self.server = parser.string().map_err(|e| e.to_string())?;
+                self.port = parser.i32_().map_err(|e| e.to_string())?;
+                let encoded = parser.string().map_err(|e| e.to_string())?;
+                self.secret = match ProxySecret::from_link(encoded.as_bytes(), true) {
+                    tdutils::status::Result::Ok(secret) => secret,
+                    tdutils::status::Result::Err(status) => {
+                        return Err(status.message().to_string());
+                    }
+                };
+                self.path = parser.string().map_err(|e| e.to_string())?;
+            }
             ProxyType::None => {}
         }
         Ok(())
@@ -822,9 +1060,17 @@ impl Proxy {
             2 => Ok(ProxyType::Mtproto),
             3 => Ok(ProxyType::HttpTcp),
             4 => Ok(ProxyType::HttpCaching),
+            5 => Ok(ProxyType::Web),
             _ => Err(format!("Unknown proxy type {value}")),
         }
     }
+}
+
+/// `td::trim` (td/utils/misc.cpp) — the ASCII space set, not the Unicode
+/// one, to keep the byte-level behavior of the host/path normalization.
+fn ascii_trim(s: &str) -> String {
+    s.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r'))
+        .to_owned()
 }
 
 /// `NetType` (net/NetType.h:17) — the i8 discriminants are the C++ enum
@@ -1448,8 +1694,236 @@ mod tests {
             port,
             user: "user".to_string(),
             password: "pass".to_string(),
+            path: String::new(),
             secret: ProxySecret::default(),
         }
+    }
+
+    /// The 1.8.70 web-proxy ladder (net/Proxy.cpp:159-173) — the port
+    /// gate rides before the server/port validation, the host
+    /// normalization answers the C++ reference forms (upstream
+    /// test/link.cpp vectors), and the store/parse bytes keep the
+    /// tl_helpers field order (b54698832).
+    #[test]
+    fn web_proxies_create_store_and_round_trip_like_the_cpp() {
+        let web_type = |path: &str, secret: &str| {
+            td_api::ProxyType::proxyTypeWeb(td_api::proxyTypeWeb {
+                path: path.to_owned(),
+                secret: secret.to_owned(),
+            })
+        };
+
+        // the port gate: 0 and 443 pass, everything else is the 400 band
+        assert_eq!(
+            Proxy::create_proxy_parts(
+                "proxy.example.com",
+                8080,
+                Some(&web_type("", "8561944064fc730cbfa4473562d8ec59"))
+            )
+            .unwrap_err(),
+            "Web proxy port must be 443"
+        );
+
+        // the plain hex secret form, port 0 → forced 443
+        let proxy = Proxy::create_proxy_parts(
+            "proxy.example.com",
+            0,
+            Some(&web_type("", "8561944064fc730cbfa4473562d8ec59")),
+        )
+        .expect("a plain web proxy");
+        assert_eq!(proxy.type_, ProxyType::Web);
+        assert_eq!(proxy.port, Proxy::WEB_PROXY_PORT);
+        assert_eq!(proxy.server, "proxy.example.com");
+        assert_eq!(proxy.path, "");
+
+        // host normalization: scheme/trailing-dot strip, the punycode
+        // pass, and the two rejection bands — the generic invalid-host
+        // ladder and the distinct WHATWG "ends in a number" error
+        let normalized = |server: &str| {
+            Proxy::create_proxy_parts(
+                server,
+                443,
+                Some(&web_type("", "8561944064fc730cbfa4473562d8ec59")),
+            )
+            .map(|proxy| proxy.server)
+        };
+        assert_eq!(
+            normalized("HTTPS://Proxy.Example.COM.").as_deref(),
+            Ok("proxy.example.com")
+        );
+        assert_eq!(
+            normalized("Пример.РФ").as_deref(),
+            Ok("xn--e1afmkfd.xn--p1ai")
+        );
+        for server in ["localhost", "", "a", "-a.b", "a-.b"] {
+            assert_eq!(
+                normalized(server).unwrap_err(),
+                "Invalid web proxy server",
+                "host must be invalid: {server}"
+            );
+        }
+        for server in ["1.2.3.4", "proxy.0x7f", "proxy.127.1"] {
+            assert_eq!(
+                normalized(server).unwrap_err(),
+                "Web proxy server must be a domain name",
+                "host must be a number-ending rejection: {server}"
+            );
+        }
+
+        // the path validator: segment starts are alphanumeric, separators
+        // are '-'/'_', '/' only between segments
+        let with_path = |path: &str| {
+            Proxy::create_proxy_parts(
+                "proxy.example.com",
+                443,
+                Some(&web_type(path, "dd8561944064fc730cbfa4473562d8ec59")),
+            )
+            .map(|proxy| proxy.path)
+        };
+        assert_eq!(with_path("a/b_c").as_deref(), Ok("a/b_c"));
+        assert_eq!(
+            with_path("-app").unwrap_err(),
+            "Invalid web proxy path",
+            "a segment must not start with a separator"
+        );
+        assert_eq!(
+            with_path("a//b").unwrap_err(),
+            "Invalid web proxy path",
+            "an empty segment is the C++ is_segment_start band"
+        );
+        assert_eq!(
+            with_path("a.b").unwrap_err(),
+            "Invalid web proxy path",
+            "a dot is not a path byte"
+        );
+        assert_eq!(with_path("").as_deref(), Ok(""), "an empty path is valid");
+
+        // fake-TLS secrets are refused for web proxies (the relay never
+        // answers the TLS handshake) — the vector is the upstream
+        // ee-prefixed secret of test/link.cpp's regular-proxy band
+        assert_eq!(
+            Proxy::get_web_proxy_secret("7tAAAAAAAAAAAAAAAAAAAAAAAAcuZ29vZ2xlLmNvbQ").unwrap_err(),
+            "Web proxies don't support fake TLS secrets"
+        );
+
+        // the 0x70 marked link-secret round trip: a path-carrying link
+        // secret decodes to the dd-padded secret; the same secret without
+        // a path falls back to the plain form
+        let marked = Proxy::get_web_proxy_link_secret("cN2FYZRAZPxzDL-kRzVi2OxZ", true).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&marked.get_encoded_secret()),
+            "dd8561944064fc730cbfa4473562d8ec59"
+        );
+        let unmarked = Proxy::get_web_proxy_link_secret("8561944064fc730cbfa4473562d8ec59", false);
+        assert!(unmarked.is_ok(), "the plain hex form parses without a path");
+        assert_eq!(
+            Proxy::get_web_proxy_link_secret("8561944064fc730cbfa4473562d8ec59", true).unwrap_err(),
+            "Wrong proxy secret",
+            "an unmarked secret is rejected when the proxy has a path"
+        );
+
+        // parse_web_proxy_address: the "host[/path]" address form
+        assert_eq!(
+            Proxy::parse_web_proxy_address(" proxy.example.com/a/b_c ").unwrap(),
+            ("proxy.example.com".to_owned(), "a/b_c".to_owned())
+        );
+
+        // the store bytes: the Web type int32 leads, then server, port,
+        // encoded secret, path — and parse round-trips (the C++
+        // tl_helpers order, Proxy.h:186-191)
+        let pathed = Proxy::create_proxy_parts(
+            "proxy.example.com",
+            443,
+            Some(&web_type("a/b_c", "dd8561944064fc730cbfa4473562d8ec59")),
+        )
+        .unwrap();
+        let mut round_tripped = Proxy::default();
+        round_tripped.parse(&pathed.store()).unwrap();
+        assert_eq!(round_tripped, pathed);
+        // the type discriminant is 5 in the stored form
+        assert_eq!(&pathed.store()[..4], &[5, 0, 0, 0]);
+
+        // the td_api object shape (Proxy.cpp:224-226): the path and the
+        // encoded secret rebuild proxyTypeWeb
+        let object = pathed.get_proxy_object();
+        assert_eq!(object.port, 443);
+        match object.r#type.expect("the proxy type") {
+            td_api::ProxyType::proxyTypeWeb(type_web) => {
+                assert_eq!(type_web.path, "a/b_c");
+                assert_eq!(type_web.secret, "dd8561944064fc730cbfa4473562d8ec59");
+            }
+            other => panic!("unexpected proxy type {other:?}"),
+        }
+
+        // the mtproto-transport condition (net/Proxy.h:145-147): the web
+        // variant counts like Mtproto for the header update; the socks
+        // variant does not
+        assert!(pathed.use_mtproto_transport_proxy());
+        assert!(!socks5("s", 80).use_mtproto_transport_proxy());
+    }
+
+    /// The web variant through the existing proxy functions — `add_proxy`
+    /// (ConnectionCreator.cpp:117-160) accepts it like any other type,
+    /// routes the enable through the mtproto-header hop the C++
+    /// `use_mtproto_transport_proxy()` condition fires (cpp:429-431),
+    /// answers it in `get_proxies`, and the pmc record round-trips the
+    /// registry through a reopen.
+    #[test]
+    fn web_proxies_flow_through_the_existing_proxy_functions() {
+        let mut env = TestProxyEnv::new("web-proxy-functions");
+        let mut creator = ConnectionCreator::default();
+        let web = td_api::Proxy {
+            server: "Proxy.Example.COM.".to_owned(),
+            port: 0,
+            r#type: Some(td_api::ProxyType::proxyTypeWeb(td_api::proxyTypeWeb {
+                path: "a/b_c".to_owned(),
+                secret: "dd8561944064fc730cbfa4473562d8ec59".to_owned(),
+            })),
+        };
+
+        // add+enable: id 2, the header hop fires for the web proxy (the
+        // socks5 add never fired one), and the enabled option lands.
+        let added = creator
+            .add_proxy(&mut env, -1, Some(&web), true, "relay".to_owned())
+            .unwrap();
+        assert_eq!(added.id, 2);
+        assert!(added.is_enabled);
+        assert_eq!(env.mtproto_updates, vec![Some(ProxyType::Web)]);
+        assert_eq!(
+            env.options.get("enabled_proxy_id").map(String::as_str),
+            Some("I2")
+        );
+
+        // get_proxies answers the normalized proxyTypeWeb object.
+        let proxies = creator.get_proxies();
+        let listed = &proxies.proxies[0];
+        assert_eq!(listed.id, 2);
+        assert!(listed.is_enabled);
+        let listed_proxy = listed.proxy.as_ref().expect("the proxy object");
+        assert_eq!(listed_proxy.server, "proxy.example.com");
+        assert_eq!(listed_proxy.port, 443);
+        match listed_proxy.r#type.as_ref().expect("the proxy type") {
+            td_api::ProxyType::proxyTypeWeb(type_web) => {
+                assert_eq!(type_web.path, "a/b_c");
+                assert_eq!(type_web.secret, "dd8561944064fc730cbfa4473562d8ec59");
+            }
+            other => panic!("unexpected proxy type {other:?}"),
+        }
+
+        // the header clears on the disable hop (cpp:448-450), like an
+        // mtproto proxy
+        creator.disable_proxy(&mut env);
+        assert_eq!(env.mtproto_updates, vec![Some(ProxyType::Web), None]);
+
+        // the pmc record round-trips a reopen: restore_proxies rebuilds
+        // the registry with the web variant intact.
+        drop(creator);
+        let mut restored = ConnectionCreator::default();
+        restored.restore_proxies(&mut env);
+        let proxies = restored.get_proxies();
+        assert_eq!(proxies.proxies.len(), 1);
+        assert_eq!(restored.proxies[&2].0.type_, ProxyType::Web);
+        assert_eq!(restored.proxies[&2].0.path, "a/b_c");
     }
 
     /// The `create_proxy` 400 ladder (Proxy.cpp:12-48), each band in
@@ -1557,6 +2031,7 @@ mod tests {
             port: 443,
             user: String::new(),
             password: String::new(),
+            path: String::new(),
             secret: ProxySecret::from_link(b"00112233445566778899aabbccddeeff", false).unwrap(),
         };
         assert_eq!(

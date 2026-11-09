@@ -41,8 +41,36 @@ pub const MAX_MNEMONIC_BACKUP_SIZE: usize = 215;
 /// 48 base64(any-alphabet) characters decoding to 36 bytes with a valid
 /// CRC-16/XMODEM checksum over the first 34 and the anycast/metadata bits
 /// in the first byte.
+///
+/// The 4af7ec065 raw form: with `allow_raw`, a `"<workchain>:<64
+/// hexadecimal digits>"` address passes without the checksum walk.
 pub fn check_ton_address(address: &str) -> Result<()> {
+    check_ton_address_impl(address, false)
+}
+
+/// `check_ton_address(address, true)` — the raw-address arm of
+/// getAddressTonWallet/sendTonWalletTransfer
+/// (TonWalletManager.cpp:1437-1458, 4af7ec065).
+pub fn check_ton_address_allow_raw(address: &str) -> Result<()> {
+    check_ton_address_impl(address, true)
+}
+
+fn check_ton_address_impl(address: &str, allow_raw: bool) -> Result<()> {
     let error = |code: i32, msg: &str| Status::error(code, msg);
+    if allow_raw && let Some(colon_pos) = address.find(':') {
+        // raw address "<workchain>:<64 hexadecimal digits>"
+        if address[..colon_pos].parse::<i32>().is_err() {
+            return Result::Err(error(400, "Invalid address workchain"));
+        }
+        let account_id = &address[colon_pos + 1..];
+        if account_id.len() != 64 {
+            return Result::Err(error(400, "Invalid address length"));
+        }
+        if !account_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Result::Err(error(400, "Invalid address format"));
+        }
+        return Result::Ok(());
+    }
     if address.len() != 48 {
         return Result::Err(error(400, "Invalid address length"));
     }
@@ -374,6 +402,8 @@ pub fn get_ton_wallet_transaction_object(
     let mut peer_user_id = 0i64;
     let mut peer_domain = String::new();
     let mut peer_provider_name = String::new();
+    let mut is_telegram_gift = false;
+    let mut is_saved = false;
     match peer {
         Some(telegram_api::WalletTransactionPeer::walletTransactionPeerUser(peer)) => {
             peer_user_id = peer.user_id;
@@ -393,6 +423,12 @@ pub fn get_ton_wallet_transaction_object(
             peer_domain = peer.domain;
             peer_provider_name = peer.provider_name;
         }
+        // cpp:2343-2344 — the channel peer fields stay unread.
+        Some(telegram_api::WalletTransactionPeer::walletTransactionPeerChannel(_)) => {}
+        Some(telegram_api::WalletTransactionPeer::walletTransactionPeerTelegramGift(peer)) => {
+            is_telegram_gift = true;
+            is_saved = peer.own_profile;
+        }
         Some(telegram_api::WalletTransactionPeer::walletTransactionPeerUnsupported(_)) | None => {}
     }
     let mut amount = amount;
@@ -411,35 +447,51 @@ pub fn get_ton_wallet_transaction_object(
         )
     };
     let transaction_type = if let Some(nft) = nft {
-        td_api::TonWalletTransactionType::tonWalletTransactionTypeNftTransfer(
-            td_api::tonWalletTransactionTypeNftTransfer {
-                nft: Some(get_ton_nft_object(&nft)),
-                is_outgoing: !incoming,
-                comment: comment.clone(),
-                is_comment_encrypted: comment_encrypted,
-            },
-        )
-    } else if !peer_provider_name.is_empty() {
-        td_api::TonWalletTransactionType::tonWalletTransactionTypeOnRampDeposit(
-            td_api::tonWalletTransactionTypeOnRampDeposit {
-                amount,
-                provider_name: peer_provider_name,
-            },
-        )
-    } else if key_change {
-        peer_user_id = my_user_id;
-        td_api::TonWalletTransactionType::tonWalletTransactionTypeKeyChange(
-            td_api::tonWalletTransactionTypeKeyChange,
-        )
+        let nft_object = get_ton_nft_object(&nft);
+        if is_telegram_gift {
+            td_api::TonWalletTransactionType::tonWalletTransactionTypeTelegramGiftTransfer(
+                td_api::tonWalletTransactionTypeTelegramGiftTransfer {
+                    nft: Some(nft_object),
+                    is_outgoing: !incoming,
+                    is_saved,
+                },
+            )
+        } else {
+            td_api::TonWalletTransactionType::tonWalletTransactionTypeNftTransfer(
+                td_api::tonWalletTransactionTypeNftTransfer {
+                    nft: Some(nft_object),
+                    is_outgoing: !incoming,
+                    comment: comment.clone(),
+                    is_comment_encrypted: comment_encrypted,
+                },
+            )
+        }
     } else {
-        td_api::TonWalletTransactionType::tonWalletTransactionTypeTransfer(
-            td_api::tonWalletTransactionTypeTransfer {
-                amount,
-                is_gasless: gasless,
-                comment,
-                is_comment_encrypted: comment_encrypted,
-            },
-        )
+        if is_telegram_gift {
+            tdutils::log_error!("Receive Telegram gift transaction {id} without NFT");
+        }
+        if !peer_provider_name.is_empty() {
+            td_api::TonWalletTransactionType::tonWalletTransactionTypeOnRampDeposit(
+                td_api::tonWalletTransactionTypeOnRampDeposit {
+                    amount,
+                    provider_name: peer_provider_name,
+                },
+            )
+        } else if key_change {
+            peer_user_id = my_user_id;
+            td_api::TonWalletTransactionType::tonWalletTransactionTypeKeyChange(
+                td_api::tonWalletTransactionTypeKeyChange,
+            )
+        } else {
+            td_api::TonWalletTransactionType::tonWalletTransactionTypeTransfer(
+                td_api::tonWalletTransactionTypeTransfer {
+                    amount,
+                    is_gasless: gasless,
+                    comment,
+                    is_comment_encrypted: comment_encrypted,
+                },
+            )
+        }
     };
     td_api::TonWalletTransaction {
         id,
@@ -487,6 +539,10 @@ pub(crate) fn get_ton_nft_object(item: &telegram_api::wallet_NftItem) -> td_api:
             tdutils::status::Result::Ok(value) => Some(Box::new(value)),
             tdutils::status::Result::Err(_) => None,
         },
+        // The wire gift (TonNft.cpp:69-76 StarGift parse → upgradedGift)
+        // needs the StarGiftEnv conversion plane — the TON-wallet-cards
+        // family follow-up.
+        gift: None,
     }
 }
 
@@ -1320,7 +1376,7 @@ impl TonWalletManager {
         address: &str,
         mut promise: Promise<td_api::UserTonWalletAddress>,
     ) {
-        match check_ton_address(address) {
+        match check_ton_address_allow_raw(address) {
             Result::Ok(()) => {}
             Result::Err(status) => return promise.set_error(status),
         }
@@ -1633,7 +1689,7 @@ impl TonWalletManager {
         sending_id: i32,
         mut promise: Promise<td_api::TonWalletTransferResult>,
     ) {
-        match check_ton_address(peer_address) {
+        match check_ton_address_allow_raw(peer_address) {
             Result::Ok(()) => {}
             Result::Err(status) => return promise.set_error(status),
         }
@@ -2526,6 +2582,37 @@ mod tests {
 
         // Wrong length.
         assert!(check_ton_address(&address[..47]).is_error());
+
+        // 4af7ec065 — the raw "<workchain>:<64 hex digits>" form: the
+        // allow_raw arms accept it, the strict arm does not.
+        let raw_address = "0:8002F3AB9BE0AC5D76E6E0A73E33C33E0E6F9EDF1CBC3A71D24A0AF1D6C1D70B";
+        assert_eq!(raw_address.len(), "0:".len() + 64);
+        assert!(check_ton_address_allow_raw(raw_address).is_ok());
+        assert!(check_ton_address(raw_address).is_error());
+        assert!(
+            check_ton_address_allow_raw(
+                "-1:8002f3ab9be0ac5d76e6e0a73e33c33e0e6f9edf1cbc3a71d24a0af1d6c1d70b"
+            )
+            .is_ok()
+        );
+        // non-numeric workchain
+        assert!(
+            check_ton_address_allow_raw(
+                "x:8002f3ab9be0ac5d76e6e0a73e33c33e0e6f9edf1cbc3a71d24a0af1d6c1d70b"
+            )
+            .is_error()
+        );
+        // wrong account length
+        assert!(check_ton_address_allow_raw("0:8002f3ab").is_error());
+        // non-hex digit
+        assert!(
+            check_ton_address_allow_raw(
+                "0:8002f3ab9be0ac5d76e6e0a73e33c33e0e6f9edf1cbc3a71d24a0af1d6c1d70g"
+            )
+            .is_error()
+        );
+        // the user-friendly form still passes the allow_raw arm
+        assert!(check_ton_address_allow_raw(&address).is_ok());
     }
 
     /// The recording env: the update outbox + the seam sends.
