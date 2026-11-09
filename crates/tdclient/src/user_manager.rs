@@ -10654,10 +10654,7 @@ impl UserManager {
     /// (079246056): every call restarts the entry's clock.
     fn add_user_photos(&mut self, user_id: UserId) -> &mut UserPhotos {
         assert!(user_id.is_valid());
-        let entry = self
-            .user_photos
-            .entry(user_id.get())
-            .or_insert_with(UserPhotos::new);
+        let entry = self.user_photos.entry(user_id.get()).or_default();
         entry.expires_at = tdutils::time::now() + USER_PHOTOS_CACHE_TIME;
         entry
     }
@@ -11776,10 +11773,7 @@ impl UserManager {
     /// (079246056): every call restarts the entry's clock.
     fn add_user_saved_music(&mut self, user_id: UserId) -> &mut UserSavedMusic {
         assert!(user_id.is_valid());
-        let entry = self
-            .user_saved_music
-            .entry(user_id.get())
-            .or_insert_with(UserSavedMusic::new);
+        let entry = self.user_saved_music.entry(user_id.get()).or_default();
         entry.expires_at = tdutils::time::now() + USER_SAVED_MUSIC_CACHE_TIME;
         entry
     }

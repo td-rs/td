@@ -961,19 +961,18 @@ impl AccountManager {
             && are_all_users_allowed(&rules)
         {
             let phone_number = env.get_option_string("my_phone_number", "");
-            if !phone_number.is_empty() {
-                if let Ok(url) =
+            if !phone_number.is_empty()
+                && let Ok(url) =
                     env.get_phone_number_user_link(&phone_number, &unpaid_messages_token)
-                {
-                    return promise.set_value(td_api::UserLink {
-                        url,
-                        expires_in: get_user_link_expires_in(
-                            unpaid_messages_token_expire_date,
-                            env.unix_time(),
-                        ),
-                        can_get_permanent_link: true,
-                    });
-                }
+            {
+                return promise.set_value(td_api::UserLink {
+                    url,
+                    expires_in: get_user_link_expires_in(
+                        unpaid_messages_token_expire_date,
+                        env.unix_time(),
+                    ),
+                    can_get_permanent_link: true,
+                });
             }
         }
         self.pending_user_link.push((

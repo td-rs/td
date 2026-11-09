@@ -2966,9 +2966,11 @@ mod tests {
         ))
     }
 
-    fn json_array(values: Vec<Box<telegram_api::JSONValue>>) -> Box<telegram_api::JSONValue> {
+    fn json_array(values: Vec<telegram_api::JSONValue>) -> Box<telegram_api::JSONValue> {
         Box::new(telegram_api::JSONValue::jsonArray(
-            telegram_api::jsonArray { value: values },
+            telegram_api::jsonArray {
+                value: values.into_iter().map(Box::new).collect(),
+            },
         ))
     }
 
@@ -3662,11 +3664,11 @@ mod tests {
             (
                 "wallet_card_bg_gifts".to_string(),
                 json_array(vec![
-                    json_string("first_gift"),
+                    *json_string("first_gift"),
                     // an empty name and a \xff carrier are rejected
-                    json_string(""),
-                    json_string("bad\u{ff}name"),
-                    json_string("second_gift"),
+                    *json_string(""),
+                    *json_string("bad\u{ff}name"),
+                    *json_string("second_gift"),
                 ]),
             ),
             (

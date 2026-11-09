@@ -9566,8 +9566,7 @@ impl Td {
             if paired >= parked.len() {
                 break;
             }
-            let (token, expire_date, promise) =
-                std::mem::replace(&mut parked[paired], (String::new(), 0, Promise::default()));
+            let (token, expire_date, promise) = std::mem::take(&mut parked[paired]);
             paired += 1;
             let net = self.account_net();
             let mut env = AccountEnv {
@@ -10244,32 +10243,6 @@ impl Td {
         };
         let result = f(&mut user_manager, &mut env);
         self.user_manager = user_manager;
-        result
-    }
-
-    /// The chat twin of [`Self::with_user_manager_env`] — the
-    /// `reload_channel_full` tail's manager pair.
-    fn with_chat_manager_env<R>(
-        &mut self,
-        f: impl FnOnce(
-            &mut crate::chat_manager::ChatManager,
-            &mut crate::user_manager::UserManager,
-            &mut crate::user_manager::UserEnv,
-        ) -> R,
-    ) -> R {
-        let mut chat_manager = std::mem::take(&mut self.chat_manager);
-        let mut user_manager = std::mem::take(&mut self.user_manager);
-        let mut env = crate::user_manager::UserEnv {
-            global: &mut self.global,
-            options: self
-                .option_manager
-                .as_mut()
-                .expect("the option manager is set for the netted td"),
-            auth_is_bot: self.auth_manager.is_bot(),
-        };
-        let result = f(&mut chat_manager, &mut user_manager, &mut env);
-        self.user_manager = user_manager;
-        self.chat_manager = chat_manager;
         result
     }
 
@@ -39915,7 +39888,7 @@ impl AccountManagerEnv for AccountEnv<'_> {
         unpaid_messages_token: &str,
     ) -> std::result::Result<String, Status> {
         let mut env = TdLinkEnv {
-            global: &mut self.global,
+            global: self.global,
             options: self.options.as_deref_mut(),
         };
         crate::link_manager::get_internal_link(
@@ -40451,7 +40424,7 @@ impl CommunityManagerEnv for CommunityEnv<'_> {
         &mut self,
         community_id: crate::community_id::CommunityId,
     ) {
-        let (mut filter_env, mut dialog_filter_manager) = dialog_filter_env_split(&mut self.td);
+        let (mut filter_env, dialog_filter_manager) = dialog_filter_env_split(self.td);
         dialog_filter_manager.remove_community_from_dialog_filters(&mut filter_env, community_id);
     }
 

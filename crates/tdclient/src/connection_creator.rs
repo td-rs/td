@@ -1879,7 +1879,6 @@ mod tests {
                 path: "a/b_c".to_owned(),
                 secret: "dd8561944064fc730cbfa4473562d8ec59".to_owned(),
             })),
-            ..TestProxyEnv::proxy("unused", 1080)
         };
 
         // add+enable: id 2, the header hop fires for the web proxy (the

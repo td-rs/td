@@ -1604,8 +1604,7 @@ mod message_reaction_tests {
     /// paid reaction never does), and the unread marks clear.
     #[test]
     fn remove_reactions_by_sender_drops_every_trace_of_the_sender() {
-        let mut env = Env::default();
-        env.is_premium = true;
+        let env = Env { is_premium: true };
         let me = DialogId::new(-99);
         let sender = DialogId::new(-7);
 
