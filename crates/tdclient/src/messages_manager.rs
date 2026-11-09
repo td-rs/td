@@ -5200,6 +5200,145 @@ impl MessageQuote {
             is_manual,
         })
     }
+
+    /// `MessageQuote::get_text_size` (MessageQuote.cpp:179-185, upstream
+    /// 334b39f98) — the plain-text bytes plus the quote texts of the rich
+    /// parts, the size the quote-changed warning compares against.
+    pub fn get_text_size(&self) -> usize {
+        let mut size = self.text.text.len();
+        for rich_text in &self.rich_texts {
+            size += rich_text.get_quote_text().len();
+        }
+        size
+    }
+
+    /// `MessageQuote::need_quote_changed_warning` (MessageQuote.cpp:187-201)
+    /// — 1 when the change is impossible (warn), -1 when an automatic
+    /// quote legitimately changed (the original message was edited), 0
+    /// when no warning is needed. The 1.8.70 quotes plane feeds the rich
+    /// texts into both the equality and the position check (upstream
+    /// 4e1635ac8 + 334b39f98).
+    pub fn need_quote_changed_warning(old_quote: &MessageQuote, new_quote: &MessageQuote) -> i32 {
+        if old_quote.position != new_quote.position
+            && old_quote.position.max(new_quote.position)
+                < i32::try_from(old_quote.get_text_size().min(new_quote.get_text_size()))
+                    .unwrap_or(i32::MAX)
+        {
+            // quote position can't change
+            return 1;
+        }
+        if old_quote.is_manual != new_quote.is_manual {
+            // quote manual property can't change
+            return 1;
+        }
+        if old_quote.text != new_quote.text || old_quote.rich_texts != new_quote.rich_texts {
+            if old_quote.is_manual {
+                return 1;
+            }
+            // automatic quote can change if the original message was edited
+            return -1;
+        }
+        0
+    }
+
+    /// `MessageQuote::create_automatic_quote(Td *, FormattedText &&)`
+    /// (MessageQuote.cpp:96-101) — the truncated automatic quote of a
+    /// plain-text reply; the option read (`message_reply_quote_length_max`)
+    /// arrives as a parameter for the seam callers.
+    pub fn create_automatic_quote(text: FormattedText, quote_length_max: usize) -> MessageQuote {
+        let mut text = text;
+        crate::message_entity::truncate_formatted_text(&mut text, quote_length_max);
+        // the C++ hands the truncated text to the stripping ctor
+        MessageQuote::new_stripped(text, Vec::new(), 0, false)
+    }
+
+    /// `MessageQuote::create_automatic_quote(Td *, const RichMessage &)`
+    /// (MessageQuote.cpp:103-130, upstream dbeb09f45) — the automatic
+    /// quote of a rich-message reply: at most 32 rich parts, total quote
+    /// text within the length cap, each part shaped whole through
+    /// `get_quote_fragment`. The C++ walks the RichMessage; the port
+    /// walks its page blocks (`RichMessage::for_each_quote_text` is the
+    /// blocks walker — RichMessage itself rides Wave-2 WebPages).
+    pub fn create_automatic_quote_from_page_blocks(
+        page_blocks: &[crate::webpage::WebPageBlock],
+        quote_length_max: usize,
+    ) -> MessageQuote {
+        const MAX_QUOTE_RICH_TEXTS: usize = 32; // server-side limit
+        let mut rich_texts = Vec::new();
+        let mut length = 0usize;
+        let mut is_finished = false;
+        crate::webpage::for_each_web_page_blocks_quote_text(page_blocks, &mut |rich_text| {
+            if is_finished {
+                return;
+            }
+            if rich_texts.len() >= MAX_QUOTE_RICH_TEXTS || length >= quote_length_max {
+                is_finished = true;
+                return;
+            }
+            let text = rich_text.get_quote_text();
+            if text.is_empty() {
+                return;
+            }
+            let mut end = tdutils::utf8::utf8_length(&text);
+            if length + end > quote_length_max {
+                end = quote_length_max - length;
+                is_finished = true;
+            }
+            let fragment = rich_text.get_quote_fragment(0, end);
+            if fragment.empty() {
+                return;
+            }
+            length += tdutils::utf8::utf8_length(&fragment.get_quote_text());
+            rich_texts.push(fragment);
+        });
+        // the C++ hands the parts to the stripping ctor (a no-op after
+        // get_quote_fragment's own strip, kept for the exact call shape)
+        MessageQuote::new_stripped(FormattedText::default(), rich_texts, 0, false)
+    }
+
+    /// `MessageQuote::update_input_reply_to_message` (MessageQuote.cpp:203-214)
+    /// — writes the quote onto the send-wire reply header: the text arm
+    /// or the rich arm (upstream 4e1635ac8/1631ed57b), then the position.
+    /// The C++ 1.8.70 store auto-flags the string/vector fields; the
+    /// Rust wire store writes the flags verbatim, so the bits are set
+    /// here exactly when the fields are non-empty (bit 2 text, bit 3
+    /// entities, bit 4 offset, bit 8 rich — telegram_api.tl
+    /// inputReplyToMessage).
+    pub fn update_input_reply_to_message<U: crate::message_entity::UserManagerLike + ?Sized>(
+        &self,
+        user_manager: Option<&mut U>,
+        input_reply_to_message: &mut telegram_api::inputReplyToMessage,
+    ) {
+        if self.is_empty() {
+            return;
+        }
+        assert!(self.is_manual, "the C++ CHECKs is_manual_");
+        if self.rich_texts.is_empty() {
+            input_reply_to_message.quote_text = self.text.text.clone();
+            input_reply_to_message.quote_entities =
+                crate::message_entity::get_input_message_entities(
+                    user_manager,
+                    &self.text.entities,
+                    "update_input_reply_to_message",
+                );
+            if !input_reply_to_message.quote_text.is_empty() {
+                input_reply_to_message.flags |= 1 << 2;
+            }
+            if !input_reply_to_message.quote_entities.is_empty() {
+                input_reply_to_message.flags |= 1 << 3;
+            }
+        } else {
+            input_reply_to_message.quote_rich =
+                crate::webpage::get_quote_rich_texts_input(&self.rich_texts);
+            if !input_reply_to_message.quote_rich.is_empty() {
+                input_reply_to_message.flags |= 1 << 8;
+            }
+        }
+        if self.position != 0 {
+            input_reply_to_message.flags |= 1 << 4;
+            input_reply_to_message.quote_offset = self.position;
+        }
+    }
 }
 
 /// `td::LastForwardedMessageInfo` (MessageForwardInfo.h:26-73) — where the
@@ -40409,6 +40548,205 @@ mod tests {
                 .get_input_text_quote_object::<()>(None)
                 .is_none()
         );
+    }
+
+    /// `create_automatic_quote` (upstream dbeb09f45) — the plain-text
+    /// truncation and the rich-message walk over page blocks (32-part
+    /// cap, total length cap, whole-part shaping).
+    #[test]
+    fn message_quote_create_automatic_quote() {
+        // the text variant truncates to the option cap
+        let quote = MessageQuote::create_automatic_quote(
+            FormattedText {
+                text: "hello rich world".to_owned(),
+                entities: Vec::new(),
+            },
+            5,
+        );
+        assert_eq!(quote.text.text, "hello");
+        assert!(!quote.is_manual);
+        assert_eq!(quote.position, 0);
+        assert!(quote.rich_texts.is_empty());
+
+        // the rich variant: the first part fills the cap and finishes the
+        // walk (the math block after it is not quoted)
+        let blocks = vec![
+            crate::webpage::WebPageBlock::Paragraph(crate::webpage::RichText::create_plain(
+                "hello world".to_owned(),
+            )),
+            crate::webpage::WebPageBlock::Math {
+                source: "x^2".to_owned(),
+            },
+        ];
+        let quote = MessageQuote::create_automatic_quote_from_page_blocks(&blocks, 8);
+        assert!(!quote.is_empty());
+        assert!(quote.text.text.is_empty());
+        assert_eq!(quote.rich_texts.len(), 1);
+        assert_eq!(quote.rich_texts[0].get_quote_text(), "hello wo");
+        assert!(!quote.is_manual);
+
+        // a wide cap quotes every part whole, in the walk order
+        let quote = MessageQuote::create_automatic_quote_from_page_blocks(&blocks, 100);
+        assert_eq!(quote.rich_texts.len(), 2);
+        assert_eq!(quote.rich_texts[0].get_quote_text(), "hello world");
+        assert_eq!(quote.rich_texts[1].get_quote_text(), "x^2");
+
+        // the 32-part server-side cap
+        let blocks: Vec<crate::webpage::WebPageBlock> = (0..33)
+            .map(|i| {
+                crate::webpage::WebPageBlock::Paragraph(crate::webpage::RichText::create_plain(
+                    i.to_string(),
+                ))
+            })
+            .collect();
+        let quote = MessageQuote::create_automatic_quote_from_page_blocks(&blocks, 1000);
+        assert_eq!(quote.rich_texts.len(), 32);
+
+        // a math part longer than the whole cap is cut by code points —
+        // an empty fragment (window 0..0 for a spent cap) never lands
+        let blocks = vec![crate::webpage::WebPageBlock::Math {
+            source: "abc".to_owned(),
+        }];
+        let quote = MessageQuote::create_automatic_quote_from_page_blocks(&blocks, 0);
+        assert!(quote.is_empty());
+    }
+
+    /// `need_quote_changed_warning` + `get_text_size` (upstream
+    /// 334b39f98 on top of 4e1635ac8) — the tri-state answer.
+    #[test]
+    fn message_quote_need_quote_changed_warning() {
+        let manual = |text: &str| MessageQuote {
+            text: FormattedText {
+                text: text.to_owned(),
+                entities: Vec::new(),
+            },
+            is_manual: true,
+            ..MessageQuote::default()
+        };
+        let automatic = |text: &str| MessageQuote {
+            text: FormattedText {
+                text: text.to_owned(),
+                entities: Vec::new(),
+            },
+            is_manual: false,
+            ..MessageQuote::default()
+        };
+
+        // identical quotes need no warning
+        assert_eq!(
+            MessageQuote::need_quote_changed_warning(&manual("a"), &manual("a")),
+            0
+        );
+
+        // the position can't move past the quote size: max(position) must
+        // stay under the smaller quote-text byte size
+        let mut moved = manual("abcde");
+        moved.position = 3; // 3 < 5
+        assert_eq!(
+            MessageQuote::need_quote_changed_warning(&manual("abcde"), &moved),
+            1
+        );
+        // a move to exactly the size falls through to the equality checks
+        let mut moved = manual("abcde");
+        moved.position = 5; // 5 < 5 is false
+        assert_eq!(
+            MessageQuote::need_quote_changed_warning(&manual("abcde"), &moved),
+            0
+        );
+
+        // the manual property can't change
+        assert_eq!(
+            MessageQuote::need_quote_changed_warning(&manual("a"), &automatic("a")),
+            1
+        );
+
+        // a changed manual quote warns; a changed automatic quote is an
+        // edit of the original message
+        assert_eq!(
+            MessageQuote::need_quote_changed_warning(&manual("a"), &manual("b")),
+            1
+        );
+        assert_eq!(
+            MessageQuote::need_quote_changed_warning(&automatic("a"), &automatic("b")),
+            -1
+        );
+
+        // the rich texts count into both the equality and the size: an
+        // automatic rich-only quote changing parts is an edit, and the
+        // position bound sums the quote-text bytes
+        let rich = |parts: usize| MessageQuote {
+            rich_texts: (0..parts)
+                .map(|_| crate::webpage::RichText::create_plain("ab".to_owned()))
+                .collect(),
+            is_manual: false,
+            ..MessageQuote::default()
+        };
+        assert_eq!(rich(1).get_text_size(), 2);
+        assert_eq!(rich(2).get_text_size(), 4);
+        assert_eq!(
+            MessageQuote::need_quote_changed_warning(&rich(1), &rich(2)),
+            -1
+        );
+        let mut moved = rich(1);
+        moved.position = 1; // 1 < the 2-byte quote text
+        assert_eq!(
+            MessageQuote::need_quote_changed_warning(&rich(1), &moved),
+            1
+        );
+    }
+
+    /// `update_input_reply_to_message` (upstream 4e1635ac8/1631ed57b) —
+    /// the quote fields and flag bits written onto the send-wire reply.
+    #[test]
+    fn message_quote_update_input_reply_to_message() {
+        // an empty quote leaves the wire reply untouched
+        let mut wire = telegram_api::inputReplyToMessage::default();
+        MessageQuote::default().update_input_reply_to_message::<()>(None, &mut wire);
+        assert_eq!(wire.flags, 0);
+
+        // the text arm: quote text + entities + offset, bits 2/3/4
+        let quote = MessageQuote {
+            text: FormattedText {
+                text: "ab".to_owned(),
+                entities: vec![crate::message_entity::MessageEntity {
+                    r#type: Some(crate::message_entity::Type::Bold),
+                    offset: 0,
+                    length: 2,
+                    ..crate::message_entity::MessageEntity::default()
+                }],
+            },
+            position: 5,
+            is_manual: true,
+            ..MessageQuote::default()
+        };
+        let mut wire = telegram_api::inputReplyToMessage::default();
+        quote.update_input_reply_to_message::<()>(None, &mut wire);
+        assert_eq!(wire.quote_text, "ab");
+        assert_eq!(wire.quote_entities.len(), 1);
+        assert!(matches!(
+            wire.quote_entities[0],
+            telegram_api::MessageEntity::messageEntityBold(_)
+        ));
+        assert_eq!(wire.quote_offset, 5);
+        assert_eq!(wire.flags, (1 << 2) | (1 << 3) | (1 << 4));
+        assert!(wire.quote_rich.is_empty());
+
+        // the rich arm: bit 8 and the wire rich texts, no text fields
+        let quote = MessageQuote {
+            rich_texts: vec![crate::webpage::RichText::create_math("x".to_owned())],
+            position: 0,
+            is_manual: true,
+            ..MessageQuote::default()
+        };
+        let mut wire = telegram_api::inputReplyToMessage::default();
+        quote.update_input_reply_to_message::<()>(None, &mut wire);
+        assert!(wire.quote_text.is_empty());
+        assert_eq!(wire.flags, 1 << 8);
+        assert_eq!(wire.quote_rich.len(), 1);
+        assert!(matches!(
+            wire.quote_rich[0].as_ref(),
+            telegram_api::RichText::textMath(t) if t.source == "x"
+        ));
     }
 
     #[test]

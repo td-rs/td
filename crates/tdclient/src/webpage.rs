@@ -3843,6 +3843,28 @@ pub fn parse_quote_rich_texts(parser: &mut Parser<'_>) -> Result<Vec<RichText>, 
     Ok(rich_texts)
 }
 
+/// The wire half of [`get_quote_rich_texts_object`] — the `quote_rich_`
+/// vector of `MessageQuote::update_input_reply_to_message`
+/// (MessageQuote.cpp:206-211): the C++ fills a `GetInputPageBlockContext`
+/// over Td; the quote-stripped rich texts only reach the env-free input
+/// arms, so the no-op env stands in again.
+pub fn get_quote_rich_texts_input(rich_texts: &[RichText]) -> Vec<Box<telegram_api::RichText>> {
+    let mut env = NoObjectEnv;
+    let mut user_manager = ();
+    let mut context = GetInputPageBlockContext {
+        env: &mut env,
+        photos: Vec::new(),
+        documents: Vec::new(),
+        media_pos: 0,
+        user_manager: &mut user_manager,
+    };
+    rich_texts
+        .iter()
+        .map(|rich_text| rich_text.get_input_rich_text(&mut context))
+        .map(Box::new)
+        .collect()
+}
+
 /// The no-op env behind [`get_quote_rich_texts_object`] — every method
 /// answers the empty default; none is reachable for quote-stripped rich
 /// texts (the env-armed arms — Icon/MentionName/Button and the
