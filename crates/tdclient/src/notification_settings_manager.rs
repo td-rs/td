@@ -41,7 +41,7 @@ use crate::notification_settings::{
     NotificationSettingsScope, ReactionNotificationSettings, ScopeNotificationSettings,
     are_different_equivalent_notification_sounds, are_equivalent_notification_sounds,
     dup_notification_sound, get_input_notify_peer_for_scope,
-    get_notification_sound_ringtone_id, get_notification_settings_scope_object,
+    get_notification_settings_scope_object, get_notification_sound_ringtone_id,
     get_scope_notification_settings_from_td_api, get_scope_notification_settings_from_telegram,
     get_scope_notification_settings_object, is_notification_sound_default,
 };
@@ -464,7 +464,11 @@ impl NotificationSettingsManager {
         dialog_id: DialogId,
     ) -> i32 {
         let community_settings = self.get_dialog_community_notification_settings(env, dialog_id);
-        self.get_dialog_default_mute_until_with_community(env, dialog_id, community_settings.as_ref())
+        self.get_dialog_default_mute_until_with_community(
+            env,
+            dialog_id,
+            community_settings.as_ref(),
+        )
     }
 
     /// `get_dialog_default_mute_until(dialog_id, community_settings)`
@@ -1490,7 +1494,9 @@ mod tests {
             "the unmute is scheduled 101 monotonic seconds out"
         );
         assert_eq!(
-            manager.get_scope(NotificationSettingsScope::Private).mute_until,
+            manager
+                .get_scope(NotificationSettingsScope::Private)
+                .mute_until,
             1_000_100
         );
     }
@@ -1513,7 +1519,9 @@ mod tests {
 
         // the scope became synchronized and muted-for-50
         assert_eq!(
-            manager.get_scope(NotificationSettingsScope::Group).mute_until,
+            manager
+                .get_scope(NotificationSettingsScope::Group)
+                .mute_until,
             1_000_050
         );
         assert!(manager.next_deadline().is_some());
@@ -1611,7 +1619,9 @@ mod tests {
         env.unix_time = 1_000_030;
         manager.tick_timeouts(&mut env);
         assert_eq!(
-            manager.get_scope(NotificationSettingsScope::Private).mute_until,
+            manager
+                .get_scope(NotificationSettingsScope::Private)
+                .mute_until,
             1_000_050
         );
 
@@ -1620,7 +1630,9 @@ mod tests {
         env.unix_time = 1_000_052;
         manager.tick_timeouts(&mut env);
         assert_eq!(
-            manager.get_scope(NotificationSettingsScope::Private).mute_until,
+            manager
+                .get_scope(NotificationSettingsScope::Private)
+                .mute_until,
             0
         );
         assert!(manager.next_deadline().is_none());
@@ -1682,10 +1694,16 @@ mod tests {
         manager.reset_all_notification_settings(&mut env);
 
         assert_eq!(
-            manager.get_scope(NotificationSettingsScope::Private).mute_until,
+            manager
+                .get_scope(NotificationSettingsScope::Private)
+                .mute_until,
             0
         );
-        assert!(manager.get_scope(NotificationSettingsScope::Private).show_preview);
+        assert!(
+            manager
+                .get_scope(NotificationSettingsScope::Private)
+                .show_preview
+        );
         assert_eq!(
             env.binlog.last().expect("set").1,
             RESET_ALL_NOTIFICATION_SETTINGS_ON_SERVER
@@ -2055,7 +2073,10 @@ mod tests {
         );
         assert_eq!(
             manager.get_dialog_default_mute_stories(&mut env, dialog_id),
-            (scope_settings.use_default_mute_stories, scope_settings.mute_stories)
+            (
+                scope_settings.use_default_mute_stories,
+                scope_settings.mute_stories
+            )
         );
 
         // an absent (unsynchronized) community falls through too

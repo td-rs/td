@@ -18,7 +18,7 @@ use crate::community_id::CommunityId;
 use crate::dialog_id::DialogId;
 use crate::messages_manager::{
     DialogNotificationSettings, get_chat_notification_settings_object,
-    get_dialog_notification_settings_from_telegram, get_dialog_notification_settings_from_td_api,
+    get_dialog_notification_settings_from_td_api, get_dialog_notification_settings_from_telegram,
     need_update_dialog_notification_settings,
 };
 use crate::td_api;
@@ -123,9 +123,7 @@ pub trait CommunityManagerEnv {
         community_id: CommunityId,
         input_community: telegram_api::InputChannel,
     ) {
-        tdutils::log_info!(
-            "Send account_getNotifySettings for {community_id:?} — [net-inert]"
-        );
+        tdutils::log_info!("Send account_getNotifySettings for {community_id:?} — [net-inert]");
         let _ = input_community;
     }
 
@@ -140,9 +138,7 @@ pub trait CommunityManagerEnv {
         input_community: telegram_api::InputChannel,
         notification_settings: &DialogNotificationSettings,
     ) {
-        tdutils::log_info!(
-            "Send account_updateNotifySettings for {community_id:?} — [net-inert]"
-        );
+        tdutils::log_info!("Send account_updateNotifySettings for {community_id:?} — [net-inert]");
         let _ = (input_community, notification_settings);
     }
 
@@ -266,7 +262,8 @@ pub struct CommunityManager {
     get_community_notification_settings_queries: std::collections::BTreeSet<i64>,
     /// `pending_community_notification_settings_` (c9ed2c390) — the
     /// settings parked until the community's chat list loads.
-    pending_community_notification_settings: std::collections::BTreeMap<i64, DialogNotificationSettings>,
+    pending_community_notification_settings:
+        std::collections::BTreeMap<i64, DialogNotificationSettings>,
     /// The `community_unmute_timeout_` MultiTimeout slots (9a16c4396,
     /// d46d51f61); the value is the absolute process-time deadline.
     community_unmute_timeout: std::collections::BTreeMap<i64, f64>,
@@ -545,7 +542,8 @@ impl CommunityManager {
             // cached community.
             return;
         };
-        let need_update = need_update_dialog_notification_settings(&current_settings, &new_settings);
+        let need_update =
+            need_update_dialog_notification_settings(&current_settings, &new_settings);
         if !need_update.are_changed && !need_update.need_update_local {
             self.pending_community_notification_settings
                 .remove(&community_id.get());
@@ -599,8 +597,10 @@ impl CommunityManager {
             return;
         };
         new_settings.fix_mute_until(env.auth_is_bot(), env.unix_time());
-        let need_update =
-            need_update_dialog_notification_settings(&community.notification_settings, &new_settings);
+        let need_update = need_update_dialog_notification_settings(
+            &community.notification_settings,
+            &new_settings,
+        );
         if need_update.are_changed || need_update.need_update_local {
             self.do_update_community_notification_settings(env, community_id, new_settings);
         }
@@ -689,8 +689,10 @@ impl CommunityManager {
             // holds a loaded full.
             return false;
         };
-        let need_update =
-            need_update_dialog_notification_settings(&community_full.notification_settings, &new_settings);
+        let need_update = need_update_dialog_notification_settings(
+            &community_full.notification_settings,
+            &new_settings,
+        );
         if need_update.are_changed || need_update.need_update_local {
             community_full.notification_settings = new_settings;
         }
@@ -804,7 +806,11 @@ impl CommunityManager {
             }
             return None;
         }
-        Some(self.communities[&community_id.get()].notification_settings.clone())
+        Some(
+            self.communities[&community_id.get()]
+                .notification_settings
+                .clone(),
+        )
     }
 
     /// `on_get_community_notification_settings_error` (09634ee46) — the
@@ -856,12 +862,17 @@ impl CommunityManager {
                 "Full information about the community must be received first",
             ));
         }
-        let old_settings = self.communities_full[&community_id.get()].notification_settings.clone();
-        let new_settings =
-            match get_dialog_notification_settings_from_td_api(notification_settings, &old_settings, env.unix_time()) {
-                Ok(new_settings) => new_settings,
-                Err(status) => return promise.set_error(status),
-            };
+        let old_settings = self.communities_full[&community_id.get()]
+            .notification_settings
+            .clone();
+        let new_settings = match get_dialog_notification_settings_from_td_api(
+            notification_settings,
+            &old_settings,
+            env.unix_time(),
+        ) {
+            Ok(new_settings) => new_settings,
+            Err(status) => return promise.set_error(status),
+        };
         self.update_community_notification_settings(env, community_id, new_settings.clone());
         let need_update_server = self.update_community_full_notification_settings(
             env,
@@ -874,8 +885,11 @@ impl CommunityManager {
         }
         // The wire form is the full's (already updated) settings. The C++
         // CHECK band: the community is cached (the have_community gate).
-        let wire_settings =
-            self.communities_full[&community_id.get()].notification_settings.clone();        if let Some(input_community) = self.get_input_community_impl(env.auth_is_bot(), community_id)
+        let wire_settings = self.communities_full[&community_id.get()]
+            .notification_settings
+            .clone();
+        if let Some(input_community) =
+            self.get_input_community_impl(env.auth_is_bot(), community_id)
         {
             env.send_update_community_notify_settings_query(
                 community_id,
@@ -1737,8 +1751,7 @@ mod tests {
         ));
         // unsync vs a muted state changed (the -1 triple vs a real one)
         assert!(CommunityManager::need_update_community_dialogs(
-            &unsync,
-            &muted
+            &unsync, &muted
         ));
         // a mute flips the state
         assert!(CommunityManager::need_update_community_dialogs(
@@ -1853,12 +1866,7 @@ mod tests {
 
         // a null settings object converts to the unsynchronized default
         // and is dropped
-        manager.on_update_community_notify_settings(
-            &mut env,
-            CommunityId::new(7),
-            None,
-            "test",
-        );
+        manager.on_update_community_notify_settings(&mut env, CommunityId::new(7), None, "test");
         assert!(env.updates.is_empty());
         assert_eq!(
             manager
@@ -1873,8 +1881,12 @@ mod tests {
         // a synchronized wire form applies to the community + fires the
         // full update; an expired wire mute clears
         let wire = wire_peer_notify_settings(90);
-        manager
-            .on_update_community_notify_settings(&mut env, CommunityId::new(7), Some(&wire), "test");
+        manager.on_update_community_notify_settings(
+            &mut env,
+            CommunityId::new(7),
+            Some(&wire),
+            "test",
+        );
         assert_eq!(
             manager
                 .communities
@@ -1896,8 +1908,12 @@ mod tests {
 
         let wire = wire_peer_notify_settings(200);
         env.updates.clear();
-        manager
-            .on_update_community_notify_settings(&mut env, CommunityId::new(7), Some(&wire), "test");
+        manager.on_update_community_notify_settings(
+            &mut env,
+            CommunityId::new(7),
+            Some(&wire),
+            "test",
+        );
         assert_eq!(
             manager
                 .communities
@@ -1922,12 +1938,7 @@ mod tests {
 
         // the missing-community and missing-full 400s
         let (promise, recorded) = record();
-        manager.set_community_notification_settings(
-            &mut env,
-            CommunityId::new(8),
-            None,
-            promise,
-        );
+        manager.set_community_notification_settings(&mut env, CommunityId::new(8), None, promise);
         assert_eq!(
             recorded
                 .0
@@ -1941,12 +1952,7 @@ mod tests {
             "Community not found"
         );
         let (promise, recorded) = record();
-        manager.set_community_notification_settings(
-            &mut env,
-            CommunityId::new(7),
-            None,
-            promise,
-        );
+        manager.set_community_notification_settings(&mut env, CommunityId::new(7), None, promise);
         assert_eq!(
             recorded
                 .0
@@ -2092,7 +2098,11 @@ mod tests {
             0
         );
         assert!(manager.next_deadline().is_none());
-        assert_eq!(env.fanouts.len(), 2, "the mute flip and the clear both fan out");
+        assert_eq!(
+            env.fanouts.len(),
+            2,
+            "the mute flip and the clear both fan out"
+        );
 
         // an already-expired mute never arms (fix_mute_until clears it at
         // the update)
@@ -2287,8 +2297,12 @@ mod tests {
         // the wire update refreshes the full's half, which the object
         // converts (mute_for = mute_until - now)
         let wire = wire_peer_notify_settings(150);
-        manager
-            .on_update_community_notify_settings(&mut env, CommunityId::new(7), Some(&wire), "test");
+        manager.on_update_community_notify_settings(
+            &mut env,
+            CommunityId::new(7),
+            Some(&wire),
+            "test",
+        );
         let info = manager
             .get_community_full_info_object(&mut env, CommunityId::new(7))
             .unwrap();

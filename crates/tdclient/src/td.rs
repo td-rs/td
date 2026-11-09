@@ -3132,9 +3132,7 @@ enum CommunityNetKind {
     /// the notification-settings postpone reload rides it with the id
     /// (the reload promise resolves on error too, applying the parked
     /// settings).
-    GetFullCommunity {
-        community_id: Option<CommunityId>,
-    },
+    GetFullCommunity { community_id: Option<CommunityId> },
     /// `CreateCommunityQuery` (cpp:120) — the error ladder's
     /// `on_get_dialog_error` keys on the request dialog.
     CreateCommunity { dialog_id: DialogId },
@@ -25081,10 +25079,8 @@ impl Td {
                     };
                     let mut manager = std::mem::take(&mut td.community_manager);
                     let mut env = CommunityEnv { td: &mut *td };
-                    manager.on_reload_community_full_for_notification_settings(
-                        &mut env,
-                        community_id,
-                    );
+                    manager
+                        .on_reload_community_full_for_notification_settings(&mut env, community_id);
                     td.community_manager = manager;
                 };
                 if query.is_error() {
@@ -25189,7 +25185,8 @@ impl Td {
                 match telegram_api::PeerNotifySettings::parse(query.ok()) {
                     Ok(settings) => {
                         let mut manager = std::mem::take(&mut self.community_manager);
-                        let mut env = CommunityEnv { td: &mut *self };                        manager.on_update_community_notify_settings(
+                        let mut env = CommunityEnv { td: &mut *self };
+                        manager.on_update_community_notify_settings(
                             &mut env,
                             community_id,
                             Some(&settings),
@@ -25224,10 +25221,10 @@ impl Td {
                     );
                     // trying to repair notification settings for the
                     // community (the empty-promise Get re-send)
-                    if let Some(input_community) = self.community_manager.get_input_community_impl(
-                        self.auth_manager.is_bot(),
-                        community_id,
-                    ) {
+                    if let Some(input_community) = self
+                        .community_manager
+                        .get_input_community_impl(self.auth_manager.is_bot(), community_id)
+                    {
                         let mut env = CommunityEnv { td: &mut *self };
                         env.send_get_community_notify_settings_query(community_id, input_community);
                     }
@@ -58874,28 +58871,25 @@ mod tests {
             sent[0].tl_constructor(),
             telegram_api::account_getNotifySettings::ID
         );
-        net_complete(
-            sent.drain(..).next().unwrap(),
-            {
-                let mut out = Vec::new();
-                telegram_api::PeerNotifySettings {
-                    flags: 0,
-                    show_previews: true,
-                    silent: false,
-                    mute_until: 0,
-                    ios_sound: None,
-                    android_sound: None,
-                    other_sound: None,
-                    stories_muted: false,
-                    stories_hide_sender: false,
-                    stories_ios_sound: None,
-                    stories_android_sound: None,
-                    stories_other_sound: None,
-                }
-                .store_boxed(&mut out);
-                out
-            },
-        );
+        net_complete(sent.drain(..).next().unwrap(), {
+            let mut out = Vec::new();
+            telegram_api::PeerNotifySettings {
+                flags: 0,
+                show_previews: true,
+                silent: false,
+                mute_until: 0,
+                ios_sound: None,
+                android_sound: None,
+                other_sound: None,
+                stories_muted: false,
+                stories_hide_sender: false,
+                stories_ios_sound: None,
+                stories_android_sound: None,
+                stories_other_sound: None,
+            }
+            .store_boxed(&mut out);
+            out
+        });
         td.dispatch_completed_community_net();
 
         // 1. setCommunityNotificationSettings — the full-gated request
@@ -58903,42 +58897,38 @@ mod tests {
         //    inputNotifyCommunity; boolTrue settles the promise
         td.request(
             1,
-            Function::setCommunityNotificationSettings(
-                td_api::setCommunityNotificationSettings {
-                    community_id: 7,
-                    notification_settings: Some(td_api::ChatNotificationSettings {
-                        use_default_mute_for: false,
-                        mute_for: 100,
-                        use_default_sound: true,
-                        sound_id: 0,
-                        use_default_show_preview: true,
-                        show_preview: true,
-                        use_default_mute_stories: true,
-                        mute_stories: false,
-                        use_default_story_sound: true,
-                        story_sound_id: 0,
-                        use_default_show_story_poster: true,
-                        show_story_poster: true,
-                        use_default_disable_pinned_message_notifications: true,
-                        disable_pinned_message_notifications: false,
-                        use_default_disable_mention_notifications: true,
-                        disable_mention_notifications: false,
-                    }),
-                },
-            ),
+            Function::setCommunityNotificationSettings(td_api::setCommunityNotificationSettings {
+                community_id: 7,
+                notification_settings: Some(td_api::ChatNotificationSettings {
+                    use_default_mute_for: false,
+                    mute_for: 100,
+                    use_default_sound: true,
+                    sound_id: 0,
+                    use_default_show_preview: true,
+                    show_preview: true,
+                    use_default_mute_stories: true,
+                    mute_stories: false,
+                    use_default_story_sound: true,
+                    story_sound_id: 0,
+                    use_default_show_story_poster: true,
+                    show_story_poster: true,
+                    use_default_disable_pinned_message_notifications: true,
+                    disable_pinned_message_notifications: false,
+                    use_default_disable_mention_notifications: true,
+                    disable_mention_notifications: false,
+                }),
+            }),
         );
         td.flush_deferred_results();
-        let sent = take_sent_query(
-            &rec,
-            telegram_api::account_updateNotifySettings::ID,
-        );
-        let body = telegram_api::account_updateNotifySettings::parse(sent.query())
-            .expect("the sent body");
+        let sent = take_sent_query(&rec, telegram_api::account_updateNotifySettings::ID);
+        let body =
+            telegram_api::account_updateNotifySettings::parse(sent.query()).expect("the sent body");
         assert!(matches!(
             body.peer,
             Some(telegram_api::InputNotifyPeer::inputNotifyCommunity(_))
         ));
-        let settings = body.settings.expect("the wire settings");        assert_eq!(settings.mute_until, unix_time + 100);
+        let settings = body.settings.expect("the wire settings");
+        assert_eq!(settings.mute_until, unix_time + 100);
         net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
         td.dispatch_completed_community_net();
         td.flush_deferred_results();
@@ -58958,62 +58948,54 @@ mod tests {
         //    query and forwards the error to the request
         td.request(
             2,
-            Function::setCommunityNotificationSettings(
-                td_api::setCommunityNotificationSettings {
-                    community_id: 7,
-                    notification_settings: Some(td_api::ChatNotificationSettings {
-                        use_default_mute_for: false,
-                        mute_for: 200,
-                        use_default_sound: true,
-                        sound_id: 0,
-                        use_default_show_preview: true,
-                        show_preview: true,
-                        use_default_mute_stories: true,
-                        mute_stories: false,
-                        use_default_story_sound: true,
-                        story_sound_id: 0,
-                        use_default_show_story_poster: true,
-                        show_story_poster: true,
-                        use_default_disable_pinned_message_notifications: true,
-                        disable_pinned_message_notifications: false,
-                        use_default_disable_mention_notifications: true,
-                        disable_mention_notifications: false,
-                    }),
-                },
-            ),
+            Function::setCommunityNotificationSettings(td_api::setCommunityNotificationSettings {
+                community_id: 7,
+                notification_settings: Some(td_api::ChatNotificationSettings {
+                    use_default_mute_for: false,
+                    mute_for: 200,
+                    use_default_sound: true,
+                    sound_id: 0,
+                    use_default_show_preview: true,
+                    show_preview: true,
+                    use_default_mute_stories: true,
+                    mute_stories: false,
+                    use_default_story_sound: true,
+                    story_sound_id: 0,
+                    use_default_show_story_poster: true,
+                    show_story_poster: true,
+                    use_default_disable_pinned_message_notifications: true,
+                    disable_pinned_message_notifications: false,
+                    use_default_disable_mention_notifications: true,
+                    disable_mention_notifications: false,
+                }),
+            }),
         );
         td.flush_deferred_results();
-        let sent = take_sent_query(
-            &rec,
-            telegram_api::account_updateNotifySettings::ID,
-        );
+        let sent = take_sent_query(&rec, telegram_api::account_updateNotifySettings::ID);
         net_fail(sent, 400, "PEER_ID_INVALID");
         td.dispatch_completed_community_net();
         td.flush_deferred_results();
         // the repair Get query went out and the request failed
         let repair = take_sent_query(&rec, telegram_api::account_getNotifySettings::ID);
-        net_complete(
-            repair,
-            {
-                let mut out = Vec::new();
-                telegram_api::PeerNotifySettings {
-                    flags: 0,
-                    show_previews: true,
-                    silent: false,
-                    mute_until: 0,
-                    ios_sound: None,
-                    android_sound: None,
-                    other_sound: None,
-                    stories_muted: false,
-                    stories_hide_sender: false,
-                    stories_ios_sound: None,
-                    stories_android_sound: None,
-                    stories_other_sound: None,
-                }
-                .store_boxed(&mut out);
-                out
-            },
-        );
+        net_complete(repair, {
+            let mut out = Vec::new();
+            telegram_api::PeerNotifySettings {
+                flags: 0,
+                show_previews: true,
+                silent: false,
+                mute_until: 0,
+                ios_sound: None,
+                android_sound: None,
+                other_sound: None,
+                stories_muted: false,
+                stories_hide_sender: false,
+                stories_ios_sound: None,
+                stories_android_sound: None,
+                stories_other_sound: None,
+            }
+            .store_boxed(&mut out);
+            out
+        });
         td.dispatch_completed_community_net();
         td.flush_deferred_results();
         let error = error_of(&callback, 2);
@@ -59044,11 +59026,7 @@ mod tests {
             );
         });
         let sent = std::mem::take(&mut *rec.sent.lock());
-        assert_eq!(
-            sent.len(),
-            1,
-            "the in-flight Get query dedups across reads"
-        );
+        assert_eq!(sent.len(), 1, "the in-flight Get query dedups across reads");
         assert_eq!(
             sent[0].tl_constructor(),
             telegram_api::account_getNotifySettings::ID
@@ -59065,28 +59043,25 @@ mod tests {
         let sent = std::mem::take(&mut *rec.sent.lock());
         assert_eq!(sent.len(), 1, "the erased entry re-sends the query");
         // drain the last query so the drained-assert below holds
-        net_complete(
-            sent.into_iter().next().unwrap(),
-            {
-                let mut out = Vec::new();
-                telegram_api::PeerNotifySettings {
-                    flags: 0,
-                    show_previews: true,
-                    silent: false,
-                    mute_until: 0,
-                    ios_sound: None,
-                    android_sound: None,
-                    other_sound: None,
-                    stories_muted: false,
-                    stories_hide_sender: false,
-                    stories_ios_sound: None,
-                    stories_android_sound: None,
-                    stories_other_sound: None,
-                }
-                .store_boxed(&mut out);
-                out
-            },
-        );
+        net_complete(sent.into_iter().next().unwrap(), {
+            let mut out = Vec::new();
+            telegram_api::PeerNotifySettings {
+                flags: 0,
+                show_previews: true,
+                silent: false,
+                mute_until: 0,
+                ios_sound: None,
+                android_sound: None,
+                other_sound: None,
+                stories_muted: false,
+                stories_hide_sender: false,
+                stories_ios_sound: None,
+                stories_android_sound: None,
+                stories_other_sound: None,
+            }
+            .store_boxed(&mut out);
+            out
+        });
         td.dispatch_completed_community_net();
         assert!(td.community_net_completed.lock().is_empty(), "drained");
     }

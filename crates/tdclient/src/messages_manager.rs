@@ -3518,8 +3518,8 @@ pub fn get_chat_notification_settings_object(
         story_sound_id: get_notification_sound_ringtone_id(&notification_settings.story_sound),
         use_default_show_story_poster: notification_settings.use_default_hide_story_sender,
         show_story_poster: !notification_settings.hide_story_sender,
-        use_default_disable_pinned_message_notifications:
-            notification_settings.use_default_disable_pinned_message_notifications,
+        use_default_disable_pinned_message_notifications: notification_settings
+            .use_default_disable_pinned_message_notifications,
         disable_pinned_message_notifications: notification_settings
             .disable_pinned_message_notifications,
         use_default_disable_mention_notifications: notification_settings
@@ -3556,7 +3556,10 @@ pub fn get_dialog_notification_settings_from_td_api(
         dup_notification_sound, get_notification_sound_from_id, is_notification_sound_default,
     };
     let Some(notification_settings) = notification_settings else {
-        return Err(Status::error(400, "New notification settings must be non-empty"));
+        return Err(Status::error(
+            400,
+            "New notification settings must be non-empty",
+        ));
     };
 
     let mute_until = if notification_settings.use_default_mute_for {
@@ -3564,8 +3567,10 @@ pub fn get_dialog_notification_settings_from_td_api(
     } else {
         get_mute_until(notification_settings.mute_for, unix_time)
     };
-    let mut notification_sound =
-        get_notification_sound_from_id(notification_settings.use_default_sound, notification_settings.sound_id);
+    let mut notification_sound = get_notification_sound_from_id(
+        notification_settings.use_default_sound,
+        notification_settings.sound_id,
+    );
     if is_notification_sound_default(&old_settings.sound)
         && is_notification_sound_default(&notification_sound)
     {
@@ -3592,8 +3597,8 @@ pub fn get_dialog_notification_settings_from_td_api(
         use_default_hide_story_sender: notification_settings.use_default_show_story_poster,
         hide_story_sender: !notification_settings.show_story_poster,
         silent_send_message: old_settings.silent_send_message,
-        use_default_disable_pinned_message_notifications:
-            notification_settings.use_default_disable_pinned_message_notifications,
+        use_default_disable_pinned_message_notifications: notification_settings
+            .use_default_disable_pinned_message_notifications,
         disable_pinned_message_notifications: notification_settings
             .disable_pinned_message_notifications,
         use_default_disable_mention_notifications: notification_settings
@@ -3701,25 +3706,33 @@ pub fn need_update_dialog_notification_settings(
     let mut result = NeedUpdateDialogNotificationSettings::default();
     result.need_update_server = current_settings.mute_until != new_settings.mute_until
         || !are_equivalent_notification_sounds(&current_settings.sound, &new_settings.sound)
-        || !are_equivalent_notification_sounds(&current_settings.story_sound, &new_settings.story_sound)
+        || !are_equivalent_notification_sounds(
+            &current_settings.story_sound,
+            &new_settings.story_sound,
+        )
         || current_settings.show_preview != new_settings.show_preview
         || current_settings.mute_stories != new_settings.mute_stories
         || current_settings.hide_story_sender != new_settings.hide_story_sender
         || current_settings.use_default_mute_until != new_settings.use_default_mute_until
         || current_settings.use_default_show_preview != new_settings.use_default_show_preview
         || current_settings.use_default_mute_stories != new_settings.use_default_mute_stories
-        || current_settings.use_default_hide_story_sender != new_settings.use_default_hide_story_sender;
+        || current_settings.use_default_hide_story_sender
+            != new_settings.use_default_hide_story_sender;
     result.need_update_local = current_settings.use_default_disable_pinned_message_notifications
         != new_settings.use_default_disable_pinned_message_notifications
         || current_settings.disable_pinned_message_notifications
             != new_settings.disable_pinned_message_notifications
         || current_settings.use_default_disable_mention_notifications
             != new_settings.use_default_disable_mention_notifications
-        || current_settings.disable_mention_notifications != new_settings.disable_mention_notifications;
+        || current_settings.disable_mention_notifications
+            != new_settings.disable_mention_notifications;
     result.are_changed = result.need_update_server
         || result.need_update_local
         || current_settings.is_synchronized != new_settings.is_synchronized
-        || are_different_equivalent_notification_sounds(&current_settings.sound, &new_settings.sound)
+        || are_different_equivalent_notification_sounds(
+            &current_settings.sound,
+            &new_settings.sound,
+        )
         || are_different_equivalent_notification_sounds(
             &current_settings.story_sound,
             &new_settings.story_sound,
@@ -38071,7 +38084,10 @@ mod tests {
         // an expired mute clamps to 0 instead of going negative
         let mut expired = settings.clone();
         expired.mute_until = 100;
-        assert_eq!(get_chat_notification_settings_object(&expired, 400).mute_for, 0);
+        assert_eq!(
+            get_chat_notification_settings_object(&expired, 400).mute_for,
+            0
+        );
     }
 
     #[test]
@@ -38160,8 +38176,7 @@ mod tests {
         let mut old = DialogNotificationSettings::default();
         old.use_default_disable_pinned_message_notifications = false;
         old.disable_pinned_message_notifications = true;
-        let absent =
-            get_dialog_notification_settings_from_telegram(None, Some(&old), 100);
+        let absent = get_dialog_notification_settings_from_telegram(None, Some(&old), 100);
         assert!(!absent.is_synchronized);
         assert!(!absent.use_default_disable_pinned_message_notifications);
         assert!(absent.disable_pinned_message_notifications);
@@ -38195,8 +38210,7 @@ mod tests {
 
         let mut future = wire.clone();
         future.mute_until = 300;
-        let converted =
-            get_dialog_notification_settings_from_telegram(Some(&future), None, 100);
+        let converted = get_dialog_notification_settings_from_telegram(Some(&future), None, 100);
         assert_eq!(converted.mute_until, 300);
         // no old settings → the local defaults
         assert!(converted.use_default_disable_pinned_message_notifications);
@@ -38241,8 +38255,7 @@ mod tests {
             title: "b".to_owned(),
             data: String::new(),
         });
-        let verdict =
-            need_update_dialog_notification_settings(&with_local, &with_other_local);
+        let verdict = need_update_dialog_notification_settings(&with_local, &with_other_local);
         assert!(!verdict.need_update_server);
         assert!(verdict.are_changed);
 
