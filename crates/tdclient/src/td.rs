@@ -3881,6 +3881,35 @@ pub(crate) type BoostNetHandle = NetKindHandle<crate::boost_manager::BoostNetKin
 /// `FinishCreateCommunityChain` convention).
 type ConvertGiftQueue = Arc<Mutex<Vec<(crate::dialog_id::DialogId, Promise<()>)>>>;
 
+/// The phone-number-privacy chain queue — the C++
+/// `PromiseCreator::lambda` of `AccountManager::create_user_link`
+/// (AccountManager.cpp:1407-1420): the `get_privacy` answer parks here
+/// and the pump re-enters `on_get_find_by_phone_number_privacy` with the
+/// FIFO-paired `(token, expiry, promise)` triple (the same
+/// queue-decoupling convention).
+type PhonePrivacyAnswerQueue =
+    Arc<Mutex<Vec<tdutils::status::Result<td_api::UserPrivacySettingRules>>>>;
+
+/// The `PrivacyManager::get_privacy` promise of the `getUserLink`
+/// phone-number arm — parks the rules answer onto the
+/// [`PhonePrivacyAnswerQueue`] (the C++ lambda's
+/// `on_get_find_by_phone_number_privacy` send_closure).
+struct PhonePrivacyChain {
+    answers: PhonePrivacyAnswerQueue,
+}
+
+impl tdutils::promise::PromiseInterface<td_api::UserPrivacySettingRules> for PhonePrivacyChain {
+    fn set_value(&mut self, value: td_api::UserPrivacySettingRules) {
+        self.answers.lock().push(tdutils::status::Result::Ok(value));
+    }
+
+    fn set_error(&mut self, error: Status) {
+        self.answers
+            .lock()
+            .push(tdutils::status::Result::Err(error));
+    }
+}
+
 /// The `delete_forum_topic` continuation queue — the C++
 /// `PromiseCreator::lambda` (ForumTopicManager.cpp:1028-1037): the
 /// affected-history loop's completion parks the request promise for the
@@ -6569,6 +6598,12 @@ pub struct Td {
     /// The ConvertStarGiftQuery continuation queue (the reload-completes-
     /// into-transfer-tail hop).
     convert_gift_queue: ConvertGiftQueue,
+    /// The phone-number-privacy chain answers — the C++
+    /// `PromiseCreator::lambda` queue of `create_user_link`
+    /// (AccountManager.cpp:1407-1420); the pump drains them into the
+    /// account manager's `on_get_find_by_phone_number_privacy`
+    /// FIFO-paired with its `pending_phone_privacy_link` triples.
+    phone_privacy_answers: PhonePrivacyAnswerQueue,
     /// The interned sponsored-peer search queries (the
     /// `GetSponsoredPeers { query_index }` kind payload).
     sponsored_peer_queries: Vec<std::sync::Arc<str>>,
@@ -7095,6 +7130,7 @@ impl Td {
             forum_topic_delete_completions: Arc::new(Mutex::new(Vec::new())),
             message_query_net_pending: crate::message_query_manager::PendingNetQueries::default(),
             convert_gift_queue: Arc::new(Mutex::new(Vec::new())),
+            phone_privacy_answers: Arc::new(Mutex::new(Vec::new())),
             sponsored_peer_queries: Vec::new(),
             nearest_dc_promises: Vec::new(),
             country_language_codes: Vec::new(),
@@ -9465,6 +9501,13 @@ impl Td {
         self.dispatch_completed_star_gift_net();
         self.dispatch_completed_messages_net();
         self.dispatch_completed_send_message_net();
+        // The `getUserLink` phone-number arm (AccountManager.cpp:1401-1427)
+        // — the parked `get_privacy` drives fire after the privacy plane
+        // drained, so both the synchronized-cache and the net-answer
+        // completions reach `on_get_find_by_phone_number_privacy` in this
+        // tick.
+        self.drive_phone_privacy_links();
+        self.drain_phone_privacy_answers();
         let completed = std::mem::take(&mut *self.net_completed.lock());
         for (token, query) in completed {
             let Some((request_id, kind)) = self.pending_net.remove(&token) else {
@@ -9479,6 +9522,74 @@ impl Td {
         if tdactor::Scheduler::in_scheduler_context() {
             tdactor::send_closure_later(self.actor_id_of::<Td>(), TdMessage::FlushDeferred);
         }
+    }
+
+    /// Drive the parked `getUserLink` phone-number-privacy lookups
+    /// (AccountManager.cpp:1416-1420) — one `get_privacy` per pump pass
+    /// serves the whole FIFO lot (the privacy manager's own promise
+    /// dedup; the marker count collapses to at most one in-flight
+    /// query per setting).
+    fn drive_phone_privacy_links(&mut self) {
+        let requests = std::mem::take(&mut self.account_manager.phone_privacy_requests);
+        if requests == 0 {
+            return;
+        }
+        let promise = Promise::from_interface(PhonePrivacyChain {
+            answers: Arc::clone(&self.phone_privacy_answers),
+        });
+        let (mut privacy_manager, mut env) = privacy_env_split(self);
+        let _ = privacy_manager.get_privacy(
+            &mut env,
+            Some(
+                &td_api::UserPrivacySetting::userPrivacySettingAllowFindingByPhoneNumber(
+                    td_api::userPrivacySettingAllowFindingByPhoneNumber,
+                ),
+            ),
+            promise,
+        );
+        self.privacy_manager = privacy_manager;
+    }
+
+    /// Drain the phone-number-privacy chain answers — FIFO-pair each
+    /// rules result with the account manager's oldest parked
+    /// `(token, expiry, promise)` triple and re-enter
+    /// `on_get_find_by_phone_number_privacy` (the C++
+    /// `PromiseCreator::lambda`).
+    fn drain_phone_privacy_answers(&mut self) {
+        let answers = std::mem::take(&mut *self.phone_privacy_answers.lock());
+        if answers.is_empty() {
+            return;
+        }
+        let mut parked = std::mem::take(&mut self.account_manager.pending_phone_privacy_link);
+        let mut paired = 0;
+        for answer in answers {
+            if paired >= parked.len() {
+                break;
+            }
+            let (token, expire_date, promise) =
+                std::mem::replace(&mut parked[paired], (String::new(), 0, Promise::default()));
+            paired += 1;
+            let net = self.account_net();
+            let mut env = AccountEnv {
+                global: &mut self.global,
+                options: self.option_manager.as_mut(),
+                user_manager: &mut self.user_manager,
+                chat_manager: &mut self.chat_manager,
+                device_token_manager: &mut self.device_token_manager,
+                auth_is_bot: self.auth_manager.is_bot(),
+                updates: &mut self.account_updates,
+                net,
+            };
+            self.account_manager.on_get_find_by_phone_number_privacy(
+                &mut env,
+                answer,
+                token,
+                expire_date,
+                promise,
+            );
+        }
+        parked.drain(0..paired);
+        self.account_manager.pending_phone_privacy_link = parked;
     }
 
     /// The cloned updates dispatch surface for the env builders — `None`
@@ -25575,39 +25686,102 @@ impl Td {
                     }
                 }
             }
-            // `ExportContactTokenQuery` (cpp:545-572) — the expires
-            // clamp keeps the link alive for at least a second; the
-            // token link answers `can_get_permanent_link = false`
-            // (cpp:625).
+            // `ExportContactTokenQuery` (cpp:578-616) — the expires clamp
+            // keeps the link alive for at least a second; the token link
+            // answers `can_get_permanent_link = false` (cpp:615). A
+            // carried unpaid-messages token rewrites the answer through
+            // the link manager: the url must parse to an
+            // internalLinkTypeUserToken, the `free=` query is appended,
+            // and the earlier of the two expiries wins.
             AccountNetKind::ExportContactToken => {
-                let promise = self
-                    .account_manager
-                    .take_promise(|m| &mut m.pending_user_link);
+                let promise = (!self.account_manager.pending_user_link.is_empty())
+                    .then(|| self.account_manager.pending_user_link.remove(0));
                 if query.is_error() {
-                    if let Some(mut promise) = promise {
+                    if let Some((_, _, mut promise)) = promise {
                         promise.set_error(query.error().clone());
                     }
                     return;
                 }
                 match telegram_api::ExportedContactToken::parse(query.ok()) {
                     Ok(ptr) => {
-                        if let Some(mut promise) = promise {
-                            // get_user_link_expires_in (cpp:571-576)
-                            // — the zero guard before the clamp.
-                            let expires_in = if ptr.expires == 0 {
-                                0
-                            } else {
-                                (ptr.expires - self.global.unix_time()).max(1)
-                            };
+                        if let Some((token, token_expire_date, mut promise)) = promise {
+                            let mut url = ptr.url;
+                            let mut expire_date = ptr.expires;
+                            if !token.is_empty() {
+                                let rewrite_error =
+                                    |promise: &mut Promise<td_api::UserLink>, status: Status| {
+                                        promise.set_error(status);
+                                    };
+                                let mut env = TdLinkEnv {
+                                    global: &mut self.global,
+                                    options: self.option_manager.as_mut(),
+                                };
+                                match crate::link_manager::parse_internal_link(
+                                    &mut env, &url, false,
+                                ) {
+                                    Some(link) => {
+                                        let link_type = link.get_internal_link_type_object(&env);
+                                        match link_type {
+                                            td_api::InternalLinkType::internalLinkTypeUserToken(
+                                                mut type_token,
+                                            ) => {
+                                                type_token.unpaid_messages_token = token.clone();
+                                                match crate::link_manager::get_internal_link(
+                                                    &mut env,
+                                                    Some(&td_api::InternalLinkType::internalLinkTypeUserToken(type_token)),
+                                                    false,
+                                                ) {
+                                                    Ok(r_url) => url = r_url,
+                                                    Err(status) => {
+                                                        rewrite_error(
+                                                            &mut promise,
+                                                            status,
+                                                        );
+                                                        return;
+                                                    }
+                                                }
+                                                if token_expire_date != 0
+                                                    && token_expire_date < expire_date
+                                                {
+                                                    expire_date = token_expire_date;
+                                                }
+                                            }
+                                            _ => {
+                                                rewrite_error(
+                                                    &mut promise,
+                                                    Status::error(
+                                                        500,
+                                                        "Receive unsupported user link",
+                                                    ),
+                                                );
+                                                return;
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        rewrite_error(
+                                            &mut promise,
+                                            Status::error(500, "Receive invalid user link"),
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
                             promise.set_value(td_api::UserLink {
-                                url: ptr.url,
-                                expires_in,
+                                url,
+                                // get_user_link_expires_in (cpp:571-576)
+                                // — the zero guard before the clamp.
+                                expires_in: if expire_date == 0 {
+                                    0
+                                } else {
+                                    (expire_date - self.global.unix_time()).max(1)
+                                },
                                 can_get_permanent_link: false,
                             });
                         }
                     }
                     Err(_) => {
-                        if let Some(mut promise) = promise {
+                        if let Some((_, _, mut promise)) = promise {
                             promise.set_error(parse_error("contacts_exportContactToken"));
                         }
                     }
@@ -39653,6 +39827,32 @@ impl AccountManagerEnv for AccountEnv<'_> {
         self.user_manager
             .get_user_first_username_of(my_id)
             .to_owned()
+    }
+
+    /// `LinkManager::get_internal_link(internalLinkTypeUserPhoneNumber
+    /// (phone, "", false, token), false)` — the phone-number arm of
+    /// `on_get_find_by_phone_number_privacy` (AccountManager.cpp:1410-1417).
+    fn get_phone_number_user_link(
+        &mut self,
+        phone_number: &str,
+        unpaid_messages_token: &str,
+    ) -> std::result::Result<String, Status> {
+        let mut env = TdLinkEnv {
+            global: &mut self.global,
+            options: self.options.as_deref_mut(),
+        };
+        crate::link_manager::get_internal_link(
+            &mut env,
+            Some(&td_api::InternalLinkType::internalLinkTypeUserPhoneNumber(
+                td_api::internalLinkTypeUserPhoneNumber {
+                    phone_number: phone_number.to_owned(),
+                    draft_text: String::new(),
+                    open_profile: false,
+                    unpaid_messages_token: unpaid_messages_token.to_owned(),
+                },
+            )),
+            false,
+        )
     }
 
     // ---- The net query senders — the C++ ResultHandler send legs
@@ -60558,12 +60758,33 @@ mod tests {
 
         // 1. getUserLink — the plain form (remove_messages_fee =
         //    false) with the empty first username parks at the
-        //    contacts_exportContactToken query; the answer clamps the
+        //    phone-number privacy (AccountManager.cpp:1401-1420); the
+        //    pump drives account.getPrivacy, and without a
+        //    my_phone_number option the chain falls through to the
+        //    contacts_exportContactToken query — the answer clamps the
         //    expiry against the td clock.
         let (promise, slot) = record_account_user_link();
         with_account_manager(&mut td, |manager, env| {
             manager.get_user_link(env, false, false, false, promise);
         });
+        assert!(
+            rec.sent.lock().is_empty(),
+            "the phone arm waits for the privacy drive"
+        );
+        td.dispatch_completed_walking();
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::account_getPrivacy::ID
+        );
+        net_complete(
+            sent.into_iter().next().unwrap(),
+            wire_privacy_rules_answer(vec![telegram_api::PrivacyRule::privacyValueAllowAll(
+                telegram_api::privacyValueAllowAll,
+            )]),
+        );
+        td.dispatch_completed_walking();
         let sent = std::mem::take(&mut *rec.sent.lock());
         assert_eq!(sent.len(), 1);
         assert_eq!(

@@ -414,6 +414,12 @@ fn is_valid_user_token(token: &str) -> bool {
     !token.is_empty() && tdutils::utf8::check_utf8(token.as_bytes())
 }
 
+/// `is_valid_unpaid_messages_token` (LinkManager.cpp:66-68) — at most
+/// 64 base64url characters.
+fn is_valid_unpaid_messages_token(token: &str) -> bool {
+    !token.is_empty() && token.len() <= 64 && crate::misc::is_base64url_characters(token.as_bytes())
+}
+
 /// `is_valid_login_code` (cpp:126-128).
 fn is_valid_login_code(code: &str) -> bool {
     !code.is_empty() && tdutils::utf8::check_utf8(code.as_bytes())
@@ -641,6 +647,39 @@ fn get_url_query_draft_text(url_query: &tdutils::http_url::HttpUrlQuery) -> Stri
     } else {
         text.to_owned()
     }
+}
+
+/// `get_url_query_unpaid_messages_token` (LinkManager.cpp:462-468) — the
+/// `free=` argument keeps only the valid token forms.
+fn get_url_query_unpaid_messages_token(url_query: &tdutils::http_url::HttpUrlQuery) -> String {
+    let token = url_query.get_arg("free").unwrap_or("");
+    if !is_valid_unpaid_messages_token(token) {
+        return String::new();
+    }
+    token.to_owned()
+}
+
+/// `get_dialog_link_query` (LinkManager.cpp:470-481) — the shared
+/// `&`-prefixed query of the dialog links; the external callers rewrite
+/// the leading separator to `?`.
+fn get_dialog_link_query(
+    draft_text: &str,
+    open_profile: bool,
+    unpaid_messages_token: &str,
+) -> String {
+    let mut query = String::new();
+    if !draft_text.is_empty() {
+        query.push_str("&text=");
+        query.push_str(&url_encode(draft_text));
+    }
+    if open_profile {
+        query.push_str("&profile");
+    }
+    if !unpaid_messages_token.is_empty() {
+        query.push_str("&free=");
+        query.push_str(unpaid_messages_token);
+    }
+    query
 }
 
 /// `get_referral_program_start_parameter_prefixes` (cpp:391-396). The
@@ -1065,6 +1104,9 @@ pub enum InternalLink {
         dialog_username: String,
         draft_text: String,
         open_profile: bool,
+        /// The `?free=` URL-query token (`get_url_query_unpaid_
+        /// messages_token`, LinkManager.cpp:462-468).
+        unpaid_messages_token: String,
     },
     /// `InternalLinkQrCodeAuthentication`.
     QrCodeAuthentication,
@@ -1126,9 +1168,13 @@ pub enum InternalLink {
         phone_number: String,
         draft_text: String,
         open_profile: bool,
+        unpaid_messages_token: String,
     },
     /// `InternalLinkUserToken`.
-    UserToken { token: String },
+    UserToken {
+        token: String,
+        unpaid_messages_token: String,
+    },
     /// `InternalLinkVideoChat`.
     VideoChat {
         dialog_username: String,
@@ -1181,11 +1227,13 @@ impl InternalLink {
         phone_number: &str,
         draft_text: String,
         open_profile: bool,
+        unpaid_messages_token: String,
     ) -> InternalLink {
         InternalLink::UserPhoneNumber {
             phone_number: format!("+{phone_number}"),
             draft_text,
             open_profile,
+            unpaid_messages_token,
         }
     }
 
@@ -1558,15 +1606,13 @@ impl InternalLink {
                 dialog_username,
                 draft_text,
                 open_profile,
+                unpaid_messages_token,
             } => td_api::InternalLinkType::internalLinkTypePublicChat(
                 td_api::internalLinkTypePublicChat {
                     chat_username: dialog_username.clone(),
                     draft_text: draft_text.clone(),
                     open_profile: *open_profile,
-                    // The `?free=` URL-query token (LinkManager.cpp
-                    // get_url_query_unpaid_messages_token) rides the
-                    // unpaid-links family follow-up.
-                    unpaid_messages_token: String::new(),
+                    unpaid_messages_token: unpaid_messages_token.clone(),
                 },
             ),
             InternalLink::QrCodeAuthentication => {
@@ -1738,28 +1784,24 @@ impl InternalLink {
                 phone_number,
                 draft_text,
                 open_profile,
+                unpaid_messages_token,
             } => td_api::InternalLinkType::internalLinkTypeUserPhoneNumber(
                 td_api::internalLinkTypeUserPhoneNumber {
                     phone_number: phone_number.clone(),
                     draft_text: draft_text.clone(),
                     open_profile: *open_profile,
-                    // The `?free=` URL-query token (LinkManager.cpp
-                    // get_url_query_unpaid_messages_token) rides the
-                    // unpaid-links family follow-up.
-                    unpaid_messages_token: String::new(),
+                    unpaid_messages_token: unpaid_messages_token.clone(),
                 },
             ),
-            InternalLink::UserToken { token } => {
-                td_api::InternalLinkType::internalLinkTypeUserToken(
-                    td_api::internalLinkTypeUserToken {
-                        token: token.clone(),
-                        // The `?free=` URL-query token (LinkManager.cpp
-                        // get_url_query_unpaid_messages_token) rides the
-                        // unpaid-links family follow-up.
-                        unpaid_messages_token: String::new(),
-                    },
-                )
-            }
+            InternalLink::UserToken {
+                token,
+                unpaid_messages_token,
+            } => td_api::InternalLinkType::internalLinkTypeUserToken(
+                td_api::internalLinkTypeUserToken {
+                    token: token.clone(),
+                    unpaid_messages_token: unpaid_messages_token.clone(),
+                },
+            ),
             InternalLink::VideoChat {
                 dialog_username,
                 invite_hash,
@@ -3025,6 +3067,7 @@ fn parse_tg_link_query(
                             dialog_username: username,
                             draft_text: String::new(),
                             open_profile: false,
+                            unpaid_messages_token: String::new(),
                         }),
                         value.clone(),
                         url_query.get_arg("startattach").unwrap_or(""),
@@ -3069,10 +3112,12 @@ fn parse_tg_link_query(
                 }
             }
             // resolve?domain=<username>
+            // resolve?domain=<username>&free=<token>
             return Some(InternalLink::PublicDialog {
                 dialog_username: username,
                 draft_text: get_url_query_draft_text(&url_query),
-                open_profile: has_arg("profile"),
+                open_profile: url_query.has_arg("profile"),
+                unpaid_messages_token: get_url_query_unpaid_messages_token(&url_query),
             });
         } else {
             let phone_number_str = get_arg("phone");
@@ -3089,16 +3134,19 @@ fn parse_tg_link_query(
                             phone_number,
                             String::new(),
                             false,
+                            String::new(),
                         )),
                         attach,
                         url_query.get_arg("startattach").unwrap_or(""),
                     ));
                 }
                 // resolve?phone=12345
+                // resolve?phone=12345&free=<token>
                 return Some(InternalLink::new_user_phone_number(
                     phone_number,
                     get_url_query_draft_text(&url_query),
-                    has_arg("profile"),
+                    url_query.has_arg("profile"),
+                    get_url_query_unpaid_messages_token(&url_query),
                 ));
             }
         }
@@ -3112,9 +3160,13 @@ fn parse_tg_link_query(
         }
     } else if path.len() == 1 && path[0] == "contact" {
         // contact?token=<token>
+        // contact?token=<token>&free=<token>
         let token = get_arg("token");
         if is_valid_user_token(&token) {
-            return Some(InternalLink::UserToken { token });
+            return Some(InternalLink::UserToken {
+                token,
+                unpaid_messages_token: get_url_query_unpaid_messages_token(&url_query),
+            });
         }
     } else if !path.is_empty() && path[0] == "contacts" {
         // contacts[/section]
@@ -4184,22 +4236,26 @@ fn parse_t_me_link_query(
             let attach = get_arg("attach");
             if crate::misc::is_valid_username(&attach) {
                 // /+<phone_number>?attach=<bot_username>
+                // /+<phone_number>?attach=<bot_username>&startattach=<start_parameter>
                 return Some(InternalLink::new_attach_menu_bot(
                     None,
                     Some(InternalLink::new_user_phone_number(
                         &invite_hash,
                         String::new(),
                         false,
+                        String::new(),
                     )),
                     attach,
                     url_query.get_arg("startattach").unwrap_or(""),
                 ));
             }
             // /+<phone_number>
+            // /+<phone_number>?free=<token>
             return Some(InternalLink::new_user_phone_number(
                 &invite_hash,
                 get_url_query_draft_text(&url_query),
-                has_arg("profile"),
+                url_query.has_arg("profile"),
+                get_url_query_unpaid_messages_token(&url_query),
             ));
         } else if !invite_hash.is_empty() && is_base64url_characters(invite_hash.as_bytes()) {
             // /+<link>
@@ -4222,8 +4278,10 @@ fn parse_t_me_link_query(
     } else if path[0] == "contact" {
         if path.len() >= 2 && is_valid_user_token(&path[1]) {
             // /contact/<token>
+            // /contact/<token>?free=<token>
             return Some(InternalLink::UserToken {
                 token: path[1].clone(),
+                unpaid_messages_token: get_url_query_unpaid_messages_token(&url_query),
             });
         }
     } else if path[0] == "addstickers" || path[0] == "addemoji" {
@@ -4620,6 +4678,7 @@ fn parse_t_me_link_query(
                         dialog_username: username,
                         draft_text: String::new(),
                         open_profile: false,
+                        unpaid_messages_token: String::new(),
                     }),
                     value.clone(),
                     url_query.get_arg("startattach").unwrap_or(""),
@@ -4643,10 +4702,12 @@ fn parse_t_me_link_query(
         }
 
         // /<username>
+        // /<username>?free=<token>
         return Some(InternalLink::PublicDialog {
             dialog_username: username,
             draft_text: get_url_query_draft_text(&url_query),
-            open_profile: has_arg("profile"),
+            open_profile: url_query.has_arg("profile"),
+            unpaid_messages_token: get_url_query_unpaid_messages_token(&url_query),
         });
     }
     None
@@ -5504,11 +5565,20 @@ fn get_internal_link_impl(
             if !tdutils::utf8::check_utf8(link.draft_text.as_bytes()) {
                 return Err(Status::error(400, "Draft text must be encoded in UTF-8"));
             }
+            if !link.unpaid_messages_token.is_empty()
+                && !is_valid_unpaid_messages_token(&link.unpaid_messages_token)
+            {
+                return Err(Status::error(
+                    400,
+                    "Invalid unpaid messages token specified",
+                ));
+            }
             Ok(get_public_dialog_link(
                 env,
                 &link.chat_username,
                 &link.draft_text,
                 link.open_profile,
+                &link.unpaid_messages_token,
                 is_internal,
             ))
         }
@@ -5811,43 +5881,56 @@ fn get_internal_link_impl(
             if !tdutils::utf8::check_utf8(link.draft_text.as_bytes()) {
                 return Err(Status::error(400, "Draft text must be encoded in UTF-8"));
             }
+            if !link.unpaid_messages_token.is_empty()
+                && !is_valid_unpaid_messages_token(&link.unpaid_messages_token)
+            {
+                return Err(Status::error(
+                    400,
+                    "Invalid unpaid messages token specified",
+                ));
+            }
+            let mut query = get_dialog_link_query(
+                &link.draft_text,
+                link.open_profile,
+                &link.unpaid_messages_token,
+            );
             if is_internal {
-                Ok(format!(
-                    "tg://resolve?phone=+{phone_number}{}{}{}",
-                    if link.draft_text.is_empty() {
-                        ""
-                    } else {
-                        "&text="
-                    },
-                    url_encode(&link.draft_text),
-                    if link.open_profile { "&profile" } else { "" }
-                ))
+                Ok(format!("tg://resolve?phone=+{phone_number}{query}"))
             } else {
-                let has_draft = !link.draft_text.is_empty();
-                Ok(format!(
-                    "{}+{phone_number}{}{}{}",
-                    get_t_me_url(env),
-                    if has_draft { "?text=" } else { "" },
-                    url_encode(&link.draft_text),
-                    if link.open_profile {
-                        if has_draft { "&profile" } else { "?profile" }
-                    } else {
-                        ""
-                    }
-                ))
+                if !query.is_empty() {
+                    query.replace_range(0..1, "?");
+                }
+                Ok(format!("{}+{phone_number}{query}", get_t_me_url(env)))
             }
         }
         T::internalLinkTypeUserToken(link) => {
             if !is_valid_user_token(&link.token) {
                 return Err(Status::error(400, "Invalid user token specified"));
             }
+            if !link.unpaid_messages_token.is_empty()
+                && !is_valid_unpaid_messages_token(&link.unpaid_messages_token)
+            {
+                return Err(Status::error(
+                    400,
+                    "Invalid unpaid messages token specified",
+                ));
+            }
+            let mut query = get_dialog_link_query("", false, &link.unpaid_messages_token);
             if is_internal {
-                Ok(format!("tg://contact?token={}", url_encode(&link.token)))
-            } else {
                 Ok(format!(
-                    "{}contact/{}",
+                    "tg://contact?token={}{}",
+                    url_encode(&link.token),
+                    query
+                ))
+            } else {
+                if !query.is_empty() {
+                    query.replace_range(0..1, "?");
+                }
+                Ok(format!(
+                    "{}contact/{}{}",
                     get_t_me_url(env),
-                    url_encode(&link.token)
+                    url_encode(&link.token),
+                    query
                 ))
             }
         }
@@ -6070,39 +6153,23 @@ fn get_settings_link(section: &td_api::SettingsSection) -> std::result::Result<S
     })
 }
 
-/// `LinkManager::get_public_dialog_link` (cpp:4340-4348).
+/// `LinkManager::get_public_dialog_link` (cpp:4881-4892).
 fn get_public_dialog_link(
     env: &impl LinkEnv,
     username: &str,
     draft_text: &str,
     open_profile: bool,
+    unpaid_messages_token: &str,
     is_internal: bool,
 ) -> String {
+    let mut query = get_dialog_link_query(draft_text, open_profile, unpaid_messages_token);
     if is_internal {
-        format!(
-            "tg://resolve?domain={}{}{}{}",
-            url_encode(username),
-            if draft_text.is_empty() { "" } else { "&text=" },
-            url_encode(draft_text),
-            if open_profile { "&profile" } else { "" }
-        )
+        format!("tg://resolve?domain={}{}", url_encode(username), query)
     } else {
-        format!(
-            "{}{}{}{}{}",
-            get_t_me_url(env),
-            url_encode(username),
-            if draft_text.is_empty() { "" } else { "?text=" },
-            url_encode(draft_text),
-            if open_profile {
-                if draft_text.is_empty() {
-                    "?profile"
-                } else {
-                    "&profile"
-                }
-            } else {
-                ""
-            }
-        )
+        if !query.is_empty() {
+            query.replace_range(0..1, "?");
+        }
+        format!("{}{}{}", get_t_me_url(env), url_encode(username), query)
     }
 }
 
@@ -7842,6 +7909,215 @@ mod tests {
         assert_eq!(
             get_proxy_link(&env, &http, true).unwrap_err().message(),
             "HTTP proxies have no public links"
+        );
+    }
+
+    /// The `free=` unpaid-messages-token vectors (upstream 869e6e6c5 +
+    /// c6f5bdb50, test/link.cpp) — the token parses on every
+    /// dialog/user/token link form and drops on the invalid shapes
+    /// (empty, a space, over 64 characters).
+    #[test]
+    fn unpaid_messages_tokens_parse_on_every_dialog_link_form() {
+        struct FreeLinkEnv;
+        impl LinkEnv for FreeLinkEnv {}
+        let mut env = FreeLinkEnv;
+        let mut parse = |link: &str| parse_internal_link(&mut env, link, false);
+
+        let public_chat =
+            |draft: &str, open_profile: bool, free: &str| InternalLink::PublicDialog {
+                dialog_username: "username".to_owned(),
+                draft_text: draft.to_owned(),
+                open_profile,
+                unpaid_messages_token: free.to_owned(),
+            };
+        let user_phone =
+            |draft: &str, open_profile: bool, free: &str| InternalLink::UserPhoneNumber {
+                phone_number: "+123456".to_owned(),
+                draft_text: draft.to_owned(),
+                open_profile,
+                unpaid_messages_token: free.to_owned(),
+            };
+        let user_token = |token: &str, free: &str| InternalLink::UserToken {
+            token: token.to_owned(),
+            unpaid_messages_token: free.to_owned(),
+        };
+
+        // tg:resolve?domain= + free
+        assert_eq!(
+            parse("tg:resolve?domain=username&free=AbCd-_0123456789").unwrap(),
+            public_chat("", false, "AbCd-_0123456789")
+        );
+        assert_eq!(
+            parse("tg:resolve?domain=username&free=abc&profile&text=@asd").unwrap(),
+            public_chat(" @asd", true, "abc")
+        );
+        for link in [
+            "tg:resolve?domain=username&free=",
+            "tg:resolve?domain=username&free=a%20b",
+            "tg:resolve?domain=username&free=a+b",
+        ] {
+            assert_eq!(parse(link).unwrap(), public_chat("", false, ""), "{link}");
+        }
+
+        // tg:resolve?phone= + free
+        assert_eq!(
+            parse("tg:resolve?phone=123456&free=AbCd-_0123456789").unwrap(),
+            user_phone("", false, "AbCd-_0123456789")
+        );
+        assert_eq!(
+            parse("tg:resolve?phone=123456&free=abc&profile&text=@asd").unwrap(),
+            user_phone(" @asd", true, "abc")
+        );
+        assert_eq!(
+            parse("tg:resolve?phone=123456&free=a%20b").unwrap(),
+            user_phone("", false, "")
+        );
+
+        // tg:contact?token= + free — the token travels either way around
+        assert_eq!(
+            parse("tg:contact?token=123456&free=AbCd-_0123456789").unwrap(),
+            user_token("123456", "AbCd-_0123456789")
+        );
+        assert_eq!(
+            parse("tg:contact?free=abc&token=123456").unwrap(),
+            user_token("123456", "abc")
+        );
+        assert_eq!(
+            parse("tg:contact?token=123456&free=").unwrap(),
+            user_token("123456", "")
+        );
+        assert_eq!(
+            parse("tg:contact?token=123456&free=a%20b").unwrap(),
+            user_token("123456", "")
+        );
+
+        // the t.me forms: /<username>, /+<phone>, /contact/<token> — the
+        // 64-byte token stays, the 65-byte one drops
+        assert_eq!(
+            parse("t.me/username?free=AbCd-_0123456789").unwrap(),
+            public_chat("", false, "AbCd-_0123456789")
+        );
+        assert_eq!(
+            parse("t.me/username?text=@asd&free=abc&profile").unwrap(),
+            public_chat(" @asd", true, "abc")
+        );
+        assert_eq!(
+            parse("t.me/username?free=a%20b").unwrap(),
+            public_chat("", false, "")
+        );
+        // the 64-byte token stays, the 65-byte one drops
+        assert_eq!(
+            parse("t.me/username?free=0123456789012345678901234567890123456789012345678901234567890123")
+                .unwrap(),
+            public_chat(
+                "",
+                false,
+                "0123456789012345678901234567890123456789012345678901234567890123"
+            )
+        );
+        assert_eq!(
+            parse("t.me/username?free=01234567890123456789012345678901234567890123456789012345678901234")
+                .unwrap(),
+            public_chat("", false, "")
+        );
+        assert_eq!(
+            parse("t.me/+123456?free=AbCd-_0123456789").unwrap(),
+            user_phone("", false, "AbCd-_0123456789")
+        );
+        assert_eq!(
+            parse("t.me/+123456?free=abc&profile&text=@asd").unwrap(),
+            user_phone(" @asd", true, "abc")
+        );
+        assert_eq!(
+            parse("t.me/+123456?free=a%20b").unwrap(),
+            user_phone("", false, "")
+        );
+        assert_eq!(
+            parse("t.me/contact/123456?free=AbCd-_0123456789").unwrap(),
+            user_token("123456", "AbCd-_0123456789")
+        );
+        assert_eq!(
+            parse("t.me/contact/123456/?free=abc").unwrap(),
+            user_token("123456", "abc")
+        );
+        assert_eq!(
+            parse("t.me/contact/123456?free=a%20b").unwrap(),
+            user_token("123456", "")
+        );
+    }
+
+    /// The `free=` query generation (`get_dialog_link_query`,
+    /// LinkManager.cpp:470-481): every dialog-link builder appends the
+    /// unpaid-messages token after text/profile, and the invalid token
+    /// forms answer the C++ 400 band.
+    #[test]
+    fn unpaid_messages_tokens_generate_the_free_query() {
+        struct FreeLinkEnv;
+        impl LinkEnv for FreeLinkEnv {}
+        let mut env = FreeLinkEnv;
+        let phone = td_api::InternalLinkType::internalLinkTypeUserPhoneNumber(
+            td_api::internalLinkTypeUserPhoneNumber {
+                phone_number: "+123456".to_owned(),
+                draft_text: String::new(),
+                open_profile: false,
+                unpaid_messages_token: "abc".to_owned(),
+            },
+        );
+        assert_eq!(
+            get_internal_link(&mut env, Some(&phone), false).unwrap(),
+            "https://t.me/+123456?free=abc"
+        );
+        assert_eq!(
+            get_internal_link(&mut env, Some(&phone), true).unwrap(),
+            "tg://resolve?phone=+123456&free=abc"
+        );
+
+        let token = td_api::InternalLinkType::internalLinkTypeUserToken(
+            td_api::internalLinkTypeUserToken {
+                token: "123456".to_owned(),
+                unpaid_messages_token: "abc".to_owned(),
+            },
+        );
+        assert_eq!(
+            get_internal_link(&mut env, Some(&token), false).unwrap(),
+            "https://t.me/contact/123456?free=abc"
+        );
+        assert_eq!(
+            get_internal_link(&mut env, Some(&token), true).unwrap(),
+            "tg://contact?token=123456&free=abc"
+        );
+
+        let chat = td_api::InternalLinkType::internalLinkTypePublicChat(
+            td_api::internalLinkTypePublicChat {
+                chat_username: "username".to_owned(),
+                draft_text: "@asd".to_owned(),
+                open_profile: true,
+                unpaid_messages_token: "abc".to_owned(),
+            },
+        );
+        assert_eq!(
+            get_internal_link(&mut env, Some(&chat), false).unwrap(),
+            "https://t.me/username?text=%40asd&profile&free=abc"
+        );
+        assert_eq!(
+            get_internal_link(&mut env, Some(&chat), true).unwrap(),
+            "tg://resolve?domain=username&text=%40asd&profile&free=abc"
+        );
+
+        // the invalid-token 400 band (LinkManager.cpp:4425-4428)
+        let bad = td_api::InternalLinkType::internalLinkTypeUserPhoneNumber(
+            td_api::internalLinkTypeUserPhoneNumber {
+                phone_number: "+123456".to_owned(),
+                draft_text: String::new(),
+                open_profile: false,
+                unpaid_messages_token: "a b".to_owned(),
+            },
+        );
+        assert_eq!(
+            get_internal_link(&mut env, Some(&bad), false)
+                .unwrap_err()
+                .message(),
+            "Invalid unpaid messages token specified"
         );
     }
 }
