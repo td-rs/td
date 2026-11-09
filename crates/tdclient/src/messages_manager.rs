@@ -4790,6 +4790,9 @@ impl MessageQuote {
                 -1,
             )),
             position: self.position,
+            // The rich-quote plane (MessageQuote.hpp rich_texts) rides the
+            // 1.8.70 quotes-family follow-up; the plain-text quote ports now.
+            rich_texts: Vec::new(),
         })
     }
 
@@ -4808,6 +4811,9 @@ impl MessageQuote {
                 -1,
             )),
             position: self.position,
+            // The rich-quote plane (MessageQuote.hpp rich_texts) rides the
+            // 1.8.70 quotes-family follow-up; the plain-text quote ports now.
+            rich_texts: Vec::new(),
             is_manual: self.is_manual,
         })
     }
@@ -11430,7 +11436,7 @@ const HIDDEN_AUTHOR_DIALOG_ID: i64 = 2666000;
 
 /// `MTPROTO_LAYER` (Version.h:13) — the layer constant the legacy flag
 /// encodes.
-const MTPROTO_LAYER: i32 = 230;
+const MTPROTO_LAYER: i32 = 233;
 
 /// `SavedMessagesTopicId::SavedMessagesTopicId(DialogId, const
 /// MessageForwardInfo *, DialogId)` (SavedMessagesTopicId.cpp:22-58) — the

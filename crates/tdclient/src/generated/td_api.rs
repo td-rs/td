@@ -4680,6 +4680,144 @@ impl ArchiveChatListSettings {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "areaPosition")]
+pub struct AreaPosition {
+    pub x_percentage: f64,
+    pub y_percentage: f64,
+    pub width_percentage: f64,
+    pub height_percentage: f64,
+    pub rotation_angle: f64,
+    pub corner_radius_percentage: f64,
+}
+
+impl AreaPosition {
+    pub const ID: i32 = 302471805;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__f64(out, self.x_percentage);
+        tl::__f64(out, self.y_percentage);
+        tl::__f64(out, self.width_percentage);
+        tl::__f64(out, self.height_percentage);
+        tl::__f64(out, self.rotation_angle);
+        tl::__f64(out, self.corner_radius_percentage);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let x_percentage: f64 = r.f64()?;
+        let y_percentage: f64 = r.f64()?;
+        let width_percentage: f64 = r.f64()?;
+        let height_percentage: f64 = r.f64()?;
+        let rotation_angle: f64 = r.f64()?;
+        let corner_radius_percentage: f64 = r.f64()?;
+        Result::Ok(Self { x_percentage, y_percentage, width_percentage, height_percentage, rotation_angle, corner_radius_percentage })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"areaPosition\"");
+        out.push_str(",\"x_percentage\":");
+        tl_json::double(out, self.x_percentage);
+        out.push_str(",\"y_percentage\":");
+        tl_json::double(out, self.y_percentage);
+        out.push_str(",\"width_percentage\":");
+        tl_json::double(out, self.width_percentage);
+        out.push_str(",\"height_percentage\":");
+        tl_json::double(out, self.height_percentage);
+        out.push_str(",\"rotation_angle\":");
+        tl_json::double(out, self.rotation_angle);
+        out.push_str(",\"corner_radius_percentage\":");
+        tl_json::double(out, self.corner_radius_percentage);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "x_percentage") {
+            value.x_percentage = tl_json::read_f64(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "y_percentage") {
+            value.y_percentage = tl_json::read_f64(__j2)?;
+        }
+        if let Some(__j4) = tl_json::field(o, "width_percentage") {
+            value.width_percentage = tl_json::read_f64(__j4)?;
+        }
+        if let Some(__j6) = tl_json::field(o, "height_percentage") {
+            value.height_percentage = tl_json::read_f64(__j6)?;
+        }
+        if let Some(__j8) = tl_json::field(o, "rotation_angle") {
+            value.rotation_angle = tl_json::read_f64(__j8)?;
+        }
+        if let Some(__j10) = tl_json::field(o, "corner_radius_percentage") {
+            value.corner_radius_percentage = tl_json::read_f64(__j10)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "areaPosition");
+        s.store_field_double("x_percentage", self.x_percentage);
+        s.store_field_double("y_percentage", self.y_percentage);
+        s.store_field_double("width_percentage", self.width_percentage);
+        s.store_field_double("height_percentage", self.height_percentage);
+        s.store_field_double("rotation_angle", self.rotation_angle);
+        s.store_field_double("corner_radius_percentage", self.corner_radius_percentage);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "attachmentMenuBot")]
 pub struct AttachmentMenuBot {
     pub bot_user_id: i64,
@@ -53629,6 +53767,126 @@ impl From<CollectibleItemType> for Object {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "communities")]
+pub struct Communities {
+    pub community_ids: Vec<i64>,
+}
+
+impl Communities {
+    pub const ID: i32 = -330512172;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.community_ids.len() as i32);
+        for __v0 in &self.community_ids {
+            tl::__i64(out, *__v0);
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let __v0: Vec<i64> = {
+            let count: u32 = r.i32()? as u32;
+            if count as usize > r.remaining() {
+                return Result::Err("Wrong vector length");
+            }
+            let mut res = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                res.push(r.i64()?);
+            }
+            res
+        };
+        let community_ids: Vec<i64> = __v0;
+        Result::Ok(Self { community_ids })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"communities\"");
+        out.push_str(",\"community_ids\":");
+        out.push('[');
+        let mut __first = true;
+        for __v0 in &self.community_ids {
+            if !__first {
+                out.push(',');
+            }
+            __first = false;
+            tl_json::num64(out, *__v0);
+        }
+        out.push(']');
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "community_ids") {
+            value.community_ids = tl_json::read_vector(__j0, tl_json::read_i64)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "communities");
+        s.store_vector_begin("community_ids", self.community_ids.len());
+        for __v0 in &self.community_ids {
+            s.store_field_int("", *__v0);
+        }
+        s.store_class_end();
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "community")]
 pub struct Community {
     pub id: i64,
@@ -53638,10 +53896,11 @@ pub struct Community {
     pub date: i32,
     pub status: Option<CommunityMemberStatus>,
     pub permissions: Option<CommunityPermissions>,
+    pub are_chats_collapsed: bool,
 }
 
 impl Community {
-    pub const ID: i32 = 1684827592;
+    pub const ID: i32 = -1501636358;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -53662,6 +53921,7 @@ impl Community {
         let __d2 = Default::default();
         let __m2 = self.permissions.as_ref().unwrap_or(&__d2);
         __m2.store(out);
+        tl::__bool(out, self.are_chats_collapsed);
     }
 
     pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
@@ -53689,7 +53949,8 @@ impl Community {
         let date: i32 = r.i32()?;
         let status: Option<CommunityMemberStatus> = Some(CommunityMemberStatus::read(r)?);
         let permissions: Option<CommunityPermissions> = Some(CommunityPermissions::read_bare(r)?);
-        Result::Ok(Self { id, have_access, name, photo, date, status, permissions })
+        let are_chats_collapsed: bool = r.bool()?;
+        Result::Ok(Self { id, have_access, name, photo, date, status, permissions, are_chats_collapsed })
     }
 
     pub fn to_json(&self) -> String {
@@ -53720,6 +53981,8 @@ impl Community {
             out.push_str(",\"permissions\":");
             __o2.to_json_into(out);
         }
+        out.push_str(",\"are_chats_collapsed\":");
+        tl_json::boolean(out, self.are_chats_collapsed);
         out.push('}');
     }
 
@@ -53761,6 +54024,9 @@ impl Community {
         if let Some(__j12) = tl_json::field(o, "permissions") && !matches!(__j12, tl_json::Json::Null) {
             value.permissions = Some(CommunityPermissions::from_json_value(__j12)?);
         }
+        if let Some(__j14) = tl_json::field(o, "are_chats_collapsed") {
+            value.are_chats_collapsed = tl_json::read_bool(__j14)?;
+        }
         Result::Ok(value)
     }
 
@@ -53784,6 +54050,265 @@ impl Community {
             Some(__m2) => __m2.store_debug(s, "permissions"),
             None => s.store_null("permissions"),
         }
+        s.store_field_bool("are_chats_collapsed", self.are_chats_collapsed);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "communityAddChatRequest")]
+pub struct CommunityAddChatRequest {
+    pub chat_id: i64,
+    pub is_hidden: bool,
+    pub sender_user_id: i64,
+    pub date: i32,
+}
+
+impl CommunityAddChatRequest {
+    pub const ID: i32 = 2125404501;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i64(out, self.chat_id);
+        tl::__bool(out, self.is_hidden);
+        tl::__i64(out, self.sender_user_id);
+        tl::__i32(out, self.date);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let chat_id: i64 = r.i64()?;
+        let is_hidden: bool = r.bool()?;
+        let sender_user_id: i64 = r.i64()?;
+        let date: i32 = r.i32()?;
+        Result::Ok(Self { chat_id, is_hidden, sender_user_id, date })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"communityAddChatRequest\"");
+        out.push_str(",\"chat_id\":");
+        tl_json::num64(out, self.chat_id);
+        out.push_str(",\"is_hidden\":");
+        tl_json::boolean(out, self.is_hidden);
+        out.push_str(",\"sender_user_id\":");
+        tl_json::num64(out, self.sender_user_id);
+        out.push_str(",\"date\":");
+        tl_json::num32(out, self.date);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "chat_id") {
+            value.chat_id = tl_json::read_i64(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "is_hidden") {
+            value.is_hidden = tl_json::read_bool(__j2)?;
+        }
+        if let Some(__j4) = tl_json::field(o, "sender_user_id") {
+            value.sender_user_id = tl_json::read_i64(__j4)?;
+        }
+        if let Some(__j6) = tl_json::field(o, "date") {
+            value.date = tl_json::read_i32(__j6)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "communityAddChatRequest");
+        s.store_field_int("chat_id", self.chat_id);
+        s.store_field_bool("is_hidden", self.is_hidden);
+        s.store_field_int("sender_user_id", self.sender_user_id);
+        s.store_field_int("date", self.date as i64);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "communityAddChatRequests")]
+pub struct CommunityAddChatRequests {
+    pub total_count: i32,
+    pub requests: Vec<CommunityAddChatRequest>,
+    pub next_offset: String,
+}
+
+impl CommunityAddChatRequests {
+    pub const ID: i32 = 2015337973;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.total_count);
+        tl::__i32(out, self.requests.len() as i32);
+        for __v0 in &self.requests {
+            (*__v0).store(out);
+        }
+        tl::__string(out, &self.next_offset);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let total_count: i32 = r.i32()?;
+        let __v0: Vec<CommunityAddChatRequest> = {
+            let count: u32 = r.i32()? as u32;
+            if count as usize > r.remaining() {
+                return Result::Err("Wrong vector length");
+            }
+            let mut res = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                res.push(CommunityAddChatRequest::read_bare(r)?);
+            }
+            res
+        };
+        let requests: Vec<CommunityAddChatRequest> = __v0;
+        let next_offset: String = r.string()?;
+        Result::Ok(Self { total_count, requests, next_offset })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"communityAddChatRequests\"");
+        out.push_str(",\"total_count\":");
+        tl_json::num32(out, self.total_count);
+        out.push_str(",\"requests\":");
+        out.push('[');
+        let mut __first = true;
+        for __v0 in &self.requests {
+            if !__first {
+                out.push(',');
+            }
+            __first = false;
+            (*__v0).to_json_into(out);
+        }
+        out.push(']');
+        out.push_str(",\"next_offset\":");
+        tl_json::str(out, &self.next_offset);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "total_count") {
+            value.total_count = tl_json::read_i32(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "requests") {
+            value.requests = tl_json::read_vector(__j2, CommunityAddChatRequest::from_json_value)?;
+        }
+        if let Some(__j4) = tl_json::field(o, "next_offset") {
+            value.next_offset = tl_json::read_string(__j4)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "communityAddChatRequests");
+        s.store_field_int("total_count", self.total_count as i64);
+        s.store_vector_begin("requests", self.requests.len());
+        for __v0 in &self.requests {
+            __v0.store_debug(s, "");
+        }
+        s.store_class_end();
+        s.store_field_str("next_offset", &self.next_offset);
         s.store_class_end();
     }
 
@@ -54044,10 +54569,11 @@ pub struct CommunityFullInfo {
     pub administrator_count: i32,
     pub banned_count: i32,
     pub add_chat_request_count: i32,
+    pub notification_settings: Option<ChatNotificationSettings>,
 }
 
 impl CommunityFullInfo {
-    pub const ID: i32 = -88511019;
+    pub const ID: i32 = -917988141;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -54065,6 +54591,9 @@ impl CommunityFullInfo {
         tl::__i32(out, self.administrator_count);
         tl::__i32(out, self.banned_count);
         tl::__i32(out, self.add_chat_request_count);
+        let __d2 = Default::default();
+        let __m2 = self.notification_settings.as_ref().unwrap_or(&__d2);
+        __m2.store(out);
     }
 
     pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
@@ -54101,7 +54630,8 @@ impl CommunityFullInfo {
         let administrator_count: i32 = r.i32()?;
         let banned_count: i32 = r.i32()?;
         let add_chat_request_count: i32 = r.i32()?;
-        Result::Ok(Self { photo, chats, administrator_count, banned_count, add_chat_request_count })
+        let notification_settings: Option<ChatNotificationSettings> = Some(ChatNotificationSettings::read_bare(r)?);
+        Result::Ok(Self { photo, chats, administrator_count, banned_count, add_chat_request_count, notification_settings })
     }
 
     pub fn to_json(&self) -> String {
@@ -54133,6 +54663,10 @@ impl CommunityFullInfo {
         tl_json::num32(out, self.banned_count);
         out.push_str(",\"add_chat_request_count\":");
         tl_json::num32(out, self.add_chat_request_count);
+        if let Some(__o2) = &self.notification_settings {
+            out.push_str(",\"notification_settings\":");
+            __o2.to_json_into(out);
+        }
         out.push('}');
     }
 
@@ -54168,6 +54702,9 @@ impl CommunityFullInfo {
         if let Some(__j8) = tl_json::field(o, "add_chat_request_count") {
             value.add_chat_request_count = tl_json::read_i32(__j8)?;
         }
+        if let Some(__j10) = tl_json::field(o, "notification_settings") && !matches!(__j10, tl_json::Json::Null) {
+            value.notification_settings = Some(ChatNotificationSettings::from_json_value(__j10)?);
+        }
         Result::Ok(value)
     }
 
@@ -54187,6 +54724,10 @@ impl CommunityFullInfo {
         s.store_field_int("administrator_count", self.administrator_count as i64);
         s.store_field_int("banned_count", self.banned_count as i64);
         s.store_field_int("add_chat_request_count", self.add_chat_request_count as i64);
+        match &self.notification_settings {
+            Some(__m2) => __m2.store_debug(s, "notification_settings"),
+            None => s.store_null("notification_settings"),
+        }
         s.store_class_end();
     }
 
@@ -54280,6 +54821,162 @@ impl CommunityId {
     pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
         s.store_class_begin(field_name, "communityId");
         s.store_field_int("id", self.id);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "communityMemberChats")]
+pub struct CommunityMemberChats {
+    pub owned_chat_ids: Vec<i64>,
+    pub joined_chat_ids: Vec<i64>,
+}
+
+impl CommunityMemberChats {
+    pub const ID: i32 = 2068259090;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.owned_chat_ids.len() as i32);
+        for __v0 in &self.owned_chat_ids {
+            tl::__i64(out, *__v0);
+        }
+        tl::__i32(out, self.joined_chat_ids.len() as i32);
+        for __v1 in &self.joined_chat_ids {
+            tl::__i64(out, *__v1);
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let __v0: Vec<i64> = {
+            let count: u32 = r.i32()? as u32;
+            if count as usize > r.remaining() {
+                return Result::Err("Wrong vector length");
+            }
+            let mut res = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                res.push(r.i64()?);
+            }
+            res
+        };
+        let owned_chat_ids: Vec<i64> = __v0;
+        let __v1: Vec<i64> = {
+            let count: u32 = r.i32()? as u32;
+            if count as usize > r.remaining() {
+                return Result::Err("Wrong vector length");
+            }
+            let mut res = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                res.push(r.i64()?);
+            }
+            res
+        };
+        let joined_chat_ids: Vec<i64> = __v1;
+        Result::Ok(Self { owned_chat_ids, joined_chat_ids })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"communityMemberChats\"");
+        out.push_str(",\"owned_chat_ids\":");
+        out.push('[');
+        let mut __first = true;
+        for __v0 in &self.owned_chat_ids {
+            if !__first {
+                out.push(',');
+            }
+            __first = false;
+            tl_json::num64(out, *__v0);
+        }
+        out.push(']');
+        out.push_str(",\"joined_chat_ids\":");
+        out.push('[');
+        let mut __first = true;
+        for __v1 in &self.joined_chat_ids {
+            if !__first {
+                out.push(',');
+            }
+            __first = false;
+            tl_json::num64(out, *__v1);
+        }
+        out.push(']');
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "owned_chat_ids") {
+            value.owned_chat_ids = tl_json::read_vector(__j0, tl_json::read_i64)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "joined_chat_ids") {
+            value.joined_chat_ids = tl_json::read_vector(__j2, tl_json::read_i64)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "communityMemberChats");
+        s.store_vector_begin("owned_chat_ids", self.owned_chat_ids.len());
+        for __v0 in &self.owned_chat_ids {
+            s.store_field_int("", *__v0);
+        }
+        s.store_class_end();
+        s.store_vector_begin("joined_chat_ids", self.joined_chat_ids.len());
+        for __v1 in &self.joined_chat_ids {
+            s.store_field_int("", *__v1);
+        }
+        s.store_class_end();
         s.store_class_end();
     }
 
@@ -65982,6 +66679,305 @@ impl EmojiStatuses {
         let mut storer = TlStorerToString { out: &mut out, shift: 0 };
         self.store_debug(&mut storer, "");
         out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "emojiTypeRegular")]
+pub struct emojiTypeRegular {
+    pub emoji: String,
+}
+
+impl emojiTypeRegular {
+    pub const ID: i32 = -1750786913;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__string(out, &self.emoji);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let emoji: String = r.string()?;
+        Result::Ok(Self { emoji })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"emojiTypeRegular\"");
+        out.push_str(",\"emoji\":");
+        tl_json::str(out, &self.emoji);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "emoji") {
+            value.emoji = tl_json::read_string(__j0)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "emojiTypeRegular");
+        s.store_field_str("emoji", &self.emoji);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "emojiTypeCustomEmoji")]
+pub struct emojiTypeCustomEmoji {
+    pub custom_emoji_id: i64,
+}
+
+impl emojiTypeCustomEmoji {
+    pub const ID: i32 = 2048600228;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i64(out, self.custom_emoji_id);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let custom_emoji_id: i64 = r.i64()?;
+        Result::Ok(Self { custom_emoji_id })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"emojiTypeCustomEmoji\"");
+        out.push_str(",\"custom_emoji_id\":");
+        tl_json::num64q(out, self.custom_emoji_id);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "custom_emoji_id") {
+            value.custom_emoji_id = tl_json::read_i64(__j0)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "emojiTypeCustomEmoji");
+        s.store_field_int("custom_emoji_id", self.custom_emoji_id);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "@type")]
+pub enum EmojiType {
+    #[serde(rename = "emojiTypeRegular")]
+    emojiTypeRegular(emojiTypeRegular),
+    #[serde(rename = "emojiTypeCustomEmoji")]
+    emojiTypeCustomEmoji(emojiTypeCustomEmoji),
+}
+
+impl EmojiType {
+    pub fn store(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::emojiTypeRegular(v) => v.store_boxed(out),
+            Self::emojiTypeCustomEmoji(v) => v.store_boxed(out),
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        match r.i32()? {
+            self::emojiTypeRegular::ID => Result::Ok(Self::emojiTypeRegular(self::emojiTypeRegular::read_bare(r)?)),
+            self::emojiTypeCustomEmoji::ID => Result::Ok(Self::emojiTypeCustomEmoji(self::emojiTypeCustomEmoji::read_bare(r)?)),
+            _ => Result::Err("Unknown constructor"),
+        }
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        match self {
+            Self::emojiTypeRegular(v) => v.to_json_into(out),
+            Self::emojiTypeCustomEmoji(v) => v.to_json_into(out),
+        }
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    fn __json_new_emojiTypeRegular(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::emojiTypeRegular(self::emojiTypeRegular::from_json_object(o)?))
+    }
+    fn __json_new_emojiTypeCustomEmoji(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::emojiTypeCustomEmoji(self::emojiTypeCustomEmoji::from_json_object(o)?))
+    }
+    /// td's `from_json(object_ptr<T>&, JsonValue)`: null yields the
+    /// default variant (C++ keeps a null pointer — see the model note),
+    /// an object's `@type` (name or numeric id) selects the variant.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        let o = match v {
+            tl_json::Json::Null => return Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => o,
+            other => return Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        };
+        let ty = match tl_json::field(o, "@type") {
+            Some(ty) => ty,
+            None => return Result::Err("Can't find field \"@type\"".to_owned()),
+        };
+        match ty {
+            tl_json::Json::String(s) => match s.as_str() {
+                "emojiTypeRegular" => Self::__json_new_emojiTypeRegular(o),
+                "emojiTypeCustomEmoji" => Self::__json_new_emojiTypeCustomEmoji(o),
+                _ => Result::Err(format!("Unknown class \"{s}\"")),
+            },
+            tl_json::Json::Number(n) => match tl_json::to_integer_i32(n) {
+                self::emojiTypeRegular::ID => Self::__json_new_emojiTypeRegular(o),
+                self::emojiTypeCustomEmoji::ID => Self::__json_new_emojiTypeCustomEmoji(o),
+                id => Result::Err(format!("Unknown constructor 0x{:08x}", id as u32)),
+            },
+            other => Result::Err(format!("Expected String or Integer, but receive {}", other.type_name())),
+        }
+    }
+
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        match self {
+            Self::emojiTypeRegular(v) => v.store_debug(s, field_name),
+            Self::emojiTypeCustomEmoji(v) => v.store_debug(s, field_name),
+        }
+    }
+
+    /// td's `to_string(const BaseObject&)` for this type.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+impl Default for EmojiType {
+    fn default() -> Self {
+        Self::emojiTypeRegular(Default::default())
+    }
+}
+
+impl From<EmojiType> for Object {
+    fn from(value: EmojiType) -> Object {
+        match value {
+            EmojiType::emojiTypeRegular(v) => Object::emojiTypeRegular(v),
+            EmojiType::emojiTypeCustomEmoji(v) => Object::emojiTypeCustomEmoji(v),
+        }
     }
 }
 
@@ -96298,6 +97294,305 @@ impl inputMessageChecklist {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "inputMessageWidget")]
+pub struct inputMessageWidget {
+    pub width: i32,
+    pub height: i32,
+    pub html: String,
+    pub public_data: String,
+    pub chat_data: String,
+    pub caption: Option<FormattedText>,
+    pub show_caption_above_media: bool,
+    pub allow_queries: bool,
+    pub is_shared: bool,
+}
+
+impl inputMessageWidget {
+    pub const ID: i32 = 999197869;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.width);
+        tl::__i32(out, self.height);
+        tl::__string(out, &self.html);
+        tl::__string(out, &self.public_data);
+        tl::__string(out, &self.chat_data);
+        let __d0 = Default::default();
+        let __m0 = self.caption.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+        tl::__bool(out, self.show_caption_above_media);
+        tl::__bool(out, self.allow_queries);
+        tl::__bool(out, self.is_shared);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let width: i32 = r.i32()?;
+        let height: i32 = r.i32()?;
+        let html: String = r.string()?;
+        let public_data: String = r.string()?;
+        let chat_data: String = r.string()?;
+        let caption: Option<FormattedText> = Some(FormattedText::read_bare(r)?);
+        let show_caption_above_media: bool = r.bool()?;
+        let allow_queries: bool = r.bool()?;
+        let is_shared: bool = r.bool()?;
+        Result::Ok(Self { width, height, html, public_data, chat_data, caption, show_caption_above_media, allow_queries, is_shared })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"inputMessageWidget\"");
+        out.push_str(",\"width\":");
+        tl_json::num32(out, self.width);
+        out.push_str(",\"height\":");
+        tl_json::num32(out, self.height);
+        out.push_str(",\"html\":");
+        tl_json::str(out, &self.html);
+        out.push_str(",\"public_data\":");
+        tl_json::str(out, &self.public_data);
+        out.push_str(",\"chat_data\":");
+        tl_json::str(out, &self.chat_data);
+        if let Some(__o0) = &self.caption {
+            out.push_str(",\"caption\":");
+            __o0.to_json_into(out);
+        }
+        out.push_str(",\"show_caption_above_media\":");
+        tl_json::boolean(out, self.show_caption_above_media);
+        out.push_str(",\"allow_queries\":");
+        tl_json::boolean(out, self.allow_queries);
+        out.push_str(",\"is_shared\":");
+        tl_json::boolean(out, self.is_shared);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "width") {
+            value.width = tl_json::read_i32(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "height") {
+            value.height = tl_json::read_i32(__j2)?;
+        }
+        if let Some(__j4) = tl_json::field(o, "html") {
+            value.html = tl_json::read_string(__j4)?;
+        }
+        if let Some(__j6) = tl_json::field(o, "public_data") {
+            value.public_data = tl_json::read_string(__j6)?;
+        }
+        if let Some(__j8) = tl_json::field(o, "chat_data") {
+            value.chat_data = tl_json::read_string(__j8)?;
+        }
+        if let Some(__j10) = tl_json::field(o, "caption") && !matches!(__j10, tl_json::Json::Null) {
+            value.caption = Some(FormattedText::from_json_value(__j10)?);
+        }
+        if let Some(__j12) = tl_json::field(o, "show_caption_above_media") {
+            value.show_caption_above_media = tl_json::read_bool(__j12)?;
+        }
+        if let Some(__j14) = tl_json::field(o, "allow_queries") {
+            value.allow_queries = tl_json::read_bool(__j14)?;
+        }
+        if let Some(__j16) = tl_json::field(o, "is_shared") {
+            value.is_shared = tl_json::read_bool(__j16)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "inputMessageWidget");
+        s.store_field_int("width", self.width as i64);
+        s.store_field_int("height", self.height as i64);
+        s.store_field_str("html", &self.html);
+        s.store_field_str("public_data", &self.public_data);
+        s.store_field_str("chat_data", &self.chat_data);
+        match &self.caption {
+            Some(__m0) => __m0.store_debug(s, "caption"),
+            None => s.store_null("caption"),
+        }
+        s.store_field_bool("show_caption_above_media", self.show_caption_above_media);
+        s.store_field_bool("allow_queries", self.allow_queries);
+        s.store_field_bool("is_shared", self.is_shared);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "inputMessageSharedWidget")]
+pub struct inputMessageSharedWidget {
+    pub widget_id: i64,
+    pub chat_data: String,
+    pub caption: Option<FormattedText>,
+    pub show_caption_above_media: bool,
+}
+
+impl inputMessageSharedWidget {
+    pub const ID: i32 = -271303570;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i64(out, self.widget_id);
+        tl::__string(out, &self.chat_data);
+        let __d0 = Default::default();
+        let __m0 = self.caption.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+        tl::__bool(out, self.show_caption_above_media);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let widget_id: i64 = r.i64()?;
+        let chat_data: String = r.string()?;
+        let caption: Option<FormattedText> = Some(FormattedText::read_bare(r)?);
+        let show_caption_above_media: bool = r.bool()?;
+        Result::Ok(Self { widget_id, chat_data, caption, show_caption_above_media })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"inputMessageSharedWidget\"");
+        out.push_str(",\"widget_id\":");
+        tl_json::num64q(out, self.widget_id);
+        out.push_str(",\"chat_data\":");
+        tl_json::str(out, &self.chat_data);
+        if let Some(__o0) = &self.caption {
+            out.push_str(",\"caption\":");
+            __o0.to_json_into(out);
+        }
+        out.push_str(",\"show_caption_above_media\":");
+        tl_json::boolean(out, self.show_caption_above_media);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "widget_id") {
+            value.widget_id = tl_json::read_i64(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "chat_data") {
+            value.chat_data = tl_json::read_string(__j2)?;
+        }
+        if let Some(__j4) = tl_json::field(o, "caption") && !matches!(__j4, tl_json::Json::Null) {
+            value.caption = Some(FormattedText::from_json_value(__j4)?);
+        }
+        if let Some(__j6) = tl_json::field(o, "show_caption_above_media") {
+            value.show_caption_above_media = tl_json::read_bool(__j6)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "inputMessageSharedWidget");
+        s.store_field_int("widget_id", self.widget_id);
+        s.store_field_str("chat_data", &self.chat_data);
+        match &self.caption {
+            Some(__m0) => __m0.store_debug(s, "caption"),
+            None => s.store_null("caption"),
+        }
+        s.store_field_bool("show_caption_above_media", self.show_caption_above_media);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "inputMessageForwarded")]
 pub struct inputMessageForwarded {
     pub from_chat_id: i64,
@@ -96489,6 +97784,10 @@ pub enum InputMessageContent {
     inputMessageStory(inputMessageStory),
     #[serde(rename = "inputMessageChecklist")]
     inputMessageChecklist(inputMessageChecklist),
+    #[serde(rename = "inputMessageWidget")]
+    inputMessageWidget(inputMessageWidget),
+    #[serde(rename = "inputMessageSharedWidget")]
+    inputMessageSharedWidget(inputMessageSharedWidget),
     #[serde(rename = "inputMessageForwarded")]
     inputMessageForwarded(inputMessageForwarded),
 }
@@ -96518,6 +97817,8 @@ impl InputMessageContent {
             Self::inputMessageStakeDice(v) => v.store_boxed(out),
             Self::inputMessageStory(v) => v.store_boxed(out),
             Self::inputMessageChecklist(v) => v.store_boxed(out),
+            Self::inputMessageWidget(v) => v.store_boxed(out),
+            Self::inputMessageSharedWidget(v) => v.store_boxed(out),
             Self::inputMessageForwarded(v) => v.store_boxed(out),
         }
     }
@@ -96551,6 +97852,8 @@ impl InputMessageContent {
             self::inputMessageStakeDice::ID => Result::Ok(Self::inputMessageStakeDice(self::inputMessageStakeDice::read_bare(r)?)),
             self::inputMessageStory::ID => Result::Ok(Self::inputMessageStory(self::inputMessageStory::read_bare(r)?)),
             self::inputMessageChecklist::ID => Result::Ok(Self::inputMessageChecklist(self::inputMessageChecklist::read_bare(r)?)),
+            self::inputMessageWidget::ID => Result::Ok(Self::inputMessageWidget(self::inputMessageWidget::read_bare(r)?)),
+            self::inputMessageSharedWidget::ID => Result::Ok(Self::inputMessageSharedWidget(self::inputMessageSharedWidget::read_bare(r)?)),
             self::inputMessageForwarded::ID => Result::Ok(Self::inputMessageForwarded(self::inputMessageForwarded::read_bare(r)?)),
             _ => Result::Err("Unknown constructor"),
         }
@@ -96586,6 +97889,8 @@ impl InputMessageContent {
             Self::inputMessageStakeDice(v) => v.to_json_into(out),
             Self::inputMessageStory(v) => v.to_json_into(out),
             Self::inputMessageChecklist(v) => v.to_json_into(out),
+            Self::inputMessageWidget(v) => v.to_json_into(out),
+            Self::inputMessageSharedWidget(v) => v.to_json_into(out),
             Self::inputMessageForwarded(v) => v.to_json_into(out),
         }
     }
@@ -96661,6 +97966,12 @@ impl InputMessageContent {
     fn __json_new_inputMessageChecklist(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::inputMessageChecklist(self::inputMessageChecklist::from_json_object(o)?))
     }
+    fn __json_new_inputMessageWidget(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::inputMessageWidget(self::inputMessageWidget::from_json_object(o)?))
+    }
+    fn __json_new_inputMessageSharedWidget(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::inputMessageSharedWidget(self::inputMessageSharedWidget::from_json_object(o)?))
+    }
     fn __json_new_inputMessageForwarded(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::inputMessageForwarded(self::inputMessageForwarded::from_json_object(o)?))
     }
@@ -96701,6 +98012,8 @@ impl InputMessageContent {
                 "inputMessageStakeDice" => Self::__json_new_inputMessageStakeDice(o),
                 "inputMessageStory" => Self::__json_new_inputMessageStory(o),
                 "inputMessageChecklist" => Self::__json_new_inputMessageChecklist(o),
+                "inputMessageWidget" => Self::__json_new_inputMessageWidget(o),
+                "inputMessageSharedWidget" => Self::__json_new_inputMessageSharedWidget(o),
                 "inputMessageForwarded" => Self::__json_new_inputMessageForwarded(o),
                 _ => Result::Err(format!("Unknown class \"{s}\"")),
             },
@@ -96727,6 +98040,8 @@ impl InputMessageContent {
                 self::inputMessageStakeDice::ID => Self::__json_new_inputMessageStakeDice(o),
                 self::inputMessageStory::ID => Self::__json_new_inputMessageStory(o),
                 self::inputMessageChecklist::ID => Self::__json_new_inputMessageChecklist(o),
+                self::inputMessageWidget::ID => Self::__json_new_inputMessageWidget(o),
+                self::inputMessageSharedWidget::ID => Self::__json_new_inputMessageSharedWidget(o),
                 self::inputMessageForwarded::ID => Self::__json_new_inputMessageForwarded(o),
                 id => Result::Err(format!("Unknown constructor 0x{:08x}", id as u32)),
             },
@@ -96758,6 +98073,8 @@ impl InputMessageContent {
             Self::inputMessageStakeDice(v) => v.store_debug(s, field_name),
             Self::inputMessageStory(v) => v.store_debug(s, field_name),
             Self::inputMessageChecklist(v) => v.store_debug(s, field_name),
+            Self::inputMessageWidget(v) => v.store_debug(s, field_name),
+            Self::inputMessageSharedWidget(v) => v.store_debug(s, field_name),
             Self::inputMessageForwarded(v) => v.store_debug(s, field_name),
         }
     }
@@ -96802,6 +98119,8 @@ impl From<InputMessageContent> for Object {
             InputMessageContent::inputMessageStakeDice(v) => Object::inputMessageStakeDice(v),
             InputMessageContent::inputMessageStory(v) => Object::inputMessageStory(v),
             InputMessageContent::inputMessageChecklist(v) => Object::inputMessageChecklist(v),
+            InputMessageContent::inputMessageWidget(v) => Object::inputMessageWidget(v),
+            InputMessageContent::inputMessageSharedWidget(v) => Object::inputMessageSharedWidget(v),
             InputMessageContent::inputMessageForwarded(v) => Object::inputMessageForwarded(v),
         }
     }
@@ -106006,6 +107325,350 @@ impl From<InputPollType> for Object {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "inputProfileShareThemeEmoji")]
+pub struct inputProfileShareThemeEmoji {
+    pub emojis: Vec<EmojiType>,
+    pub use_default_background: bool,
+    pub background_backdrop_id: i32,
+}
+
+impl inputProfileShareThemeEmoji {
+    pub const ID: i32 = 598852636;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.emojis.len() as i32);
+        for __v0 in &self.emojis {
+            (*__v0).store(out);
+        }
+        tl::__bool(out, self.use_default_background);
+        tl::__i32(out, self.background_backdrop_id);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let __v0: Vec<EmojiType> = {
+            let count: u32 = r.i32()? as u32;
+            if count as usize > r.remaining() {
+                return Result::Err("Wrong vector length");
+            }
+            let mut res = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                res.push(EmojiType::read(r)?);
+            }
+            res
+        };
+        let emojis: Vec<EmojiType> = __v0;
+        let use_default_background: bool = r.bool()?;
+        let background_backdrop_id: i32 = r.i32()?;
+        Result::Ok(Self { emojis, use_default_background, background_backdrop_id })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"inputProfileShareThemeEmoji\"");
+        out.push_str(",\"emojis\":");
+        out.push('[');
+        let mut __first = true;
+        for __v0 in &self.emojis {
+            if !__first {
+                out.push(',');
+            }
+            __first = false;
+            (*__v0).to_json_into(out);
+        }
+        out.push(']');
+        out.push_str(",\"use_default_background\":");
+        tl_json::boolean(out, self.use_default_background);
+        out.push_str(",\"background_backdrop_id\":");
+        tl_json::num32(out, self.background_backdrop_id);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "emojis") {
+            value.emojis = tl_json::read_vector(__j0, EmojiType::from_json_value)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "use_default_background") {
+            value.use_default_background = tl_json::read_bool(__j2)?;
+        }
+        if let Some(__j4) = tl_json::field(o, "background_backdrop_id") {
+            value.background_backdrop_id = tl_json::read_i32(__j4)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "inputProfileShareThemeEmoji");
+        s.store_vector_begin("emojis", self.emojis.len());
+        for __v0 in &self.emojis {
+            __v0.store_debug(s, "");
+        }
+        s.store_class_end();
+        s.store_field_bool("use_default_background", self.use_default_background);
+        s.store_field_int("background_backdrop_id", self.background_backdrop_id as i64);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "inputProfileShareThemeUpgradedGift")]
+pub struct inputProfileShareThemeUpgradedGift {
+    pub received_gift_id: String,
+}
+
+impl inputProfileShareThemeUpgradedGift {
+    pub const ID: i32 = -1197057055;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__string(out, &self.received_gift_id);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let received_gift_id: String = r.string()?;
+        Result::Ok(Self { received_gift_id })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"inputProfileShareThemeUpgradedGift\"");
+        out.push_str(",\"received_gift_id\":");
+        tl_json::str(out, &self.received_gift_id);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "received_gift_id") {
+            value.received_gift_id = tl_json::read_string(__j0)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "inputProfileShareThemeUpgradedGift");
+        s.store_field_str("received_gift_id", &self.received_gift_id);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "@type")]
+pub enum InputProfileShareTheme {
+    #[serde(rename = "inputProfileShareThemeEmoji")]
+    inputProfileShareThemeEmoji(inputProfileShareThemeEmoji),
+    #[serde(rename = "inputProfileShareThemeUpgradedGift")]
+    inputProfileShareThemeUpgradedGift(inputProfileShareThemeUpgradedGift),
+}
+
+impl InputProfileShareTheme {
+    pub fn store(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::inputProfileShareThemeEmoji(v) => v.store_boxed(out),
+            Self::inputProfileShareThemeUpgradedGift(v) => v.store_boxed(out),
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        match r.i32()? {
+            self::inputProfileShareThemeEmoji::ID => Result::Ok(Self::inputProfileShareThemeEmoji(self::inputProfileShareThemeEmoji::read_bare(r)?)),
+            self::inputProfileShareThemeUpgradedGift::ID => Result::Ok(Self::inputProfileShareThemeUpgradedGift(self::inputProfileShareThemeUpgradedGift::read_bare(r)?)),
+            _ => Result::Err("Unknown constructor"),
+        }
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        match self {
+            Self::inputProfileShareThemeEmoji(v) => v.to_json_into(out),
+            Self::inputProfileShareThemeUpgradedGift(v) => v.to_json_into(out),
+        }
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    fn __json_new_inputProfileShareThemeEmoji(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::inputProfileShareThemeEmoji(self::inputProfileShareThemeEmoji::from_json_object(o)?))
+    }
+    fn __json_new_inputProfileShareThemeUpgradedGift(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::inputProfileShareThemeUpgradedGift(self::inputProfileShareThemeUpgradedGift::from_json_object(o)?))
+    }
+    /// td's `from_json(object_ptr<T>&, JsonValue)`: null yields the
+    /// default variant (C++ keeps a null pointer — see the model note),
+    /// an object's `@type` (name or numeric id) selects the variant.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        let o = match v {
+            tl_json::Json::Null => return Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => o,
+            other => return Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        };
+        let ty = match tl_json::field(o, "@type") {
+            Some(ty) => ty,
+            None => return Result::Err("Can't find field \"@type\"".to_owned()),
+        };
+        match ty {
+            tl_json::Json::String(s) => match s.as_str() {
+                "inputProfileShareThemeEmoji" => Self::__json_new_inputProfileShareThemeEmoji(o),
+                "inputProfileShareThemeUpgradedGift" => Self::__json_new_inputProfileShareThemeUpgradedGift(o),
+                _ => Result::Err(format!("Unknown class \"{s}\"")),
+            },
+            tl_json::Json::Number(n) => match tl_json::to_integer_i32(n) {
+                self::inputProfileShareThemeEmoji::ID => Self::__json_new_inputProfileShareThemeEmoji(o),
+                self::inputProfileShareThemeUpgradedGift::ID => Self::__json_new_inputProfileShareThemeUpgradedGift(o),
+                id => Result::Err(format!("Unknown constructor 0x{:08x}", id as u32)),
+            },
+            other => Result::Err(format!("Expected String or Integer, but receive {}", other.type_name())),
+        }
+    }
+
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        match self {
+            Self::inputProfileShareThemeEmoji(v) => v.store_debug(s, field_name),
+            Self::inputProfileShareThemeUpgradedGift(v) => v.store_debug(s, field_name),
+        }
+    }
+
+    /// td's `to_string(const BaseObject&)` for this type.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+impl Default for InputProfileShareTheme {
+    fn default() -> Self {
+        Self::inputProfileShareThemeEmoji(Default::default())
+    }
+}
+
+impl From<InputProfileShareTheme> for Object {
+    fn from(value: InputProfileShareTheme) -> Object {
+        match value {
+            InputProfileShareTheme::inputProfileShareThemeEmoji(v) => Object::inputProfileShareThemeEmoji(v),
+            InputProfileShareTheme::inputProfileShareThemeUpgradedGift(v) => Object::inputProfileShareThemeUpgradedGift(v),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "inputRichMessage")]
 pub struct InputRichMessage {
     pub source: Option<Box<RichMessageSource>>,
@@ -106369,12 +108032,12 @@ impl InputSticker {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "inputStoryArea")]
 pub struct InputStoryArea {
-    pub position: Option<StoryAreaPosition>,
+    pub position: Option<AreaPosition>,
     pub r#type: Option<InputStoryAreaType>,
 }
 
 impl InputStoryArea {
-    pub const ID: i32 = 122859135;
+    pub const ID: i32 = -75965406;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -106408,7 +108071,7 @@ impl InputStoryArea {
     }
 
     pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
-        let position: Option<StoryAreaPosition> = Some(StoryAreaPosition::read_bare(r)?);
+        let position: Option<AreaPosition> = Some(AreaPosition::read_bare(r)?);
         let r#type: Option<InputStoryAreaType> = Some(InputStoryAreaType::read(r)?);
         Result::Ok(Self { position, r#type })
     }
@@ -106450,7 +108113,7 @@ impl InputStoryArea {
     fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
         let mut value = Self::default();
         if let Some(__j0) = tl_json::field(o, "position") && !matches!(__j0, tl_json::Json::Null) {
-            value.position = Some(StoryAreaPosition::from_json_value(__j0)?);
+            value.position = Some(AreaPosition::from_json_value(__j0)?);
         }
         if let Some(__j2) = tl_json::field(o, "type") && !matches!(__j2, tl_json::Json::Null) {
             value.r#type = Some(InputStoryAreaType::from_json_value(__j2)?);
@@ -106586,108 +108249,6 @@ impl inputStoryAreaTypeLocation {
             Some(__m1) => __m1.store_debug(s, "address"),
             None => s.store_null("address"),
         }
-        s.store_class_end();
-    }
-
-    /// td's `to_string(const BaseObject&)` for this constructor.
-    pub fn to_debug_string(&self) -> String {
-        let mut out = String::new();
-        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
-        self.store_debug(&mut storer, "");
-        out
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename = "inputStoryAreaTypeFoundVenue")]
-pub struct inputStoryAreaTypeFoundVenue {
-    pub query_id: i64,
-    pub result_id: String,
-}
-
-impl inputStoryAreaTypeFoundVenue {
-    pub const ID: i32 = -1395809130;
-
-    pub fn store_boxed(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&Self::ID.to_le_bytes());
-        self.store(out);
-    }
-
-    pub fn store(&self, out: &mut Vec<u8>) {
-        tl::__i64(out, self.query_id);
-        tl::__string(out, &self.result_id);
-    }
-
-    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
-        let mut r = tl::Reader::new(input);
-        Self::read(&mut r)
-    }
-
-    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
-        let mut r = tl::Reader::new(input);
-        Self::read_bare(&mut r)
-    }
-
-    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
-        if r.i32()? != Self::ID {
-            return Result::Err("Wrong constructor");
-        }
-        Self::read_bare(r)
-    }
-
-    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
-        let query_id: i64 = r.i64()?;
-        let result_id: String = r.string()?;
-        Result::Ok(Self { query_id, result_id })
-    }
-
-    pub fn to_json(&self) -> String {
-        let mut out = String::new();
-        self.to_json_into(&mut out);
-        out
-    }
-
-    pub fn to_json_into(&self, out: &mut String) {
-        out.push_str("{\"@type\":\"inputStoryAreaTypeFoundVenue\"");
-        out.push_str(",\"query_id\":");
-        tl_json::num64q(out, self.query_id);
-        out.push_str(",\"result_id\":");
-        tl_json::str(out, &self.result_id);
-        out.push('}');
-    }
-
-    pub fn from_json(input: &str) -> Result<Self, String> {
-        let root = tl_json::parse_json(input)?;
-        Self::from_json_value(&root)
-    }
-
-    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
-    /// object is accepted and `@type` is ignored — only the fields read.
-    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
-        match v {
-            tl_json::Json::Null => Result::Ok(Self::default()),
-            tl_json::Json::Object(o) => Self::from_json_object(o),
-            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
-        }
-    }
-
-    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
-        let mut value = Self::default();
-        if let Some(__j0) = tl_json::field(o, "query_id") {
-            value.query_id = tl_json::read_i64(__j0)?;
-        }
-        if let Some(__j2) = tl_json::field(o, "result_id") {
-            value.result_id = tl_json::read_string(__j2)?;
-        }
-        Result::Ok(value)
-    }
-
-    /// td's generated `Class::store(TlStorerToString&, const char*)`
-    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
-    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
-        s.store_class_begin(field_name, "inputStoryAreaTypeFoundVenue");
-        s.store_field_int("query_id", self.query_id);
-        s.store_field_str("result_id", &self.result_id);
         s.store_class_end();
     }
 
@@ -107324,8 +108885,6 @@ impl inputStoryAreaTypeUpgradedGift {
 pub enum InputStoryAreaType {
     #[serde(rename = "inputStoryAreaTypeLocation")]
     inputStoryAreaTypeLocation(inputStoryAreaTypeLocation),
-    #[serde(rename = "inputStoryAreaTypeFoundVenue")]
-    inputStoryAreaTypeFoundVenue(inputStoryAreaTypeFoundVenue),
     #[serde(rename = "inputStoryAreaTypePreviousVenue")]
     inputStoryAreaTypePreviousVenue(inputStoryAreaTypePreviousVenue),
     #[serde(rename = "inputStoryAreaTypeSuggestedReaction")]
@@ -107344,7 +108903,6 @@ impl InputStoryAreaType {
     pub fn store(&self, out: &mut Vec<u8>) {
         match self {
             Self::inputStoryAreaTypeLocation(v) => v.store_boxed(out),
-            Self::inputStoryAreaTypeFoundVenue(v) => v.store_boxed(out),
             Self::inputStoryAreaTypePreviousVenue(v) => v.store_boxed(out),
             Self::inputStoryAreaTypeSuggestedReaction(v) => v.store_boxed(out),
             Self::inputStoryAreaTypeMessage(v) => v.store_boxed(out),
@@ -107362,7 +108920,6 @@ impl InputStoryAreaType {
     pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
         match r.i32()? {
             self::inputStoryAreaTypeLocation::ID => Result::Ok(Self::inputStoryAreaTypeLocation(self::inputStoryAreaTypeLocation::read_bare(r)?)),
-            self::inputStoryAreaTypeFoundVenue::ID => Result::Ok(Self::inputStoryAreaTypeFoundVenue(self::inputStoryAreaTypeFoundVenue::read_bare(r)?)),
             self::inputStoryAreaTypePreviousVenue::ID => Result::Ok(Self::inputStoryAreaTypePreviousVenue(self::inputStoryAreaTypePreviousVenue::read_bare(r)?)),
             self::inputStoryAreaTypeSuggestedReaction::ID => Result::Ok(Self::inputStoryAreaTypeSuggestedReaction(self::inputStoryAreaTypeSuggestedReaction::read_bare(r)?)),
             self::inputStoryAreaTypeMessage::ID => Result::Ok(Self::inputStoryAreaTypeMessage(self::inputStoryAreaTypeMessage::read_bare(r)?)),
@@ -107382,7 +108939,6 @@ impl InputStoryAreaType {
     pub fn to_json_into(&self, out: &mut String) {
         match self {
             Self::inputStoryAreaTypeLocation(v) => v.to_json_into(out),
-            Self::inputStoryAreaTypeFoundVenue(v) => v.to_json_into(out),
             Self::inputStoryAreaTypePreviousVenue(v) => v.to_json_into(out),
             Self::inputStoryAreaTypeSuggestedReaction(v) => v.to_json_into(out),
             Self::inputStoryAreaTypeMessage(v) => v.to_json_into(out),
@@ -107399,9 +108955,6 @@ impl InputStoryAreaType {
 
     fn __json_new_inputStoryAreaTypeLocation(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::inputStoryAreaTypeLocation(self::inputStoryAreaTypeLocation::from_json_object(o)?))
-    }
-    fn __json_new_inputStoryAreaTypeFoundVenue(o: &tl_json::Object) -> Result<Self, String> {
-        Result::Ok(Self::inputStoryAreaTypeFoundVenue(self::inputStoryAreaTypeFoundVenue::from_json_object(o)?))
     }
     fn __json_new_inputStoryAreaTypePreviousVenue(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::inputStoryAreaTypePreviousVenue(self::inputStoryAreaTypePreviousVenue::from_json_object(o)?))
@@ -107437,7 +108990,6 @@ impl InputStoryAreaType {
         match ty {
             tl_json::Json::String(s) => match s.as_str() {
                 "inputStoryAreaTypeLocation" => Self::__json_new_inputStoryAreaTypeLocation(o),
-                "inputStoryAreaTypeFoundVenue" => Self::__json_new_inputStoryAreaTypeFoundVenue(o),
                 "inputStoryAreaTypePreviousVenue" => Self::__json_new_inputStoryAreaTypePreviousVenue(o),
                 "inputStoryAreaTypeSuggestedReaction" => Self::__json_new_inputStoryAreaTypeSuggestedReaction(o),
                 "inputStoryAreaTypeMessage" => Self::__json_new_inputStoryAreaTypeMessage(o),
@@ -107448,7 +109000,6 @@ impl InputStoryAreaType {
             },
             tl_json::Json::Number(n) => match tl_json::to_integer_i32(n) {
                 self::inputStoryAreaTypeLocation::ID => Self::__json_new_inputStoryAreaTypeLocation(o),
-                self::inputStoryAreaTypeFoundVenue::ID => Self::__json_new_inputStoryAreaTypeFoundVenue(o),
                 self::inputStoryAreaTypePreviousVenue::ID => Self::__json_new_inputStoryAreaTypePreviousVenue(o),
                 self::inputStoryAreaTypeSuggestedReaction::ID => Self::__json_new_inputStoryAreaTypeSuggestedReaction(o),
                 self::inputStoryAreaTypeMessage::ID => Self::__json_new_inputStoryAreaTypeMessage(o),
@@ -107464,7 +109015,6 @@ impl InputStoryAreaType {
     pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
         match self {
             Self::inputStoryAreaTypeLocation(v) => v.store_debug(s, field_name),
-            Self::inputStoryAreaTypeFoundVenue(v) => v.store_debug(s, field_name),
             Self::inputStoryAreaTypePreviousVenue(v) => v.store_debug(s, field_name),
             Self::inputStoryAreaTypeSuggestedReaction(v) => v.store_debug(s, field_name),
             Self::inputStoryAreaTypeMessage(v) => v.store_debug(s, field_name),
@@ -107493,7 +109043,6 @@ impl From<InputStoryAreaType> for Object {
     fn from(value: InputStoryAreaType) -> Object {
         match value {
             InputStoryAreaType::inputStoryAreaTypeLocation(v) => Object::inputStoryAreaTypeLocation(v),
-            InputStoryAreaType::inputStoryAreaTypeFoundVenue(v) => Object::inputStoryAreaTypeFoundVenue(v),
             InputStoryAreaType::inputStoryAreaTypePreviousVenue(v) => Object::inputStoryAreaTypePreviousVenue(v),
             InputStoryAreaType::inputStoryAreaTypeSuggestedReaction(v) => Object::inputStoryAreaTypeSuggestedReaction(v),
             InputStoryAreaType::inputStoryAreaTypeMessage(v) => Object::inputStoryAreaTypeMessage(v),
@@ -108149,11 +109698,12 @@ impl InputSuggestedPostInfo {
 #[serde(rename = "inputTextQuote")]
 pub struct InputTextQuote {
     pub text: Option<FormattedText>,
+    pub rich_texts: Vec<Box<RichText>>,
     pub position: i32,
 }
 
 impl InputTextQuote {
-    pub const ID: i32 = -1219859172;
+    pub const ID: i32 = 101518612;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -108164,6 +109714,10 @@ impl InputTextQuote {
         let __d0 = Default::default();
         let __m0 = self.text.as_ref().unwrap_or(&__d0);
         __m0.store(out);
+        tl::__i32(out, self.rich_texts.len() as i32);
+        for __v1 in &self.rich_texts {
+            (*__v1).store(out);
+        }
         tl::__i32(out, self.position);
     }
 
@@ -108186,8 +109740,20 @@ impl InputTextQuote {
 
     pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
         let text: Option<FormattedText> = Some(FormattedText::read_bare(r)?);
+        let __v0: Vec<Box<RichText>> = {
+            let count: u32 = r.i32()? as u32;
+            if count as usize > r.remaining() {
+                return Result::Err("Wrong vector length");
+            }
+            let mut res = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                res.push(Box::new(RichText::read(r)?));
+            }
+            res
+        };
+        let rich_texts: Vec<Box<RichText>> = __v0;
         let position: i32 = r.i32()?;
-        Result::Ok(Self { text, position })
+        Result::Ok(Self { text, rich_texts, position })
     }
 
     pub fn to_json(&self) -> String {
@@ -108202,6 +109768,17 @@ impl InputTextQuote {
             out.push_str(",\"text\":");
             __o0.to_json_into(out);
         }
+        out.push_str(",\"rich_texts\":");
+        out.push('[');
+        let mut __first = true;
+        for __v1 in &self.rich_texts {
+            if !__first {
+                out.push(',');
+            }
+            __first = false;
+            (*__v1).to_json_into(out);
+        }
+        out.push(']');
         out.push_str(",\"position\":");
         tl_json::num32(out, self.position);
         out.push('}');
@@ -108227,8 +109804,11 @@ impl InputTextQuote {
         if let Some(__j0) = tl_json::field(o, "text") && !matches!(__j0, tl_json::Json::Null) {
             value.text = Some(FormattedText::from_json_value(__j0)?);
         }
-        if let Some(__j2) = tl_json::field(o, "position") {
-            value.position = tl_json::read_i32(__j2)?;
+        if let Some(__j2) = tl_json::field(o, "rich_texts") {
+            value.rich_texts = tl_json::read_vector(__j2, |__e3| Result::Ok(Box::new(RichText::from_json_value(__e3)?)))?;
+        }
+        if let Some(__j5) = tl_json::field(o, "position") {
+            value.position = tl_json::read_i32(__j5)?;
         }
         Result::Ok(value)
     }
@@ -108241,6 +109821,11 @@ impl InputTextQuote {
             Some(__m0) => __m0.store_debug(s, "text"),
             None => s.store_null("text"),
         }
+        s.store_vector_begin("rich_texts", self.rich_texts.len());
+        for __v1 in &self.rich_texts {
+            __v1.store_debug(s, "");
+        }
+        s.store_class_end();
         s.store_field_int("position", self.position as i64);
         s.store_class_end();
     }
@@ -108360,6 +109945,115 @@ impl InputThumbnail {
         }
         s.store_field_int("width", self.width as i64);
         s.store_field_int("height", self.height as i64);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "inputTonWalletCardSticker")]
+pub struct InputTonWalletCardSticker {
+    pub position: Option<AreaPosition>,
+    pub nft_address: String,
+}
+
+impl InputTonWalletCardSticker {
+    pub const ID: i32 = 296964261;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let __d0 = Default::default();
+        let __m0 = self.position.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+        tl::__string(out, &self.nft_address);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let position: Option<AreaPosition> = Some(AreaPosition::read_bare(r)?);
+        let nft_address: String = r.string()?;
+        Result::Ok(Self { position, nft_address })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"inputTonWalletCardSticker\"");
+        if let Some(__o0) = &self.position {
+            out.push_str(",\"position\":");
+            __o0.to_json_into(out);
+        }
+        out.push_str(",\"nft_address\":");
+        tl_json::str(out, &self.nft_address);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "position") && !matches!(__j0, tl_json::Json::Null) {
+            value.position = Some(AreaPosition::from_json_value(__j0)?);
+        }
+        if let Some(__j2) = tl_json::field(o, "nft_address") {
+            value.nft_address = tl_json::read_string(__j2)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "inputTonWalletCardSticker");
+        match &self.position {
+            Some(__m0) => __m0.store_debug(s, "position"),
+            None => s.store_null("position"),
+        }
+        s.store_field_str("nft_address", &self.nft_address);
         s.store_class_end();
     }
 
@@ -112561,10 +114255,11 @@ pub struct internalLinkTypePublicChat {
     pub chat_username: String,
     pub draft_text: String,
     pub open_profile: bool,
+    pub unpaid_messages_token: String,
 }
 
 impl internalLinkTypePublicChat {
-    pub const ID: i32 = 1769614592;
+    pub const ID: i32 = -1978459296;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -112575,6 +114270,7 @@ impl internalLinkTypePublicChat {
         tl::__string(out, &self.chat_username);
         tl::__string(out, &self.draft_text);
         tl::__bool(out, self.open_profile);
+        tl::__string(out, &self.unpaid_messages_token);
     }
 
     pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
@@ -112598,7 +114294,8 @@ impl internalLinkTypePublicChat {
         let chat_username: String = r.string()?;
         let draft_text: String = r.string()?;
         let open_profile: bool = r.bool()?;
-        Result::Ok(Self { chat_username, draft_text, open_profile })
+        let unpaid_messages_token: String = r.string()?;
+        Result::Ok(Self { chat_username, draft_text, open_profile, unpaid_messages_token })
     }
 
     pub fn to_json(&self) -> String {
@@ -112615,6 +114312,8 @@ impl internalLinkTypePublicChat {
         tl_json::str(out, &self.draft_text);
         out.push_str(",\"open_profile\":");
         tl_json::boolean(out, self.open_profile);
+        out.push_str(",\"unpaid_messages_token\":");
+        tl_json::str(out, &self.unpaid_messages_token);
         out.push('}');
     }
 
@@ -112644,6 +114343,9 @@ impl internalLinkTypePublicChat {
         if let Some(__j4) = tl_json::field(o, "open_profile") {
             value.open_profile = tl_json::read_bool(__j4)?;
         }
+        if let Some(__j6) = tl_json::field(o, "unpaid_messages_token") {
+            value.unpaid_messages_token = tl_json::read_string(__j6)?;
+        }
         Result::Ok(value)
     }
 
@@ -112654,6 +114356,7 @@ impl internalLinkTypePublicChat {
         s.store_field_str("chat_username", &self.chat_username);
         s.store_field_str("draft_text", &self.draft_text);
         s.store_field_bool("open_profile", self.open_profile);
+        s.store_field_str("unpaid_messages_token", &self.unpaid_messages_token);
         s.store_class_end();
     }
 
@@ -113960,7 +115663,7 @@ pub struct internalLinkTypeTonWalletTransfer {
 }
 
 impl internalLinkTypeTonWalletTransfer {
-    pub const ID: i32 = -1697768710;
+    pub const ID: i32 = 9715338;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -114010,7 +115713,7 @@ impl internalLinkTypeTonWalletTransfer {
             __o0.to_json_into(out);
         }
         out.push_str(",\"gram_amount\":");
-        tl_json::num64(out, self.gram_amount);
+        tl_json::num64q(out, self.gram_amount);
         out.push('}');
     }
 
@@ -114253,10 +115956,11 @@ pub struct internalLinkTypeUserPhoneNumber {
     pub phone_number: String,
     pub draft_text: String,
     pub open_profile: bool,
+    pub unpaid_messages_token: String,
 }
 
 impl internalLinkTypeUserPhoneNumber {
-    pub const ID: i32 = 273398536;
+    pub const ID: i32 = 1068134051;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -114267,6 +115971,7 @@ impl internalLinkTypeUserPhoneNumber {
         tl::__string(out, &self.phone_number);
         tl::__string(out, &self.draft_text);
         tl::__bool(out, self.open_profile);
+        tl::__string(out, &self.unpaid_messages_token);
     }
 
     pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
@@ -114290,7 +115995,8 @@ impl internalLinkTypeUserPhoneNumber {
         let phone_number: String = r.string()?;
         let draft_text: String = r.string()?;
         let open_profile: bool = r.bool()?;
-        Result::Ok(Self { phone_number, draft_text, open_profile })
+        let unpaid_messages_token: String = r.string()?;
+        Result::Ok(Self { phone_number, draft_text, open_profile, unpaid_messages_token })
     }
 
     pub fn to_json(&self) -> String {
@@ -114307,6 +116013,8 @@ impl internalLinkTypeUserPhoneNumber {
         tl_json::str(out, &self.draft_text);
         out.push_str(",\"open_profile\":");
         tl_json::boolean(out, self.open_profile);
+        out.push_str(",\"unpaid_messages_token\":");
+        tl_json::str(out, &self.unpaid_messages_token);
         out.push('}');
     }
 
@@ -114336,6 +116044,9 @@ impl internalLinkTypeUserPhoneNumber {
         if let Some(__j4) = tl_json::field(o, "open_profile") {
             value.open_profile = tl_json::read_bool(__j4)?;
         }
+        if let Some(__j6) = tl_json::field(o, "unpaid_messages_token") {
+            value.unpaid_messages_token = tl_json::read_string(__j6)?;
+        }
         Result::Ok(value)
     }
 
@@ -114346,6 +116057,7 @@ impl internalLinkTypeUserPhoneNumber {
         s.store_field_str("phone_number", &self.phone_number);
         s.store_field_str("draft_text", &self.draft_text);
         s.store_field_bool("open_profile", self.open_profile);
+        s.store_field_str("unpaid_messages_token", &self.unpaid_messages_token);
         s.store_class_end();
     }
 
@@ -114362,10 +116074,11 @@ impl internalLinkTypeUserPhoneNumber {
 #[serde(rename = "internalLinkTypeUserToken")]
 pub struct internalLinkTypeUserToken {
     pub token: String,
+    pub unpaid_messages_token: String,
 }
 
 impl internalLinkTypeUserToken {
-    pub const ID: i32 = -1462248615;
+    pub const ID: i32 = -1224824778;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -114374,6 +116087,7 @@ impl internalLinkTypeUserToken {
 
     pub fn store(&self, out: &mut Vec<u8>) {
         tl::__string(out, &self.token);
+        tl::__string(out, &self.unpaid_messages_token);
     }
 
     pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
@@ -114395,7 +116109,8 @@ impl internalLinkTypeUserToken {
 
     pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
         let token: String = r.string()?;
-        Result::Ok(Self { token })
+        let unpaid_messages_token: String = r.string()?;
+        Result::Ok(Self { token, unpaid_messages_token })
     }
 
     pub fn to_json(&self) -> String {
@@ -114408,6 +116123,8 @@ impl internalLinkTypeUserToken {
         out.push_str("{\"@type\":\"internalLinkTypeUserToken\"");
         out.push_str(",\"token\":");
         tl_json::str(out, &self.token);
+        out.push_str(",\"unpaid_messages_token\":");
+        tl_json::str(out, &self.unpaid_messages_token);
         out.push('}');
     }
 
@@ -114431,6 +116148,9 @@ impl internalLinkTypeUserToken {
         if let Some(__j0) = tl_json::field(o, "token") {
             value.token = tl_json::read_string(__j0)?;
         }
+        if let Some(__j2) = tl_json::field(o, "unpaid_messages_token") {
+            value.unpaid_messages_token = tl_json::read_string(__j2)?;
+        }
         Result::Ok(value)
     }
 
@@ -114439,6 +116159,7 @@ impl internalLinkTypeUserToken {
     pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
         s.store_class_begin(field_name, "internalLinkTypeUserToken");
         s.store_field_str("token", &self.token);
+        s.store_field_str("unpaid_messages_token", &self.unpaid_messages_token);
         s.store_class_end();
     }
 
@@ -131978,6 +133699,196 @@ impl messageStory {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "messageWidget")]
+pub struct messageWidget {
+    pub width: i32,
+    pub height: i32,
+    pub html: String,
+    pub public_data: String,
+    pub chat_data: String,
+    pub widget_id: i64,
+    pub caption: Option<FormattedText>,
+    pub show_caption_above_media: bool,
+    pub is_copy: bool,
+    pub can_send_queries: bool,
+    pub can_send_background_queries: bool,
+}
+
+impl messageWidget {
+    pub const ID: i32 = -1527832547;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.width);
+        tl::__i32(out, self.height);
+        tl::__string(out, &self.html);
+        tl::__string(out, &self.public_data);
+        tl::__string(out, &self.chat_data);
+        tl::__i64(out, self.widget_id);
+        let __d0 = Default::default();
+        let __m0 = self.caption.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+        tl::__bool(out, self.show_caption_above_media);
+        tl::__bool(out, self.is_copy);
+        tl::__bool(out, self.can_send_queries);
+        tl::__bool(out, self.can_send_background_queries);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let width: i32 = r.i32()?;
+        let height: i32 = r.i32()?;
+        let html: String = r.string()?;
+        let public_data: String = r.string()?;
+        let chat_data: String = r.string()?;
+        let widget_id: i64 = r.i64()?;
+        let caption: Option<FormattedText> = Some(FormattedText::read_bare(r)?);
+        let show_caption_above_media: bool = r.bool()?;
+        let is_copy: bool = r.bool()?;
+        let can_send_queries: bool = r.bool()?;
+        let can_send_background_queries: bool = r.bool()?;
+        Result::Ok(Self { width, height, html, public_data, chat_data, widget_id, caption, show_caption_above_media, is_copy, can_send_queries, can_send_background_queries })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"messageWidget\"");
+        out.push_str(",\"width\":");
+        tl_json::num32(out, self.width);
+        out.push_str(",\"height\":");
+        tl_json::num32(out, self.height);
+        out.push_str(",\"html\":");
+        tl_json::str(out, &self.html);
+        out.push_str(",\"public_data\":");
+        tl_json::str(out, &self.public_data);
+        out.push_str(",\"chat_data\":");
+        tl_json::str(out, &self.chat_data);
+        out.push_str(",\"widget_id\":");
+        tl_json::num64q(out, self.widget_id);
+        if let Some(__o0) = &self.caption {
+            out.push_str(",\"caption\":");
+            __o0.to_json_into(out);
+        }
+        out.push_str(",\"show_caption_above_media\":");
+        tl_json::boolean(out, self.show_caption_above_media);
+        out.push_str(",\"is_copy\":");
+        tl_json::boolean(out, self.is_copy);
+        out.push_str(",\"can_send_queries\":");
+        tl_json::boolean(out, self.can_send_queries);
+        out.push_str(",\"can_send_background_queries\":");
+        tl_json::boolean(out, self.can_send_background_queries);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "width") {
+            value.width = tl_json::read_i32(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "height") {
+            value.height = tl_json::read_i32(__j2)?;
+        }
+        if let Some(__j4) = tl_json::field(o, "html") {
+            value.html = tl_json::read_string(__j4)?;
+        }
+        if let Some(__j6) = tl_json::field(o, "public_data") {
+            value.public_data = tl_json::read_string(__j6)?;
+        }
+        if let Some(__j8) = tl_json::field(o, "chat_data") {
+            value.chat_data = tl_json::read_string(__j8)?;
+        }
+        if let Some(__j10) = tl_json::field(o, "widget_id") {
+            value.widget_id = tl_json::read_i64(__j10)?;
+        }
+        if let Some(__j12) = tl_json::field(o, "caption") && !matches!(__j12, tl_json::Json::Null) {
+            value.caption = Some(FormattedText::from_json_value(__j12)?);
+        }
+        if let Some(__j14) = tl_json::field(o, "show_caption_above_media") {
+            value.show_caption_above_media = tl_json::read_bool(__j14)?;
+        }
+        if let Some(__j16) = tl_json::field(o, "is_copy") {
+            value.is_copy = tl_json::read_bool(__j16)?;
+        }
+        if let Some(__j18) = tl_json::field(o, "can_send_queries") {
+            value.can_send_queries = tl_json::read_bool(__j18)?;
+        }
+        if let Some(__j20) = tl_json::field(o, "can_send_background_queries") {
+            value.can_send_background_queries = tl_json::read_bool(__j20)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "messageWidget");
+        s.store_field_int("width", self.width as i64);
+        s.store_field_int("height", self.height as i64);
+        s.store_field_str("html", &self.html);
+        s.store_field_str("public_data", &self.public_data);
+        s.store_field_str("chat_data", &self.chat_data);
+        s.store_field_int("widget_id", self.widget_id);
+        match &self.caption {
+            Some(__m0) => __m0.store_debug(s, "caption"),
+            None => s.store_null("caption"),
+        }
+        s.store_field_bool("show_caption_above_media", self.show_caption_above_media);
+        s.store_field_bool("is_copy", self.is_copy);
+        s.store_field_bool("can_send_queries", self.can_send_queries);
+        s.store_field_bool("can_send_background_queries", self.can_send_background_queries);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "messageChecklist")]
 pub struct messageChecklist {
     pub list: Option<Checklist>,
@@ -138373,7 +140284,7 @@ pub struct messageTonWalletTransfer {
 }
 
 impl messageTonWalletTransfer {
-    pub const ID: i32 = -1872034960;
+    pub const ID: i32 = -772044490;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -138431,7 +140342,7 @@ impl messageTonWalletTransfer {
         out.push_str(",\"peer_address\":");
         tl_json::str(out, &self.peer_address);
         out.push_str(",\"amount\":");
-        tl_json::num64(out, self.amount);
+        tl_json::num64q(out, self.amount);
         out.push_str(",\"comment\":");
         tl_json::str(out, &self.comment);
         out.push_str(",\"is_comment_encrypted\":");
@@ -138652,6 +140563,7 @@ pub struct messageGift {
     pub is_saved: bool,
     pub is_prepaid_upgrade: bool,
     pub can_be_upgraded: bool,
+    pub can_be_deleted: bool,
     pub was_converted: bool,
     pub was_upgraded: bool,
     pub was_refunded: bool,
@@ -138660,7 +140572,7 @@ pub struct messageGift {
 }
 
 impl messageGift {
-    pub const ID: i32 = -1990929579;
+    pub const ID: i32 = 645689206;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -138690,6 +140602,7 @@ impl messageGift {
         tl::__bool(out, self.is_saved);
         tl::__bool(out, self.is_prepaid_upgrade);
         tl::__bool(out, self.can_be_upgraded);
+        tl::__bool(out, self.can_be_deleted);
         tl::__bool(out, self.was_converted);
         tl::__bool(out, self.was_upgraded);
         tl::__bool(out, self.was_refunded);
@@ -138729,12 +140642,13 @@ impl messageGift {
         let is_saved: bool = r.bool()?;
         let is_prepaid_upgrade: bool = r.bool()?;
         let can_be_upgraded: bool = r.bool()?;
+        let can_be_deleted: bool = r.bool()?;
         let was_converted: bool = r.bool()?;
         let was_upgraded: bool = r.bool()?;
         let was_refunded: bool = r.bool()?;
         let upgraded_received_gift_id: String = r.string()?;
         let prepaid_upgrade_hash: String = r.string()?;
-        Result::Ok(Self { gift, sender_id, receiver_id, received_gift_id, text, unique_gift_number, sell_star_count, prepaid_upgrade_star_count, is_upgrade_separate, is_from_auction, is_private, is_saved, is_prepaid_upgrade, can_be_upgraded, was_converted, was_upgraded, was_refunded, upgraded_received_gift_id, prepaid_upgrade_hash })
+        Result::Ok(Self { gift, sender_id, receiver_id, received_gift_id, text, unique_gift_number, sell_star_count, prepaid_upgrade_star_count, is_upgrade_separate, is_from_auction, is_private, is_saved, is_prepaid_upgrade, can_be_upgraded, can_be_deleted, was_converted, was_upgraded, was_refunded, upgraded_received_gift_id, prepaid_upgrade_hash })
     }
 
     pub fn to_json(&self) -> String {
@@ -138781,6 +140695,8 @@ impl messageGift {
         tl_json::boolean(out, self.is_prepaid_upgrade);
         out.push_str(",\"can_be_upgraded\":");
         tl_json::boolean(out, self.can_be_upgraded);
+        out.push_str(",\"can_be_deleted\":");
+        tl_json::boolean(out, self.can_be_deleted);
         out.push_str(",\"was_converted\":");
         tl_json::boolean(out, self.was_converted);
         out.push_str(",\"was_upgraded\":");
@@ -138853,20 +140769,23 @@ impl messageGift {
         if let Some(__j26) = tl_json::field(o, "can_be_upgraded") {
             value.can_be_upgraded = tl_json::read_bool(__j26)?;
         }
-        if let Some(__j28) = tl_json::field(o, "was_converted") {
-            value.was_converted = tl_json::read_bool(__j28)?;
+        if let Some(__j28) = tl_json::field(o, "can_be_deleted") {
+            value.can_be_deleted = tl_json::read_bool(__j28)?;
         }
-        if let Some(__j30) = tl_json::field(o, "was_upgraded") {
-            value.was_upgraded = tl_json::read_bool(__j30)?;
+        if let Some(__j30) = tl_json::field(o, "was_converted") {
+            value.was_converted = tl_json::read_bool(__j30)?;
         }
-        if let Some(__j32) = tl_json::field(o, "was_refunded") {
-            value.was_refunded = tl_json::read_bool(__j32)?;
+        if let Some(__j32) = tl_json::field(o, "was_upgraded") {
+            value.was_upgraded = tl_json::read_bool(__j32)?;
         }
-        if let Some(__j34) = tl_json::field(o, "upgraded_received_gift_id") {
-            value.upgraded_received_gift_id = tl_json::read_string(__j34)?;
+        if let Some(__j34) = tl_json::field(o, "was_refunded") {
+            value.was_refunded = tl_json::read_bool(__j34)?;
         }
-        if let Some(__j36) = tl_json::field(o, "prepaid_upgrade_hash") {
-            value.prepaid_upgrade_hash = tl_json::read_string(__j36)?;
+        if let Some(__j36) = tl_json::field(o, "upgraded_received_gift_id") {
+            value.upgraded_received_gift_id = tl_json::read_string(__j36)?;
+        }
+        if let Some(__j38) = tl_json::field(o, "prepaid_upgrade_hash") {
+            value.prepaid_upgrade_hash = tl_json::read_string(__j38)?;
         }
         Result::Ok(value)
     }
@@ -138901,6 +140820,7 @@ impl messageGift {
         s.store_field_bool("is_saved", self.is_saved);
         s.store_field_bool("is_prepaid_upgrade", self.is_prepaid_upgrade);
         s.store_field_bool("can_be_upgraded", self.can_be_upgraded);
+        s.store_field_bool("can_be_deleted", self.can_be_deleted);
         s.store_field_bool("was_converted", self.was_converted);
         s.store_field_bool("was_upgraded", self.was_upgraded);
         s.store_field_bool("was_refunded", self.was_refunded);
@@ -139889,6 +141809,90 @@ impl messageDirectMessagePriceChanged {
         s.store_class_begin(field_name, "messageDirectMessagePriceChanged");
         s.store_field_bool("is_enabled", self.is_enabled);
         s.store_field_int("paid_message_star_count", self.paid_message_star_count);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "messageUnpaidMessagesAllowedByLink")]
+pub struct messageUnpaidMessagesAllowedByLink;
+
+impl messageUnpaidMessagesAllowedByLink {
+    pub const ID: i32 = -962021078;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let _ = out;
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let _ = r;
+        Result::Ok(Self)
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"messageUnpaidMessagesAllowedByLink\"");
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(_o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "messageUnpaidMessagesAllowedByLink");
         s.store_class_end();
     }
 
@@ -141886,6 +143890,8 @@ pub enum MessageContent {
     messageStakeDice(messageStakeDice),
     #[serde(rename = "messageStory")]
     messageStory(messageStory),
+    #[serde(rename = "messageWidget")]
+    messageWidget(messageWidget),
     #[serde(rename = "messageChecklist")]
     messageChecklist(messageChecklist),
     #[serde(rename = "messageInvoice")]
@@ -142016,6 +144022,8 @@ pub enum MessageContent {
     messagePaidMessagePriceChanged(messagePaidMessagePriceChanged),
     #[serde(rename = "messageDirectMessagePriceChanged")]
     messageDirectMessagePriceChanged(messageDirectMessagePriceChanged),
+    #[serde(rename = "messageUnpaidMessagesAllowedByLink")]
+    messageUnpaidMessagesAllowedByLink(messageUnpaidMessagesAllowedByLink),
     #[serde(rename = "messageChecklistTasksDone")]
     messageChecklistTasksDone(messageChecklistTasksDone),
     #[serde(rename = "messageChecklistTasksAdded")]
@@ -142080,6 +144088,7 @@ impl MessageContent {
             Self::messagePoll(v) => v.store_boxed(out),
             Self::messageStakeDice(v) => v.store_boxed(out),
             Self::messageStory(v) => v.store_boxed(out),
+            Self::messageWidget(v) => v.store_boxed(out),
             Self::messageChecklist(v) => v.store_boxed(out),
             Self::messageInvoice(v) => v.store_boxed(out),
             Self::messageCall(v) => v.store_boxed(out),
@@ -142145,6 +144154,7 @@ impl MessageContent {
             Self::messagePaidMessagesRefunded(v) => v.store_boxed(out),
             Self::messagePaidMessagePriceChanged(v) => v.store_boxed(out),
             Self::messageDirectMessagePriceChanged(v) => v.store_boxed(out),
+            Self::messageUnpaidMessagesAllowedByLink(v) => v.store_boxed(out),
             Self::messageChecklistTasksDone(v) => v.store_boxed(out),
             Self::messageChecklistTasksAdded(v) => v.store_boxed(out),
             Self::messageSuggestedPostApprovalFailed(v) => v.store_boxed(out),
@@ -142197,6 +144207,7 @@ impl MessageContent {
             self::messagePoll::ID => Result::Ok(Self::messagePoll(self::messagePoll::read_bare(r)?)),
             self::messageStakeDice::ID => Result::Ok(Self::messageStakeDice(self::messageStakeDice::read_bare(r)?)),
             self::messageStory::ID => Result::Ok(Self::messageStory(self::messageStory::read_bare(r)?)),
+            self::messageWidget::ID => Result::Ok(Self::messageWidget(self::messageWidget::read_bare(r)?)),
             self::messageChecklist::ID => Result::Ok(Self::messageChecklist(self::messageChecklist::read_bare(r)?)),
             self::messageInvoice::ID => Result::Ok(Self::messageInvoice(self::messageInvoice::read_bare(r)?)),
             self::messageCall::ID => Result::Ok(Self::messageCall(self::messageCall::read_bare(r)?)),
@@ -142262,6 +144273,7 @@ impl MessageContent {
             self::messagePaidMessagesRefunded::ID => Result::Ok(Self::messagePaidMessagesRefunded(self::messagePaidMessagesRefunded::read_bare(r)?)),
             self::messagePaidMessagePriceChanged::ID => Result::Ok(Self::messagePaidMessagePriceChanged(self::messagePaidMessagePriceChanged::read_bare(r)?)),
             self::messageDirectMessagePriceChanged::ID => Result::Ok(Self::messageDirectMessagePriceChanged(self::messageDirectMessagePriceChanged::read_bare(r)?)),
+            self::messageUnpaidMessagesAllowedByLink::ID => Result::Ok(Self::messageUnpaidMessagesAllowedByLink(self::messageUnpaidMessagesAllowedByLink::read_bare(r)?)),
             self::messageChecklistTasksDone::ID => Result::Ok(Self::messageChecklistTasksDone(self::messageChecklistTasksDone::read_bare(r)?)),
             self::messageChecklistTasksAdded::ID => Result::Ok(Self::messageChecklistTasksAdded(self::messageChecklistTasksAdded::read_bare(r)?)),
             self::messageSuggestedPostApprovalFailed::ID => Result::Ok(Self::messageSuggestedPostApprovalFailed(self::messageSuggestedPostApprovalFailed::read_bare(r)?)),
@@ -142316,6 +144328,7 @@ impl MessageContent {
             Self::messagePoll(v) => v.to_json_into(out),
             Self::messageStakeDice(v) => v.to_json_into(out),
             Self::messageStory(v) => v.to_json_into(out),
+            Self::messageWidget(v) => v.to_json_into(out),
             Self::messageChecklist(v) => v.to_json_into(out),
             Self::messageInvoice(v) => v.to_json_into(out),
             Self::messageCall(v) => v.to_json_into(out),
@@ -142381,6 +144394,7 @@ impl MessageContent {
             Self::messagePaidMessagesRefunded(v) => v.to_json_into(out),
             Self::messagePaidMessagePriceChanged(v) => v.to_json_into(out),
             Self::messageDirectMessagePriceChanged(v) => v.to_json_into(out),
+            Self::messageUnpaidMessagesAllowedByLink(v) => v.to_json_into(out),
             Self::messageChecklistTasksDone(v) => v.to_json_into(out),
             Self::messageChecklistTasksAdded(v) => v.to_json_into(out),
             Self::messageSuggestedPostApprovalFailed(v) => v.to_json_into(out),
@@ -142480,6 +144494,9 @@ impl MessageContent {
     }
     fn __json_new_messageStory(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::messageStory(self::messageStory::from_json_object(o)?))
+    }
+    fn __json_new_messageWidget(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::messageWidget(self::messageWidget::from_json_object(o)?))
     }
     fn __json_new_messageChecklist(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::messageChecklist(self::messageChecklist::from_json_object(o)?))
@@ -142676,6 +144693,9 @@ impl MessageContent {
     fn __json_new_messageDirectMessagePriceChanged(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::messageDirectMessagePriceChanged(self::messageDirectMessagePriceChanged::from_json_object(o)?))
     }
+    fn __json_new_messageUnpaidMessagesAllowedByLink(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::messageUnpaidMessagesAllowedByLink(self::messageUnpaidMessagesAllowedByLink::from_json_object(o)?))
+    }
     fn __json_new_messageChecklistTasksDone(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::messageChecklistTasksDone(self::messageChecklistTasksDone::from_json_object(o)?))
     }
@@ -142767,6 +144787,7 @@ impl MessageContent {
                 "messagePoll" => Self::__json_new_messagePoll(o),
                 "messageStakeDice" => Self::__json_new_messageStakeDice(o),
                 "messageStory" => Self::__json_new_messageStory(o),
+                "messageWidget" => Self::__json_new_messageWidget(o),
                 "messageChecklist" => Self::__json_new_messageChecklist(o),
                 "messageInvoice" => Self::__json_new_messageInvoice(o),
                 "messageCall" => Self::__json_new_messageCall(o),
@@ -142832,6 +144853,7 @@ impl MessageContent {
                 "messagePaidMessagesRefunded" => Self::__json_new_messagePaidMessagesRefunded(o),
                 "messagePaidMessagePriceChanged" => Self::__json_new_messagePaidMessagePriceChanged(o),
                 "messageDirectMessagePriceChanged" => Self::__json_new_messageDirectMessagePriceChanged(o),
+                "messageUnpaidMessagesAllowedByLink" => Self::__json_new_messageUnpaidMessagesAllowedByLink(o),
                 "messageChecklistTasksDone" => Self::__json_new_messageChecklistTasksDone(o),
                 "messageChecklistTasksAdded" => Self::__json_new_messageChecklistTasksAdded(o),
                 "messageSuggestedPostApprovalFailed" => Self::__json_new_messageSuggestedPostApprovalFailed(o),
@@ -142877,6 +144899,7 @@ impl MessageContent {
                 self::messagePoll::ID => Self::__json_new_messagePoll(o),
                 self::messageStakeDice::ID => Self::__json_new_messageStakeDice(o),
                 self::messageStory::ID => Self::__json_new_messageStory(o),
+                self::messageWidget::ID => Self::__json_new_messageWidget(o),
                 self::messageChecklist::ID => Self::__json_new_messageChecklist(o),
                 self::messageInvoice::ID => Self::__json_new_messageInvoice(o),
                 self::messageCall::ID => Self::__json_new_messageCall(o),
@@ -142942,6 +144965,7 @@ impl MessageContent {
                 self::messagePaidMessagesRefunded::ID => Self::__json_new_messagePaidMessagesRefunded(o),
                 self::messagePaidMessagePriceChanged::ID => Self::__json_new_messagePaidMessagePriceChanged(o),
                 self::messageDirectMessagePriceChanged::ID => Self::__json_new_messageDirectMessagePriceChanged(o),
+                self::messageUnpaidMessagesAllowedByLink::ID => Self::__json_new_messageUnpaidMessagesAllowedByLink(o),
                 self::messageChecklistTasksDone::ID => Self::__json_new_messageChecklistTasksDone(o),
                 self::messageChecklistTasksAdded::ID => Self::__json_new_messageChecklistTasksAdded(o),
                 self::messageSuggestedPostApprovalFailed::ID => Self::__json_new_messageSuggestedPostApprovalFailed(o),
@@ -142992,6 +145016,7 @@ impl MessageContent {
             Self::messagePoll(v) => v.store_debug(s, field_name),
             Self::messageStakeDice(v) => v.store_debug(s, field_name),
             Self::messageStory(v) => v.store_debug(s, field_name),
+            Self::messageWidget(v) => v.store_debug(s, field_name),
             Self::messageChecklist(v) => v.store_debug(s, field_name),
             Self::messageInvoice(v) => v.store_debug(s, field_name),
             Self::messageCall(v) => v.store_debug(s, field_name),
@@ -143057,6 +145082,7 @@ impl MessageContent {
             Self::messagePaidMessagesRefunded(v) => v.store_debug(s, field_name),
             Self::messagePaidMessagePriceChanged(v) => v.store_debug(s, field_name),
             Self::messageDirectMessagePriceChanged(v) => v.store_debug(s, field_name),
+            Self::messageUnpaidMessagesAllowedByLink(v) => v.store_debug(s, field_name),
             Self::messageChecklistTasksDone(v) => v.store_debug(s, field_name),
             Self::messageChecklistTasksAdded(v) => v.store_debug(s, field_name),
             Self::messageSuggestedPostApprovalFailed(v) => v.store_debug(s, field_name),
@@ -143120,6 +145146,7 @@ impl From<MessageContent> for Object {
             MessageContent::messagePoll(v) => Object::messagePoll(v),
             MessageContent::messageStakeDice(v) => Object::messageStakeDice(v),
             MessageContent::messageStory(v) => Object::messageStory(v),
+            MessageContent::messageWidget(v) => Object::messageWidget(v),
             MessageContent::messageChecklist(v) => Object::messageChecklist(v),
             MessageContent::messageInvoice(v) => Object::messageInvoice(v),
             MessageContent::messageCall(v) => Object::messageCall(v),
@@ -143185,6 +145212,7 @@ impl From<MessageContent> for Object {
             MessageContent::messagePaidMessagesRefunded(v) => Object::messagePaidMessagesRefunded(v),
             MessageContent::messagePaidMessagePriceChanged(v) => Object::messagePaidMessagePriceChanged(v),
             MessageContent::messageDirectMessagePriceChanged(v) => Object::messageDirectMessagePriceChanged(v),
+            MessageContent::messageUnpaidMessagesAllowedByLink(v) => Object::messageUnpaidMessagesAllowedByLink(v),
             MessageContent::messageChecklistTasksDone(v) => Object::messageChecklistTasksDone(v),
             MessageContent::messageChecklistTasksAdded(v) => Object::messageChecklistTasksAdded(v),
             MessageContent::messageSuggestedPostApprovalFailed(v) => Object::messageSuggestedPostApprovalFailed(v),
@@ -154982,6 +157010,10 @@ pub struct OauthLinkInfo {
     pub bot_user_id: i64,
     pub request_write_access: bool,
     pub request_phone_number_access: bool,
+    pub request_ton_wallet_access: bool,
+    pub dapp_client_id: String,
+    pub ton_connect_manifest_url: String,
+    pub ton_proof_payload: String,
     pub browser: String,
     pub platform: String,
     pub ip_address: String,
@@ -154991,7 +157023,7 @@ pub struct OauthLinkInfo {
 }
 
 impl OauthLinkInfo {
-    pub const ID: i32 = -908945202;
+    pub const ID: i32 = 1519482150;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -155007,6 +157039,10 @@ impl OauthLinkInfo {
         tl::__i64(out, self.bot_user_id);
         tl::__bool(out, self.request_write_access);
         tl::__bool(out, self.request_phone_number_access);
+        tl::__bool(out, self.request_ton_wallet_access);
+        tl::__string(out, &self.dapp_client_id);
+        tl::__string(out, &self.ton_connect_manifest_url);
+        tl::__string(out, &self.ton_proof_payload);
         tl::__string(out, &self.browser);
         tl::__string(out, &self.platform);
         tl::__string(out, &self.ip_address);
@@ -155044,6 +157080,10 @@ impl OauthLinkInfo {
         let bot_user_id: i64 = r.i64()?;
         let request_write_access: bool = r.bool()?;
         let request_phone_number_access: bool = r.bool()?;
+        let request_ton_wallet_access: bool = r.bool()?;
+        let dapp_client_id: String = r.string()?;
+        let ton_connect_manifest_url: String = r.string()?;
+        let ton_proof_payload: String = r.string()?;
         let browser: String = r.string()?;
         let platform: String = r.string()?;
         let ip_address: String = r.string()?;
@@ -155061,7 +157101,7 @@ impl OauthLinkInfo {
             res
         };
         let match_codes: Vec<String> = __v0;
-        Result::Ok(Self { user_id, url, domain, from_app, verified_app_name, bot_user_id, request_write_access, request_phone_number_access, browser, platform, ip_address, location, match_code_first, match_codes })
+        Result::Ok(Self { user_id, url, domain, from_app, verified_app_name, bot_user_id, request_write_access, request_phone_number_access, request_ton_wallet_access, dapp_client_id, ton_connect_manifest_url, ton_proof_payload, browser, platform, ip_address, location, match_code_first, match_codes })
     }
 
     pub fn to_json(&self) -> String {
@@ -155088,6 +157128,14 @@ impl OauthLinkInfo {
         tl_json::boolean(out, self.request_write_access);
         out.push_str(",\"request_phone_number_access\":");
         tl_json::boolean(out, self.request_phone_number_access);
+        out.push_str(",\"request_ton_wallet_access\":");
+        tl_json::boolean(out, self.request_ton_wallet_access);
+        out.push_str(",\"dapp_client_id\":");
+        tl_json::str(out, &self.dapp_client_id);
+        out.push_str(",\"ton_connect_manifest_url\":");
+        tl_json::str(out, &self.ton_connect_manifest_url);
+        out.push_str(",\"ton_proof_payload\":");
+        tl_json::str(out, &self.ton_proof_payload);
         out.push_str(",\"browser\":");
         tl_json::str(out, &self.browser);
         out.push_str(",\"platform\":");
@@ -155153,23 +157201,35 @@ impl OauthLinkInfo {
         if let Some(__j14) = tl_json::field(o, "request_phone_number_access") {
             value.request_phone_number_access = tl_json::read_bool(__j14)?;
         }
-        if let Some(__j16) = tl_json::field(o, "browser") {
-            value.browser = tl_json::read_string(__j16)?;
+        if let Some(__j16) = tl_json::field(o, "request_ton_wallet_access") {
+            value.request_ton_wallet_access = tl_json::read_bool(__j16)?;
         }
-        if let Some(__j18) = tl_json::field(o, "platform") {
-            value.platform = tl_json::read_string(__j18)?;
+        if let Some(__j18) = tl_json::field(o, "dapp_client_id") {
+            value.dapp_client_id = tl_json::read_string(__j18)?;
         }
-        if let Some(__j20) = tl_json::field(o, "ip_address") {
-            value.ip_address = tl_json::read_string(__j20)?;
+        if let Some(__j20) = tl_json::field(o, "ton_connect_manifest_url") {
+            value.ton_connect_manifest_url = tl_json::read_string(__j20)?;
         }
-        if let Some(__j22) = tl_json::field(o, "location") {
-            value.location = tl_json::read_string(__j22)?;
+        if let Some(__j22) = tl_json::field(o, "ton_proof_payload") {
+            value.ton_proof_payload = tl_json::read_string(__j22)?;
         }
-        if let Some(__j24) = tl_json::field(o, "match_code_first") {
-            value.match_code_first = tl_json::read_bool(__j24)?;
+        if let Some(__j24) = tl_json::field(o, "browser") {
+            value.browser = tl_json::read_string(__j24)?;
         }
-        if let Some(__j26) = tl_json::field(o, "match_codes") {
-            value.match_codes = tl_json::read_vector(__j26, tl_json::read_string)?;
+        if let Some(__j26) = tl_json::field(o, "platform") {
+            value.platform = tl_json::read_string(__j26)?;
+        }
+        if let Some(__j28) = tl_json::field(o, "ip_address") {
+            value.ip_address = tl_json::read_string(__j28)?;
+        }
+        if let Some(__j30) = tl_json::field(o, "location") {
+            value.location = tl_json::read_string(__j30)?;
+        }
+        if let Some(__j32) = tl_json::field(o, "match_code_first") {
+            value.match_code_first = tl_json::read_bool(__j32)?;
+        }
+        if let Some(__j34) = tl_json::field(o, "match_codes") {
+            value.match_codes = tl_json::read_vector(__j34, tl_json::read_string)?;
         }
         Result::Ok(value)
     }
@@ -155186,6 +157246,10 @@ impl OauthLinkInfo {
         s.store_field_int("bot_user_id", self.bot_user_id);
         s.store_field_bool("request_write_access", self.request_write_access);
         s.store_field_bool("request_phone_number_access", self.request_phone_number_access);
+        s.store_field_bool("request_ton_wallet_access", self.request_ton_wallet_access);
+        s.store_field_str("dapp_client_id", &self.dapp_client_id);
+        s.store_field_str("ton_connect_manifest_url", &self.ton_connect_manifest_url);
+        s.store_field_str("ton_proof_payload", &self.ton_proof_payload);
         s.store_field_str("browser", &self.browser);
         s.store_field_str("platform", &self.platform);
         s.store_field_str("ip_address", &self.ip_address);
@@ -185040,6 +187104,595 @@ impl ProfilePhoto {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "profileShareThemeEmoji")]
+pub struct profileShareThemeEmoji {
+    pub emojis: Vec<EmojiType>,
+    pub use_default_background: bool,
+    pub background_backdrop_id: i32,
+}
+
+impl profileShareThemeEmoji {
+    pub const ID: i32 = 960068711;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.emojis.len() as i32);
+        for __v0 in &self.emojis {
+            (*__v0).store(out);
+        }
+        tl::__bool(out, self.use_default_background);
+        tl::__i32(out, self.background_backdrop_id);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let __v0: Vec<EmojiType> = {
+            let count: u32 = r.i32()? as u32;
+            if count as usize > r.remaining() {
+                return Result::Err("Wrong vector length");
+            }
+            let mut res = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                res.push(EmojiType::read(r)?);
+            }
+            res
+        };
+        let emojis: Vec<EmojiType> = __v0;
+        let use_default_background: bool = r.bool()?;
+        let background_backdrop_id: i32 = r.i32()?;
+        Result::Ok(Self { emojis, use_default_background, background_backdrop_id })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"profileShareThemeEmoji\"");
+        out.push_str(",\"emojis\":");
+        out.push('[');
+        let mut __first = true;
+        for __v0 in &self.emojis {
+            if !__first {
+                out.push(',');
+            }
+            __first = false;
+            (*__v0).to_json_into(out);
+        }
+        out.push(']');
+        out.push_str(",\"use_default_background\":");
+        tl_json::boolean(out, self.use_default_background);
+        out.push_str(",\"background_backdrop_id\":");
+        tl_json::num32(out, self.background_backdrop_id);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "emojis") {
+            value.emojis = tl_json::read_vector(__j0, EmojiType::from_json_value)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "use_default_background") {
+            value.use_default_background = tl_json::read_bool(__j2)?;
+        }
+        if let Some(__j4) = tl_json::field(o, "background_backdrop_id") {
+            value.background_backdrop_id = tl_json::read_i32(__j4)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "profileShareThemeEmoji");
+        s.store_vector_begin("emojis", self.emojis.len());
+        for __v0 in &self.emojis {
+            __v0.store_debug(s, "");
+        }
+        s.store_class_end();
+        s.store_field_bool("use_default_background", self.use_default_background);
+        s.store_field_int("background_backdrop_id", self.background_backdrop_id as i64);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "profileShareThemeUpgradedGift")]
+pub struct profileShareThemeUpgradedGift {
+    pub gift: Option<UpgradedGift>,
+}
+
+impl profileShareThemeUpgradedGift {
+    pub const ID: i32 = 1196453182;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let __d0 = Default::default();
+        let __m0 = self.gift.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let gift: Option<UpgradedGift> = Some(UpgradedGift::read_bare(r)?);
+        Result::Ok(Self { gift })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"profileShareThemeUpgradedGift\"");
+        if let Some(__o0) = &self.gift {
+            out.push_str(",\"gift\":");
+            __o0.to_json_into(out);
+        }
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "gift") && !matches!(__j0, tl_json::Json::Null) {
+            value.gift = Some(UpgradedGift::from_json_value(__j0)?);
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "profileShareThemeUpgradedGift");
+        match &self.gift {
+            Some(__m0) => __m0.store_debug(s, "gift"),
+            None => s.store_null("gift"),
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "@type")]
+pub enum ProfileShareTheme {
+    #[serde(rename = "profileShareThemeEmoji")]
+    profileShareThemeEmoji(profileShareThemeEmoji),
+    #[serde(rename = "profileShareThemeUpgradedGift")]
+    profileShareThemeUpgradedGift(profileShareThemeUpgradedGift),
+}
+
+impl ProfileShareTheme {
+    pub fn store(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::profileShareThemeEmoji(v) => v.store_boxed(out),
+            Self::profileShareThemeUpgradedGift(v) => v.store_boxed(out),
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        match r.i32()? {
+            self::profileShareThemeEmoji::ID => Result::Ok(Self::profileShareThemeEmoji(self::profileShareThemeEmoji::read_bare(r)?)),
+            self::profileShareThemeUpgradedGift::ID => Result::Ok(Self::profileShareThemeUpgradedGift(self::profileShareThemeUpgradedGift::read_bare(r)?)),
+            _ => Result::Err("Unknown constructor"),
+        }
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        match self {
+            Self::profileShareThemeEmoji(v) => v.to_json_into(out),
+            Self::profileShareThemeUpgradedGift(v) => v.to_json_into(out),
+        }
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    fn __json_new_profileShareThemeEmoji(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::profileShareThemeEmoji(self::profileShareThemeEmoji::from_json_object(o)?))
+    }
+    fn __json_new_profileShareThemeUpgradedGift(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::profileShareThemeUpgradedGift(self::profileShareThemeUpgradedGift::from_json_object(o)?))
+    }
+    /// td's `from_json(object_ptr<T>&, JsonValue)`: null yields the
+    /// default variant (C++ keeps a null pointer — see the model note),
+    /// an object's `@type` (name or numeric id) selects the variant.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        let o = match v {
+            tl_json::Json::Null => return Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => o,
+            other => return Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        };
+        let ty = match tl_json::field(o, "@type") {
+            Some(ty) => ty,
+            None => return Result::Err("Can't find field \"@type\"".to_owned()),
+        };
+        match ty {
+            tl_json::Json::String(s) => match s.as_str() {
+                "profileShareThemeEmoji" => Self::__json_new_profileShareThemeEmoji(o),
+                "profileShareThemeUpgradedGift" => Self::__json_new_profileShareThemeUpgradedGift(o),
+                _ => Result::Err(format!("Unknown class \"{s}\"")),
+            },
+            tl_json::Json::Number(n) => match tl_json::to_integer_i32(n) {
+                self::profileShareThemeEmoji::ID => Self::__json_new_profileShareThemeEmoji(o),
+                self::profileShareThemeUpgradedGift::ID => Self::__json_new_profileShareThemeUpgradedGift(o),
+                id => Result::Err(format!("Unknown constructor 0x{:08x}", id as u32)),
+            },
+            other => Result::Err(format!("Expected String or Integer, but receive {}", other.type_name())),
+        }
+    }
+
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        match self {
+            Self::profileShareThemeEmoji(v) => v.store_debug(s, field_name),
+            Self::profileShareThemeUpgradedGift(v) => v.store_debug(s, field_name),
+        }
+    }
+
+    /// td's `to_string(const BaseObject&)` for this type.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+impl Default for ProfileShareTheme {
+    fn default() -> Self {
+        Self::profileShareThemeEmoji(Default::default())
+    }
+}
+
+impl From<ProfileShareTheme> for Object {
+    fn from(value: ProfileShareTheme) -> Object {
+        match value {
+            ProfileShareTheme::profileShareThemeEmoji(v) => Object::profileShareThemeEmoji(v),
+            ProfileShareTheme::profileShareThemeUpgradedGift(v) => Object::profileShareThemeUpgradedGift(v),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "profileShareThemeBackdrop")]
+pub struct ProfileShareThemeBackdrop {
+    pub id: i32,
+    pub name: String,
+    pub colors: Option<UpgradedGiftBackdropColors>,
+}
+
+impl ProfileShareThemeBackdrop {
+    pub const ID: i32 = 74158313;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.id);
+        tl::__string(out, &self.name);
+        let __d0 = Default::default();
+        let __m0 = self.colors.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let id: i32 = r.i32()?;
+        let name: String = r.string()?;
+        let colors: Option<UpgradedGiftBackdropColors> = Some(UpgradedGiftBackdropColors::read_bare(r)?);
+        Result::Ok(Self { id, name, colors })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"profileShareThemeBackdrop\"");
+        out.push_str(",\"id\":");
+        tl_json::num32(out, self.id);
+        out.push_str(",\"name\":");
+        tl_json::str(out, &self.name);
+        if let Some(__o0) = &self.colors {
+            out.push_str(",\"colors\":");
+            __o0.to_json_into(out);
+        }
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "id") {
+            value.id = tl_json::read_i32(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "name") {
+            value.name = tl_json::read_string(__j2)?;
+        }
+        if let Some(__j4) = tl_json::field(o, "colors") && !matches!(__j4, tl_json::Json::Null) {
+            value.colors = Some(UpgradedGiftBackdropColors::from_json_value(__j4)?);
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "profileShareThemeBackdrop");
+        s.store_field_int("id", self.id as i64);
+        s.store_field_str("name", &self.name);
+        match &self.colors {
+            Some(__m0) => __m0.store_debug(s, "colors"),
+            None => s.store_null("colors"),
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "profileShareThemeBackdrops")]
+pub struct ProfileShareThemeBackdrops {
+    pub backdrops: Vec<ProfileShareThemeBackdrop>,
+}
+
+impl ProfileShareThemeBackdrops {
+    pub const ID: i32 = 628501977;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.backdrops.len() as i32);
+        for __v0 in &self.backdrops {
+            (*__v0).store(out);
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let __v0: Vec<ProfileShareThemeBackdrop> = {
+            let count: u32 = r.i32()? as u32;
+            if count as usize > r.remaining() {
+                return Result::Err("Wrong vector length");
+            }
+            let mut res = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                res.push(ProfileShareThemeBackdrop::read_bare(r)?);
+            }
+            res
+        };
+        let backdrops: Vec<ProfileShareThemeBackdrop> = __v0;
+        Result::Ok(Self { backdrops })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"profileShareThemeBackdrops\"");
+        out.push_str(",\"backdrops\":");
+        out.push('[');
+        let mut __first = true;
+        for __v0 in &self.backdrops {
+            if !__first {
+                out.push(',');
+            }
+            __first = false;
+            (*__v0).to_json_into(out);
+        }
+        out.push(']');
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "backdrops") {
+            value.backdrops = tl_json::read_vector(__j0, ProfileShareThemeBackdrop::from_json_value)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "profileShareThemeBackdrops");
+        s.store_vector_begin("backdrops", self.backdrops.len());
+        for __v0 in &self.backdrops {
+            __v0.store_debug(s, "");
+        }
+        s.store_class_end();
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "profileTabPosts")]
 pub struct profileTabPosts;
 
@@ -186320,6 +188973,108 @@ impl proxyTypeMtproto {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "proxyTypeWeb")]
+pub struct proxyTypeWeb {
+    pub path: String,
+    pub secret: String,
+}
+
+impl proxyTypeWeb {
+    pub const ID: i32 = -1848134196;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__string(out, &self.path);
+        tl::__string(out, &self.secret);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let path: String = r.string()?;
+        let secret: String = r.string()?;
+        Result::Ok(Self { path, secret })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"proxyTypeWeb\"");
+        out.push_str(",\"path\":");
+        tl_json::str(out, &self.path);
+        out.push_str(",\"secret\":");
+        tl_json::str(out, &self.secret);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "path") {
+            value.path = tl_json::read_string(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "secret") {
+            value.secret = tl_json::read_string(__j2)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "proxyTypeWeb");
+        s.store_field_str("path", &self.path);
+        s.store_field_str("secret", &self.secret);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "@type")]
 pub enum ProxyType {
@@ -186329,6 +189084,8 @@ pub enum ProxyType {
     proxyTypeHttp(proxyTypeHttp),
     #[serde(rename = "proxyTypeMtproto")]
     proxyTypeMtproto(proxyTypeMtproto),
+    #[serde(rename = "proxyTypeWeb")]
+    proxyTypeWeb(proxyTypeWeb),
 }
 
 impl ProxyType {
@@ -186337,6 +189094,7 @@ impl ProxyType {
             Self::proxyTypeSocks5(v) => v.store_boxed(out),
             Self::proxyTypeHttp(v) => v.store_boxed(out),
             Self::proxyTypeMtproto(v) => v.store_boxed(out),
+            Self::proxyTypeWeb(v) => v.store_boxed(out),
         }
     }
 
@@ -186350,6 +189108,7 @@ impl ProxyType {
             self::proxyTypeSocks5::ID => Result::Ok(Self::proxyTypeSocks5(self::proxyTypeSocks5::read_bare(r)?)),
             self::proxyTypeHttp::ID => Result::Ok(Self::proxyTypeHttp(self::proxyTypeHttp::read_bare(r)?)),
             self::proxyTypeMtproto::ID => Result::Ok(Self::proxyTypeMtproto(self::proxyTypeMtproto::read_bare(r)?)),
+            self::proxyTypeWeb::ID => Result::Ok(Self::proxyTypeWeb(self::proxyTypeWeb::read_bare(r)?)),
             _ => Result::Err("Unknown constructor"),
         }
     }
@@ -186365,6 +189124,7 @@ impl ProxyType {
             Self::proxyTypeSocks5(v) => v.to_json_into(out),
             Self::proxyTypeHttp(v) => v.to_json_into(out),
             Self::proxyTypeMtproto(v) => v.to_json_into(out),
+            Self::proxyTypeWeb(v) => v.to_json_into(out),
         }
     }
 
@@ -186381,6 +189141,9 @@ impl ProxyType {
     }
     fn __json_new_proxyTypeMtproto(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::proxyTypeMtproto(self::proxyTypeMtproto::from_json_object(o)?))
+    }
+    fn __json_new_proxyTypeWeb(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::proxyTypeWeb(self::proxyTypeWeb::from_json_object(o)?))
     }
     /// td's `from_json(object_ptr<T>&, JsonValue)`: null yields the
     /// default variant (C++ keeps a null pointer — see the model note),
@@ -186400,12 +189163,14 @@ impl ProxyType {
                 "proxyTypeSocks5" => Self::__json_new_proxyTypeSocks5(o),
                 "proxyTypeHttp" => Self::__json_new_proxyTypeHttp(o),
                 "proxyTypeMtproto" => Self::__json_new_proxyTypeMtproto(o),
+                "proxyTypeWeb" => Self::__json_new_proxyTypeWeb(o),
                 _ => Result::Err(format!("Unknown class \"{s}\"")),
             },
             tl_json::Json::Number(n) => match tl_json::to_integer_i32(n) {
                 self::proxyTypeSocks5::ID => Self::__json_new_proxyTypeSocks5(o),
                 self::proxyTypeHttp::ID => Self::__json_new_proxyTypeHttp(o),
                 self::proxyTypeMtproto::ID => Self::__json_new_proxyTypeMtproto(o),
+                self::proxyTypeWeb::ID => Self::__json_new_proxyTypeWeb(o),
                 id => Result::Err(format!("Unknown constructor 0x{:08x}", id as u32)),
             },
             other => Result::Err(format!("Expected String or Integer, but receive {}", other.type_name())),
@@ -186417,6 +189182,7 @@ impl ProxyType {
             Self::proxyTypeSocks5(v) => v.store_debug(s, field_name),
             Self::proxyTypeHttp(v) => v.store_debug(s, field_name),
             Self::proxyTypeMtproto(v) => v.store_debug(s, field_name),
+            Self::proxyTypeWeb(v) => v.store_debug(s, field_name),
         }
     }
 
@@ -186441,6 +189207,7 @@ impl From<ProxyType> for Object {
             ProxyType::proxyTypeSocks5(v) => Object::proxyTypeSocks5(v),
             ProxyType::proxyTypeHttp(v) => Object::proxyTypeHttp(v),
             ProxyType::proxyTypeMtproto(v) => Object::proxyTypeMtproto(v),
+            ProxyType::proxyTypeWeb(v) => Object::proxyTypeWeb(v),
         }
     }
 }
@@ -194698,6 +197465,7 @@ pub struct ReceivedGift {
     pub is_pinned: bool,
     pub can_be_upgraded: bool,
     pub can_be_transferred: bool,
+    pub can_be_deleted: bool,
     pub was_refunded: bool,
     pub date: i32,
     pub gift: Option<SentGift>,
@@ -194715,7 +197483,7 @@ pub struct ReceivedGift {
 }
 
 impl ReceivedGift {
-    pub const ID: i32 = -389770324;
+    pub const ID: i32 = 1335050615;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -194736,6 +197504,7 @@ impl ReceivedGift {
         tl::__bool(out, self.is_pinned);
         tl::__bool(out, self.can_be_upgraded);
         tl::__bool(out, self.can_be_transferred);
+        tl::__bool(out, self.can_be_deleted);
         tl::__bool(out, self.was_refunded);
         tl::__i32(out, self.date);
         let __d2 = Default::default();
@@ -194784,6 +197553,7 @@ impl ReceivedGift {
         let is_pinned: bool = r.bool()?;
         let can_be_upgraded: bool = r.bool()?;
         let can_be_transferred: bool = r.bool()?;
+        let can_be_deleted: bool = r.bool()?;
         let was_refunded: bool = r.bool()?;
         let date: i32 = r.i32()?;
         let gift: Option<SentGift> = Some(SentGift::read(r)?);
@@ -194809,7 +197579,7 @@ impl ReceivedGift {
         let export_date: i32 = r.i32()?;
         let prepaid_upgrade_hash: String = r.string()?;
         let craft_date: i32 = r.i32()?;
-        Result::Ok(Self { received_gift_id, sender_id, text, unique_gift_number, is_private, is_saved, is_pinned, can_be_upgraded, can_be_transferred, was_refunded, date, gift, collection_ids, sell_star_count, prepaid_upgrade_star_count, is_upgrade_separate, transfer_star_count, drop_original_details_star_count, next_transfer_date, next_resale_date, export_date, prepaid_upgrade_hash, craft_date })
+        Result::Ok(Self { received_gift_id, sender_id, text, unique_gift_number, is_private, is_saved, is_pinned, can_be_upgraded, can_be_transferred, can_be_deleted, was_refunded, date, gift, collection_ids, sell_star_count, prepaid_upgrade_star_count, is_upgrade_separate, transfer_star_count, drop_original_details_star_count, next_transfer_date, next_resale_date, export_date, prepaid_upgrade_hash, craft_date })
     }
 
     pub fn to_json(&self) -> String {
@@ -194842,6 +197612,8 @@ impl ReceivedGift {
         tl_json::boolean(out, self.can_be_upgraded);
         out.push_str(",\"can_be_transferred\":");
         tl_json::boolean(out, self.can_be_transferred);
+        out.push_str(",\"can_be_deleted\":");
+        tl_json::boolean(out, self.can_be_deleted);
         out.push_str(",\"was_refunded\":");
         tl_json::boolean(out, self.was_refunded);
         out.push_str(",\"date\":");
@@ -194928,47 +197700,50 @@ impl ReceivedGift {
         if let Some(__j16) = tl_json::field(o, "can_be_transferred") {
             value.can_be_transferred = tl_json::read_bool(__j16)?;
         }
-        if let Some(__j18) = tl_json::field(o, "was_refunded") {
-            value.was_refunded = tl_json::read_bool(__j18)?;
+        if let Some(__j18) = tl_json::field(o, "can_be_deleted") {
+            value.can_be_deleted = tl_json::read_bool(__j18)?;
         }
-        if let Some(__j20) = tl_json::field(o, "date") {
-            value.date = tl_json::read_i32(__j20)?;
+        if let Some(__j20) = tl_json::field(o, "was_refunded") {
+            value.was_refunded = tl_json::read_bool(__j20)?;
         }
-        if let Some(__j22) = tl_json::field(o, "gift") && !matches!(__j22, tl_json::Json::Null) {
-            value.gift = Some(SentGift::from_json_value(__j22)?);
+        if let Some(__j22) = tl_json::field(o, "date") {
+            value.date = tl_json::read_i32(__j22)?;
         }
-        if let Some(__j24) = tl_json::field(o, "collection_ids") {
-            value.collection_ids = tl_json::read_vector(__j24, tl_json::read_i32)?;
+        if let Some(__j24) = tl_json::field(o, "gift") && !matches!(__j24, tl_json::Json::Null) {
+            value.gift = Some(SentGift::from_json_value(__j24)?);
         }
-        if let Some(__j26) = tl_json::field(o, "sell_star_count") {
-            value.sell_star_count = tl_json::read_i64(__j26)?;
+        if let Some(__j26) = tl_json::field(o, "collection_ids") {
+            value.collection_ids = tl_json::read_vector(__j26, tl_json::read_i32)?;
         }
-        if let Some(__j28) = tl_json::field(o, "prepaid_upgrade_star_count") {
-            value.prepaid_upgrade_star_count = tl_json::read_i64(__j28)?;
+        if let Some(__j28) = tl_json::field(o, "sell_star_count") {
+            value.sell_star_count = tl_json::read_i64(__j28)?;
         }
-        if let Some(__j30) = tl_json::field(o, "is_upgrade_separate") {
-            value.is_upgrade_separate = tl_json::read_bool(__j30)?;
+        if let Some(__j30) = tl_json::field(o, "prepaid_upgrade_star_count") {
+            value.prepaid_upgrade_star_count = tl_json::read_i64(__j30)?;
         }
-        if let Some(__j32) = tl_json::field(o, "transfer_star_count") {
-            value.transfer_star_count = tl_json::read_i64(__j32)?;
+        if let Some(__j32) = tl_json::field(o, "is_upgrade_separate") {
+            value.is_upgrade_separate = tl_json::read_bool(__j32)?;
         }
-        if let Some(__j34) = tl_json::field(o, "drop_original_details_star_count") {
-            value.drop_original_details_star_count = tl_json::read_i64(__j34)?;
+        if let Some(__j34) = tl_json::field(o, "transfer_star_count") {
+            value.transfer_star_count = tl_json::read_i64(__j34)?;
         }
-        if let Some(__j36) = tl_json::field(o, "next_transfer_date") {
-            value.next_transfer_date = tl_json::read_i32(__j36)?;
+        if let Some(__j36) = tl_json::field(o, "drop_original_details_star_count") {
+            value.drop_original_details_star_count = tl_json::read_i64(__j36)?;
         }
-        if let Some(__j38) = tl_json::field(o, "next_resale_date") {
-            value.next_resale_date = tl_json::read_i32(__j38)?;
+        if let Some(__j38) = tl_json::field(o, "next_transfer_date") {
+            value.next_transfer_date = tl_json::read_i32(__j38)?;
         }
-        if let Some(__j40) = tl_json::field(o, "export_date") {
-            value.export_date = tl_json::read_i32(__j40)?;
+        if let Some(__j40) = tl_json::field(o, "next_resale_date") {
+            value.next_resale_date = tl_json::read_i32(__j40)?;
         }
-        if let Some(__j42) = tl_json::field(o, "prepaid_upgrade_hash") {
-            value.prepaid_upgrade_hash = tl_json::read_string(__j42)?;
+        if let Some(__j42) = tl_json::field(o, "export_date") {
+            value.export_date = tl_json::read_i32(__j42)?;
         }
-        if let Some(__j44) = tl_json::field(o, "craft_date") {
-            value.craft_date = tl_json::read_i32(__j44)?;
+        if let Some(__j44) = tl_json::field(o, "prepaid_upgrade_hash") {
+            value.prepaid_upgrade_hash = tl_json::read_string(__j44)?;
+        }
+        if let Some(__j46) = tl_json::field(o, "craft_date") {
+            value.craft_date = tl_json::read_i32(__j46)?;
         }
         Result::Ok(value)
     }
@@ -194992,6 +197767,7 @@ impl ReceivedGift {
         s.store_field_bool("is_pinned", self.is_pinned);
         s.store_field_bool("can_be_upgraded", self.can_be_upgraded);
         s.store_field_bool("can_be_transferred", self.can_be_transferred);
+        s.store_field_bool("can_be_deleted", self.can_be_deleted);
         s.store_field_bool("was_refunded", self.was_refunded);
         s.store_field_int("date", self.date as i64);
         match &self.gift {
@@ -214543,6 +217319,126 @@ impl ShippingOption {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "speechRecognitionLanguages")]
+pub struct SpeechRecognitionLanguages {
+    pub language_codes: Vec<String>,
+}
+
+impl SpeechRecognitionLanguages {
+    pub const ID: i32 = -1112642086;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.language_codes.len() as i32);
+        for __v0 in &self.language_codes {
+            tl::__string(out, &**__v0);
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let __v0: Vec<String> = {
+            let count: u32 = r.i32()? as u32;
+            if count as usize > r.remaining() {
+                return Result::Err("Wrong vector length");
+            }
+            let mut res = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                res.push(r.string()?);
+            }
+            res
+        };
+        let language_codes: Vec<String> = __v0;
+        Result::Ok(Self { language_codes })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"speechRecognitionLanguages\"");
+        out.push_str(",\"language_codes\":");
+        out.push('[');
+        let mut __first = true;
+        for __v0 in &self.language_codes {
+            if !__first {
+                out.push(',');
+            }
+            __first = false;
+            tl_json::str(out, __v0);
+        }
+        out.push(']');
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "language_codes") {
+            value.language_codes = tl_json::read_vector(__j0, tl_json::read_string)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "speechRecognitionLanguages");
+        s.store_vector_begin("language_codes", self.language_codes.len());
+        for __v0 in &self.language_codes {
+            s.store_field_str("", __v0);
+        }
+        s.store_class_end();
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "speechRecognitionResultPending")]
 pub struct speechRecognitionResultPending {
     pub partial_text: String,
@@ -228511,11 +231407,12 @@ pub struct Story {
     pub content: Option<StoryContent>,
     pub areas: Vec<StoryArea>,
     pub caption: Option<FormattedText>,
+    pub music: Option<Audio>,
     pub album_ids: Vec<i32>,
 }
 
 impl Story {
-    pub const ID: i32 = -1551193142;
+    pub const ID: i32 = -1192230650;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -228566,9 +231463,12 @@ impl Story {
         let __d7 = Default::default();
         let __m7 = self.caption.as_ref().unwrap_or(&__d7);
         __m7.store(out);
+        let __d8 = Default::default();
+        let __m8 = self.music.as_ref().unwrap_or(&__d8);
+        __m8.store(out);
         tl::__i32(out, self.album_ids.len() as i32);
-        for __v8 in &self.album_ids {
-            tl::__i32(out, *__v8);
+        for __v9 in &self.album_ids {
+            tl::__i32(out, *__v9);
         }
     }
 
@@ -228627,6 +231527,7 @@ impl Story {
         };
         let areas: Vec<StoryArea> = __v0;
         let caption: Option<FormattedText> = Some(FormattedText::read_bare(r)?);
+        let music: Option<Audio> = Some(Audio::read_bare(r)?);
         let __v1: Vec<i32> = {
             let count: u32 = r.i32()? as u32;
             if count as usize > r.remaining() {
@@ -228639,7 +231540,7 @@ impl Story {
             res
         };
         let album_ids: Vec<i32> = __v1;
-        Result::Ok(Self { id, poster_chat_id, poster_id, date, is_being_posted, is_being_edited, is_edited, is_posted_to_chat_page, is_visible_only_for_self, can_be_added_to_album, can_be_deleted, can_be_edited, can_be_forwarded, can_be_replied, can_set_privacy_settings, can_toggle_is_posted_to_chat_page, can_get_statistics, can_get_interactions, has_expired_viewers, repost_info, interaction_info, chosen_reaction_type, privacy_settings, content, areas, caption, album_ids })
+        Result::Ok(Self { id, poster_chat_id, poster_id, date, is_being_posted, is_being_edited, is_edited, is_posted_to_chat_page, is_visible_only_for_self, can_be_added_to_album, can_be_deleted, can_be_edited, can_be_forwarded, can_be_replied, can_set_privacy_settings, can_toggle_is_posted_to_chat_page, can_get_statistics, can_get_interactions, has_expired_viewers, repost_info, interaction_info, chosen_reaction_type, privacy_settings, content, areas, caption, music, album_ids })
     }
 
     pub fn to_json(&self) -> String {
@@ -228725,15 +231626,19 @@ impl Story {
             out.push_str(",\"caption\":");
             __o7.to_json_into(out);
         }
+        if let Some(__o8) = &self.music {
+            out.push_str(",\"music\":");
+            __o8.to_json_into(out);
+        }
         out.push_str(",\"album_ids\":");
         out.push('[');
         let mut __first = true;
-        for __v8 in &self.album_ids {
+        for __v9 in &self.album_ids {
             if !__first {
                 out.push(',');
             }
             __first = false;
-            tl_json::num32(out, *__v8);
+            tl_json::num32(out, *__v9);
         }
         out.push(']');
         out.push('}');
@@ -228834,8 +231739,11 @@ impl Story {
         if let Some(__j50) = tl_json::field(o, "caption") && !matches!(__j50, tl_json::Json::Null) {
             value.caption = Some(FormattedText::from_json_value(__j50)?);
         }
-        if let Some(__j52) = tl_json::field(o, "album_ids") {
-            value.album_ids = tl_json::read_vector(__j52, tl_json::read_i32)?;
+        if let Some(__j52) = tl_json::field(o, "music") && !matches!(__j52, tl_json::Json::Null) {
+            value.music = Some(Audio::from_json_value(__j52)?);
+        }
+        if let Some(__j54) = tl_json::field(o, "album_ids") {
+            value.album_ids = tl_json::read_vector(__j54, tl_json::read_i32)?;
         }
         Result::Ok(value)
     }
@@ -228895,9 +231803,13 @@ impl Story {
             Some(__m7) => __m7.store_debug(s, "caption"),
             None => s.store_null("caption"),
         }
+        match &self.music {
+            Some(__m8) => __m8.store_debug(s, "music"),
+            None => s.store_null("music"),
+        }
         s.store_vector_begin("album_ids", self.album_ids.len());
-        for __v8 in &self.album_ids {
-            s.store_field_int("", *__v8 as i64);
+        for __v9 in &self.album_ids {
+            s.store_field_int("", *__v9 as i64);
         }
         s.store_class_end();
         s.store_class_end();
@@ -229169,12 +232081,12 @@ impl StoryAlbums {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "storyArea")]
 pub struct StoryArea {
-    pub position: Option<StoryAreaPosition>,
+    pub position: Option<AreaPosition>,
     pub r#type: Option<StoryAreaType>,
 }
 
 impl StoryArea {
-    pub const ID: i32 = -906033314;
+    pub const ID: i32 = 1181283812;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -229208,7 +232120,7 @@ impl StoryArea {
     }
 
     pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
-        let position: Option<StoryAreaPosition> = Some(StoryAreaPosition::read_bare(r)?);
+        let position: Option<AreaPosition> = Some(AreaPosition::read_bare(r)?);
         let r#type: Option<StoryAreaType> = Some(StoryAreaType::read(r)?);
         Result::Ok(Self { position, r#type })
     }
@@ -229250,7 +232162,7 @@ impl StoryArea {
     fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
         let mut value = Self::default();
         if let Some(__j0) = tl_json::field(o, "position") && !matches!(__j0, tl_json::Json::Null) {
-            value.position = Some(StoryAreaPosition::from_json_value(__j0)?);
+            value.position = Some(AreaPosition::from_json_value(__j0)?);
         }
         if let Some(__j2) = tl_json::field(o, "type") && !matches!(__j2, tl_json::Json::Null) {
             value.r#type = Some(StoryAreaType::from_json_value(__j2)?);
@@ -229270,144 +232182,6 @@ impl StoryArea {
             Some(__m1) => __m1.store_debug(s, "type"),
             None => s.store_null("type"),
         }
-        s.store_class_end();
-    }
-
-    /// td's `to_string(const BaseObject&)` for this constructor.
-    pub fn to_debug_string(&self) -> String {
-        let mut out = String::new();
-        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
-        self.store_debug(&mut storer, "");
-        out
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename = "storyAreaPosition")]
-pub struct StoryAreaPosition {
-    pub x_percentage: f64,
-    pub y_percentage: f64,
-    pub width_percentage: f64,
-    pub height_percentage: f64,
-    pub rotation_angle: f64,
-    pub corner_radius_percentage: f64,
-}
-
-impl StoryAreaPosition {
-    pub const ID: i32 = -1533023124;
-
-    pub fn store_boxed(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&Self::ID.to_le_bytes());
-        self.store(out);
-    }
-
-    pub fn store(&self, out: &mut Vec<u8>) {
-        tl::__f64(out, self.x_percentage);
-        tl::__f64(out, self.y_percentage);
-        tl::__f64(out, self.width_percentage);
-        tl::__f64(out, self.height_percentage);
-        tl::__f64(out, self.rotation_angle);
-        tl::__f64(out, self.corner_radius_percentage);
-    }
-
-    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
-        let mut r = tl::Reader::new(input);
-        Self::read(&mut r)
-    }
-
-    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
-        let mut r = tl::Reader::new(input);
-        Self::read_bare(&mut r)
-    }
-
-    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
-        if r.i32()? != Self::ID {
-            return Result::Err("Wrong constructor");
-        }
-        Self::read_bare(r)
-    }
-
-    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
-        let x_percentage: f64 = r.f64()?;
-        let y_percentage: f64 = r.f64()?;
-        let width_percentage: f64 = r.f64()?;
-        let height_percentage: f64 = r.f64()?;
-        let rotation_angle: f64 = r.f64()?;
-        let corner_radius_percentage: f64 = r.f64()?;
-        Result::Ok(Self { x_percentage, y_percentage, width_percentage, height_percentage, rotation_angle, corner_radius_percentage })
-    }
-
-    pub fn to_json(&self) -> String {
-        let mut out = String::new();
-        self.to_json_into(&mut out);
-        out
-    }
-
-    pub fn to_json_into(&self, out: &mut String) {
-        out.push_str("{\"@type\":\"storyAreaPosition\"");
-        out.push_str(",\"x_percentage\":");
-        tl_json::double(out, self.x_percentage);
-        out.push_str(",\"y_percentage\":");
-        tl_json::double(out, self.y_percentage);
-        out.push_str(",\"width_percentage\":");
-        tl_json::double(out, self.width_percentage);
-        out.push_str(",\"height_percentage\":");
-        tl_json::double(out, self.height_percentage);
-        out.push_str(",\"rotation_angle\":");
-        tl_json::double(out, self.rotation_angle);
-        out.push_str(",\"corner_radius_percentage\":");
-        tl_json::double(out, self.corner_radius_percentage);
-        out.push('}');
-    }
-
-    pub fn from_json(input: &str) -> Result<Self, String> {
-        let root = tl_json::parse_json(input)?;
-        Self::from_json_value(&root)
-    }
-
-    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
-    /// object is accepted and `@type` is ignored — only the fields read.
-    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
-        match v {
-            tl_json::Json::Null => Result::Ok(Self::default()),
-            tl_json::Json::Object(o) => Self::from_json_object(o),
-            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
-        }
-    }
-
-    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
-        let mut value = Self::default();
-        if let Some(__j0) = tl_json::field(o, "x_percentage") {
-            value.x_percentage = tl_json::read_f64(__j0)?;
-        }
-        if let Some(__j2) = tl_json::field(o, "y_percentage") {
-            value.y_percentage = tl_json::read_f64(__j2)?;
-        }
-        if let Some(__j4) = tl_json::field(o, "width_percentage") {
-            value.width_percentage = tl_json::read_f64(__j4)?;
-        }
-        if let Some(__j6) = tl_json::field(o, "height_percentage") {
-            value.height_percentage = tl_json::read_f64(__j6)?;
-        }
-        if let Some(__j8) = tl_json::field(o, "rotation_angle") {
-            value.rotation_angle = tl_json::read_f64(__j8)?;
-        }
-        if let Some(__j10) = tl_json::field(o, "corner_radius_percentage") {
-            value.corner_radius_percentage = tl_json::read_f64(__j10)?;
-        }
-        Result::Ok(value)
-    }
-
-    /// td's generated `Class::store(TlStorerToString&, const char*)`
-    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
-    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
-        s.store_class_begin(field_name, "storyAreaPosition");
-        s.store_field_double("x_percentage", self.x_percentage);
-        s.store_field_double("y_percentage", self.y_percentage);
-        s.store_field_double("width_percentage", self.width_percentage);
-        s.store_field_double("height_percentage", self.height_percentage);
-        s.store_field_double("rotation_angle", self.rotation_angle);
-        s.store_field_double("corner_radius_percentage", self.corner_radius_percentage);
         s.store_class_end();
     }
 
@@ -237056,13 +239830,14 @@ pub struct Supergroup {
     pub verification_status: Option<VerificationStatus>,
     pub has_direct_messages_group: bool,
     pub has_forum_tabs: bool,
+    pub has_forum_sidebar: bool,
     pub restriction_info: Option<RestrictionInfo>,
     pub paid_message_star_count: i64,
     pub active_story_state: Option<ActiveStoryState>,
 }
 
 impl Supergroup {
-    pub const ID: i32 = -1134998957;
+    pub const ID: i32 = -1673662503;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -237098,6 +239873,7 @@ impl Supergroup {
         __m2.store(out);
         tl::__bool(out, self.has_direct_messages_group);
         tl::__bool(out, self.has_forum_tabs);
+        tl::__bool(out, self.has_forum_sidebar);
         let __d3 = Default::default();
         let __m3 = self.restriction_info.as_ref().unwrap_or(&__d3);
         __m3.store(out);
@@ -237147,10 +239923,11 @@ impl Supergroup {
         let verification_status: Option<VerificationStatus> = Some(VerificationStatus::read_bare(r)?);
         let has_direct_messages_group: bool = r.bool()?;
         let has_forum_tabs: bool = r.bool()?;
+        let has_forum_sidebar: bool = r.bool()?;
         let restriction_info: Option<RestrictionInfo> = Some(RestrictionInfo::read_bare(r)?);
         let paid_message_star_count: i64 = r.i64()?;
         let active_story_state: Option<ActiveStoryState> = Some(ActiveStoryState::read(r)?);
-        Result::Ok(Self { id, usernames, date, status, member_count, boost_level, has_automatic_translation, has_linked_chat, has_location, sign_messages, show_message_sender, join_to_send_messages, join_by_request, is_slow_mode_enabled, is_channel, is_broadcast_group, is_forum, is_direct_messages_group, is_administered_direct_messages_group, verification_status, has_direct_messages_group, has_forum_tabs, restriction_info, paid_message_star_count, active_story_state })
+        Result::Ok(Self { id, usernames, date, status, member_count, boost_level, has_automatic_translation, has_linked_chat, has_location, sign_messages, show_message_sender, join_to_send_messages, join_by_request, is_slow_mode_enabled, is_channel, is_broadcast_group, is_forum, is_direct_messages_group, is_administered_direct_messages_group, verification_status, has_direct_messages_group, has_forum_tabs, has_forum_sidebar, restriction_info, paid_message_star_count, active_story_state })
     }
 
     pub fn to_json(&self) -> String {
@@ -237211,6 +239988,8 @@ impl Supergroup {
         tl_json::boolean(out, self.has_direct_messages_group);
         out.push_str(",\"has_forum_tabs\":");
         tl_json::boolean(out, self.has_forum_tabs);
+        out.push_str(",\"has_forum_sidebar\":");
+        tl_json::boolean(out, self.has_forum_sidebar);
         if let Some(__o3) = &self.restriction_info {
             out.push_str(",\"restriction_info\":");
             __o3.to_json_into(out);
@@ -237307,14 +240086,17 @@ impl Supergroup {
         if let Some(__j42) = tl_json::field(o, "has_forum_tabs") {
             value.has_forum_tabs = tl_json::read_bool(__j42)?;
         }
-        if let Some(__j44) = tl_json::field(o, "restriction_info") && !matches!(__j44, tl_json::Json::Null) {
-            value.restriction_info = Some(RestrictionInfo::from_json_value(__j44)?);
+        if let Some(__j44) = tl_json::field(o, "has_forum_sidebar") {
+            value.has_forum_sidebar = tl_json::read_bool(__j44)?;
         }
-        if let Some(__j46) = tl_json::field(o, "paid_message_star_count") {
-            value.paid_message_star_count = tl_json::read_i64(__j46)?;
+        if let Some(__j46) = tl_json::field(o, "restriction_info") && !matches!(__j46, tl_json::Json::Null) {
+            value.restriction_info = Some(RestrictionInfo::from_json_value(__j46)?);
         }
-        if let Some(__j48) = tl_json::field(o, "active_story_state") && !matches!(__j48, tl_json::Json::Null) {
-            value.active_story_state = Some(ActiveStoryState::from_json_value(__j48)?);
+        if let Some(__j48) = tl_json::field(o, "paid_message_star_count") {
+            value.paid_message_star_count = tl_json::read_i64(__j48)?;
+        }
+        if let Some(__j50) = tl_json::field(o, "active_story_state") && !matches!(__j50, tl_json::Json::Null) {
+            value.active_story_state = Some(ActiveStoryState::from_json_value(__j50)?);
         }
         Result::Ok(value)
     }
@@ -237354,6 +240136,7 @@ impl Supergroup {
         }
         s.store_field_bool("has_direct_messages_group", self.has_direct_messages_group);
         s.store_field_bool("has_forum_tabs", self.has_forum_tabs);
+        s.store_field_bool("has_forum_sidebar", self.has_forum_sidebar);
         match &self.restriction_info {
             Some(__m3) => __m3.store_debug(s, "restriction_info"),
             None => s.store_null("restriction_info"),
@@ -237418,12 +240201,13 @@ pub struct SupergroupFullInfo {
     pub bot_commands: Vec<BotCommands>,
     pub bot_verification: Option<BotVerification>,
     pub main_profile_tab: Option<ProfileTab>,
+    pub share_theme: Option<ProfileShareTheme>,
     pub upgraded_from_basic_group_id: i64,
     pub upgraded_from_max_message_id: i64,
 }
 
 impl SupergroupFullInfo {
-    pub const ID: i32 = -1489590969;
+    pub const ID: i32 = -335770436;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -237484,6 +240268,9 @@ impl SupergroupFullInfo {
         let __d5 = Default::default();
         let __m5 = self.main_profile_tab.as_ref().unwrap_or(&__d5);
         __m5.store(out);
+        let __d6 = Default::default();
+        let __m6 = self.share_theme.as_ref().unwrap_or(&__d6);
+        __m6.store(out);
         tl::__i64(out, self.upgraded_from_basic_group_id);
         tl::__i64(out, self.upgraded_from_max_message_id);
     }
@@ -237557,9 +240344,10 @@ impl SupergroupFullInfo {
         let bot_commands: Vec<BotCommands> = __v0;
         let bot_verification: Option<BotVerification> = Some(BotVerification::read_bare(r)?);
         let main_profile_tab: Option<ProfileTab> = Some(ProfileTab::read(r)?);
+        let share_theme: Option<ProfileShareTheme> = Some(ProfileShareTheme::read(r)?);
         let upgraded_from_basic_group_id: i64 = r.i64()?;
         let upgraded_from_max_message_id: i64 = r.i64()?;
-        Result::Ok(Self { photo, community_id, description, member_count, administrator_count, restricted_count, banned_count, linked_chat_id, direct_messages_chat_id, slow_mode_delay, slow_mode_delay_expires_in, can_enable_paid_messages, can_enable_paid_reaction, can_get_members, has_hidden_members, can_hide_members, can_set_sticker_set, can_set_location, can_get_statistics, can_get_revenue_statistics, can_get_star_revenue_statistics, can_send_gift, can_toggle_aggressive_anti_spam, is_all_history_available, can_have_sponsored_messages, has_aggressive_anti_spam_enabled, has_paid_media_allowed, has_pinned_stories, gift_count, my_boost_count, unrestrict_boost_count, outgoing_paid_message_star_count, sticker_set_id, custom_emoji_sticker_set_id, location, invite_link, guard_bot_user_id, bot_commands, bot_verification, main_profile_tab, upgraded_from_basic_group_id, upgraded_from_max_message_id })
+        Result::Ok(Self { photo, community_id, description, member_count, administrator_count, restricted_count, banned_count, linked_chat_id, direct_messages_chat_id, slow_mode_delay, slow_mode_delay_expires_in, can_enable_paid_messages, can_enable_paid_reaction, can_get_members, has_hidden_members, can_hide_members, can_set_sticker_set, can_set_location, can_get_statistics, can_get_revenue_statistics, can_get_star_revenue_statistics, can_send_gift, can_toggle_aggressive_anti_spam, is_all_history_available, can_have_sponsored_messages, has_aggressive_anti_spam_enabled, has_paid_media_allowed, has_pinned_stories, gift_count, my_boost_count, unrestrict_boost_count, outgoing_paid_message_star_count, sticker_set_id, custom_emoji_sticker_set_id, location, invite_link, guard_bot_user_id, bot_commands, bot_verification, main_profile_tab, share_theme, upgraded_from_basic_group_id, upgraded_from_max_message_id })
     }
 
     pub fn to_json(&self) -> String {
@@ -237668,6 +240456,10 @@ impl SupergroupFullInfo {
         if let Some(__o5) = &self.main_profile_tab {
             out.push_str(",\"main_profile_tab\":");
             __o5.to_json_into(out);
+        }
+        if let Some(__o6) = &self.share_theme {
+            out.push_str(",\"share_theme\":");
+            __o6.to_json_into(out);
         }
         out.push_str(",\"upgraded_from_basic_group_id\":");
         tl_json::num64(out, self.upgraded_from_basic_group_id);
@@ -237813,11 +240605,14 @@ impl SupergroupFullInfo {
         if let Some(__j78) = tl_json::field(o, "main_profile_tab") && !matches!(__j78, tl_json::Json::Null) {
             value.main_profile_tab = Some(ProfileTab::from_json_value(__j78)?);
         }
-        if let Some(__j80) = tl_json::field(o, "upgraded_from_basic_group_id") {
-            value.upgraded_from_basic_group_id = tl_json::read_i64(__j80)?;
+        if let Some(__j80) = tl_json::field(o, "share_theme") && !matches!(__j80, tl_json::Json::Null) {
+            value.share_theme = Some(ProfileShareTheme::from_json_value(__j80)?);
         }
-        if let Some(__j82) = tl_json::field(o, "upgraded_from_max_message_id") {
-            value.upgraded_from_max_message_id = tl_json::read_i64(__j82)?;
+        if let Some(__j82) = tl_json::field(o, "upgraded_from_basic_group_id") {
+            value.upgraded_from_basic_group_id = tl_json::read_i64(__j82)?;
+        }
+        if let Some(__j84) = tl_json::field(o, "upgraded_from_max_message_id") {
+            value.upgraded_from_max_message_id = tl_json::read_i64(__j84)?;
         }
         Result::Ok(value)
     }
@@ -237884,6 +240679,10 @@ impl SupergroupFullInfo {
         match &self.main_profile_tab {
             Some(__m5) => __m5.store_debug(s, "main_profile_tab"),
             None => s.store_null("main_profile_tab"),
+        }
+        match &self.share_theme {
+            Some(__m6) => __m6.store_debug(s, "share_theme"),
+            None => s.store_null("share_theme"),
         }
         s.store_field_int("upgraded_from_basic_group_id", self.upgraded_from_basic_group_id);
         s.store_field_int("upgraded_from_max_message_id", self.upgraded_from_max_message_id);
@@ -245532,12 +248331,13 @@ impl From<TextParseMode> for Object {
 #[serde(rename = "textQuote")]
 pub struct TextQuote {
     pub text: Option<FormattedText>,
+    pub rich_texts: Vec<Box<RichText>>,
     pub position: i32,
     pub is_manual: bool,
 }
 
 impl TextQuote {
-    pub const ID: i32 = -2039105358;
+    pub const ID: i32 = -1448848157;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -245548,6 +248348,10 @@ impl TextQuote {
         let __d0 = Default::default();
         let __m0 = self.text.as_ref().unwrap_or(&__d0);
         __m0.store(out);
+        tl::__i32(out, self.rich_texts.len() as i32);
+        for __v1 in &self.rich_texts {
+            (*__v1).store(out);
+        }
         tl::__i32(out, self.position);
         tl::__bool(out, self.is_manual);
     }
@@ -245571,9 +248375,21 @@ impl TextQuote {
 
     pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
         let text: Option<FormattedText> = Some(FormattedText::read_bare(r)?);
+        let __v0: Vec<Box<RichText>> = {
+            let count: u32 = r.i32()? as u32;
+            if count as usize > r.remaining() {
+                return Result::Err("Wrong vector length");
+            }
+            let mut res = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                res.push(Box::new(RichText::read(r)?));
+            }
+            res
+        };
+        let rich_texts: Vec<Box<RichText>> = __v0;
         let position: i32 = r.i32()?;
         let is_manual: bool = r.bool()?;
-        Result::Ok(Self { text, position, is_manual })
+        Result::Ok(Self { text, rich_texts, position, is_manual })
     }
 
     pub fn to_json(&self) -> String {
@@ -245588,6 +248404,17 @@ impl TextQuote {
             out.push_str(",\"text\":");
             __o0.to_json_into(out);
         }
+        out.push_str(",\"rich_texts\":");
+        out.push('[');
+        let mut __first = true;
+        for __v1 in &self.rich_texts {
+            if !__first {
+                out.push(',');
+            }
+            __first = false;
+            (*__v1).to_json_into(out);
+        }
+        out.push(']');
         out.push_str(",\"position\":");
         tl_json::num32(out, self.position);
         out.push_str(",\"is_manual\":");
@@ -245615,11 +248442,14 @@ impl TextQuote {
         if let Some(__j0) = tl_json::field(o, "text") && !matches!(__j0, tl_json::Json::Null) {
             value.text = Some(FormattedText::from_json_value(__j0)?);
         }
-        if let Some(__j2) = tl_json::field(o, "position") {
-            value.position = tl_json::read_i32(__j2)?;
+        if let Some(__j2) = tl_json::field(o, "rich_texts") {
+            value.rich_texts = tl_json::read_vector(__j2, |__e3| Result::Ok(Box::new(RichText::from_json_value(__e3)?)))?;
         }
-        if let Some(__j4) = tl_json::field(o, "is_manual") {
-            value.is_manual = tl_json::read_bool(__j4)?;
+        if let Some(__j5) = tl_json::field(o, "position") {
+            value.position = tl_json::read_i32(__j5)?;
+        }
+        if let Some(__j7) = tl_json::field(o, "is_manual") {
+            value.is_manual = tl_json::read_bool(__j7)?;
         }
         Result::Ok(value)
     }
@@ -245632,8 +248462,235 @@ impl TextQuote {
             Some(__m0) => __m0.store_debug(s, "text"),
             None => s.store_null("text"),
         }
+        s.store_vector_begin("rich_texts", self.rich_texts.len());
+        for __v1 in &self.rich_texts {
+            __v1.store_debug(s, "");
+        }
+        s.store_class_end();
         s.store_field_int("position", self.position as i64);
         s.store_field_bool("is_manual", self.is_manual);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "textRange")]
+pub struct TextRange {
+    pub offset: i32,
+    pub length: i32,
+}
+
+impl TextRange {
+    pub const ID: i32 = 1166339562;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.offset);
+        tl::__i32(out, self.length);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let offset: i32 = r.i32()?;
+        let length: i32 = r.i32()?;
+        Result::Ok(Self { offset, length })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"textRange\"");
+        out.push_str(",\"offset\":");
+        tl_json::num32(out, self.offset);
+        out.push_str(",\"length\":");
+        tl_json::num32(out, self.length);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "offset") {
+            value.offset = tl_json::read_i32(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "length") {
+            value.length = tl_json::read_i32(__j2)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "textRange");
+        s.store_field_int("offset", self.offset as i64);
+        s.store_field_int("length", self.length as i64);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "textRanges")]
+pub struct TextRanges {
+    pub ranges: Vec<TextRange>,
+}
+
+impl TextRanges {
+    pub const ID: i32 = 986061048;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.ranges.len() as i32);
+        for __v0 in &self.ranges {
+            (*__v0).store(out);
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let __v0: Vec<TextRange> = {
+            let count: u32 = r.i32()? as u32;
+            if count as usize > r.remaining() {
+                return Result::Err("Wrong vector length");
+            }
+            let mut res = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                res.push(TextRange::read_bare(r)?);
+            }
+            res
+        };
+        let ranges: Vec<TextRange> = __v0;
+        Result::Ok(Self { ranges })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"textRanges\"");
+        out.push_str(",\"ranges\":");
+        out.push('[');
+        let mut __first = true;
+        for __v0 in &self.ranges {
+            if !__first {
+                out.push(',');
+            }
+            __first = false;
+            (*__v0).to_json_into(out);
+        }
+        out.push(']');
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "ranges") {
+            value.ranges = tl_json::read_vector(__j0, TextRange::from_json_value)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "textRanges");
+        s.store_vector_begin("ranges", self.ranges.len());
+        for __v0 in &self.ranges {
+            __v0.store_debug(s, "");
+        }
+        s.store_class_end();
         s.store_class_end();
     }
 
@@ -247650,6 +250707,133 @@ impl TonConnectChallenge {
         s.store_class_begin(field_name, "tonConnectChallenge");
         s.store_bytes_field("challenge", &self.challenge);
         s.store_field_int("event_id", self.event_id);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "tonConnectConnectData")]
+pub struct TonConnectConnectData {
+    pub session_id: i64,
+    pub challenge_answer: Vec<u8>,
+    pub body: Vec<u8>,
+    pub proof: Option<TonWalletOwnershipProof>,
+}
+
+impl TonConnectConnectData {
+    pub const ID: i32 = -173687207;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i64(out, self.session_id);
+        tl::__string(out, &self.challenge_answer);
+        tl::__string(out, &self.body);
+        let __d0 = Default::default();
+        let __m0 = self.proof.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let session_id: i64 = r.i64()?;
+        let challenge_answer: Vec<u8> = r.bytes()?;
+        let body: Vec<u8> = r.bytes()?;
+        let proof: Option<TonWalletOwnershipProof> = Some(TonWalletOwnershipProof::read_bare(r)?);
+        Result::Ok(Self { session_id, challenge_answer, body, proof })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"tonConnectConnectData\"");
+        out.push_str(",\"session_id\":");
+        tl_json::num64q(out, self.session_id);
+        out.push_str(",\"challenge_answer\":");
+        tl_json::bytes(out, &self.challenge_answer);
+        out.push_str(",\"body\":");
+        tl_json::bytes(out, &self.body);
+        if let Some(__o0) = &self.proof {
+            out.push_str(",\"proof\":");
+            __o0.to_json_into(out);
+        }
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "session_id") {
+            value.session_id = tl_json::read_i64(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "challenge_answer") {
+            value.challenge_answer = tl_json::read_bytes(__j2)?;
+        }
+        if let Some(__j4) = tl_json::field(o, "body") {
+            value.body = tl_json::read_bytes(__j4)?;
+        }
+        if let Some(__j6) = tl_json::field(o, "proof") && !matches!(__j6, tl_json::Json::Null) {
+            value.proof = Some(TonWalletOwnershipProof::from_json_value(__j6)?);
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "tonConnectConnectData");
+        s.store_field_int("session_id", self.session_id);
+        s.store_bytes_field("challenge_answer", &self.challenge_answer);
+        s.store_bytes_field("body", &self.body);
+        match &self.proof {
+            Some(__m0) => __m0.store_debug(s, "proof"),
+            None => s.store_null("proof"),
+        }
         s.store_class_end();
     }
 
@@ -250119,10 +253303,11 @@ pub struct TonNft {
     pub sticker: Option<Sticker>,
     pub attributes: Vec<TonNftAttribute>,
     pub extra: Option<Box<JsonValue>>,
+    pub gift: Option<UpgradedGift>,
 }
 
 impl TonNft {
-    pub const ID: i32 = -1595898089;
+    pub const ID: i32 = -755248808;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -250155,6 +253340,9 @@ impl TonNft {
         let __d5 = Default::default();
         let __m5 = self.extra.as_ref().unwrap_or(&__d5);
         __m5.store(out);
+        let __d6 = Default::default();
+        let __m6 = self.gift.as_ref().unwrap_or(&__d6);
+        __m6.store(out);
     }
 
     pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
@@ -250198,7 +253386,8 @@ impl TonNft {
         };
         let attributes: Vec<TonNftAttribute> = __v0;
         let extra: Option<Box<JsonValue>> = Some(Box::new(JsonValue::read(r)?));
-        Result::Ok(Self { collection_address, address, owner_address, index, name, description, image, thumbnail, content, sticker, attributes, extra })
+        let gift: Option<UpgradedGift> = Some(UpgradedGift::read_bare(r)?);
+        Result::Ok(Self { collection_address, address, owner_address, index, name, description, image, thumbnail, content, sticker, attributes, extra, gift })
     }
 
     pub fn to_json(&self) -> String {
@@ -250251,6 +253440,10 @@ impl TonNft {
         if let Some(__o5) = &self.extra {
             out.push_str(",\"extra\":");
             __o5.to_json_into(out);
+        }
+        if let Some(__o6) = &self.gift {
+            out.push_str(",\"gift\":");
+            __o6.to_json_into(out);
         }
         out.push('}');
     }
@@ -250308,6 +253501,9 @@ impl TonNft {
         if let Some(__j22) = tl_json::field(o, "extra") && !matches!(__j22, tl_json::Json::Null) {
             value.extra = Some(Box::new(JsonValue::from_json_value(__j22)?));
         }
+        if let Some(__j24) = tl_json::field(o, "gift") && !matches!(__j24, tl_json::Json::Null) {
+            value.gift = Some(UpgradedGift::from_json_value(__j24)?);
+        }
         Result::Ok(value)
     }
 
@@ -250345,6 +253541,10 @@ impl TonNft {
         match &self.extra {
             Some(__m5) => __m5.store_debug(s, "extra"),
             None => s.store_null("extra"),
+        }
+        match &self.gift {
+            Some(__m6) => __m6.store_debug(s, "gift"),
+            None => s.store_null("gift"),
         }
         s.store_class_end();
     }
@@ -251960,6 +255160,269 @@ impl TonTransactions {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "tonWalletCard")]
+pub struct TonWalletCard {
+    pub address: String,
+    pub gram_amount: i64,
+    pub stickers: Vec<TonWalletCardSticker>,
+    pub background_nft_address: String,
+}
+
+impl TonWalletCard {
+    pub const ID: i32 = 1337170800;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__string(out, &self.address);
+        tl::__i64(out, self.gram_amount);
+        tl::__i32(out, self.stickers.len() as i32);
+        for __v0 in &self.stickers {
+            (*__v0).store(out);
+        }
+        tl::__string(out, &self.background_nft_address);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let address: String = r.string()?;
+        let gram_amount: i64 = r.i64()?;
+        let __v0: Vec<TonWalletCardSticker> = {
+            let count: u32 = r.i32()? as u32;
+            if count as usize > r.remaining() {
+                return Result::Err("Wrong vector length");
+            }
+            let mut res = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                res.push(TonWalletCardSticker::read_bare(r)?);
+            }
+            res
+        };
+        let stickers: Vec<TonWalletCardSticker> = __v0;
+        let background_nft_address: String = r.string()?;
+        Result::Ok(Self { address, gram_amount, stickers, background_nft_address })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"tonWalletCard\"");
+        out.push_str(",\"address\":");
+        tl_json::str(out, &self.address);
+        out.push_str(",\"gram_amount\":");
+        tl_json::num64q(out, self.gram_amount);
+        out.push_str(",\"stickers\":");
+        out.push('[');
+        let mut __first = true;
+        for __v0 in &self.stickers {
+            if !__first {
+                out.push(',');
+            }
+            __first = false;
+            (*__v0).to_json_into(out);
+        }
+        out.push(']');
+        out.push_str(",\"background_nft_address\":");
+        tl_json::str(out, &self.background_nft_address);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "address") {
+            value.address = tl_json::read_string(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "gram_amount") {
+            value.gram_amount = tl_json::read_i64(__j2)?;
+        }
+        if let Some(__j4) = tl_json::field(o, "stickers") {
+            value.stickers = tl_json::read_vector(__j4, TonWalletCardSticker::from_json_value)?;
+        }
+        if let Some(__j6) = tl_json::field(o, "background_nft_address") {
+            value.background_nft_address = tl_json::read_string(__j6)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "tonWalletCard");
+        s.store_field_str("address", &self.address);
+        s.store_field_int("gram_amount", self.gram_amount);
+        s.store_vector_begin("stickers", self.stickers.len());
+        for __v0 in &self.stickers {
+            __v0.store_debug(s, "");
+        }
+        s.store_class_end();
+        s.store_field_str("background_nft_address", &self.background_nft_address);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "tonWalletCardSticker")]
+pub struct TonWalletCardSticker {
+    pub position: Option<AreaPosition>,
+    pub nft: Option<TonNft>,
+}
+
+impl TonWalletCardSticker {
+    pub const ID: i32 = -712456570;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let __d0 = Default::default();
+        let __m0 = self.position.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+        let __d1 = Default::default();
+        let __m1 = self.nft.as_ref().unwrap_or(&__d1);
+        __m1.store(out);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let position: Option<AreaPosition> = Some(AreaPosition::read_bare(r)?);
+        let nft: Option<TonNft> = Some(TonNft::read_bare(r)?);
+        Result::Ok(Self { position, nft })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"tonWalletCardSticker\"");
+        if let Some(__o0) = &self.position {
+            out.push_str(",\"position\":");
+            __o0.to_json_into(out);
+        }
+        if let Some(__o1) = &self.nft {
+            out.push_str(",\"nft\":");
+            __o1.to_json_into(out);
+        }
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "position") && !matches!(__j0, tl_json::Json::Null) {
+            value.position = Some(AreaPosition::from_json_value(__j0)?);
+        }
+        if let Some(__j2) = tl_json::field(o, "nft") && !matches!(__j2, tl_json::Json::Null) {
+            value.nft = Some(TonNft::from_json_value(__j2)?);
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "tonWalletCardSticker");
+        match &self.position {
+            Some(__m0) => __m0.store_debug(s, "position"),
+            None => s.store_null("position"),
+        }
+        match &self.nft {
+            Some(__m1) => __m1.store_debug(s, "nft"),
+            None => s.store_null("nft"),
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "tonWalletGaslessTransfersInfo")]
 pub struct TonWalletGaslessTransfersInfo {
     pub left_count: i32,
@@ -252284,6 +255747,99 @@ impl TonWalletOwnershipProofChallenge {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "tonWalletSecretPhrase")]
+pub struct TonWalletSecretPhrase {
+    pub secret_phrase: String,
+}
+
+impl TonWalletSecretPhrase {
+    pub const ID: i32 = 239382866;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__string(out, &self.secret_phrase);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let secret_phrase: String = r.string()?;
+        Result::Ok(Self { secret_phrase })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"tonWalletSecretPhrase\"");
+        out.push_str(",\"secret_phrase\":");
+        tl_json::str(out, &self.secret_phrase);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "secret_phrase") {
+            value.secret_phrase = tl_json::read_string(__j0)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "tonWalletSecretPhrase");
+        s.store_field_str("secret_phrase", &self.secret_phrase);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "tonWalletState")]
 pub struct TonWalletState {
     pub address: String,
@@ -252296,7 +255852,7 @@ pub struct TonWalletState {
 }
 
 impl TonWalletState {
-    pub const ID: i32 = -655546174;
+    pub const ID: i32 = -302902556;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -252354,7 +255910,7 @@ impl TonWalletState {
         out.push_str(",\"public_key\":");
         tl_json::bytes(out, &self.public_key);
         out.push_str(",\"gram_amount\":");
-        tl_json::num64(out, self.gram_amount);
+        tl_json::num64q(out, self.gram_amount);
         out.push_str(",\"is_being_created\":");
         tl_json::boolean(out, self.is_being_created);
         out.push_str(",\"is_backup_enabled\":");
@@ -252444,7 +256000,7 @@ pub struct TonWalletTransaction {
 }
 
 impl TonWalletTransaction {
-    pub const ID: i32 = -2081280655;
+    pub const ID: i32 = -580191176;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -252514,7 +256070,7 @@ impl TonWalletTransaction {
         out.push_str(",\"date\":");
         tl_json::num32(out, self.date);
         out.push_str(",\"fee_amount\":");
-        tl_json::num64(out, self.fee_amount);
+        tl_json::num64q(out, self.fee_amount);
         if let Some(__o0) = &self.state {
             out.push_str(",\"state\":");
             __o0.to_json_into(out);
@@ -252898,7 +256454,7 @@ pub struct tonWalletTransactionTypeOnRampDeposit {
 }
 
 impl tonWalletTransactionTypeOnRampDeposit {
-    pub const ID: i32 = -1570430820;
+    pub const ID: i32 = -282211019;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -252942,7 +256498,7 @@ impl tonWalletTransactionTypeOnRampDeposit {
     pub fn to_json_into(&self, out: &mut String) {
         out.push_str("{\"@type\":\"tonWalletTransactionTypeOnRampDeposit\"");
         out.push_str(",\"amount\":");
-        tl_json::num64(out, self.amount);
+        tl_json::num64q(out, self.amount);
         out.push_str(",\"provider_name\":");
         tl_json::str(out, &self.provider_name);
         out.push('}');
@@ -253002,7 +256558,7 @@ pub struct tonWalletTransactionTypeTransfer {
 }
 
 impl tonWalletTransactionTypeTransfer {
-    pub const ID: i32 = -2077618700;
+    pub const ID: i32 = -1040037236;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -253050,7 +256606,7 @@ impl tonWalletTransactionTypeTransfer {
     pub fn to_json_into(&self, out: &mut String) {
         out.push_str("{\"@type\":\"tonWalletTransactionTypeTransfer\"");
         out.push_str(",\"amount\":");
-        tl_json::num64(out, self.amount);
+        tl_json::num64q(out, self.amount);
         out.push_str(",\"is_gasless\":");
         tl_json::boolean(out, self.is_gasless);
         out.push_str(",\"comment\":");
@@ -253240,6 +256796,124 @@ impl tonWalletTransactionTypeNftTransfer {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "tonWalletTransactionTypeTelegramGiftTransfer")]
+pub struct tonWalletTransactionTypeTelegramGiftTransfer {
+    pub nft: Option<TonNft>,
+    pub is_outgoing: bool,
+    pub is_saved: bool,
+}
+
+impl tonWalletTransactionTypeTelegramGiftTransfer {
+    pub const ID: i32 = -1432434212;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let __d0 = Default::default();
+        let __m0 = self.nft.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+        tl::__bool(out, self.is_outgoing);
+        tl::__bool(out, self.is_saved);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let nft: Option<TonNft> = Some(TonNft::read_bare(r)?);
+        let is_outgoing: bool = r.bool()?;
+        let is_saved: bool = r.bool()?;
+        Result::Ok(Self { nft, is_outgoing, is_saved })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"tonWalletTransactionTypeTelegramGiftTransfer\"");
+        if let Some(__o0) = &self.nft {
+            out.push_str(",\"nft\":");
+            __o0.to_json_into(out);
+        }
+        out.push_str(",\"is_outgoing\":");
+        tl_json::boolean(out, self.is_outgoing);
+        out.push_str(",\"is_saved\":");
+        tl_json::boolean(out, self.is_saved);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "nft") && !matches!(__j0, tl_json::Json::Null) {
+            value.nft = Some(TonNft::from_json_value(__j0)?);
+        }
+        if let Some(__j2) = tl_json::field(o, "is_outgoing") {
+            value.is_outgoing = tl_json::read_bool(__j2)?;
+        }
+        if let Some(__j4) = tl_json::field(o, "is_saved") {
+            value.is_saved = tl_json::read_bool(__j4)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "tonWalletTransactionTypeTelegramGiftTransfer");
+        match &self.nft {
+            Some(__m0) => __m0.store_debug(s, "nft"),
+            None => s.store_null("nft"),
+        }
+        s.store_field_bool("is_outgoing", self.is_outgoing);
+        s.store_field_bool("is_saved", self.is_saved);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "tonWalletTransactionTypeKeyChange")]
 pub struct tonWalletTransactionTypeKeyChange;
 
@@ -253332,6 +257006,8 @@ pub enum TonWalletTransactionType {
     tonWalletTransactionTypeTransfer(tonWalletTransactionTypeTransfer),
     #[serde(rename = "tonWalletTransactionTypeNftTransfer")]
     tonWalletTransactionTypeNftTransfer(tonWalletTransactionTypeNftTransfer),
+    #[serde(rename = "tonWalletTransactionTypeTelegramGiftTransfer")]
+    tonWalletTransactionTypeTelegramGiftTransfer(tonWalletTransactionTypeTelegramGiftTransfer),
     #[serde(rename = "tonWalletTransactionTypeKeyChange")]
     tonWalletTransactionTypeKeyChange(tonWalletTransactionTypeKeyChange),
 }
@@ -253342,6 +257018,7 @@ impl TonWalletTransactionType {
             Self::tonWalletTransactionTypeOnRampDeposit(v) => v.store_boxed(out),
             Self::tonWalletTransactionTypeTransfer(v) => v.store_boxed(out),
             Self::tonWalletTransactionTypeNftTransfer(v) => v.store_boxed(out),
+            Self::tonWalletTransactionTypeTelegramGiftTransfer(v) => v.store_boxed(out),
             Self::tonWalletTransactionTypeKeyChange(v) => v.store_boxed(out),
         }
     }
@@ -253356,6 +257033,7 @@ impl TonWalletTransactionType {
             self::tonWalletTransactionTypeOnRampDeposit::ID => Result::Ok(Self::tonWalletTransactionTypeOnRampDeposit(self::tonWalletTransactionTypeOnRampDeposit::read_bare(r)?)),
             self::tonWalletTransactionTypeTransfer::ID => Result::Ok(Self::tonWalletTransactionTypeTransfer(self::tonWalletTransactionTypeTransfer::read_bare(r)?)),
             self::tonWalletTransactionTypeNftTransfer::ID => Result::Ok(Self::tonWalletTransactionTypeNftTransfer(self::tonWalletTransactionTypeNftTransfer::read_bare(r)?)),
+            self::tonWalletTransactionTypeTelegramGiftTransfer::ID => Result::Ok(Self::tonWalletTransactionTypeTelegramGiftTransfer(self::tonWalletTransactionTypeTelegramGiftTransfer::read_bare(r)?)),
             self::tonWalletTransactionTypeKeyChange::ID => Result::Ok(Self::tonWalletTransactionTypeKeyChange(self::tonWalletTransactionTypeKeyChange::read_bare(r)?)),
             _ => Result::Err("Unknown constructor"),
         }
@@ -253372,6 +257050,7 @@ impl TonWalletTransactionType {
             Self::tonWalletTransactionTypeOnRampDeposit(v) => v.to_json_into(out),
             Self::tonWalletTransactionTypeTransfer(v) => v.to_json_into(out),
             Self::tonWalletTransactionTypeNftTransfer(v) => v.to_json_into(out),
+            Self::tonWalletTransactionTypeTelegramGiftTransfer(v) => v.to_json_into(out),
             Self::tonWalletTransactionTypeKeyChange(v) => v.to_json_into(out),
         }
     }
@@ -253389,6 +257068,9 @@ impl TonWalletTransactionType {
     }
     fn __json_new_tonWalletTransactionTypeNftTransfer(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::tonWalletTransactionTypeNftTransfer(self::tonWalletTransactionTypeNftTransfer::from_json_object(o)?))
+    }
+    fn __json_new_tonWalletTransactionTypeTelegramGiftTransfer(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::tonWalletTransactionTypeTelegramGiftTransfer(self::tonWalletTransactionTypeTelegramGiftTransfer::from_json_object(o)?))
     }
     fn __json_new_tonWalletTransactionTypeKeyChange(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::tonWalletTransactionTypeKeyChange(self::tonWalletTransactionTypeKeyChange::from_json_object(o)?))
@@ -253411,6 +257093,7 @@ impl TonWalletTransactionType {
                 "tonWalletTransactionTypeOnRampDeposit" => Self::__json_new_tonWalletTransactionTypeOnRampDeposit(o),
                 "tonWalletTransactionTypeTransfer" => Self::__json_new_tonWalletTransactionTypeTransfer(o),
                 "tonWalletTransactionTypeNftTransfer" => Self::__json_new_tonWalletTransactionTypeNftTransfer(o),
+                "tonWalletTransactionTypeTelegramGiftTransfer" => Self::__json_new_tonWalletTransactionTypeTelegramGiftTransfer(o),
                 "tonWalletTransactionTypeKeyChange" => Self::__json_new_tonWalletTransactionTypeKeyChange(o),
                 _ => Result::Err(format!("Unknown class \"{s}\"")),
             },
@@ -253418,6 +257101,7 @@ impl TonWalletTransactionType {
                 self::tonWalletTransactionTypeOnRampDeposit::ID => Self::__json_new_tonWalletTransactionTypeOnRampDeposit(o),
                 self::tonWalletTransactionTypeTransfer::ID => Self::__json_new_tonWalletTransactionTypeTransfer(o),
                 self::tonWalletTransactionTypeNftTransfer::ID => Self::__json_new_tonWalletTransactionTypeNftTransfer(o),
+                self::tonWalletTransactionTypeTelegramGiftTransfer::ID => Self::__json_new_tonWalletTransactionTypeTelegramGiftTransfer(o),
                 self::tonWalletTransactionTypeKeyChange::ID => Self::__json_new_tonWalletTransactionTypeKeyChange(o),
                 id => Result::Err(format!("Unknown constructor 0x{:08x}", id as u32)),
             },
@@ -253430,6 +257114,7 @@ impl TonWalletTransactionType {
             Self::tonWalletTransactionTypeOnRampDeposit(v) => v.store_debug(s, field_name),
             Self::tonWalletTransactionTypeTransfer(v) => v.store_debug(s, field_name),
             Self::tonWalletTransactionTypeNftTransfer(v) => v.store_debug(s, field_name),
+            Self::tonWalletTransactionTypeTelegramGiftTransfer(v) => v.store_debug(s, field_name),
             Self::tonWalletTransactionTypeKeyChange(v) => v.store_debug(s, field_name),
         }
     }
@@ -253455,6 +257140,7 @@ impl From<TonWalletTransactionType> for Object {
             TonWalletTransactionType::tonWalletTransactionTypeOnRampDeposit(v) => Object::tonWalletTransactionTypeOnRampDeposit(v),
             TonWalletTransactionType::tonWalletTransactionTypeTransfer(v) => Object::tonWalletTransactionTypeTransfer(v),
             TonWalletTransactionType::tonWalletTransactionTypeNftTransfer(v) => Object::tonWalletTransactionTypeNftTransfer(v),
+            TonWalletTransactionType::tonWalletTransactionTypeTelegramGiftTransfer(v) => Object::tonWalletTransactionTypeTelegramGiftTransfer(v),
             TonWalletTransactionType::tonWalletTransactionTypeKeyChange(v) => Object::tonWalletTransactionTypeKeyChange(v),
         }
     }
@@ -253469,7 +257155,7 @@ pub struct TonWalletTransactions {
 }
 
 impl TonWalletTransactions {
-    pub const ID: i32 = -1372826145;
+    pub const ID: i32 = -402386265;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -253529,7 +257215,7 @@ impl TonWalletTransactions {
     pub fn to_json_into(&self, out: &mut String) {
         out.push_str("{\"@type\":\"tonWalletTransactions\"");
         out.push_str(",\"gram_amount\":");
-        tl_json::num64(out, self.gram_amount);
+        tl_json::num64q(out, self.gram_amount);
         out.push_str(",\"transactions\":");
         out.push('[');
         let mut __first = true;
@@ -271395,6 +275081,301 @@ impl updateConnectionState {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "updateWebProxyCarrierOpened")]
+pub struct updateWebProxyCarrierOpened {
+    pub carrier: Option<WebProxyCarrier>,
+}
+
+impl updateWebProxyCarrierOpened {
+    pub const ID: i32 = 841731638;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let __d0 = Default::default();
+        let __m0 = self.carrier.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let carrier: Option<WebProxyCarrier> = Some(WebProxyCarrier::read_bare(r)?);
+        Result::Ok(Self { carrier })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"updateWebProxyCarrierOpened\"");
+        if let Some(__o0) = &self.carrier {
+            out.push_str(",\"carrier\":");
+            __o0.to_json_into(out);
+        }
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "carrier") && !matches!(__j0, tl_json::Json::Null) {
+            value.carrier = Some(WebProxyCarrier::from_json_value(__j0)?);
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "updateWebProxyCarrierOpened");
+        match &self.carrier {
+            Some(__m0) => __m0.store_debug(s, "carrier"),
+            None => s.store_null("carrier"),
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "updateWebProxyCarrierData")]
+pub struct updateWebProxyCarrierData {
+    pub carrier_id: i32,
+    pub data: Vec<u8>,
+}
+
+impl updateWebProxyCarrierData {
+    pub const ID: i32 = 940277833;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.carrier_id);
+        tl::__string(out, &self.data);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let carrier_id: i32 = r.i32()?;
+        let data: Vec<u8> = r.bytes()?;
+        Result::Ok(Self { carrier_id, data })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"updateWebProxyCarrierData\"");
+        out.push_str(",\"carrier_id\":");
+        tl_json::num32(out, self.carrier_id);
+        out.push_str(",\"data\":");
+        tl_json::bytes(out, &self.data);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "carrier_id") {
+            value.carrier_id = tl_json::read_i32(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "data") {
+            value.data = tl_json::read_bytes(__j2)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "updateWebProxyCarrierData");
+        s.store_field_int("carrier_id", self.carrier_id as i64);
+        s.store_bytes_field("data", &self.data);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "updateWebProxyCarrierClosed")]
+pub struct updateWebProxyCarrierClosed {
+    pub carrier_id: i32,
+}
+
+impl updateWebProxyCarrierClosed {
+    pub const ID: i32 = -1055062045;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.carrier_id);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let carrier_id: i32 = r.i32()?;
+        Result::Ok(Self { carrier_id })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"updateWebProxyCarrierClosed\"");
+        out.push_str(",\"carrier_id\":");
+        tl_json::num32(out, self.carrier_id);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "carrier_id") {
+            value.carrier_id = tl_json::read_i32(__j0)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "updateWebProxyCarrierClosed");
+        s.store_field_int("carrier_id", self.carrier_id as i64);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "updateFreezeState")]
 pub struct updateFreezeState {
     pub is_frozen: bool,
@@ -273796,6 +277777,108 @@ impl updateSpeechRecognitionTrial {
         s.store_field_int("weekly_count", self.weekly_count as i64);
         s.store_field_int("left_count", self.left_count as i64);
         s.store_field_int("next_reset_date", self.next_reset_date as i64);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "updateSpeechRecognitionInFile")]
+pub struct updateSpeechRecognitionInFile {
+    pub recognition_id: i64,
+    pub partial_text: String,
+}
+
+impl updateSpeechRecognitionInFile {
+    pub const ID: i32 = -922861464;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i64(out, self.recognition_id);
+        tl::__string(out, &self.partial_text);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let recognition_id: i64 = r.i64()?;
+        let partial_text: String = r.string()?;
+        Result::Ok(Self { recognition_id, partial_text })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"updateSpeechRecognitionInFile\"");
+        out.push_str(",\"recognition_id\":");
+        tl_json::num64q(out, self.recognition_id);
+        out.push_str(",\"partial_text\":");
+        tl_json::str(out, &self.partial_text);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "recognition_id") {
+            value.recognition_id = tl_json::read_i64(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "partial_text") {
+            value.partial_text = tl_json::read_string(__j2)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "updateSpeechRecognitionInFile");
+        s.store_field_int("recognition_id", self.recognition_id);
+        s.store_field_str("partial_text", &self.partial_text);
         s.store_class_end();
     }
 
@@ -276323,6 +280406,525 @@ impl updateNewBusinessCallbackQuery {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "updateNewWidgetQuery")]
+pub struct updateNewWidgetQuery {
+    pub id: i64,
+    pub sender_user_id: i64,
+    pub chat_id: i64,
+    pub message_id: i64,
+    pub chat_instance: i64,
+    pub chat_type: String,
+    pub query_type: Option<WidgetQueryType>,
+    pub data: Vec<u8>,
+    pub widget_id: i64,
+    pub wallet_card: Option<TonWalletCard>,
+}
+
+impl updateNewWidgetQuery {
+    pub const ID: i32 = -43285453;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i64(out, self.id);
+        tl::__i64(out, self.sender_user_id);
+        tl::__i64(out, self.chat_id);
+        tl::__i64(out, self.message_id);
+        tl::__i64(out, self.chat_instance);
+        tl::__string(out, &self.chat_type);
+        let __d0 = Default::default();
+        let __m0 = self.query_type.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+        tl::__string(out, &self.data);
+        tl::__i64(out, self.widget_id);
+        let __d1 = Default::default();
+        let __m1 = self.wallet_card.as_ref().unwrap_or(&__d1);
+        __m1.store(out);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let id: i64 = r.i64()?;
+        let sender_user_id: i64 = r.i64()?;
+        let chat_id: i64 = r.i64()?;
+        let message_id: i64 = r.i64()?;
+        let chat_instance: i64 = r.i64()?;
+        let chat_type: String = r.string()?;
+        let query_type: Option<WidgetQueryType> = Some(WidgetQueryType::read(r)?);
+        let data: Vec<u8> = r.bytes()?;
+        let widget_id: i64 = r.i64()?;
+        let wallet_card: Option<TonWalletCard> = Some(TonWalletCard::read_bare(r)?);
+        Result::Ok(Self { id, sender_user_id, chat_id, message_id, chat_instance, chat_type, query_type, data, widget_id, wallet_card })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"updateNewWidgetQuery\"");
+        out.push_str(",\"id\":");
+        tl_json::num64q(out, self.id);
+        out.push_str(",\"sender_user_id\":");
+        tl_json::num64(out, self.sender_user_id);
+        out.push_str(",\"chat_id\":");
+        tl_json::num64(out, self.chat_id);
+        out.push_str(",\"message_id\":");
+        tl_json::num64(out, self.message_id);
+        out.push_str(",\"chat_instance\":");
+        tl_json::num64q(out, self.chat_instance);
+        out.push_str(",\"chat_type\":");
+        tl_json::str(out, &self.chat_type);
+        if let Some(__o0) = &self.query_type {
+            out.push_str(",\"query_type\":");
+            __o0.to_json_into(out);
+        }
+        out.push_str(",\"data\":");
+        tl_json::bytes(out, &self.data);
+        out.push_str(",\"widget_id\":");
+        tl_json::num64q(out, self.widget_id);
+        if let Some(__o1) = &self.wallet_card {
+            out.push_str(",\"wallet_card\":");
+            __o1.to_json_into(out);
+        }
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "id") {
+            value.id = tl_json::read_i64(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "sender_user_id") {
+            value.sender_user_id = tl_json::read_i64(__j2)?;
+        }
+        if let Some(__j4) = tl_json::field(o, "chat_id") {
+            value.chat_id = tl_json::read_i64(__j4)?;
+        }
+        if let Some(__j6) = tl_json::field(o, "message_id") {
+            value.message_id = tl_json::read_i64(__j6)?;
+        }
+        if let Some(__j8) = tl_json::field(o, "chat_instance") {
+            value.chat_instance = tl_json::read_i64(__j8)?;
+        }
+        if let Some(__j10) = tl_json::field(o, "chat_type") {
+            value.chat_type = tl_json::read_string(__j10)?;
+        }
+        if let Some(__j12) = tl_json::field(o, "query_type") && !matches!(__j12, tl_json::Json::Null) {
+            value.query_type = Some(WidgetQueryType::from_json_value(__j12)?);
+        }
+        if let Some(__j14) = tl_json::field(o, "data") {
+            value.data = tl_json::read_bytes(__j14)?;
+        }
+        if let Some(__j16) = tl_json::field(o, "widget_id") {
+            value.widget_id = tl_json::read_i64(__j16)?;
+        }
+        if let Some(__j18) = tl_json::field(o, "wallet_card") && !matches!(__j18, tl_json::Json::Null) {
+            value.wallet_card = Some(TonWalletCard::from_json_value(__j18)?);
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "updateNewWidgetQuery");
+        s.store_field_int("id", self.id);
+        s.store_field_int("sender_user_id", self.sender_user_id);
+        s.store_field_int("chat_id", self.chat_id);
+        s.store_field_int("message_id", self.message_id);
+        s.store_field_int("chat_instance", self.chat_instance);
+        s.store_field_str("chat_type", &self.chat_type);
+        match &self.query_type {
+            Some(__m0) => __m0.store_debug(s, "query_type"),
+            None => s.store_null("query_type"),
+        }
+        s.store_bytes_field("data", &self.data);
+        s.store_field_int("widget_id", self.widget_id);
+        match &self.wallet_card {
+            Some(__m1) => __m1.store_debug(s, "wallet_card"),
+            None => s.store_null("wallet_card"),
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "updateNewInlineWidgetQuery")]
+pub struct updateNewInlineWidgetQuery {
+    pub id: i64,
+    pub sender_user_id: i64,
+    pub inline_message_id: String,
+    pub chat_instance: i64,
+    pub chat_type: String,
+    pub query_type: Option<WidgetQueryType>,
+    pub data: Vec<u8>,
+    pub widget_id: i64,
+    pub wallet_card: Option<TonWalletCard>,
+}
+
+impl updateNewInlineWidgetQuery {
+    pub const ID: i32 = -843836421;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i64(out, self.id);
+        tl::__i64(out, self.sender_user_id);
+        tl::__string(out, &self.inline_message_id);
+        tl::__i64(out, self.chat_instance);
+        tl::__string(out, &self.chat_type);
+        let __d0 = Default::default();
+        let __m0 = self.query_type.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+        tl::__string(out, &self.data);
+        tl::__i64(out, self.widget_id);
+        let __d1 = Default::default();
+        let __m1 = self.wallet_card.as_ref().unwrap_or(&__d1);
+        __m1.store(out);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let id: i64 = r.i64()?;
+        let sender_user_id: i64 = r.i64()?;
+        let inline_message_id: String = r.string()?;
+        let chat_instance: i64 = r.i64()?;
+        let chat_type: String = r.string()?;
+        let query_type: Option<WidgetQueryType> = Some(WidgetQueryType::read(r)?);
+        let data: Vec<u8> = r.bytes()?;
+        let widget_id: i64 = r.i64()?;
+        let wallet_card: Option<TonWalletCard> = Some(TonWalletCard::read_bare(r)?);
+        Result::Ok(Self { id, sender_user_id, inline_message_id, chat_instance, chat_type, query_type, data, widget_id, wallet_card })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"updateNewInlineWidgetQuery\"");
+        out.push_str(",\"id\":");
+        tl_json::num64q(out, self.id);
+        out.push_str(",\"sender_user_id\":");
+        tl_json::num64(out, self.sender_user_id);
+        out.push_str(",\"inline_message_id\":");
+        tl_json::str(out, &self.inline_message_id);
+        out.push_str(",\"chat_instance\":");
+        tl_json::num64q(out, self.chat_instance);
+        out.push_str(",\"chat_type\":");
+        tl_json::str(out, &self.chat_type);
+        if let Some(__o0) = &self.query_type {
+            out.push_str(",\"query_type\":");
+            __o0.to_json_into(out);
+        }
+        out.push_str(",\"data\":");
+        tl_json::bytes(out, &self.data);
+        out.push_str(",\"widget_id\":");
+        tl_json::num64q(out, self.widget_id);
+        if let Some(__o1) = &self.wallet_card {
+            out.push_str(",\"wallet_card\":");
+            __o1.to_json_into(out);
+        }
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "id") {
+            value.id = tl_json::read_i64(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "sender_user_id") {
+            value.sender_user_id = tl_json::read_i64(__j2)?;
+        }
+        if let Some(__j4) = tl_json::field(o, "inline_message_id") {
+            value.inline_message_id = tl_json::read_string(__j4)?;
+        }
+        if let Some(__j6) = tl_json::field(o, "chat_instance") {
+            value.chat_instance = tl_json::read_i64(__j6)?;
+        }
+        if let Some(__j8) = tl_json::field(o, "chat_type") {
+            value.chat_type = tl_json::read_string(__j8)?;
+        }
+        if let Some(__j10) = tl_json::field(o, "query_type") && !matches!(__j10, tl_json::Json::Null) {
+            value.query_type = Some(WidgetQueryType::from_json_value(__j10)?);
+        }
+        if let Some(__j12) = tl_json::field(o, "data") {
+            value.data = tl_json::read_bytes(__j12)?;
+        }
+        if let Some(__j14) = tl_json::field(o, "widget_id") {
+            value.widget_id = tl_json::read_i64(__j14)?;
+        }
+        if let Some(__j16) = tl_json::field(o, "wallet_card") && !matches!(__j16, tl_json::Json::Null) {
+            value.wallet_card = Some(TonWalletCard::from_json_value(__j16)?);
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "updateNewInlineWidgetQuery");
+        s.store_field_int("id", self.id);
+        s.store_field_int("sender_user_id", self.sender_user_id);
+        s.store_field_str("inline_message_id", &self.inline_message_id);
+        s.store_field_int("chat_instance", self.chat_instance);
+        s.store_field_str("chat_type", &self.chat_type);
+        match &self.query_type {
+            Some(__m0) => __m0.store_debug(s, "query_type"),
+            None => s.store_null("query_type"),
+        }
+        s.store_bytes_field("data", &self.data);
+        s.store_field_int("widget_id", self.widget_id);
+        match &self.wallet_card {
+            Some(__m1) => __m1.store_debug(s, "wallet_card"),
+            None => s.store_null("wallet_card"),
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "updateNewWidgetCopyQuery")]
+pub struct updateNewWidgetCopyQuery {
+    pub id: i64,
+    pub sender_user_id: i64,
+    pub query_type: Option<WidgetQueryType>,
+    pub data: Vec<u8>,
+    pub widget_id: i64,
+    pub wallet_card: Option<TonWalletCard>,
+}
+
+impl updateNewWidgetCopyQuery {
+    pub const ID: i32 = 755000376;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i64(out, self.id);
+        tl::__i64(out, self.sender_user_id);
+        let __d0 = Default::default();
+        let __m0 = self.query_type.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+        tl::__string(out, &self.data);
+        tl::__i64(out, self.widget_id);
+        let __d1 = Default::default();
+        let __m1 = self.wallet_card.as_ref().unwrap_or(&__d1);
+        __m1.store(out);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let id: i64 = r.i64()?;
+        let sender_user_id: i64 = r.i64()?;
+        let query_type: Option<WidgetQueryType> = Some(WidgetQueryType::read(r)?);
+        let data: Vec<u8> = r.bytes()?;
+        let widget_id: i64 = r.i64()?;
+        let wallet_card: Option<TonWalletCard> = Some(TonWalletCard::read_bare(r)?);
+        Result::Ok(Self { id, sender_user_id, query_type, data, widget_id, wallet_card })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"updateNewWidgetCopyQuery\"");
+        out.push_str(",\"id\":");
+        tl_json::num64q(out, self.id);
+        out.push_str(",\"sender_user_id\":");
+        tl_json::num64(out, self.sender_user_id);
+        if let Some(__o0) = &self.query_type {
+            out.push_str(",\"query_type\":");
+            __o0.to_json_into(out);
+        }
+        out.push_str(",\"data\":");
+        tl_json::bytes(out, &self.data);
+        out.push_str(",\"widget_id\":");
+        tl_json::num64q(out, self.widget_id);
+        if let Some(__o1) = &self.wallet_card {
+            out.push_str(",\"wallet_card\":");
+            __o1.to_json_into(out);
+        }
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "id") {
+            value.id = tl_json::read_i64(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "sender_user_id") {
+            value.sender_user_id = tl_json::read_i64(__j2)?;
+        }
+        if let Some(__j4) = tl_json::field(o, "query_type") && !matches!(__j4, tl_json::Json::Null) {
+            value.query_type = Some(WidgetQueryType::from_json_value(__j4)?);
+        }
+        if let Some(__j6) = tl_json::field(o, "data") {
+            value.data = tl_json::read_bytes(__j6)?;
+        }
+        if let Some(__j8) = tl_json::field(o, "widget_id") {
+            value.widget_id = tl_json::read_i64(__j8)?;
+        }
+        if let Some(__j10) = tl_json::field(o, "wallet_card") && !matches!(__j10, tl_json::Json::Null) {
+            value.wallet_card = Some(TonWalletCard::from_json_value(__j10)?);
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "updateNewWidgetCopyQuery");
+        s.store_field_int("id", self.id);
+        s.store_field_int("sender_user_id", self.sender_user_id);
+        match &self.query_type {
+            Some(__m0) => __m0.store_debug(s, "query_type"),
+            None => s.store_null("query_type"),
+        }
+        s.store_bytes_field("data", &self.data);
+        s.store_field_int("widget_id", self.widget_id);
+        match &self.wallet_card {
+            Some(__m1) => __m1.store_debug(s, "wallet_card"),
+            None => s.store_null("wallet_card"),
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "updateNewShippingQuery")]
 pub struct updateNewShippingQuery {
     pub id: i64,
@@ -278475,6 +283077,12 @@ pub enum Update {
     updateLanguagePackStrings(updateLanguagePackStrings),
     #[serde(rename = "updateConnectionState")]
     updateConnectionState(updateConnectionState),
+    #[serde(rename = "updateWebProxyCarrierOpened")]
+    updateWebProxyCarrierOpened(updateWebProxyCarrierOpened),
+    #[serde(rename = "updateWebProxyCarrierData")]
+    updateWebProxyCarrierData(updateWebProxyCarrierData),
+    #[serde(rename = "updateWebProxyCarrierClosed")]
+    updateWebProxyCarrierClosed(updateWebProxyCarrierClosed),
     #[serde(rename = "updateFreezeState")]
     updateFreezeState(updateFreezeState),
     #[serde(rename = "updateAgeVerificationParameters")]
@@ -278519,6 +283127,8 @@ pub enum Update {
     updateGramRevenueStatus(updateGramRevenueStatus),
     #[serde(rename = "updateSpeechRecognitionTrial")]
     updateSpeechRecognitionTrial(updateSpeechRecognitionTrial),
+    #[serde(rename = "updateSpeechRecognitionInFile")]
+    updateSpeechRecognitionInFile(updateSpeechRecognitionInFile),
     #[serde(rename = "updateGroupCallMessageLevels")]
     updateGroupCallMessageLevels(updateGroupCallMessageLevels),
     #[serde(rename = "updateDiceEmojis")]
@@ -278559,6 +283169,12 @@ pub enum Update {
     updateNewInlineCallbackQuery(updateNewInlineCallbackQuery),
     #[serde(rename = "updateNewBusinessCallbackQuery")]
     updateNewBusinessCallbackQuery(updateNewBusinessCallbackQuery),
+    #[serde(rename = "updateNewWidgetQuery")]
+    updateNewWidgetQuery(updateNewWidgetQuery),
+    #[serde(rename = "updateNewInlineWidgetQuery")]
+    updateNewInlineWidgetQuery(updateNewInlineWidgetQuery),
+    #[serde(rename = "updateNewWidgetCopyQuery")]
+    updateNewWidgetCopyQuery(updateNewWidgetCopyQuery),
     #[serde(rename = "updateNewShippingQuery")]
     updateNewShippingQuery(updateNewShippingQuery),
     #[serde(rename = "updateNewPreCheckoutQuery")]
@@ -278730,6 +283346,9 @@ impl Update {
             Self::updateWebBrowserSettings(v) => v.store_boxed(out),
             Self::updateLanguagePackStrings(v) => v.store_boxed(out),
             Self::updateConnectionState(v) => v.store_boxed(out),
+            Self::updateWebProxyCarrierOpened(v) => v.store_boxed(out),
+            Self::updateWebProxyCarrierData(v) => v.store_boxed(out),
+            Self::updateWebProxyCarrierClosed(v) => v.store_boxed(out),
             Self::updateFreezeState(v) => v.store_boxed(out),
             Self::updateAgeVerificationParameters(v) => v.store_boxed(out),
             Self::updateTermsOfService(v) => v.store_boxed(out),
@@ -278752,6 +283371,7 @@ impl Update {
             Self::updateStarRevenueStatus(v) => v.store_boxed(out),
             Self::updateGramRevenueStatus(v) => v.store_boxed(out),
             Self::updateSpeechRecognitionTrial(v) => v.store_boxed(out),
+            Self::updateSpeechRecognitionInFile(v) => v.store_boxed(out),
             Self::updateGroupCallMessageLevels(v) => v.store_boxed(out),
             Self::updateDiceEmojis(v) => v.store_boxed(out),
             Self::updateStakeDiceState(v) => v.store_boxed(out),
@@ -278772,6 +283392,9 @@ impl Update {
             Self::updateNewCallbackQuery(v) => v.store_boxed(out),
             Self::updateNewInlineCallbackQuery(v) => v.store_boxed(out),
             Self::updateNewBusinessCallbackQuery(v) => v.store_boxed(out),
+            Self::updateNewWidgetQuery(v) => v.store_boxed(out),
+            Self::updateNewInlineWidgetQuery(v) => v.store_boxed(out),
+            Self::updateNewWidgetCopyQuery(v) => v.store_boxed(out),
             Self::updateNewShippingQuery(v) => v.store_boxed(out),
             Self::updateNewPreCheckoutQuery(v) => v.store_boxed(out),
             Self::updateNewCustomEvent(v) => v.store_boxed(out),
@@ -278934,6 +283557,9 @@ impl Update {
             self::updateWebBrowserSettings::ID => Result::Ok(Self::updateWebBrowserSettings(self::updateWebBrowserSettings::read_bare(r)?)),
             self::updateLanguagePackStrings::ID => Result::Ok(Self::updateLanguagePackStrings(self::updateLanguagePackStrings::read_bare(r)?)),
             self::updateConnectionState::ID => Result::Ok(Self::updateConnectionState(self::updateConnectionState::read_bare(r)?)),
+            self::updateWebProxyCarrierOpened::ID => Result::Ok(Self::updateWebProxyCarrierOpened(self::updateWebProxyCarrierOpened::read_bare(r)?)),
+            self::updateWebProxyCarrierData::ID => Result::Ok(Self::updateWebProxyCarrierData(self::updateWebProxyCarrierData::read_bare(r)?)),
+            self::updateWebProxyCarrierClosed::ID => Result::Ok(Self::updateWebProxyCarrierClosed(self::updateWebProxyCarrierClosed::read_bare(r)?)),
             self::updateFreezeState::ID => Result::Ok(Self::updateFreezeState(self::updateFreezeState::read_bare(r)?)),
             self::updateAgeVerificationParameters::ID => Result::Ok(Self::updateAgeVerificationParameters(self::updateAgeVerificationParameters::read_bare(r)?)),
             self::updateTermsOfService::ID => Result::Ok(Self::updateTermsOfService(self::updateTermsOfService::read_bare(r)?)),
@@ -278956,6 +283582,7 @@ impl Update {
             self::updateStarRevenueStatus::ID => Result::Ok(Self::updateStarRevenueStatus(self::updateStarRevenueStatus::read_bare(r)?)),
             self::updateGramRevenueStatus::ID => Result::Ok(Self::updateGramRevenueStatus(self::updateGramRevenueStatus::read_bare(r)?)),
             self::updateSpeechRecognitionTrial::ID => Result::Ok(Self::updateSpeechRecognitionTrial(self::updateSpeechRecognitionTrial::read_bare(r)?)),
+            self::updateSpeechRecognitionInFile::ID => Result::Ok(Self::updateSpeechRecognitionInFile(self::updateSpeechRecognitionInFile::read_bare(r)?)),
             self::updateGroupCallMessageLevels::ID => Result::Ok(Self::updateGroupCallMessageLevels(self::updateGroupCallMessageLevels::read_bare(r)?)),
             self::updateDiceEmojis::ID => Result::Ok(Self::updateDiceEmojis(self::updateDiceEmojis::read_bare(r)?)),
             self::updateStakeDiceState::ID => Result::Ok(Self::updateStakeDiceState(self::updateStakeDiceState::read_bare(r)?)),
@@ -278976,6 +283603,9 @@ impl Update {
             self::updateNewCallbackQuery::ID => Result::Ok(Self::updateNewCallbackQuery(self::updateNewCallbackQuery::read_bare(r)?)),
             self::updateNewInlineCallbackQuery::ID => Result::Ok(Self::updateNewInlineCallbackQuery(self::updateNewInlineCallbackQuery::read_bare(r)?)),
             self::updateNewBusinessCallbackQuery::ID => Result::Ok(Self::updateNewBusinessCallbackQuery(self::updateNewBusinessCallbackQuery::read_bare(r)?)),
+            self::updateNewWidgetQuery::ID => Result::Ok(Self::updateNewWidgetQuery(self::updateNewWidgetQuery::read_bare(r)?)),
+            self::updateNewInlineWidgetQuery::ID => Result::Ok(Self::updateNewInlineWidgetQuery(self::updateNewInlineWidgetQuery::read_bare(r)?)),
+            self::updateNewWidgetCopyQuery::ID => Result::Ok(Self::updateNewWidgetCopyQuery(self::updateNewWidgetCopyQuery::read_bare(r)?)),
             self::updateNewShippingQuery::ID => Result::Ok(Self::updateNewShippingQuery(self::updateNewShippingQuery::read_bare(r)?)),
             self::updateNewPreCheckoutQuery::ID => Result::Ok(Self::updateNewPreCheckoutQuery(self::updateNewPreCheckoutQuery::read_bare(r)?)),
             self::updateNewCustomEvent::ID => Result::Ok(Self::updateNewCustomEvent(self::updateNewCustomEvent::read_bare(r)?)),
@@ -279140,6 +283770,9 @@ impl Update {
             Self::updateWebBrowserSettings(v) => v.to_json_into(out),
             Self::updateLanguagePackStrings(v) => v.to_json_into(out),
             Self::updateConnectionState(v) => v.to_json_into(out),
+            Self::updateWebProxyCarrierOpened(v) => v.to_json_into(out),
+            Self::updateWebProxyCarrierData(v) => v.to_json_into(out),
+            Self::updateWebProxyCarrierClosed(v) => v.to_json_into(out),
             Self::updateFreezeState(v) => v.to_json_into(out),
             Self::updateAgeVerificationParameters(v) => v.to_json_into(out),
             Self::updateTermsOfService(v) => v.to_json_into(out),
@@ -279162,6 +283795,7 @@ impl Update {
             Self::updateStarRevenueStatus(v) => v.to_json_into(out),
             Self::updateGramRevenueStatus(v) => v.to_json_into(out),
             Self::updateSpeechRecognitionTrial(v) => v.to_json_into(out),
+            Self::updateSpeechRecognitionInFile(v) => v.to_json_into(out),
             Self::updateGroupCallMessageLevels(v) => v.to_json_into(out),
             Self::updateDiceEmojis(v) => v.to_json_into(out),
             Self::updateStakeDiceState(v) => v.to_json_into(out),
@@ -279182,6 +283816,9 @@ impl Update {
             Self::updateNewCallbackQuery(v) => v.to_json_into(out),
             Self::updateNewInlineCallbackQuery(v) => v.to_json_into(out),
             Self::updateNewBusinessCallbackQuery(v) => v.to_json_into(out),
+            Self::updateNewWidgetQuery(v) => v.to_json_into(out),
+            Self::updateNewInlineWidgetQuery(v) => v.to_json_into(out),
+            Self::updateNewWidgetCopyQuery(v) => v.to_json_into(out),
             Self::updateNewShippingQuery(v) => v.to_json_into(out),
             Self::updateNewPreCheckoutQuery(v) => v.to_json_into(out),
             Self::updateNewCustomEvent(v) => v.to_json_into(out),
@@ -279618,6 +284255,15 @@ impl Update {
     fn __json_new_updateConnectionState(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::updateConnectionState(self::updateConnectionState::from_json_object(o)?))
     }
+    fn __json_new_updateWebProxyCarrierOpened(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::updateWebProxyCarrierOpened(self::updateWebProxyCarrierOpened::from_json_object(o)?))
+    }
+    fn __json_new_updateWebProxyCarrierData(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::updateWebProxyCarrierData(self::updateWebProxyCarrierData::from_json_object(o)?))
+    }
+    fn __json_new_updateWebProxyCarrierClosed(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::updateWebProxyCarrierClosed(self::updateWebProxyCarrierClosed::from_json_object(o)?))
+    }
     fn __json_new_updateFreezeState(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::updateFreezeState(self::updateFreezeState::from_json_object(o)?))
     }
@@ -279684,6 +284330,9 @@ impl Update {
     fn __json_new_updateSpeechRecognitionTrial(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::updateSpeechRecognitionTrial(self::updateSpeechRecognitionTrial::from_json_object(o)?))
     }
+    fn __json_new_updateSpeechRecognitionInFile(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::updateSpeechRecognitionInFile(self::updateSpeechRecognitionInFile::from_json_object(o)?))
+    }
     fn __json_new_updateGroupCallMessageLevels(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::updateGroupCallMessageLevels(self::updateGroupCallMessageLevels::from_json_object(o)?))
     }
@@ -279743,6 +284392,15 @@ impl Update {
     }
     fn __json_new_updateNewBusinessCallbackQuery(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::updateNewBusinessCallbackQuery(self::updateNewBusinessCallbackQuery::from_json_object(o)?))
+    }
+    fn __json_new_updateNewWidgetQuery(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::updateNewWidgetQuery(self::updateNewWidgetQuery::from_json_object(o)?))
+    }
+    fn __json_new_updateNewInlineWidgetQuery(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::updateNewInlineWidgetQuery(self::updateNewInlineWidgetQuery::from_json_object(o)?))
+    }
+    fn __json_new_updateNewWidgetCopyQuery(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::updateNewWidgetCopyQuery(self::updateNewWidgetCopyQuery::from_json_object(o)?))
     }
     fn __json_new_updateNewShippingQuery(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::updateNewShippingQuery(self::updateNewShippingQuery::from_json_object(o)?))
@@ -279939,6 +284597,9 @@ impl Update {
                 "updateWebBrowserSettings" => Self::__json_new_updateWebBrowserSettings(o),
                 "updateLanguagePackStrings" => Self::__json_new_updateLanguagePackStrings(o),
                 "updateConnectionState" => Self::__json_new_updateConnectionState(o),
+                "updateWebProxyCarrierOpened" => Self::__json_new_updateWebProxyCarrierOpened(o),
+                "updateWebProxyCarrierData" => Self::__json_new_updateWebProxyCarrierData(o),
+                "updateWebProxyCarrierClosed" => Self::__json_new_updateWebProxyCarrierClosed(o),
                 "updateFreezeState" => Self::__json_new_updateFreezeState(o),
                 "updateAgeVerificationParameters" => Self::__json_new_updateAgeVerificationParameters(o),
                 "updateTermsOfService" => Self::__json_new_updateTermsOfService(o),
@@ -279961,6 +284622,7 @@ impl Update {
                 "updateStarRevenueStatus" => Self::__json_new_updateStarRevenueStatus(o),
                 "updateGramRevenueStatus" => Self::__json_new_updateGramRevenueStatus(o),
                 "updateSpeechRecognitionTrial" => Self::__json_new_updateSpeechRecognitionTrial(o),
+                "updateSpeechRecognitionInFile" => Self::__json_new_updateSpeechRecognitionInFile(o),
                 "updateGroupCallMessageLevels" => Self::__json_new_updateGroupCallMessageLevels(o),
                 "updateDiceEmojis" => Self::__json_new_updateDiceEmojis(o),
                 "updateStakeDiceState" => Self::__json_new_updateStakeDiceState(o),
@@ -279981,6 +284643,9 @@ impl Update {
                 "updateNewCallbackQuery" => Self::__json_new_updateNewCallbackQuery(o),
                 "updateNewInlineCallbackQuery" => Self::__json_new_updateNewInlineCallbackQuery(o),
                 "updateNewBusinessCallbackQuery" => Self::__json_new_updateNewBusinessCallbackQuery(o),
+                "updateNewWidgetQuery" => Self::__json_new_updateNewWidgetQuery(o),
+                "updateNewInlineWidgetQuery" => Self::__json_new_updateNewInlineWidgetQuery(o),
+                "updateNewWidgetCopyQuery" => Self::__json_new_updateNewWidgetCopyQuery(o),
                 "updateNewShippingQuery" => Self::__json_new_updateNewShippingQuery(o),
                 "updateNewPreCheckoutQuery" => Self::__json_new_updateNewPreCheckoutQuery(o),
                 "updateNewCustomEvent" => Self::__json_new_updateNewCustomEvent(o),
@@ -280136,6 +284801,9 @@ impl Update {
                 self::updateWebBrowserSettings::ID => Self::__json_new_updateWebBrowserSettings(o),
                 self::updateLanguagePackStrings::ID => Self::__json_new_updateLanguagePackStrings(o),
                 self::updateConnectionState::ID => Self::__json_new_updateConnectionState(o),
+                self::updateWebProxyCarrierOpened::ID => Self::__json_new_updateWebProxyCarrierOpened(o),
+                self::updateWebProxyCarrierData::ID => Self::__json_new_updateWebProxyCarrierData(o),
+                self::updateWebProxyCarrierClosed::ID => Self::__json_new_updateWebProxyCarrierClosed(o),
                 self::updateFreezeState::ID => Self::__json_new_updateFreezeState(o),
                 self::updateAgeVerificationParameters::ID => Self::__json_new_updateAgeVerificationParameters(o),
                 self::updateTermsOfService::ID => Self::__json_new_updateTermsOfService(o),
@@ -280158,6 +284826,7 @@ impl Update {
                 self::updateStarRevenueStatus::ID => Self::__json_new_updateStarRevenueStatus(o),
                 self::updateGramRevenueStatus::ID => Self::__json_new_updateGramRevenueStatus(o),
                 self::updateSpeechRecognitionTrial::ID => Self::__json_new_updateSpeechRecognitionTrial(o),
+                self::updateSpeechRecognitionInFile::ID => Self::__json_new_updateSpeechRecognitionInFile(o),
                 self::updateGroupCallMessageLevels::ID => Self::__json_new_updateGroupCallMessageLevels(o),
                 self::updateDiceEmojis::ID => Self::__json_new_updateDiceEmojis(o),
                 self::updateStakeDiceState::ID => Self::__json_new_updateStakeDiceState(o),
@@ -280178,6 +284847,9 @@ impl Update {
                 self::updateNewCallbackQuery::ID => Self::__json_new_updateNewCallbackQuery(o),
                 self::updateNewInlineCallbackQuery::ID => Self::__json_new_updateNewInlineCallbackQuery(o),
                 self::updateNewBusinessCallbackQuery::ID => Self::__json_new_updateNewBusinessCallbackQuery(o),
+                self::updateNewWidgetQuery::ID => Self::__json_new_updateNewWidgetQuery(o),
+                self::updateNewInlineWidgetQuery::ID => Self::__json_new_updateNewInlineWidgetQuery(o),
+                self::updateNewWidgetCopyQuery::ID => Self::__json_new_updateNewWidgetCopyQuery(o),
                 self::updateNewShippingQuery::ID => Self::__json_new_updateNewShippingQuery(o),
                 self::updateNewPreCheckoutQuery::ID => Self::__json_new_updateNewPreCheckoutQuery(o),
                 self::updateNewCustomEvent::ID => Self::__json_new_updateNewCustomEvent(o),
@@ -280338,6 +285010,9 @@ impl Update {
             Self::updateWebBrowserSettings(v) => v.store_debug(s, field_name),
             Self::updateLanguagePackStrings(v) => v.store_debug(s, field_name),
             Self::updateConnectionState(v) => v.store_debug(s, field_name),
+            Self::updateWebProxyCarrierOpened(v) => v.store_debug(s, field_name),
+            Self::updateWebProxyCarrierData(v) => v.store_debug(s, field_name),
+            Self::updateWebProxyCarrierClosed(v) => v.store_debug(s, field_name),
             Self::updateFreezeState(v) => v.store_debug(s, field_name),
             Self::updateAgeVerificationParameters(v) => v.store_debug(s, field_name),
             Self::updateTermsOfService(v) => v.store_debug(s, field_name),
@@ -280360,6 +285035,7 @@ impl Update {
             Self::updateStarRevenueStatus(v) => v.store_debug(s, field_name),
             Self::updateGramRevenueStatus(v) => v.store_debug(s, field_name),
             Self::updateSpeechRecognitionTrial(v) => v.store_debug(s, field_name),
+            Self::updateSpeechRecognitionInFile(v) => v.store_debug(s, field_name),
             Self::updateGroupCallMessageLevels(v) => v.store_debug(s, field_name),
             Self::updateDiceEmojis(v) => v.store_debug(s, field_name),
             Self::updateStakeDiceState(v) => v.store_debug(s, field_name),
@@ -280380,6 +285056,9 @@ impl Update {
             Self::updateNewCallbackQuery(v) => v.store_debug(s, field_name),
             Self::updateNewInlineCallbackQuery(v) => v.store_debug(s, field_name),
             Self::updateNewBusinessCallbackQuery(v) => v.store_debug(s, field_name),
+            Self::updateNewWidgetQuery(v) => v.store_debug(s, field_name),
+            Self::updateNewInlineWidgetQuery(v) => v.store_debug(s, field_name),
+            Self::updateNewWidgetCopyQuery(v) => v.store_debug(s, field_name),
             Self::updateNewShippingQuery(v) => v.store_debug(s, field_name),
             Self::updateNewPreCheckoutQuery(v) => v.store_debug(s, field_name),
             Self::updateNewCustomEvent(v) => v.store_debug(s, field_name),
@@ -280553,6 +285232,9 @@ impl From<Update> for Object {
             Update::updateWebBrowserSettings(v) => Object::updateWebBrowserSettings(v),
             Update::updateLanguagePackStrings(v) => Object::updateLanguagePackStrings(v),
             Update::updateConnectionState(v) => Object::updateConnectionState(v),
+            Update::updateWebProxyCarrierOpened(v) => Object::updateWebProxyCarrierOpened(v),
+            Update::updateWebProxyCarrierData(v) => Object::updateWebProxyCarrierData(v),
+            Update::updateWebProxyCarrierClosed(v) => Object::updateWebProxyCarrierClosed(v),
             Update::updateFreezeState(v) => Object::updateFreezeState(v),
             Update::updateAgeVerificationParameters(v) => Object::updateAgeVerificationParameters(v),
             Update::updateTermsOfService(v) => Object::updateTermsOfService(v),
@@ -280575,6 +285257,7 @@ impl From<Update> for Object {
             Update::updateStarRevenueStatus(v) => Object::updateStarRevenueStatus(v),
             Update::updateGramRevenueStatus(v) => Object::updateGramRevenueStatus(v),
             Update::updateSpeechRecognitionTrial(v) => Object::updateSpeechRecognitionTrial(v),
+            Update::updateSpeechRecognitionInFile(v) => Object::updateSpeechRecognitionInFile(v),
             Update::updateGroupCallMessageLevels(v) => Object::updateGroupCallMessageLevels(v),
             Update::updateDiceEmojis(v) => Object::updateDiceEmojis(v),
             Update::updateStakeDiceState(v) => Object::updateStakeDiceState(v),
@@ -280595,6 +285278,9 @@ impl From<Update> for Object {
             Update::updateNewCallbackQuery(v) => Object::updateNewCallbackQuery(v),
             Update::updateNewInlineCallbackQuery(v) => Object::updateNewInlineCallbackQuery(v),
             Update::updateNewBusinessCallbackQuery(v) => Object::updateNewBusinessCallbackQuery(v),
+            Update::updateNewWidgetQuery(v) => Object::updateNewWidgetQuery(v),
+            Update::updateNewInlineWidgetQuery(v) => Object::updateNewInlineWidgetQuery(v),
+            Update::updateNewWidgetCopyQuery(v) => Object::updateNewWidgetCopyQuery(v),
             Update::updateNewShippingQuery(v) => Object::updateNewShippingQuery(v),
             Update::updateNewPreCheckoutQuery(v) => Object::updateNewPreCheckoutQuery(v),
             Update::updateNewCustomEvent(v) => Object::updateNewCustomEvent(v),
@@ -280926,6 +285612,7 @@ pub struct UpgradedGift {
     pub owner_address: String,
     pub owner_name: String,
     pub gift_address: String,
+    pub can_be_ton_wallet_card_background: bool,
     pub model: Option<UpgradedGiftModel>,
     pub symbol: Option<UpgradedGiftSymbol>,
     pub backdrop: Option<UpgradedGiftBackdrop>,
@@ -280940,7 +285627,7 @@ pub struct UpgradedGift {
 }
 
 impl UpgradedGift {
-    pub const ID: i32 = 239775652;
+    pub const ID: i32 = 477673897;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -280970,6 +285657,7 @@ impl UpgradedGift {
         tl::__string(out, &self.owner_address);
         tl::__string(out, &self.owner_name);
         tl::__string(out, &self.gift_address);
+        tl::__bool(out, self.can_be_ton_wallet_card_background);
         let __d2 = Default::default();
         let __m2 = self.model.as_ref().unwrap_or(&__d2);
         __m2.store(out);
@@ -281031,6 +285719,7 @@ impl UpgradedGift {
         let owner_address: String = r.string()?;
         let owner_name: String = r.string()?;
         let gift_address: String = r.string()?;
+        let can_be_ton_wallet_card_background: bool = r.bool()?;
         let model: Option<UpgradedGiftModel> = Some(UpgradedGiftModel::read_bare(r)?);
         let symbol: Option<UpgradedGiftSymbol> = Some(UpgradedGiftSymbol::read_bare(r)?);
         let backdrop: Option<UpgradedGiftBackdrop> = Some(UpgradedGiftBackdrop::read_bare(r)?);
@@ -281042,7 +285731,7 @@ impl UpgradedGift {
         let value_currency: String = r.string()?;
         let value_amount: i64 = r.i64()?;
         let value_usd_amount: i64 = r.i64()?;
-        Result::Ok(Self { id, regular_gift_id, publisher_chat_id, title, name, number, total_upgraded_count, max_upgraded_count, is_burned, is_crafted, is_premium, is_theme_available, used_theme_chat_id, host_id, owner_id, owner_address, owner_name, gift_address, model, symbol, backdrop, original_details, colors, resale_parameters, can_send_purchase_offer, craft_probability_per_mille, value_currency, value_amount, value_usd_amount })
+        Result::Ok(Self { id, regular_gift_id, publisher_chat_id, title, name, number, total_upgraded_count, max_upgraded_count, is_burned, is_crafted, is_premium, is_theme_available, used_theme_chat_id, host_id, owner_id, owner_address, owner_name, gift_address, can_be_ton_wallet_card_background, model, symbol, backdrop, original_details, colors, resale_parameters, can_send_purchase_offer, craft_probability_per_mille, value_currency, value_amount, value_usd_amount })
     }
 
     pub fn to_json(&self) -> String {
@@ -281093,6 +285782,8 @@ impl UpgradedGift {
         tl_json::str(out, &self.owner_name);
         out.push_str(",\"gift_address\":");
         tl_json::str(out, &self.gift_address);
+        out.push_str(",\"can_be_ton_wallet_card_background\":");
+        tl_json::boolean(out, self.can_be_ton_wallet_card_background);
         if let Some(__o2) = &self.model {
             out.push_str(",\"model\":");
             __o2.to_json_into(out);
@@ -281201,38 +285892,41 @@ impl UpgradedGift {
         if let Some(__j34) = tl_json::field(o, "gift_address") {
             value.gift_address = tl_json::read_string(__j34)?;
         }
-        if let Some(__j36) = tl_json::field(o, "model") && !matches!(__j36, tl_json::Json::Null) {
-            value.model = Some(UpgradedGiftModel::from_json_value(__j36)?);
+        if let Some(__j36) = tl_json::field(o, "can_be_ton_wallet_card_background") {
+            value.can_be_ton_wallet_card_background = tl_json::read_bool(__j36)?;
         }
-        if let Some(__j38) = tl_json::field(o, "symbol") && !matches!(__j38, tl_json::Json::Null) {
-            value.symbol = Some(UpgradedGiftSymbol::from_json_value(__j38)?);
+        if let Some(__j38) = tl_json::field(o, "model") && !matches!(__j38, tl_json::Json::Null) {
+            value.model = Some(UpgradedGiftModel::from_json_value(__j38)?);
         }
-        if let Some(__j40) = tl_json::field(o, "backdrop") && !matches!(__j40, tl_json::Json::Null) {
-            value.backdrop = Some(UpgradedGiftBackdrop::from_json_value(__j40)?);
+        if let Some(__j40) = tl_json::field(o, "symbol") && !matches!(__j40, tl_json::Json::Null) {
+            value.symbol = Some(UpgradedGiftSymbol::from_json_value(__j40)?);
         }
-        if let Some(__j42) = tl_json::field(o, "original_details") && !matches!(__j42, tl_json::Json::Null) {
-            value.original_details = Some(UpgradedGiftOriginalDetails::from_json_value(__j42)?);
+        if let Some(__j42) = tl_json::field(o, "backdrop") && !matches!(__j42, tl_json::Json::Null) {
+            value.backdrop = Some(UpgradedGiftBackdrop::from_json_value(__j42)?);
         }
-        if let Some(__j44) = tl_json::field(o, "colors") && !matches!(__j44, tl_json::Json::Null) {
-            value.colors = Some(UpgradedGiftColors::from_json_value(__j44)?);
+        if let Some(__j44) = tl_json::field(o, "original_details") && !matches!(__j44, tl_json::Json::Null) {
+            value.original_details = Some(UpgradedGiftOriginalDetails::from_json_value(__j44)?);
         }
-        if let Some(__j46) = tl_json::field(o, "resale_parameters") && !matches!(__j46, tl_json::Json::Null) {
-            value.resale_parameters = Some(GiftResaleParameters::from_json_value(__j46)?);
+        if let Some(__j46) = tl_json::field(o, "colors") && !matches!(__j46, tl_json::Json::Null) {
+            value.colors = Some(UpgradedGiftColors::from_json_value(__j46)?);
         }
-        if let Some(__j48) = tl_json::field(o, "can_send_purchase_offer") {
-            value.can_send_purchase_offer = tl_json::read_bool(__j48)?;
+        if let Some(__j48) = tl_json::field(o, "resale_parameters") && !matches!(__j48, tl_json::Json::Null) {
+            value.resale_parameters = Some(GiftResaleParameters::from_json_value(__j48)?);
         }
-        if let Some(__j50) = tl_json::field(o, "craft_probability_per_mille") {
-            value.craft_probability_per_mille = tl_json::read_i32(__j50)?;
+        if let Some(__j50) = tl_json::field(o, "can_send_purchase_offer") {
+            value.can_send_purchase_offer = tl_json::read_bool(__j50)?;
         }
-        if let Some(__j52) = tl_json::field(o, "value_currency") {
-            value.value_currency = tl_json::read_string(__j52)?;
+        if let Some(__j52) = tl_json::field(o, "craft_probability_per_mille") {
+            value.craft_probability_per_mille = tl_json::read_i32(__j52)?;
         }
-        if let Some(__j54) = tl_json::field(o, "value_amount") {
-            value.value_amount = tl_json::read_i64(__j54)?;
+        if let Some(__j54) = tl_json::field(o, "value_currency") {
+            value.value_currency = tl_json::read_string(__j54)?;
         }
-        if let Some(__j56) = tl_json::field(o, "value_usd_amount") {
-            value.value_usd_amount = tl_json::read_i64(__j56)?;
+        if let Some(__j56) = tl_json::field(o, "value_amount") {
+            value.value_amount = tl_json::read_i64(__j56)?;
+        }
+        if let Some(__j58) = tl_json::field(o, "value_usd_amount") {
+            value.value_usd_amount = tl_json::read_i64(__j58)?;
         }
         Result::Ok(value)
     }
@@ -281265,6 +285959,7 @@ impl UpgradedGift {
         s.store_field_str("owner_address", &self.owner_address);
         s.store_field_str("owner_name", &self.owner_name);
         s.store_field_str("gift_address", &self.gift_address);
+        s.store_field_bool("can_be_ton_wallet_card_background", self.can_be_ton_wallet_card_background);
         match &self.model {
             Some(__m2) => __m2.store_debug(s, "model"),
             None => s.store_null("model"),
@@ -282652,6 +287347,126 @@ impl UpgradedGiftBackdropCount {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "upgradedGiftCollectionNames")]
+pub struct UpgradedGiftCollectionNames {
+    pub names: Vec<String>,
+}
+
+impl UpgradedGiftCollectionNames {
+    pub const ID: i32 = 1752259051;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.names.len() as i32);
+        for __v0 in &self.names {
+            tl::__string(out, &**__v0);
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let __v0: Vec<String> = {
+            let count: u32 = r.i32()? as u32;
+            if count as usize > r.remaining() {
+                return Result::Err("Wrong vector length");
+            }
+            let mut res = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                res.push(r.string()?);
+            }
+            res
+        };
+        let names: Vec<String> = __v0;
+        Result::Ok(Self { names })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"upgradedGiftCollectionNames\"");
+        out.push_str(",\"names\":");
+        out.push('[');
+        let mut __first = true;
+        for __v0 in &self.names {
+            if !__first {
+                out.push(',');
+            }
+            __first = false;
+            tl_json::str(out, __v0);
+        }
+        out.push(']');
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "names") {
+            value.names = tl_json::read_vector(__j0, tl_json::read_string)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "upgradedGiftCollectionNames");
+        s.store_vector_begin("names", self.names.len());
+        for __v0 in &self.names {
+            s.store_field_str("", __v0);
+        }
+        s.store_class_end();
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "upgradedGiftColors")]
 pub struct UpgradedGiftColors {
     pub id: i64,
@@ -282840,6 +287655,117 @@ impl UpgradedGiftColors {
             s.store_field_int("", *__v1 as i64);
         }
         s.store_class_end();
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "upgradedGiftDepositInfo")]
+pub struct UpgradedGiftDepositInfo {
+    pub nft_address: String,
+    pub payload: Vec<u8>,
+    pub gram_amount: i64,
+}
+
+impl UpgradedGiftDepositInfo {
+    pub const ID: i32 = -1303529334;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__string(out, &self.nft_address);
+        tl::__string(out, &self.payload);
+        tl::__i64(out, self.gram_amount);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let nft_address: String = r.string()?;
+        let payload: Vec<u8> = r.bytes()?;
+        let gram_amount: i64 = r.i64()?;
+        Result::Ok(Self { nft_address, payload, gram_amount })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"upgradedGiftDepositInfo\"");
+        out.push_str(",\"nft_address\":");
+        tl_json::str(out, &self.nft_address);
+        out.push_str(",\"payload\":");
+        tl_json::bytes(out, &self.payload);
+        out.push_str(",\"gram_amount\":");
+        tl_json::num64q(out, self.gram_amount);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "nft_address") {
+            value.nft_address = tl_json::read_string(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "payload") {
+            value.payload = tl_json::read_bytes(__j2)?;
+        }
+        if let Some(__j4) = tl_json::field(o, "gram_amount") {
+            value.gram_amount = tl_json::read_i64(__j4)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "upgradedGiftDepositInfo");
+        s.store_field_str("nft_address", &self.nft_address);
+        s.store_bytes_field("payload", &self.payload);
+        s.store_field_int("gram_amount", self.gram_amount);
         s.store_class_end();
     }
 
@@ -285041,12 +289967,14 @@ pub struct UserFullInfo {
     pub pending_rating: Option<UserRating>,
     pub pending_rating_date: i32,
     pub note: Option<FormattedText>,
+    pub ton_wallet_card: Option<TonWalletCard>,
+    pub share_theme: Option<ProfileShareTheme>,
     pub business_info: Option<BusinessInfo>,
     pub bot_info: Option<BotInfo>,
 }
 
 impl UserFullInfo {
-    pub const ID: i32 = -852016007;
+    pub const ID: i32 = 374312178;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -285111,11 +290039,17 @@ impl UserFullInfo {
         let __m12 = self.note.as_ref().unwrap_or(&__d12);
         __m12.store(out);
         let __d13 = Default::default();
-        let __m13 = self.business_info.as_ref().unwrap_or(&__d13);
+        let __m13 = self.ton_wallet_card.as_ref().unwrap_or(&__d13);
         __m13.store(out);
         let __d14 = Default::default();
-        let __m14 = self.bot_info.as_ref().unwrap_or(&__d14);
+        let __m14 = self.share_theme.as_ref().unwrap_or(&__d14);
         __m14.store(out);
+        let __d15 = Default::default();
+        let __m15 = self.business_info.as_ref().unwrap_or(&__d15);
+        __m15.store(out);
+        let __d16 = Default::default();
+        let __m16 = self.bot_info.as_ref().unwrap_or(&__d16);
+        __m16.store(out);
     }
 
     pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
@@ -285166,9 +290100,11 @@ impl UserFullInfo {
         let pending_rating: Option<UserRating> = Some(UserRating::read_bare(r)?);
         let pending_rating_date: i32 = r.i32()?;
         let note: Option<FormattedText> = Some(FormattedText::read_bare(r)?);
+        let ton_wallet_card: Option<TonWalletCard> = Some(TonWalletCard::read_bare(r)?);
+        let share_theme: Option<ProfileShareTheme> = Some(ProfileShareTheme::read(r)?);
         let business_info: Option<BusinessInfo> = Some(BusinessInfo::read_bare(r)?);
         let bot_info: Option<BotInfo> = Some(BotInfo::read_bare(r)?);
-        Result::Ok(Self { personal_photo, photo, public_photo, community_id, block_list, can_be_called, supports_video_calls, has_private_calls, has_private_forwards, has_restricted_voice_and_video_note_messages, has_posted_to_profile_stories, has_sponsored_messages_enabled, need_phone_number_privacy_exception, set_chat_background, uses_unofficial_app, bio, birthdate, personal_chat_id, gift_count, group_in_common_count, incoming_paid_message_star_count, outgoing_paid_message_star_count, gift_settings, bot_verification, main_profile_tab, first_profile_audio, rating, pending_rating, pending_rating_date, note, business_info, bot_info })
+        Result::Ok(Self { personal_photo, photo, public_photo, community_id, block_list, can_be_called, supports_video_calls, has_private_calls, has_private_forwards, has_restricted_voice_and_video_note_messages, has_posted_to_profile_stories, has_sponsored_messages_enabled, need_phone_number_privacy_exception, set_chat_background, uses_unofficial_app, bio, birthdate, personal_chat_id, gift_count, group_in_common_count, incoming_paid_message_star_count, outgoing_paid_message_star_count, gift_settings, bot_verification, main_profile_tab, first_profile_audio, rating, pending_rating, pending_rating_date, note, ton_wallet_card, share_theme, business_info, bot_info })
     }
 
     pub fn to_json(&self) -> String {
@@ -285265,13 +290201,21 @@ impl UserFullInfo {
             out.push_str(",\"note\":");
             __o12.to_json_into(out);
         }
-        if let Some(__o13) = &self.business_info {
-            out.push_str(",\"business_info\":");
+        if let Some(__o13) = &self.ton_wallet_card {
+            out.push_str(",\"ton_wallet_card\":");
             __o13.to_json_into(out);
         }
-        if let Some(__o14) = &self.bot_info {
-            out.push_str(",\"bot_info\":");
+        if let Some(__o14) = &self.share_theme {
+            out.push_str(",\"share_theme\":");
             __o14.to_json_into(out);
+        }
+        if let Some(__o15) = &self.business_info {
+            out.push_str(",\"business_info\":");
+            __o15.to_json_into(out);
+        }
+        if let Some(__o16) = &self.bot_info {
+            out.push_str(",\"bot_info\":");
+            __o16.to_json_into(out);
         }
         out.push('}');
     }
@@ -285383,11 +290327,17 @@ impl UserFullInfo {
         if let Some(__j58) = tl_json::field(o, "note") && !matches!(__j58, tl_json::Json::Null) {
             value.note = Some(FormattedText::from_json_value(__j58)?);
         }
-        if let Some(__j60) = tl_json::field(o, "business_info") && !matches!(__j60, tl_json::Json::Null) {
-            value.business_info = Some(BusinessInfo::from_json_value(__j60)?);
+        if let Some(__j60) = tl_json::field(o, "ton_wallet_card") && !matches!(__j60, tl_json::Json::Null) {
+            value.ton_wallet_card = Some(TonWalletCard::from_json_value(__j60)?);
         }
-        if let Some(__j62) = tl_json::field(o, "bot_info") && !matches!(__j62, tl_json::Json::Null) {
-            value.bot_info = Some(BotInfo::from_json_value(__j62)?);
+        if let Some(__j62) = tl_json::field(o, "share_theme") && !matches!(__j62, tl_json::Json::Null) {
+            value.share_theme = Some(ProfileShareTheme::from_json_value(__j62)?);
+        }
+        if let Some(__j64) = tl_json::field(o, "business_info") && !matches!(__j64, tl_json::Json::Null) {
+            value.business_info = Some(BusinessInfo::from_json_value(__j64)?);
+        }
+        if let Some(__j66) = tl_json::field(o, "bot_info") && !matches!(__j66, tl_json::Json::Null) {
+            value.bot_info = Some(BotInfo::from_json_value(__j66)?);
         }
         Result::Ok(value)
     }
@@ -285465,12 +290415,20 @@ impl UserFullInfo {
             Some(__m12) => __m12.store_debug(s, "note"),
             None => s.store_null("note"),
         }
+        match &self.ton_wallet_card {
+            Some(__m13) => __m13.store_debug(s, "ton_wallet_card"),
+            None => s.store_null("ton_wallet_card"),
+        }
+        match &self.share_theme {
+            Some(__m14) => __m14.store_debug(s, "share_theme"),
+            None => s.store_null("share_theme"),
+        }
         match &self.business_info {
-            Some(__m13) => __m13.store_debug(s, "business_info"),
+            Some(__m15) => __m15.store_debug(s, "business_info"),
             None => s.store_null("business_info"),
         }
         match &self.bot_info {
-            Some(__m14) => __m14.store_debug(s, "bot_info"),
+            Some(__m16) => __m16.store_debug(s, "bot_info"),
             None => s.store_null("bot_info"),
         }
         s.store_class_end();
@@ -285490,10 +290448,11 @@ impl UserFullInfo {
 pub struct UserLink {
     pub url: String,
     pub expires_in: i32,
+    pub can_get_permanent_link: bool,
 }
 
 impl UserLink {
-    pub const ID: i32 = 498138872;
+    pub const ID: i32 = -588760254;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -285503,6 +290462,7 @@ impl UserLink {
     pub fn store(&self, out: &mut Vec<u8>) {
         tl::__string(out, &self.url);
         tl::__i32(out, self.expires_in);
+        tl::__bool(out, self.can_get_permanent_link);
     }
 
     pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
@@ -285525,7 +290485,8 @@ impl UserLink {
     pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
         let url: String = r.string()?;
         let expires_in: i32 = r.i32()?;
-        Result::Ok(Self { url, expires_in })
+        let can_get_permanent_link: bool = r.bool()?;
+        Result::Ok(Self { url, expires_in, can_get_permanent_link })
     }
 
     pub fn to_json(&self) -> String {
@@ -285540,6 +290501,8 @@ impl UserLink {
         tl_json::str(out, &self.url);
         out.push_str(",\"expires_in\":");
         tl_json::num32(out, self.expires_in);
+        out.push_str(",\"can_get_permanent_link\":");
+        tl_json::boolean(out, self.can_get_permanent_link);
         out.push('}');
     }
 
@@ -285566,6 +290529,9 @@ impl UserLink {
         if let Some(__j2) = tl_json::field(o, "expires_in") {
             value.expires_in = tl_json::read_i32(__j2)?;
         }
+        if let Some(__j4) = tl_json::field(o, "can_get_permanent_link") {
+            value.can_get_permanent_link = tl_json::read_bool(__j4)?;
+        }
         Result::Ok(value)
     }
 
@@ -285575,6 +290541,7 @@ impl UserLink {
         s.store_class_begin(field_name, "userLink");
         s.store_field_str("url", &self.url);
         s.store_field_int("expires_in", self.expires_in as i64);
+        s.store_field_bool("can_get_permanent_link", self.can_get_permanent_link);
         s.store_class_end();
     }
 
@@ -289793,6 +294760,7 @@ pub struct userTypeBot {
     pub can_read_all_group_messages: bool,
     pub has_main_web_app: bool,
     pub has_topics: bool,
+    pub has_topic_sidebar: bool,
     pub allows_users_to_create_topics: bool,
     pub can_manage_bots: bool,
     pub is_inline: bool,
@@ -289806,7 +294774,7 @@ pub struct userTypeBot {
 }
 
 impl userTypeBot {
-    pub const ID: i32 = 565626918;
+    pub const ID: i32 = 1974057584;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -289819,6 +294787,7 @@ impl userTypeBot {
         tl::__bool(out, self.can_read_all_group_messages);
         tl::__bool(out, self.has_main_web_app);
         tl::__bool(out, self.has_topics);
+        tl::__bool(out, self.has_topic_sidebar);
         tl::__bool(out, self.allows_users_to_create_topics);
         tl::__bool(out, self.can_manage_bots);
         tl::__bool(out, self.is_inline);
@@ -289854,6 +294823,7 @@ impl userTypeBot {
         let can_read_all_group_messages: bool = r.bool()?;
         let has_main_web_app: bool = r.bool()?;
         let has_topics: bool = r.bool()?;
+        let has_topic_sidebar: bool = r.bool()?;
         let allows_users_to_create_topics: bool = r.bool()?;
         let can_manage_bots: bool = r.bool()?;
         let is_inline: bool = r.bool()?;
@@ -289864,7 +294834,7 @@ impl userTypeBot {
         let can_connect_to_business: bool = r.bool()?;
         let can_be_added_to_attachment_menu: bool = r.bool()?;
         let active_user_count: i32 = r.i32()?;
-        Result::Ok(Self { can_be_edited, can_join_groups, can_read_all_group_messages, has_main_web_app, has_topics, allows_users_to_create_topics, can_manage_bots, is_inline, inline_query_placeholder, supports_guest_queries, is_guard, need_location, can_connect_to_business, can_be_added_to_attachment_menu, active_user_count })
+        Result::Ok(Self { can_be_edited, can_join_groups, can_read_all_group_messages, has_main_web_app, has_topics, has_topic_sidebar, allows_users_to_create_topics, can_manage_bots, is_inline, inline_query_placeholder, supports_guest_queries, is_guard, need_location, can_connect_to_business, can_be_added_to_attachment_menu, active_user_count })
     }
 
     pub fn to_json(&self) -> String {
@@ -289885,6 +294855,8 @@ impl userTypeBot {
         tl_json::boolean(out, self.has_main_web_app);
         out.push_str(",\"has_topics\":");
         tl_json::boolean(out, self.has_topics);
+        out.push_str(",\"has_topic_sidebar\":");
+        tl_json::boolean(out, self.has_topic_sidebar);
         out.push_str(",\"allows_users_to_create_topics\":");
         tl_json::boolean(out, self.allows_users_to_create_topics);
         out.push_str(",\"can_manage_bots\":");
@@ -289940,35 +294912,38 @@ impl userTypeBot {
         if let Some(__j8) = tl_json::field(o, "has_topics") {
             value.has_topics = tl_json::read_bool(__j8)?;
         }
-        if let Some(__j10) = tl_json::field(o, "allows_users_to_create_topics") {
-            value.allows_users_to_create_topics = tl_json::read_bool(__j10)?;
+        if let Some(__j10) = tl_json::field(o, "has_topic_sidebar") {
+            value.has_topic_sidebar = tl_json::read_bool(__j10)?;
         }
-        if let Some(__j12) = tl_json::field(o, "can_manage_bots") {
-            value.can_manage_bots = tl_json::read_bool(__j12)?;
+        if let Some(__j12) = tl_json::field(o, "allows_users_to_create_topics") {
+            value.allows_users_to_create_topics = tl_json::read_bool(__j12)?;
         }
-        if let Some(__j14) = tl_json::field(o, "is_inline") {
-            value.is_inline = tl_json::read_bool(__j14)?;
+        if let Some(__j14) = tl_json::field(o, "can_manage_bots") {
+            value.can_manage_bots = tl_json::read_bool(__j14)?;
         }
-        if let Some(__j16) = tl_json::field(o, "inline_query_placeholder") {
-            value.inline_query_placeholder = tl_json::read_string(__j16)?;
+        if let Some(__j16) = tl_json::field(o, "is_inline") {
+            value.is_inline = tl_json::read_bool(__j16)?;
         }
-        if let Some(__j18) = tl_json::field(o, "supports_guest_queries") {
-            value.supports_guest_queries = tl_json::read_bool(__j18)?;
+        if let Some(__j18) = tl_json::field(o, "inline_query_placeholder") {
+            value.inline_query_placeholder = tl_json::read_string(__j18)?;
         }
-        if let Some(__j20) = tl_json::field(o, "is_guard") {
-            value.is_guard = tl_json::read_bool(__j20)?;
+        if let Some(__j20) = tl_json::field(o, "supports_guest_queries") {
+            value.supports_guest_queries = tl_json::read_bool(__j20)?;
         }
-        if let Some(__j22) = tl_json::field(o, "need_location") {
-            value.need_location = tl_json::read_bool(__j22)?;
+        if let Some(__j22) = tl_json::field(o, "is_guard") {
+            value.is_guard = tl_json::read_bool(__j22)?;
         }
-        if let Some(__j24) = tl_json::field(o, "can_connect_to_business") {
-            value.can_connect_to_business = tl_json::read_bool(__j24)?;
+        if let Some(__j24) = tl_json::field(o, "need_location") {
+            value.need_location = tl_json::read_bool(__j24)?;
         }
-        if let Some(__j26) = tl_json::field(o, "can_be_added_to_attachment_menu") {
-            value.can_be_added_to_attachment_menu = tl_json::read_bool(__j26)?;
+        if let Some(__j26) = tl_json::field(o, "can_connect_to_business") {
+            value.can_connect_to_business = tl_json::read_bool(__j26)?;
         }
-        if let Some(__j28) = tl_json::field(o, "active_user_count") {
-            value.active_user_count = tl_json::read_i32(__j28)?;
+        if let Some(__j28) = tl_json::field(o, "can_be_added_to_attachment_menu") {
+            value.can_be_added_to_attachment_menu = tl_json::read_bool(__j28)?;
+        }
+        if let Some(__j30) = tl_json::field(o, "active_user_count") {
+            value.active_user_count = tl_json::read_i32(__j30)?;
         }
         Result::Ok(value)
     }
@@ -289982,6 +294957,7 @@ impl userTypeBot {
         s.store_field_bool("can_read_all_group_messages", self.can_read_all_group_messages);
         s.store_field_bool("has_main_web_app", self.has_main_web_app);
         s.store_field_bool("has_topics", self.has_topics);
+        s.store_field_bool("has_topic_sidebar", self.has_topic_sidebar);
         s.store_field_bool("allows_users_to_create_topics", self.allows_users_to_create_topics);
         s.store_field_bool("can_manage_bots", self.can_manage_bots);
         s.store_field_bool("is_inline", self.is_inline);
@@ -294075,6 +299051,1030 @@ impl WebPageInstantView {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "webProxyCarrier")]
+pub struct WebProxyCarrier {
+    pub id: i32,
+    pub proxy_id: i32,
+    pub url: String,
+    pub origin: String,
+    pub path_prefix: String,
+    pub bridge_object_name: String,
+    pub is_temporary: bool,
+}
+
+impl WebProxyCarrier {
+    pub const ID: i32 = -1960025069;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.id);
+        tl::__i32(out, self.proxy_id);
+        tl::__string(out, &self.url);
+        tl::__string(out, &self.origin);
+        tl::__string(out, &self.path_prefix);
+        tl::__string(out, &self.bridge_object_name);
+        tl::__bool(out, self.is_temporary);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let id: i32 = r.i32()?;
+        let proxy_id: i32 = r.i32()?;
+        let url: String = r.string()?;
+        let origin: String = r.string()?;
+        let path_prefix: String = r.string()?;
+        let bridge_object_name: String = r.string()?;
+        let is_temporary: bool = r.bool()?;
+        Result::Ok(Self { id, proxy_id, url, origin, path_prefix, bridge_object_name, is_temporary })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"webProxyCarrier\"");
+        out.push_str(",\"id\":");
+        tl_json::num32(out, self.id);
+        out.push_str(",\"proxy_id\":");
+        tl_json::num32(out, self.proxy_id);
+        out.push_str(",\"url\":");
+        tl_json::str(out, &self.url);
+        out.push_str(",\"origin\":");
+        tl_json::str(out, &self.origin);
+        out.push_str(",\"path_prefix\":");
+        tl_json::str(out, &self.path_prefix);
+        out.push_str(",\"bridge_object_name\":");
+        tl_json::str(out, &self.bridge_object_name);
+        out.push_str(",\"is_temporary\":");
+        tl_json::boolean(out, self.is_temporary);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "id") {
+            value.id = tl_json::read_i32(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "proxy_id") {
+            value.proxy_id = tl_json::read_i32(__j2)?;
+        }
+        if let Some(__j4) = tl_json::field(o, "url") {
+            value.url = tl_json::read_string(__j4)?;
+        }
+        if let Some(__j6) = tl_json::field(o, "origin") {
+            value.origin = tl_json::read_string(__j6)?;
+        }
+        if let Some(__j8) = tl_json::field(o, "path_prefix") {
+            value.path_prefix = tl_json::read_string(__j8)?;
+        }
+        if let Some(__j10) = tl_json::field(o, "bridge_object_name") {
+            value.bridge_object_name = tl_json::read_string(__j10)?;
+        }
+        if let Some(__j12) = tl_json::field(o, "is_temporary") {
+            value.is_temporary = tl_json::read_bool(__j12)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "webProxyCarrier");
+        s.store_field_int("id", self.id as i64);
+        s.store_field_int("proxy_id", self.proxy_id as i64);
+        s.store_field_str("url", &self.url);
+        s.store_field_str("origin", &self.origin);
+        s.store_field_str("path_prefix", &self.path_prefix);
+        s.store_field_str("bridge_object_name", &self.bridge_object_name);
+        s.store_field_bool("is_temporary", self.is_temporary);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "webProxyCarrierErrorUnsupported")]
+pub struct webProxyCarrierErrorUnsupported;
+
+impl webProxyCarrierErrorUnsupported {
+    pub const ID: i32 = 1672767499;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let _ = out;
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let _ = r;
+        Result::Ok(Self)
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"webProxyCarrierErrorUnsupported\"");
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(_o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "webProxyCarrierErrorUnsupported");
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "webProxyCarrierErrorPaused")]
+pub struct webProxyCarrierErrorPaused;
+
+impl webProxyCarrierErrorPaused {
+    pub const ID: i32 = -365357975;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let _ = out;
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let _ = r;
+        Result::Ok(Self)
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"webProxyCarrierErrorPaused\"");
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(_o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "webProxyCarrierErrorPaused");
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "webProxyCarrierErrorLoadFailed")]
+pub struct webProxyCarrierErrorLoadFailed {
+    pub message: String,
+}
+
+impl webProxyCarrierErrorLoadFailed {
+    pub const ID: i32 = -167083783;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__string(out, &self.message);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let message: String = r.string()?;
+        Result::Ok(Self { message })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"webProxyCarrierErrorLoadFailed\"");
+        out.push_str(",\"message\":");
+        tl_json::str(out, &self.message);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "message") {
+            value.message = tl_json::read_string(__j0)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "webProxyCarrierErrorLoadFailed");
+        s.store_field_str("message", &self.message);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "webProxyCarrierErrorTerminated")]
+pub struct webProxyCarrierErrorTerminated;
+
+impl webProxyCarrierErrorTerminated {
+    pub const ID: i32 = 1557864893;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let _ = out;
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let _ = r;
+        Result::Ok(Self)
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"webProxyCarrierErrorTerminated\"");
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(_o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "webProxyCarrierErrorTerminated");
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "webProxyCarrierErrorRefused")]
+pub struct webProxyCarrierErrorRefused;
+
+impl webProxyCarrierErrorRefused {
+    pub const ID: i32 = -1306098248;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let _ = out;
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let _ = r;
+        Result::Ok(Self)
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"webProxyCarrierErrorRefused\"");
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(_o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "webProxyCarrierErrorRefused");
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "@type")]
+pub enum WebProxyCarrierError {
+    #[serde(rename = "webProxyCarrierErrorUnsupported")]
+    webProxyCarrierErrorUnsupported(webProxyCarrierErrorUnsupported),
+    #[serde(rename = "webProxyCarrierErrorPaused")]
+    webProxyCarrierErrorPaused(webProxyCarrierErrorPaused),
+    #[serde(rename = "webProxyCarrierErrorLoadFailed")]
+    webProxyCarrierErrorLoadFailed(webProxyCarrierErrorLoadFailed),
+    #[serde(rename = "webProxyCarrierErrorTerminated")]
+    webProxyCarrierErrorTerminated(webProxyCarrierErrorTerminated),
+    #[serde(rename = "webProxyCarrierErrorRefused")]
+    webProxyCarrierErrorRefused(webProxyCarrierErrorRefused),
+}
+
+impl WebProxyCarrierError {
+    pub fn store(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::webProxyCarrierErrorUnsupported(v) => v.store_boxed(out),
+            Self::webProxyCarrierErrorPaused(v) => v.store_boxed(out),
+            Self::webProxyCarrierErrorLoadFailed(v) => v.store_boxed(out),
+            Self::webProxyCarrierErrorTerminated(v) => v.store_boxed(out),
+            Self::webProxyCarrierErrorRefused(v) => v.store_boxed(out),
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        match r.i32()? {
+            self::webProxyCarrierErrorUnsupported::ID => Result::Ok(Self::webProxyCarrierErrorUnsupported(self::webProxyCarrierErrorUnsupported::read_bare(r)?)),
+            self::webProxyCarrierErrorPaused::ID => Result::Ok(Self::webProxyCarrierErrorPaused(self::webProxyCarrierErrorPaused::read_bare(r)?)),
+            self::webProxyCarrierErrorLoadFailed::ID => Result::Ok(Self::webProxyCarrierErrorLoadFailed(self::webProxyCarrierErrorLoadFailed::read_bare(r)?)),
+            self::webProxyCarrierErrorTerminated::ID => Result::Ok(Self::webProxyCarrierErrorTerminated(self::webProxyCarrierErrorTerminated::read_bare(r)?)),
+            self::webProxyCarrierErrorRefused::ID => Result::Ok(Self::webProxyCarrierErrorRefused(self::webProxyCarrierErrorRefused::read_bare(r)?)),
+            _ => Result::Err("Unknown constructor"),
+        }
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        match self {
+            Self::webProxyCarrierErrorUnsupported(v) => v.to_json_into(out),
+            Self::webProxyCarrierErrorPaused(v) => v.to_json_into(out),
+            Self::webProxyCarrierErrorLoadFailed(v) => v.to_json_into(out),
+            Self::webProxyCarrierErrorTerminated(v) => v.to_json_into(out),
+            Self::webProxyCarrierErrorRefused(v) => v.to_json_into(out),
+        }
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    fn __json_new_webProxyCarrierErrorUnsupported(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::webProxyCarrierErrorUnsupported(self::webProxyCarrierErrorUnsupported::from_json_object(o)?))
+    }
+    fn __json_new_webProxyCarrierErrorPaused(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::webProxyCarrierErrorPaused(self::webProxyCarrierErrorPaused::from_json_object(o)?))
+    }
+    fn __json_new_webProxyCarrierErrorLoadFailed(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::webProxyCarrierErrorLoadFailed(self::webProxyCarrierErrorLoadFailed::from_json_object(o)?))
+    }
+    fn __json_new_webProxyCarrierErrorTerminated(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::webProxyCarrierErrorTerminated(self::webProxyCarrierErrorTerminated::from_json_object(o)?))
+    }
+    fn __json_new_webProxyCarrierErrorRefused(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::webProxyCarrierErrorRefused(self::webProxyCarrierErrorRefused::from_json_object(o)?))
+    }
+    /// td's `from_json(object_ptr<T>&, JsonValue)`: null yields the
+    /// default variant (C++ keeps a null pointer — see the model note),
+    /// an object's `@type` (name or numeric id) selects the variant.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        let o = match v {
+            tl_json::Json::Null => return Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => o,
+            other => return Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        };
+        let ty = match tl_json::field(o, "@type") {
+            Some(ty) => ty,
+            None => return Result::Err("Can't find field \"@type\"".to_owned()),
+        };
+        match ty {
+            tl_json::Json::String(s) => match s.as_str() {
+                "webProxyCarrierErrorUnsupported" => Self::__json_new_webProxyCarrierErrorUnsupported(o),
+                "webProxyCarrierErrorPaused" => Self::__json_new_webProxyCarrierErrorPaused(o),
+                "webProxyCarrierErrorLoadFailed" => Self::__json_new_webProxyCarrierErrorLoadFailed(o),
+                "webProxyCarrierErrorTerminated" => Self::__json_new_webProxyCarrierErrorTerminated(o),
+                "webProxyCarrierErrorRefused" => Self::__json_new_webProxyCarrierErrorRefused(o),
+                _ => Result::Err(format!("Unknown class \"{s}\"")),
+            },
+            tl_json::Json::Number(n) => match tl_json::to_integer_i32(n) {
+                self::webProxyCarrierErrorUnsupported::ID => Self::__json_new_webProxyCarrierErrorUnsupported(o),
+                self::webProxyCarrierErrorPaused::ID => Self::__json_new_webProxyCarrierErrorPaused(o),
+                self::webProxyCarrierErrorLoadFailed::ID => Self::__json_new_webProxyCarrierErrorLoadFailed(o),
+                self::webProxyCarrierErrorTerminated::ID => Self::__json_new_webProxyCarrierErrorTerminated(o),
+                self::webProxyCarrierErrorRefused::ID => Self::__json_new_webProxyCarrierErrorRefused(o),
+                id => Result::Err(format!("Unknown constructor 0x{:08x}", id as u32)),
+            },
+            other => Result::Err(format!("Expected String or Integer, but receive {}", other.type_name())),
+        }
+    }
+
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        match self {
+            Self::webProxyCarrierErrorUnsupported(v) => v.store_debug(s, field_name),
+            Self::webProxyCarrierErrorPaused(v) => v.store_debug(s, field_name),
+            Self::webProxyCarrierErrorLoadFailed(v) => v.store_debug(s, field_name),
+            Self::webProxyCarrierErrorTerminated(v) => v.store_debug(s, field_name),
+            Self::webProxyCarrierErrorRefused(v) => v.store_debug(s, field_name),
+        }
+    }
+
+    /// td's `to_string(const BaseObject&)` for this type.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+impl Default for WebProxyCarrierError {
+    fn default() -> Self {
+        Self::webProxyCarrierErrorUnsupported(Default::default())
+    }
+}
+
+impl From<WebProxyCarrierError> for Object {
+    fn from(value: WebProxyCarrierError) -> Object {
+        match value {
+            WebProxyCarrierError::webProxyCarrierErrorUnsupported(v) => Object::webProxyCarrierErrorUnsupported(v),
+            WebProxyCarrierError::webProxyCarrierErrorPaused(v) => Object::webProxyCarrierErrorPaused(v),
+            WebProxyCarrierError::webProxyCarrierErrorLoadFailed(v) => Object::webProxyCarrierErrorLoadFailed(v),
+            WebProxyCarrierError::webProxyCarrierErrorTerminated(v) => Object::webProxyCarrierErrorTerminated(v),
+            WebProxyCarrierError::webProxyCarrierErrorRefused(v) => Object::webProxyCarrierErrorRefused(v),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "webProxyCarrierMessageText")]
+pub struct webProxyCarrierMessageText {
+    pub text: String,
+}
+
+impl webProxyCarrierMessageText {
+    pub const ID: i32 = -1824891891;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__string(out, &self.text);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let text: String = r.string()?;
+        Result::Ok(Self { text })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"webProxyCarrierMessageText\"");
+        out.push_str(",\"text\":");
+        tl_json::str(out, &self.text);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "text") {
+            value.text = tl_json::read_string(__j0)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "webProxyCarrierMessageText");
+        s.store_field_str("text", &self.text);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "webProxyCarrierMessageBinary")]
+pub struct webProxyCarrierMessageBinary {
+    pub data: Vec<u8>,
+}
+
+impl webProxyCarrierMessageBinary {
+    pub const ID: i32 = -305933805;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__string(out, &self.data);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let data: Vec<u8> = r.bytes()?;
+        Result::Ok(Self { data })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"webProxyCarrierMessageBinary\"");
+        out.push_str(",\"data\":");
+        tl_json::bytes(out, &self.data);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "data") {
+            value.data = tl_json::read_bytes(__j0)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "webProxyCarrierMessageBinary");
+        s.store_bytes_field("data", &self.data);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "@type")]
+pub enum WebProxyCarrierMessage {
+    #[serde(rename = "webProxyCarrierMessageText")]
+    webProxyCarrierMessageText(webProxyCarrierMessageText),
+    #[serde(rename = "webProxyCarrierMessageBinary")]
+    webProxyCarrierMessageBinary(webProxyCarrierMessageBinary),
+}
+
+impl WebProxyCarrierMessage {
+    pub fn store(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::webProxyCarrierMessageText(v) => v.store_boxed(out),
+            Self::webProxyCarrierMessageBinary(v) => v.store_boxed(out),
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        match r.i32()? {
+            self::webProxyCarrierMessageText::ID => Result::Ok(Self::webProxyCarrierMessageText(self::webProxyCarrierMessageText::read_bare(r)?)),
+            self::webProxyCarrierMessageBinary::ID => Result::Ok(Self::webProxyCarrierMessageBinary(self::webProxyCarrierMessageBinary::read_bare(r)?)),
+            _ => Result::Err("Unknown constructor"),
+        }
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        match self {
+            Self::webProxyCarrierMessageText(v) => v.to_json_into(out),
+            Self::webProxyCarrierMessageBinary(v) => v.to_json_into(out),
+        }
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    fn __json_new_webProxyCarrierMessageText(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::webProxyCarrierMessageText(self::webProxyCarrierMessageText::from_json_object(o)?))
+    }
+    fn __json_new_webProxyCarrierMessageBinary(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::webProxyCarrierMessageBinary(self::webProxyCarrierMessageBinary::from_json_object(o)?))
+    }
+    /// td's `from_json(object_ptr<T>&, JsonValue)`: null yields the
+    /// default variant (C++ keeps a null pointer — see the model note),
+    /// an object's `@type` (name or numeric id) selects the variant.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        let o = match v {
+            tl_json::Json::Null => return Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => o,
+            other => return Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        };
+        let ty = match tl_json::field(o, "@type") {
+            Some(ty) => ty,
+            None => return Result::Err("Can't find field \"@type\"".to_owned()),
+        };
+        match ty {
+            tl_json::Json::String(s) => match s.as_str() {
+                "webProxyCarrierMessageText" => Self::__json_new_webProxyCarrierMessageText(o),
+                "webProxyCarrierMessageBinary" => Self::__json_new_webProxyCarrierMessageBinary(o),
+                _ => Result::Err(format!("Unknown class \"{s}\"")),
+            },
+            tl_json::Json::Number(n) => match tl_json::to_integer_i32(n) {
+                self::webProxyCarrierMessageText::ID => Self::__json_new_webProxyCarrierMessageText(o),
+                self::webProxyCarrierMessageBinary::ID => Self::__json_new_webProxyCarrierMessageBinary(o),
+                id => Result::Err(format!("Unknown constructor 0x{:08x}", id as u32)),
+            },
+            other => Result::Err(format!("Expected String or Integer, but receive {}", other.type_name())),
+        }
+    }
+
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        match self {
+            Self::webProxyCarrierMessageText(v) => v.store_debug(s, field_name),
+            Self::webProxyCarrierMessageBinary(v) => v.store_debug(s, field_name),
+        }
+    }
+
+    /// td's `to_string(const BaseObject&)` for this type.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+impl Default for WebProxyCarrierMessage {
+    fn default() -> Self {
+        Self::webProxyCarrierMessageText(Default::default())
+    }
+}
+
+impl From<WebProxyCarrierMessage> for Object {
+    fn from(value: WebProxyCarrierMessage) -> Object {
+        match value {
+            WebProxyCarrierMessage::webProxyCarrierMessageText(v) => Object::webProxyCarrierMessageText(v),
+            WebProxyCarrierMessage::webProxyCarrierMessageBinary(v) => Object::webProxyCarrierMessageBinary(v),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "welcomeMessage")]
 pub struct WelcomeMessage {
     pub id: i32,
@@ -294171,6 +300171,757 @@ impl WelcomeMessage {
             Some(__m0) => __m0.store_debug(s, "content"),
             None => s.store_null("content"),
         }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "widgetPublicData")]
+pub struct WidgetPublicData {
+    pub data: String,
+    pub poll_period: i32,
+}
+
+impl WidgetPublicData {
+    pub const ID: i32 = 1018965146;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__string(out, &self.data);
+        tl::__i32(out, self.poll_period);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let data: String = r.string()?;
+        let poll_period: i32 = r.i32()?;
+        Result::Ok(Self { data, poll_period })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"widgetPublicData\"");
+        out.push_str(",\"data\":");
+        tl_json::str(out, &self.data);
+        out.push_str(",\"poll_period\":");
+        tl_json::num32(out, self.poll_period);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "data") {
+            value.data = tl_json::read_string(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "poll_period") {
+            value.poll_period = tl_json::read_i32(__j2)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "widgetPublicData");
+        s.store_field_str("data", &self.data);
+        s.store_field_int("poll_period", self.poll_period as i64);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "widgetQueryAnswer")]
+pub struct WidgetQueryAnswer {
+    pub data: String,
+}
+
+impl WidgetQueryAnswer {
+    pub const ID: i32 = 1557837077;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__string(out, &self.data);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let data: String = r.string()?;
+        Result::Ok(Self { data })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"widgetQueryAnswer\"");
+        out.push_str(",\"data\":");
+        tl_json::str(out, &self.data);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "data") {
+            value.data = tl_json::read_string(__j0)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "widgetQueryAnswer");
+        s.store_field_str("data", &self.data);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "widgetQueryTypeData")]
+pub struct widgetQueryTypeData {
+    pub with_wallet: bool,
+}
+
+impl widgetQueryTypeData {
+    pub const ID: i32 = 594102106;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__bool(out, self.with_wallet);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let with_wallet: bool = r.bool()?;
+        Result::Ok(Self { with_wallet })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"widgetQueryTypeData\"");
+        out.push_str(",\"with_wallet\":");
+        tl_json::boolean(out, self.with_wallet);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "with_wallet") {
+            value.with_wallet = tl_json::read_bool(__j0)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "widgetQueryTypeData");
+        s.store_field_bool("with_wallet", self.with_wallet);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "widgetQueryTypeSignData")]
+pub struct widgetQueryTypeSignData {
+    pub wallet: Option<WidgetQueryWallet>,
+    pub sign_data: String,
+}
+
+impl widgetQueryTypeSignData {
+    pub const ID: i32 = -252898499;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let __d0 = Default::default();
+        let __m0 = self.wallet.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+        tl::__string(out, &self.sign_data);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let wallet: Option<WidgetQueryWallet> = Some(WidgetQueryWallet::read_bare(r)?);
+        let sign_data: String = r.string()?;
+        Result::Ok(Self { wallet, sign_data })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"widgetQueryTypeSignData\"");
+        if let Some(__o0) = &self.wallet {
+            out.push_str(",\"wallet\":");
+            __o0.to_json_into(out);
+        }
+        out.push_str(",\"sign_data\":");
+        tl_json::str(out, &self.sign_data);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "wallet") && !matches!(__j0, tl_json::Json::Null) {
+            value.wallet = Some(WidgetQueryWallet::from_json_value(__j0)?);
+        }
+        if let Some(__j2) = tl_json::field(o, "sign_data") {
+            value.sign_data = tl_json::read_string(__j2)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "widgetQueryTypeSignData");
+        match &self.wallet {
+            Some(__m0) => __m0.store_debug(s, "wallet"),
+            None => s.store_null("wallet"),
+        }
+        s.store_field_str("sign_data", &self.sign_data);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "widgetQueryTypeSentTransaction")]
+pub struct widgetQueryTypeSentTransaction {
+    pub wallet: Option<WidgetQueryWallet>,
+    pub msg_hash: String,
+}
+
+impl widgetQueryTypeSentTransaction {
+    pub const ID: i32 = 989539590;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let __d0 = Default::default();
+        let __m0 = self.wallet.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+        tl::__string(out, &self.msg_hash);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let wallet: Option<WidgetQueryWallet> = Some(WidgetQueryWallet::read_bare(r)?);
+        let msg_hash: String = r.string()?;
+        Result::Ok(Self { wallet, msg_hash })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"widgetQueryTypeSentTransaction\"");
+        if let Some(__o0) = &self.wallet {
+            out.push_str(",\"wallet\":");
+            __o0.to_json_into(out);
+        }
+        out.push_str(",\"msg_hash\":");
+        tl_json::str(out, &self.msg_hash);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "wallet") && !matches!(__j0, tl_json::Json::Null) {
+            value.wallet = Some(WidgetQueryWallet::from_json_value(__j0)?);
+        }
+        if let Some(__j2) = tl_json::field(o, "msg_hash") {
+            value.msg_hash = tl_json::read_string(__j2)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "widgetQueryTypeSentTransaction");
+        match &self.wallet {
+            Some(__m0) => __m0.store_debug(s, "wallet"),
+            None => s.store_null("wallet"),
+        }
+        s.store_field_str("msg_hash", &self.msg_hash);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "@type")]
+pub enum WidgetQueryType {
+    #[serde(rename = "widgetQueryTypeData")]
+    widgetQueryTypeData(widgetQueryTypeData),
+    #[serde(rename = "widgetQueryTypeSignData")]
+    widgetQueryTypeSignData(widgetQueryTypeSignData),
+    #[serde(rename = "widgetQueryTypeSentTransaction")]
+    widgetQueryTypeSentTransaction(widgetQueryTypeSentTransaction),
+}
+
+impl WidgetQueryType {
+    pub fn store(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::widgetQueryTypeData(v) => v.store_boxed(out),
+            Self::widgetQueryTypeSignData(v) => v.store_boxed(out),
+            Self::widgetQueryTypeSentTransaction(v) => v.store_boxed(out),
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        match r.i32()? {
+            self::widgetQueryTypeData::ID => Result::Ok(Self::widgetQueryTypeData(self::widgetQueryTypeData::read_bare(r)?)),
+            self::widgetQueryTypeSignData::ID => Result::Ok(Self::widgetQueryTypeSignData(self::widgetQueryTypeSignData::read_bare(r)?)),
+            self::widgetQueryTypeSentTransaction::ID => Result::Ok(Self::widgetQueryTypeSentTransaction(self::widgetQueryTypeSentTransaction::read_bare(r)?)),
+            _ => Result::Err("Unknown constructor"),
+        }
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        match self {
+            Self::widgetQueryTypeData(v) => v.to_json_into(out),
+            Self::widgetQueryTypeSignData(v) => v.to_json_into(out),
+            Self::widgetQueryTypeSentTransaction(v) => v.to_json_into(out),
+        }
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    fn __json_new_widgetQueryTypeData(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::widgetQueryTypeData(self::widgetQueryTypeData::from_json_object(o)?))
+    }
+    fn __json_new_widgetQueryTypeSignData(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::widgetQueryTypeSignData(self::widgetQueryTypeSignData::from_json_object(o)?))
+    }
+    fn __json_new_widgetQueryTypeSentTransaction(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::widgetQueryTypeSentTransaction(self::widgetQueryTypeSentTransaction::from_json_object(o)?))
+    }
+    /// td's `from_json(object_ptr<T>&, JsonValue)`: null yields the
+    /// default variant (C++ keeps a null pointer — see the model note),
+    /// an object's `@type` (name or numeric id) selects the variant.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        let o = match v {
+            tl_json::Json::Null => return Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => o,
+            other => return Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        };
+        let ty = match tl_json::field(o, "@type") {
+            Some(ty) => ty,
+            None => return Result::Err("Can't find field \"@type\"".to_owned()),
+        };
+        match ty {
+            tl_json::Json::String(s) => match s.as_str() {
+                "widgetQueryTypeData" => Self::__json_new_widgetQueryTypeData(o),
+                "widgetQueryTypeSignData" => Self::__json_new_widgetQueryTypeSignData(o),
+                "widgetQueryTypeSentTransaction" => Self::__json_new_widgetQueryTypeSentTransaction(o),
+                _ => Result::Err(format!("Unknown class \"{s}\"")),
+            },
+            tl_json::Json::Number(n) => match tl_json::to_integer_i32(n) {
+                self::widgetQueryTypeData::ID => Self::__json_new_widgetQueryTypeData(o),
+                self::widgetQueryTypeSignData::ID => Self::__json_new_widgetQueryTypeSignData(o),
+                self::widgetQueryTypeSentTransaction::ID => Self::__json_new_widgetQueryTypeSentTransaction(o),
+                id => Result::Err(format!("Unknown constructor 0x{:08x}", id as u32)),
+            },
+            other => Result::Err(format!("Expected String or Integer, but receive {}", other.type_name())),
+        }
+    }
+
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        match self {
+            Self::widgetQueryTypeData(v) => v.store_debug(s, field_name),
+            Self::widgetQueryTypeSignData(v) => v.store_debug(s, field_name),
+            Self::widgetQueryTypeSentTransaction(v) => v.store_debug(s, field_name),
+        }
+    }
+
+    /// td's `to_string(const BaseObject&)` for this type.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+impl Default for WidgetQueryType {
+    fn default() -> Self {
+        Self::widgetQueryTypeData(Default::default())
+    }
+}
+
+impl From<WidgetQueryType> for Object {
+    fn from(value: WidgetQueryType) -> Object {
+        match value {
+            WidgetQueryType::widgetQueryTypeData(v) => Object::widgetQueryTypeData(v),
+            WidgetQueryType::widgetQueryTypeSignData(v) => Object::widgetQueryTypeSignData(v),
+            WidgetQueryType::widgetQueryTypeSentTransaction(v) => Object::widgetQueryTypeSentTransaction(v),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "widgetQueryWallet")]
+pub struct WidgetQueryWallet {
+    pub address: String,
+    pub gram_amount: i64,
+    pub public_key: Vec<u8>,
+    pub state_init: Vec<u8>,
+}
+
+impl WidgetQueryWallet {
+    pub const ID: i32 = -839692036;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__string(out, &self.address);
+        tl::__i64(out, self.gram_amount);
+        tl::__string(out, &self.public_key);
+        tl::__string(out, &self.state_init);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let address: String = r.string()?;
+        let gram_amount: i64 = r.i64()?;
+        let public_key: Vec<u8> = r.bytes()?;
+        let state_init: Vec<u8> = r.bytes()?;
+        Result::Ok(Self { address, gram_amount, public_key, state_init })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"widgetQueryWallet\"");
+        out.push_str(",\"address\":");
+        tl_json::str(out, &self.address);
+        out.push_str(",\"gram_amount\":");
+        tl_json::num64q(out, self.gram_amount);
+        out.push_str(",\"public_key\":");
+        tl_json::bytes(out, &self.public_key);
+        out.push_str(",\"state_init\":");
+        tl_json::bytes(out, &self.state_init);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "address") {
+            value.address = tl_json::read_string(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "gram_amount") {
+            value.gram_amount = tl_json::read_i64(__j2)?;
+        }
+        if let Some(__j4) = tl_json::field(o, "public_key") {
+            value.public_key = tl_json::read_bytes(__j4)?;
+        }
+        if let Some(__j6) = tl_json::field(o, "state_init") {
+            value.state_init = tl_json::read_bytes(__j6)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "widgetQueryWallet");
+        s.store_field_str("address", &self.address);
+        s.store_field_int("gram_amount", self.gram_amount);
+        s.store_bytes_field("public_key", &self.public_key);
+        s.store_bytes_field("state_init", &self.state_init);
         s.store_class_end();
     }
 
@@ -294299,10 +301050,11 @@ pub struct acceptOauthRequest {
     pub match_code: String,
     pub allow_write_access: bool,
     pub allow_phone_number_access: bool,
+    pub ton_connect_connect_data: Option<TonConnectConnectData>,
 }
 
 impl acceptOauthRequest {
-    pub const ID: i32 = -427442108;
+    pub const ID: i32 = -743328342;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -294314,6 +301066,9 @@ impl acceptOauthRequest {
         tl::__string(out, &self.match_code);
         tl::__bool(out, self.allow_write_access);
         tl::__bool(out, self.allow_phone_number_access);
+        let __d0 = Default::default();
+        let __m0 = self.ton_connect_connect_data.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
     }
 
     pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
@@ -294338,7 +301093,8 @@ impl acceptOauthRequest {
         let match_code: String = r.string()?;
         let allow_write_access: bool = r.bool()?;
         let allow_phone_number_access: bool = r.bool()?;
-        Result::Ok(Self { url, match_code, allow_write_access, allow_phone_number_access })
+        let ton_connect_connect_data: Option<TonConnectConnectData> = Some(TonConnectConnectData::read_bare(r)?);
+        Result::Ok(Self { url, match_code, allow_write_access, allow_phone_number_access, ton_connect_connect_data })
     }
 
     pub fn to_json(&self) -> String {
@@ -294357,6 +301113,10 @@ impl acceptOauthRequest {
         tl_json::boolean(out, self.allow_write_access);
         out.push_str(",\"allow_phone_number_access\":");
         tl_json::boolean(out, self.allow_phone_number_access);
+        if let Some(__o0) = &self.ton_connect_connect_data {
+            out.push_str(",\"ton_connect_connect_data\":");
+            __o0.to_json_into(out);
+        }
         out.push('}');
     }
 
@@ -294389,6 +301149,9 @@ impl acceptOauthRequest {
         if let Some(__j6) = tl_json::field(o, "allow_phone_number_access") {
             value.allow_phone_number_access = tl_json::read_bool(__j6)?;
         }
+        if let Some(__j8) = tl_json::field(o, "ton_connect_connect_data") && !matches!(__j8, tl_json::Json::Null) {
+            value.ton_connect_connect_data = Some(TonConnectConnectData::from_json_value(__j8)?);
+        }
         Result::Ok(value)
     }
 
@@ -294400,6 +301163,10 @@ impl acceptOauthRequest {
         s.store_field_str("match_code", &self.match_code);
         s.store_field_bool("allow_write_access", self.allow_write_access);
         s.store_field_bool("allow_phone_number_access", self.allow_phone_number_access);
+        match &self.ton_connect_connect_data {
+            Some(__m0) => __m0.store_debug(s, "ton_connect_connect_data"),
+            None => s.store_null("ton_connect_connect_data"),
+        }
         s.store_class_end();
     }
 
@@ -295522,6 +302289,117 @@ impl addChecklistTasks {
             __v0.store_debug(s, "");
         }
         s.store_class_end();
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "addCommunityChat")]
+pub struct addCommunityChat {
+    pub community_id: i64,
+    pub chat_id: i64,
+    pub is_hidden: bool,
+}
+
+impl addCommunityChat {
+    pub const ID: i32 = -861733581;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i64(out, self.community_id);
+        tl::__i64(out, self.chat_id);
+        tl::__bool(out, self.is_hidden);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let community_id: i64 = r.i64()?;
+        let chat_id: i64 = r.i64()?;
+        let is_hidden: bool = r.bool()?;
+        Result::Ok(Self { community_id, chat_id, is_hidden })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"addCommunityChat\"");
+        out.push_str(",\"community_id\":");
+        tl_json::num64(out, self.community_id);
+        out.push_str(",\"chat_id\":");
+        tl_json::num64(out, self.chat_id);
+        out.push_str(",\"is_hidden\":");
+        tl_json::boolean(out, self.is_hidden);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "community_id") {
+            value.community_id = tl_json::read_i64(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "chat_id") {
+            value.chat_id = tl_json::read_i64(__j2)?;
+        }
+        if let Some(__j4) = tl_json::field(o, "is_hidden") {
+            value.is_hidden = tl_json::read_bool(__j4)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "addCommunityChat");
+        s.store_field_int("community_id", self.community_id);
+        s.store_field_int("chat_id", self.chat_id);
+        s.store_field_bool("is_hidden", self.is_hidden);
         s.store_class_end();
     }
 
@@ -299916,6 +306794,108 @@ impl answerWebAppQuery {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "answerWidgetQuery")]
+pub struct answerWidgetQuery {
+    pub widget_query_id: i64,
+    pub data: String,
+}
+
+impl answerWidgetQuery {
+    pub const ID: i32 = -1940154684;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i64(out, self.widget_query_id);
+        tl::__string(out, &self.data);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let widget_query_id: i64 = r.i64()?;
+        let data: String = r.string()?;
+        Result::Ok(Self { widget_query_id, data })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"answerWidgetQuery\"");
+        out.push_str(",\"widget_query_id\":");
+        tl_json::num64q(out, self.widget_query_id);
+        out.push_str(",\"data\":");
+        tl_json::str(out, &self.data);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "widget_query_id") {
+            value.widget_query_id = tl_json::read_i64(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "data") {
+            value.data = tl_json::read_string(__j2)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "answerWidgetQuery");
+        s.store_field_int("widget_query_id", self.widget_query_id);
+        s.store_field_str("data", &self.data);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "applyPremiumGiftCode")]
 pub struct applyPremiumGiftCode {
     pub code: String,
@@ -299996,6 +306976,108 @@ impl applyPremiumGiftCode {
     pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
         s.store_class_begin(field_name, "applyPremiumGiftCode");
         s.store_field_str("code", &self.code);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "applyUnpaidMessagesToken")]
+pub struct applyUnpaidMessagesToken {
+    pub user_id: i64,
+    pub token: String,
+}
+
+impl applyUnpaidMessagesToken {
+    pub const ID: i32 = 532409567;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i64(out, self.user_id);
+        tl::__string(out, &self.token);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let user_id: i64 = r.i64()?;
+        let token: String = r.string()?;
+        Result::Ok(Self { user_id, token })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"applyUnpaidMessagesToken\"");
+        out.push_str(",\"user_id\":");
+        tl_json::num64(out, self.user_id);
+        out.push_str(",\"token\":");
+        tl_json::str(out, &self.token);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "user_id") {
+            value.user_id = tl_json::read_i64(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "token") {
+            value.token = tl_json::read_string(__j2)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "applyUnpaidMessagesToken");
+        s.store_field_int("user_id", self.user_id);
+        s.store_field_str("token", &self.token);
         s.store_class_end();
     }
 
@@ -314036,6 +321118,108 @@ impl deleteForumTopic {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "deleteGift")]
+pub struct deleteGift {
+    pub business_connection_id: String,
+    pub received_gift_id: String,
+}
+
+impl deleteGift {
+    pub const ID: i32 = 1819367914;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__string(out, &self.business_connection_id);
+        tl::__string(out, &self.received_gift_id);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let business_connection_id: String = r.string()?;
+        let received_gift_id: String = r.string()?;
+        Result::Ok(Self { business_connection_id, received_gift_id })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"deleteGift\"");
+        out.push_str(",\"business_connection_id\":");
+        tl_json::str(out, &self.business_connection_id);
+        out.push_str(",\"received_gift_id\":");
+        tl_json::str(out, &self.received_gift_id);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "business_connection_id") {
+            value.business_connection_id = tl_json::read_string(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "received_gift_id") {
+            value.received_gift_id = tl_json::read_string(__j2)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "deleteGift");
+        s.store_field_str("business_connection_id", &self.business_connection_id);
+        s.store_field_str("received_gift_id", &self.received_gift_id);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "deleteGiftCollection")]
 pub struct deleteGiftCollection {
     pub owner_id: Option<MessageSender>,
@@ -317408,6 +324592,115 @@ impl dismissWebToken {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "displayUpgradedGift")]
+pub struct displayUpgradedGift {
+    pub owner_id: Option<MessageSender>,
+    pub name: String,
+}
+
+impl displayUpgradedGift {
+    pub const ID: i32 = -2133297918;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let __d0 = Default::default();
+        let __m0 = self.owner_id.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+        tl::__string(out, &self.name);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let owner_id: Option<MessageSender> = Some(MessageSender::read(r)?);
+        let name: String = r.string()?;
+        Result::Ok(Self { owner_id, name })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"displayUpgradedGift\"");
+        if let Some(__o0) = &self.owner_id {
+            out.push_str(",\"owner_id\":");
+            __o0.to_json_into(out);
+        }
+        out.push_str(",\"name\":");
+        tl_json::str(out, &self.name);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "owner_id") && !matches!(__j0, tl_json::Json::Null) {
+            value.owner_id = Some(MessageSender::from_json_value(__j0)?);
+        }
+        if let Some(__j2) = tl_json::field(o, "name") {
+            value.name = tl_json::read_string(__j2)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "displayUpgradedGift");
+        match &self.owner_id {
+            Some(__m0) => __m0.store_debug(s, "owner_id"),
+            None => s.store_null("owner_id"),
+        }
+        s.store_field_str("name", &self.name);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "downloadFile")]
 pub struct downloadFile {
     pub file_id: i32,
@@ -320657,6 +327950,135 @@ impl editInlineMessageText {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "editInlineMessageWidgetData")]
+pub struct editInlineMessageWidgetData {
+    pub inline_message_id: String,
+    pub edit_public_data: bool,
+    pub public_data: String,
+    pub edit_chat_data: bool,
+    pub chat_data: String,
+}
+
+impl editInlineMessageWidgetData {
+    pub const ID: i32 = -1748954409;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__string(out, &self.inline_message_id);
+        tl::__bool(out, self.edit_public_data);
+        tl::__string(out, &self.public_data);
+        tl::__bool(out, self.edit_chat_data);
+        tl::__string(out, &self.chat_data);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let inline_message_id: String = r.string()?;
+        let edit_public_data: bool = r.bool()?;
+        let public_data: String = r.string()?;
+        let edit_chat_data: bool = r.bool()?;
+        let chat_data: String = r.string()?;
+        Result::Ok(Self { inline_message_id, edit_public_data, public_data, edit_chat_data, chat_data })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"editInlineMessageWidgetData\"");
+        out.push_str(",\"inline_message_id\":");
+        tl_json::str(out, &self.inline_message_id);
+        out.push_str(",\"edit_public_data\":");
+        tl_json::boolean(out, self.edit_public_data);
+        out.push_str(",\"public_data\":");
+        tl_json::str(out, &self.public_data);
+        out.push_str(",\"edit_chat_data\":");
+        tl_json::boolean(out, self.edit_chat_data);
+        out.push_str(",\"chat_data\":");
+        tl_json::str(out, &self.chat_data);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "inline_message_id") {
+            value.inline_message_id = tl_json::read_string(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "edit_public_data") {
+            value.edit_public_data = tl_json::read_bool(__j2)?;
+        }
+        if let Some(__j4) = tl_json::field(o, "public_data") {
+            value.public_data = tl_json::read_string(__j4)?;
+        }
+        if let Some(__j6) = tl_json::field(o, "edit_chat_data") {
+            value.edit_chat_data = tl_json::read_bool(__j6)?;
+        }
+        if let Some(__j8) = tl_json::field(o, "chat_data") {
+            value.chat_data = tl_json::read_string(__j8)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "editInlineMessageWidgetData");
+        s.store_field_str("inline_message_id", &self.inline_message_id);
+        s.store_field_bool("edit_public_data", self.edit_public_data);
+        s.store_field_str("public_data", &self.public_data);
+        s.store_field_bool("edit_chat_data", self.edit_chat_data);
+        s.store_field_str("chat_data", &self.chat_data);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "editMessageCaption")]
 pub struct editMessageCaption {
     pub chat_id: i64,
@@ -321572,6 +328994,144 @@ impl editMessageText {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "editMessageWidgetData")]
+pub struct editMessageWidgetData {
+    pub chat_id: i64,
+    pub message_id: i64,
+    pub edit_public_data: bool,
+    pub public_data: String,
+    pub edit_chat_data: bool,
+    pub chat_data: String,
+}
+
+impl editMessageWidgetData {
+    pub const ID: i32 = 1935817582;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i64(out, self.chat_id);
+        tl::__i64(out, self.message_id);
+        tl::__bool(out, self.edit_public_data);
+        tl::__string(out, &self.public_data);
+        tl::__bool(out, self.edit_chat_data);
+        tl::__string(out, &self.chat_data);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let chat_id: i64 = r.i64()?;
+        let message_id: i64 = r.i64()?;
+        let edit_public_data: bool = r.bool()?;
+        let public_data: String = r.string()?;
+        let edit_chat_data: bool = r.bool()?;
+        let chat_data: String = r.string()?;
+        Result::Ok(Self { chat_id, message_id, edit_public_data, public_data, edit_chat_data, chat_data })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"editMessageWidgetData\"");
+        out.push_str(",\"chat_id\":");
+        tl_json::num64(out, self.chat_id);
+        out.push_str(",\"message_id\":");
+        tl_json::num64(out, self.message_id);
+        out.push_str(",\"edit_public_data\":");
+        tl_json::boolean(out, self.edit_public_data);
+        out.push_str(",\"public_data\":");
+        tl_json::str(out, &self.public_data);
+        out.push_str(",\"edit_chat_data\":");
+        tl_json::boolean(out, self.edit_chat_data);
+        out.push_str(",\"chat_data\":");
+        tl_json::str(out, &self.chat_data);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "chat_id") {
+            value.chat_id = tl_json::read_i64(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "message_id") {
+            value.message_id = tl_json::read_i64(__j2)?;
+        }
+        if let Some(__j4) = tl_json::field(o, "edit_public_data") {
+            value.edit_public_data = tl_json::read_bool(__j4)?;
+        }
+        if let Some(__j6) = tl_json::field(o, "public_data") {
+            value.public_data = tl_json::read_string(__j6)?;
+        }
+        if let Some(__j8) = tl_json::field(o, "edit_chat_data") {
+            value.edit_chat_data = tl_json::read_bool(__j8)?;
+        }
+        if let Some(__j10) = tl_json::field(o, "chat_data") {
+            value.chat_data = tl_json::read_string(__j10)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "editMessageWidgetData");
+        s.store_field_int("chat_id", self.chat_id);
+        s.store_field_int("message_id", self.message_id);
+        s.store_field_bool("edit_public_data", self.edit_public_data);
+        s.store_field_str("public_data", &self.public_data);
+        s.store_field_bool("edit_chat_data", self.edit_chat_data);
+        s.store_field_str("chat_data", &self.chat_data);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "editProxy")]
 pub struct editProxy {
     pub proxy_id: i32,
@@ -322180,6 +329740,124 @@ impl editStoryCover {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "editStoryMusic")]
+pub struct editStoryMusic {
+    pub story_poster_chat_id: i64,
+    pub story_id: i32,
+    pub music: Option<InputAudio>,
+}
+
+impl editStoryMusic {
+    pub const ID: i32 = -1931178625;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i64(out, self.story_poster_chat_id);
+        tl::__i32(out, self.story_id);
+        let __d0 = Default::default();
+        let __m0 = self.music.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let story_poster_chat_id: i64 = r.i64()?;
+        let story_id: i32 = r.i32()?;
+        let music: Option<InputAudio> = Some(InputAudio::read_bare(r)?);
+        Result::Ok(Self { story_poster_chat_id, story_id, music })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"editStoryMusic\"");
+        out.push_str(",\"story_poster_chat_id\":");
+        tl_json::num64(out, self.story_poster_chat_id);
+        out.push_str(",\"story_id\":");
+        tl_json::num32(out, self.story_id);
+        if let Some(__o0) = &self.music {
+            out.push_str(",\"music\":");
+            __o0.to_json_into(out);
+        }
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "story_poster_chat_id") {
+            value.story_poster_chat_id = tl_json::read_i64(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "story_id") {
+            value.story_id = tl_json::read_i32(__j2)?;
+        }
+        if let Some(__j4) = tl_json::field(o, "music") && !matches!(__j4, tl_json::Json::Null) {
+            value.music = Some(InputAudio::from_json_value(__j4)?);
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "editStoryMusic");
+        s.store_field_int("story_poster_chat_id", self.story_poster_chat_id);
+        s.store_field_int("story_id", self.story_id as i64);
+        match &self.music {
+            Some(__m0) => __m0.store_debug(s, "music"),
+            None => s.store_null("music"),
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "editTextCompositionStyle")]
 pub struct editTextCompositionStyle {
     pub name: String,
@@ -322407,6 +330085,117 @@ impl editUserStarSubscription {
         s.store_field_int("user_id", self.user_id);
         s.store_field_str("telegram_payment_charge_id", &self.telegram_payment_charge_id);
         s.store_field_bool("is_canceled", self.is_canceled);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "editWidgetData")]
+pub struct editWidgetData {
+    pub widget_id: i64,
+    pub public_data: String,
+    pub cache_time: i32,
+}
+
+impl editWidgetData {
+    pub const ID: i32 = 1057345257;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i64(out, self.widget_id);
+        tl::__string(out, &self.public_data);
+        tl::__i32(out, self.cache_time);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let widget_id: i64 = r.i64()?;
+        let public_data: String = r.string()?;
+        let cache_time: i32 = r.i32()?;
+        Result::Ok(Self { widget_id, public_data, cache_time })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"editWidgetData\"");
+        out.push_str(",\"widget_id\":");
+        tl_json::num64q(out, self.widget_id);
+        out.push_str(",\"public_data\":");
+        tl_json::str(out, &self.public_data);
+        out.push_str(",\"cache_time\":");
+        tl_json::num32(out, self.cache_time);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "widget_id") {
+            value.widget_id = tl_json::read_i64(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "public_data") {
+            value.public_data = tl_json::read_string(__j2)?;
+        }
+        if let Some(__j4) = tl_json::field(o, "cache_time") {
+            value.cache_time = tl_json::read_i32(__j4)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "editWidgetData");
+        s.store_field_int("widget_id", self.widget_id);
+        s.store_field_str("public_data", &self.public_data);
+        s.store_field_int("cache_time", self.cache_time as i64);
         s.store_class_end();
     }
 
@@ -323123,6 +330912,206 @@ impl finishFileGeneration {
         match &self.error {
             Some(__m0) => __m0.store_debug(s, "error"),
             None => s.store_null("error"),
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "fixRecognizedRichMessageWithAi")]
+pub struct fixRecognizedRichMessageWithAi {
+    pub message: Option<Box<InputRichMessage>>,
+}
+
+impl fixRecognizedRichMessageWithAi {
+    pub const ID: i32 = -1417726111;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let __d0 = Default::default();
+        let __m0 = self.message.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let message: Option<Box<InputRichMessage>> = Some(Box::new(InputRichMessage::read_bare(r)?));
+        Result::Ok(Self { message })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"fixRecognizedRichMessageWithAi\"");
+        if let Some(__o0) = &self.message {
+            out.push_str(",\"message\":");
+            __o0.to_json_into(out);
+        }
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "message") && !matches!(__j0, tl_json::Json::Null) {
+            value.message = Some(Box::new(InputRichMessage::from_json_value(__j0)?));
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "fixRecognizedRichMessageWithAi");
+        match &self.message {
+            Some(__m0) => __m0.store_debug(s, "message"),
+            None => s.store_null("message"),
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "fixRecognizedTextWithAi")]
+pub struct fixRecognizedTextWithAi {
+    pub text: Option<FormattedText>,
+}
+
+impl fixRecognizedTextWithAi {
+    pub const ID: i32 = 1287522189;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let __d0 = Default::default();
+        let __m0 = self.text.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let text: Option<FormattedText> = Some(FormattedText::read_bare(r)?);
+        Result::Ok(Self { text })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"fixRecognizedTextWithAi\"");
+        if let Some(__o0) = &self.text {
+            out.push_str(",\"text\":");
+            __o0.to_json_into(out);
+        }
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "text") && !matches!(__j0, tl_json::Json::Null) {
+            value.text = Some(FormattedText::from_json_value(__j0)?);
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "fixRecognizedTextWithAi");
+        match &self.text {
+            Some(__m0) => __m0.store_debug(s, "text"),
+            None => s.store_null("text"),
         }
         s.store_class_end();
     }
@@ -332648,6 +340637,117 @@ impl getCommands {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "getCommunityAddChatRequests")]
+pub struct getCommunityAddChatRequests {
+    pub community_id: i64,
+    pub offset: String,
+    pub limit: i32,
+}
+
+impl getCommunityAddChatRequests {
+    pub const ID: i32 = -1000408904;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i64(out, self.community_id);
+        tl::__string(out, &self.offset);
+        tl::__i32(out, self.limit);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let community_id: i64 = r.i64()?;
+        let offset: String = r.string()?;
+        let limit: i32 = r.i32()?;
+        Result::Ok(Self { community_id, offset, limit })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"getCommunityAddChatRequests\"");
+        out.push_str(",\"community_id\":");
+        tl_json::num64(out, self.community_id);
+        out.push_str(",\"offset\":");
+        tl_json::str(out, &self.offset);
+        out.push_str(",\"limit\":");
+        tl_json::num32(out, self.limit);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "community_id") {
+            value.community_id = tl_json::read_i64(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "offset") {
+            value.offset = tl_json::read_string(__j2)?;
+        }
+        if let Some(__j4) = tl_json::field(o, "limit") {
+            value.limit = tl_json::read_i32(__j4)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "getCommunityAddChatRequests");
+        s.store_field_int("community_id", self.community_id);
+        s.store_field_str("offset", &self.offset);
+        s.store_field_int("limit", self.limit as i64);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "getCommunityFullInfo")]
 pub struct getCommunityFullInfo {
     pub community_id: i64,
@@ -332728,6 +340828,115 @@ impl getCommunityFullInfo {
     pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
         s.store_class_begin(field_name, "getCommunityFullInfo");
         s.store_field_int("community_id", self.community_id);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "getCommunityMemberChats")]
+pub struct getCommunityMemberChats {
+    pub community_id: i64,
+    pub member_id: Option<MessageSender>,
+}
+
+impl getCommunityMemberChats {
+    pub const ID: i32 = -1898245376;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i64(out, self.community_id);
+        let __d0 = Default::default();
+        let __m0 = self.member_id.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let community_id: i64 = r.i64()?;
+        let member_id: Option<MessageSender> = Some(MessageSender::read(r)?);
+        Result::Ok(Self { community_id, member_id })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"getCommunityMemberChats\"");
+        out.push_str(",\"community_id\":");
+        tl_json::num64(out, self.community_id);
+        if let Some(__o0) = &self.member_id {
+            out.push_str(",\"member_id\":");
+            __o0.to_json_into(out);
+        }
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "community_id") {
+            value.community_id = tl_json::read_i64(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "member_id") && !matches!(__j2, tl_json::Json::Null) {
+            value.member_id = Some(MessageSender::from_json_value(__j2)?);
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "getCommunityMemberChats");
+        s.store_field_int("community_id", self.community_id);
+        match &self.member_id {
+            Some(__m0) => __m0.store_debug(s, "member_id"),
+            None => s.store_null("member_id"),
+        }
         s.store_class_end();
     }
 
@@ -339490,6 +347699,90 @@ impl getInternalLinkType {
     pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
         s.store_class_begin(field_name, "getInternalLinkType");
         s.store_field_str("link", &self.link);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "getJoinedCommunities")]
+pub struct getJoinedCommunities;
+
+impl getJoinedCommunities {
+    pub const ID: i32 = 106980818;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let _ = out;
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let _ = r;
+        Result::Ok(Self)
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"getJoinedCommunities\"");
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(_o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "getJoinedCommunities");
         s.store_class_end();
     }
 
@@ -347933,6 +356226,90 @@ impl getPreparedKeyboardButton {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "getProfileShareThemeBackdrops")]
+pub struct getProfileShareThemeBackdrops;
+
+impl getProfileShareThemeBackdrops {
+    pub const ID: i32 = 1859739597;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let _ = out;
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let _ = r;
+        Result::Ok(Self)
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"getProfileShareThemeBackdrops\"");
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(_o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "getProfileShareThemeBackdrops");
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "getProxies")]
 pub struct getProxies;
 
@@ -350551,6 +358928,99 @@ impl getSecretChat {
     pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
         s.store_class_begin(field_name, "getSecretChat");
         s.store_field_int("secret_chat_id", self.secret_chat_id as i64);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "getSpeechRecognitionLanguages")]
+pub struct getSpeechRecognitionLanguages {
+    pub chat_id: i64,
+}
+
+impl getSpeechRecognitionLanguages {
+    pub const ID: i32 = -1967118600;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i64(out, self.chat_id);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let chat_id: i64 = r.i64()?;
+        Result::Ok(Self { chat_id })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"getSpeechRecognitionLanguages\"");
+        out.push_str(",\"chat_id\":");
+        tl_json::num64(out, self.chat_id);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "chat_id") {
+            value.chat_id = tl_json::read_i64(__j0)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "getSpeechRecognitionLanguages");
+        s.store_field_int("chat_id", self.chat_id);
         s.store_class_end();
     }
 
@@ -353385,6 +361855,90 @@ impl getSuggestedStickerSetName {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "getSuitableCommunityChats")]
+pub struct getSuitableCommunityChats;
+
+impl getSuitableCommunityChats {
+    pub const ID: i32 = 1870093801;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let _ = out;
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let _ = r;
+        Result::Ok(Self)
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"getSuitableCommunityChats\"");
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(_o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "getSuitableCommunityChats");
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "getSuitableDiscussionChats")]
 pub struct getSuitableDiscussionChats;
 
@@ -354207,6 +362761,99 @@ impl getTextCompositionStyleExample {
         s.store_class_begin(field_name, "getTextCompositionStyleExample");
         s.store_field_str("name", &self.name);
         s.store_field_int("example_number", self.example_number as i64);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "getTextEmojiRanges")]
+pub struct getTextEmojiRanges {
+    pub text: String,
+}
+
+impl getTextEmojiRanges {
+    pub const ID: i32 = 1507493223;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__string(out, &self.text);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let text: String = r.string()?;
+        Result::Ok(Self { text })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"getTextEmojiRanges\"");
+        out.push_str(",\"text\":");
+        tl_json::str(out, &self.text);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "text") {
+            value.text = tl_json::read_string(__j0)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "getTextEmojiRanges");
+        s.store_field_str("text", &self.text);
         s.store_class_end();
     }
 
@@ -355230,6 +363877,90 @@ impl getTonTransactions {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "getTonWalletCardBackgroundGiftCollectionNames")]
+pub struct getTonWalletCardBackgroundGiftCollectionNames;
+
+impl getTonWalletCardBackgroundGiftCollectionNames {
+    pub const ID: i32 = 1568848020;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let _ = out;
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let _ = r;
+        Result::Ok(Self)
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"getTonWalletCardBackgroundGiftCollectionNames\"");
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(_o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "getTonWalletCardBackgroundGiftCollectionNames");
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "getTonWalletNfts")]
 pub struct getTonWalletNfts {
     pub offset: String,
@@ -355422,7 +364153,7 @@ pub struct getTonWalletSecretPhrase {
 }
 
 impl getTonWalletSecretPhrase {
-    pub const ID: i32 = 1644390868;
+    pub const ID: i32 = -1175350967;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -356133,6 +364864,124 @@ impl getUpgradedGift {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "getUpgradedGiftDepositInfo")]
+pub struct getUpgradedGiftDepositInfo {
+    pub owner_id: Option<MessageSender>,
+    pub name: String,
+    pub hide_sender: bool,
+}
+
+impl getUpgradedGiftDepositInfo {
+    pub const ID: i32 = 1660337000;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let __d0 = Default::default();
+        let __m0 = self.owner_id.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+        tl::__string(out, &self.name);
+        tl::__bool(out, self.hide_sender);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let owner_id: Option<MessageSender> = Some(MessageSender::read(r)?);
+        let name: String = r.string()?;
+        let hide_sender: bool = r.bool()?;
+        Result::Ok(Self { owner_id, name, hide_sender })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"getUpgradedGiftDepositInfo\"");
+        if let Some(__o0) = &self.owner_id {
+            out.push_str(",\"owner_id\":");
+            __o0.to_json_into(out);
+        }
+        out.push_str(",\"name\":");
+        tl_json::str(out, &self.name);
+        out.push_str(",\"hide_sender\":");
+        tl_json::boolean(out, self.hide_sender);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "owner_id") && !matches!(__j0, tl_json::Json::Null) {
+            value.owner_id = Some(MessageSender::from_json_value(__j0)?);
+        }
+        if let Some(__j2) = tl_json::field(o, "name") {
+            value.name = tl_json::read_string(__j2)?;
+        }
+        if let Some(__j4) = tl_json::field(o, "hide_sender") {
+            value.hide_sender = tl_json::read_bool(__j4)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "getUpgradedGiftDepositInfo");
+        match &self.owner_id {
+            Some(__m0) => __m0.store_debug(s, "owner_id"),
+            None => s.store_null("owner_id"),
+        }
+        s.store_field_str("name", &self.name);
+        s.store_field_bool("hide_sender", self.hide_sender);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "getUpgradedGiftEmojiStatuses")]
 pub struct getUpgradedGiftEmojiStatuses;
 
@@ -356424,11 +365273,10 @@ impl getUpgradedGiftVariants {
 #[serde(rename = "getUpgradedGiftWithdrawalUrl")]
 pub struct getUpgradedGiftWithdrawalUrl {
     pub received_gift_id: String,
-    pub password: String,
 }
 
 impl getUpgradedGiftWithdrawalUrl {
-    pub const ID: i32 = -784331188;
+    pub const ID: i32 = -103064799;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -356437,7 +365285,6 @@ impl getUpgradedGiftWithdrawalUrl {
 
     pub fn store(&self, out: &mut Vec<u8>) {
         tl::__string(out, &self.received_gift_id);
-        tl::__string(out, &self.password);
     }
 
     pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
@@ -356459,8 +365306,7 @@ impl getUpgradedGiftWithdrawalUrl {
 
     pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
         let received_gift_id: String = r.string()?;
-        let password: String = r.string()?;
-        Result::Ok(Self { received_gift_id, password })
+        Result::Ok(Self { received_gift_id })
     }
 
     pub fn to_json(&self) -> String {
@@ -356473,8 +365319,6 @@ impl getUpgradedGiftWithdrawalUrl {
         out.push_str("{\"@type\":\"getUpgradedGiftWithdrawalUrl\"");
         out.push_str(",\"received_gift_id\":");
         tl_json::str(out, &self.received_gift_id);
-        out.push_str(",\"password\":");
-        tl_json::str(out, &self.password);
         out.push('}');
     }
 
@@ -356498,9 +365342,6 @@ impl getUpgradedGiftWithdrawalUrl {
         if let Some(__j0) = tl_json::field(o, "received_gift_id") {
             value.received_gift_id = tl_json::read_string(__j0)?;
         }
-        if let Some(__j2) = tl_json::field(o, "password") {
-            value.password = tl_json::read_string(__j2)?;
-        }
         Result::Ok(value)
     }
 
@@ -356509,7 +365350,6 @@ impl getUpgradedGiftWithdrawalUrl {
     pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
         s.store_class_begin(field_name, "getUpgradedGiftWithdrawalUrl");
         s.store_field_str("received_gift_id", &self.received_gift_id);
-        s.store_field_str("password", &self.password);
         s.store_class_end();
     }
 
@@ -356896,10 +365736,14 @@ impl getUserFullInfo {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "getUserLink")]
-pub struct getUserLink;
+pub struct getUserLink {
+    pub remove_messages_fee: bool,
+    pub return_permanent_link: bool,
+    pub revoke_previous_links: bool,
+}
 
 impl getUserLink {
-    pub const ID: i32 = 1226839270;
+    pub const ID: i32 = -6787376;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -356907,7 +365751,9 @@ impl getUserLink {
     }
 
     pub fn store(&self, out: &mut Vec<u8>) {
-        let _ = out;
+        tl::__bool(out, self.remove_messages_fee);
+        tl::__bool(out, self.return_permanent_link);
+        tl::__bool(out, self.revoke_previous_links);
     }
 
     pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
@@ -356928,8 +365774,10 @@ impl getUserLink {
     }
 
     pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
-        let _ = r;
-        Result::Ok(Self)
+        let remove_messages_fee: bool = r.bool()?;
+        let return_permanent_link: bool = r.bool()?;
+        let revoke_previous_links: bool = r.bool()?;
+        Result::Ok(Self { remove_messages_fee, return_permanent_link, revoke_previous_links })
     }
 
     pub fn to_json(&self) -> String {
@@ -356940,6 +365788,12 @@ impl getUserLink {
 
     pub fn to_json_into(&self, out: &mut String) {
         out.push_str("{\"@type\":\"getUserLink\"");
+        out.push_str(",\"remove_messages_fee\":");
+        tl_json::boolean(out, self.remove_messages_fee);
+        out.push_str(",\"return_permanent_link\":");
+        tl_json::boolean(out, self.return_permanent_link);
+        out.push_str(",\"revoke_previous_links\":");
+        tl_json::boolean(out, self.revoke_previous_links);
         out.push('}');
     }
 
@@ -356952,20 +365806,33 @@ impl getUserLink {
     /// object is accepted and `@type` is ignored — only the fields read.
     pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
         match v {
-            tl_json::Json::Null => Result::Ok(Self),
+            tl_json::Json::Null => Result::Ok(Self::default()),
             tl_json::Json::Object(o) => Self::from_json_object(o),
             other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
         }
     }
 
-    fn from_json_object(_o: &tl_json::Object) -> Result<Self, String> {
-        Result::Ok(Self)
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "remove_messages_fee") {
+            value.remove_messages_fee = tl_json::read_bool(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "return_permanent_link") {
+            value.return_permanent_link = tl_json::read_bool(__j2)?;
+        }
+        if let Some(__j4) = tl_json::field(o, "revoke_previous_links") {
+            value.revoke_previous_links = tl_json::read_bool(__j4)?;
+        }
+        Result::Ok(value)
     }
 
     /// td's generated `Class::store(TlStorerToString&, const char*)`
     /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
     pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
         s.store_class_begin(field_name, "getUserLink");
+        s.store_field_bool("remove_messages_fee", self.remove_messages_fee);
+        s.store_field_bool("return_permanent_link", self.return_permanent_link);
+        s.store_field_bool("revoke_previous_links", self.revoke_previous_links);
         s.store_class_end();
     }
 
@@ -358349,6 +367216,235 @@ impl getWebPageInstantView {
         s.store_class_begin(field_name, "getWebPageInstantView");
         s.store_field_str("url", &self.url);
         s.store_field_bool("only_local", self.only_local);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "getWidgetPublicData")]
+pub struct getWidgetPublicData {
+    pub chat_id: i64,
+    pub message_id: i64,
+}
+
+impl getWidgetPublicData {
+    pub const ID: i32 = 785502640;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i64(out, self.chat_id);
+        tl::__i64(out, self.message_id);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let chat_id: i64 = r.i64()?;
+        let message_id: i64 = r.i64()?;
+        Result::Ok(Self { chat_id, message_id })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"getWidgetPublicData\"");
+        out.push_str(",\"chat_id\":");
+        tl_json::num64(out, self.chat_id);
+        out.push_str(",\"message_id\":");
+        tl_json::num64(out, self.message_id);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "chat_id") {
+            value.chat_id = tl_json::read_i64(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "message_id") {
+            value.message_id = tl_json::read_i64(__j2)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "getWidgetPublicData");
+        s.store_field_int("chat_id", self.chat_id);
+        s.store_field_int("message_id", self.message_id);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "getWidgetQueryAnswer")]
+pub struct getWidgetQueryAnswer {
+    pub chat_id: i64,
+    pub message_id: i64,
+    pub query_type: Option<WidgetQueryType>,
+    pub data: Vec<u8>,
+}
+
+impl getWidgetQueryAnswer {
+    pub const ID: i32 = -1345275611;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i64(out, self.chat_id);
+        tl::__i64(out, self.message_id);
+        let __d0 = Default::default();
+        let __m0 = self.query_type.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+        tl::__string(out, &self.data);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let chat_id: i64 = r.i64()?;
+        let message_id: i64 = r.i64()?;
+        let query_type: Option<WidgetQueryType> = Some(WidgetQueryType::read(r)?);
+        let data: Vec<u8> = r.bytes()?;
+        Result::Ok(Self { chat_id, message_id, query_type, data })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"getWidgetQueryAnswer\"");
+        out.push_str(",\"chat_id\":");
+        tl_json::num64(out, self.chat_id);
+        out.push_str(",\"message_id\":");
+        tl_json::num64(out, self.message_id);
+        if let Some(__o0) = &self.query_type {
+            out.push_str(",\"query_type\":");
+            __o0.to_json_into(out);
+        }
+        out.push_str(",\"data\":");
+        tl_json::bytes(out, &self.data);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "chat_id") {
+            value.chat_id = tl_json::read_i64(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "message_id") {
+            value.message_id = tl_json::read_i64(__j2)?;
+        }
+        if let Some(__j4) = tl_json::field(o, "query_type") && !matches!(__j4, tl_json::Json::Null) {
+            value.query_type = Some(WidgetQueryType::from_json_value(__j4)?);
+        }
+        if let Some(__j6) = tl_json::field(o, "data") {
+            value.data = tl_json::read_bytes(__j6)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "getWidgetQueryAnswer");
+        s.store_field_int("chat_id", self.chat_id);
+        s.store_field_int("message_id", self.message_id);
+        match &self.query_type {
+            Some(__m0) => __m0.store_debug(s, "query_type"),
+            None => s.store_null("query_type"),
+        }
+        s.store_bytes_field("data", &self.data);
         s.store_class_end();
     }
 
@@ -363282,6 +372378,7 @@ pub struct postStory {
     pub content: Option<InputStoryContent>,
     pub areas: Option<InputStoryAreas>,
     pub caption: Option<FormattedText>,
+    pub music: Option<InputAudio>,
     pub privacy_settings: Option<StoryPrivacySettings>,
     pub album_ids: Vec<i32>,
     pub active_period: i32,
@@ -363291,7 +372388,7 @@ pub struct postStory {
 }
 
 impl postStory {
-    pub const ID: i32 = -1725643742;
+    pub const ID: i32 = -313838892;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -363310,16 +372407,19 @@ impl postStory {
         let __m2 = self.caption.as_ref().unwrap_or(&__d2);
         __m2.store(out);
         let __d3 = Default::default();
-        let __m3 = self.privacy_settings.as_ref().unwrap_or(&__d3);
+        let __m3 = self.music.as_ref().unwrap_or(&__d3);
         __m3.store(out);
+        let __d4 = Default::default();
+        let __m4 = self.privacy_settings.as_ref().unwrap_or(&__d4);
+        __m4.store(out);
         tl::__i32(out, self.album_ids.len() as i32);
-        for __v4 in &self.album_ids {
-            tl::__i32(out, *__v4);
+        for __v5 in &self.album_ids {
+            tl::__i32(out, *__v5);
         }
         tl::__i32(out, self.active_period);
-        let __d5 = Default::default();
-        let __m5 = self.from_story_full_id.as_ref().unwrap_or(&__d5);
-        __m5.store(out);
+        let __d6 = Default::default();
+        let __m6 = self.from_story_full_id.as_ref().unwrap_or(&__d6);
+        __m6.store(out);
         tl::__bool(out, self.is_posted_to_chat_page);
         tl::__bool(out, self.protect_content);
     }
@@ -363346,6 +372446,7 @@ impl postStory {
         let content: Option<InputStoryContent> = Some(InputStoryContent::read(r)?);
         let areas: Option<InputStoryAreas> = Some(InputStoryAreas::read_bare(r)?);
         let caption: Option<FormattedText> = Some(FormattedText::read_bare(r)?);
+        let music: Option<InputAudio> = Some(InputAudio::read_bare(r)?);
         let privacy_settings: Option<StoryPrivacySettings> = Some(StoryPrivacySettings::read(r)?);
         let __v0: Vec<i32> = {
             let count: u32 = r.i32()? as u32;
@@ -363363,7 +372464,7 @@ impl postStory {
         let from_story_full_id: Option<StoryFullId> = Some(StoryFullId::read_bare(r)?);
         let is_posted_to_chat_page: bool = r.bool()?;
         let protect_content: bool = r.bool()?;
-        Result::Ok(Self { chat_id, content, areas, caption, privacy_settings, album_ids, active_period, from_story_full_id, is_posted_to_chat_page, protect_content })
+        Result::Ok(Self { chat_id, content, areas, caption, music, privacy_settings, album_ids, active_period, from_story_full_id, is_posted_to_chat_page, protect_content })
     }
 
     pub fn to_json(&self) -> String {
@@ -363388,26 +372489,30 @@ impl postStory {
             out.push_str(",\"caption\":");
             __o2.to_json_into(out);
         }
-        if let Some(__o3) = &self.privacy_settings {
-            out.push_str(",\"privacy_settings\":");
+        if let Some(__o3) = &self.music {
+            out.push_str(",\"music\":");
             __o3.to_json_into(out);
+        }
+        if let Some(__o4) = &self.privacy_settings {
+            out.push_str(",\"privacy_settings\":");
+            __o4.to_json_into(out);
         }
         out.push_str(",\"album_ids\":");
         out.push('[');
         let mut __first = true;
-        for __v4 in &self.album_ids {
+        for __v5 in &self.album_ids {
             if !__first {
                 out.push(',');
             }
             __first = false;
-            tl_json::num32(out, *__v4);
+            tl_json::num32(out, *__v5);
         }
         out.push(']');
         out.push_str(",\"active_period\":");
         tl_json::num32(out, self.active_period);
-        if let Some(__o5) = &self.from_story_full_id {
+        if let Some(__o6) = &self.from_story_full_id {
             out.push_str(",\"from_story_full_id\":");
-            __o5.to_json_into(out);
+            __o6.to_json_into(out);
         }
         out.push_str(",\"is_posted_to_chat_page\":");
         tl_json::boolean(out, self.is_posted_to_chat_page);
@@ -363445,23 +372550,26 @@ impl postStory {
         if let Some(__j6) = tl_json::field(o, "caption") && !matches!(__j6, tl_json::Json::Null) {
             value.caption = Some(FormattedText::from_json_value(__j6)?);
         }
-        if let Some(__j8) = tl_json::field(o, "privacy_settings") && !matches!(__j8, tl_json::Json::Null) {
-            value.privacy_settings = Some(StoryPrivacySettings::from_json_value(__j8)?);
+        if let Some(__j8) = tl_json::field(o, "music") && !matches!(__j8, tl_json::Json::Null) {
+            value.music = Some(InputAudio::from_json_value(__j8)?);
         }
-        if let Some(__j10) = tl_json::field(o, "album_ids") {
-            value.album_ids = tl_json::read_vector(__j10, tl_json::read_i32)?;
+        if let Some(__j10) = tl_json::field(o, "privacy_settings") && !matches!(__j10, tl_json::Json::Null) {
+            value.privacy_settings = Some(StoryPrivacySettings::from_json_value(__j10)?);
         }
-        if let Some(__j12) = tl_json::field(o, "active_period") {
-            value.active_period = tl_json::read_i32(__j12)?;
+        if let Some(__j12) = tl_json::field(o, "album_ids") {
+            value.album_ids = tl_json::read_vector(__j12, tl_json::read_i32)?;
         }
-        if let Some(__j14) = tl_json::field(o, "from_story_full_id") && !matches!(__j14, tl_json::Json::Null) {
-            value.from_story_full_id = Some(StoryFullId::from_json_value(__j14)?);
+        if let Some(__j14) = tl_json::field(o, "active_period") {
+            value.active_period = tl_json::read_i32(__j14)?;
         }
-        if let Some(__j16) = tl_json::field(o, "is_posted_to_chat_page") {
-            value.is_posted_to_chat_page = tl_json::read_bool(__j16)?;
+        if let Some(__j16) = tl_json::field(o, "from_story_full_id") && !matches!(__j16, tl_json::Json::Null) {
+            value.from_story_full_id = Some(StoryFullId::from_json_value(__j16)?);
         }
-        if let Some(__j18) = tl_json::field(o, "protect_content") {
-            value.protect_content = tl_json::read_bool(__j18)?;
+        if let Some(__j18) = tl_json::field(o, "is_posted_to_chat_page") {
+            value.is_posted_to_chat_page = tl_json::read_bool(__j18)?;
+        }
+        if let Some(__j20) = tl_json::field(o, "protect_content") {
+            value.protect_content = tl_json::read_bool(__j20)?;
         }
         Result::Ok(value)
     }
@@ -363483,18 +372591,22 @@ impl postStory {
             Some(__m2) => __m2.store_debug(s, "caption"),
             None => s.store_null("caption"),
         }
+        match &self.music {
+            Some(__m3) => __m3.store_debug(s, "music"),
+            None => s.store_null("music"),
+        }
         match &self.privacy_settings {
-            Some(__m3) => __m3.store_debug(s, "privacy_settings"),
+            Some(__m4) => __m4.store_debug(s, "privacy_settings"),
             None => s.store_null("privacy_settings"),
         }
         s.store_vector_begin("album_ids", self.album_ids.len());
-        for __v4 in &self.album_ids {
-            s.store_field_int("", *__v4 as i64);
+        for __v5 in &self.album_ids {
+            s.store_field_int("", *__v5 as i64);
         }
         s.store_class_end();
         s.store_field_int("active_period", self.active_period as i64);
         match &self.from_story_full_id {
-            Some(__m5) => __m5.store_debug(s, "from_story_full_id"),
+            Some(__m6) => __m6.store_debug(s, "from_story_full_id"),
             None => s.store_null("from_story_full_id"),
         }
         s.store_field_bool("is_posted_to_chat_page", self.is_posted_to_chat_page);
@@ -364099,6 +373211,219 @@ impl processChatJoinRequests {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "processCommunityAddChatRequest")]
+pub struct processCommunityAddChatRequest {
+    pub community_id: i64,
+    pub chat_id: i64,
+    pub approve: bool,
+}
+
+impl processCommunityAddChatRequest {
+    pub const ID: i32 = 1652704988;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i64(out, self.community_id);
+        tl::__i64(out, self.chat_id);
+        tl::__bool(out, self.approve);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let community_id: i64 = r.i64()?;
+        let chat_id: i64 = r.i64()?;
+        let approve: bool = r.bool()?;
+        Result::Ok(Self { community_id, chat_id, approve })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"processCommunityAddChatRequest\"");
+        out.push_str(",\"community_id\":");
+        tl_json::num64(out, self.community_id);
+        out.push_str(",\"chat_id\":");
+        tl_json::num64(out, self.chat_id);
+        out.push_str(",\"approve\":");
+        tl_json::boolean(out, self.approve);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "community_id") {
+            value.community_id = tl_json::read_i64(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "chat_id") {
+            value.chat_id = tl_json::read_i64(__j2)?;
+        }
+        if let Some(__j4) = tl_json::field(o, "approve") {
+            value.approve = tl_json::read_bool(__j4)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "processCommunityAddChatRequest");
+        s.store_field_int("community_id", self.community_id);
+        s.store_field_int("chat_id", self.chat_id);
+        s.store_field_bool("approve", self.approve);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "processCommunityAddChatRequests")]
+pub struct processCommunityAddChatRequests {
+    pub community_id: i64,
+    pub approve: bool,
+}
+
+impl processCommunityAddChatRequests {
+    pub const ID: i32 = -1586127930;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i64(out, self.community_id);
+        tl::__bool(out, self.approve);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let community_id: i64 = r.i64()?;
+        let approve: bool = r.bool()?;
+        Result::Ok(Self { community_id, approve })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"processCommunityAddChatRequests\"");
+        out.push_str(",\"community_id\":");
+        tl_json::num64(out, self.community_id);
+        out.push_str(",\"approve\":");
+        tl_json::boolean(out, self.approve);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "community_id") {
+            value.community_id = tl_json::read_i64(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "approve") {
+            value.approve = tl_json::read_bool(__j2)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "processCommunityAddChatRequests");
+        s.store_field_int("community_id", self.community_id);
+        s.store_field_bool("approve", self.approve);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "processGiftPurchaseOffer")]
 pub struct processGiftPurchaseOffer {
     pub message_id: i64,
@@ -364281,6 +373606,115 @@ impl processPushNotification {
     pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
         s.store_class_begin(field_name, "processPushNotification");
         s.store_field_str("payload", &self.payload);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "processWebProxyCarrierMessage")]
+pub struct processWebProxyCarrierMessage {
+    pub carrier_id: i32,
+    pub message: Option<WebProxyCarrierMessage>,
+}
+
+impl processWebProxyCarrierMessage {
+    pub const ID: i32 = 782285617;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.carrier_id);
+        let __d0 = Default::default();
+        let __m0 = self.message.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let carrier_id: i32 = r.i32()?;
+        let message: Option<WebProxyCarrierMessage> = Some(WebProxyCarrierMessage::read(r)?);
+        Result::Ok(Self { carrier_id, message })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"processWebProxyCarrierMessage\"");
+        out.push_str(",\"carrier_id\":");
+        tl_json::num32(out, self.carrier_id);
+        if let Some(__o0) = &self.message {
+            out.push_str(",\"message\":");
+            __o0.to_json_into(out);
+        }
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "carrier_id") {
+            value.carrier_id = tl_json::read_i32(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "message") && !matches!(__j2, tl_json::Json::Null) {
+            value.message = Some(WebProxyCarrierMessage::from_json_value(__j2)?);
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "processWebProxyCarrierMessage");
+        s.store_field_int("carrier_id", self.carrier_id as i64);
+        match &self.message {
+            Some(__m0) => __m0.store_debug(s, "message"),
+            None => s.store_null("message"),
+        }
         s.store_class_end();
     }
 
@@ -365645,6 +375079,115 @@ impl recognizeSpeech {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "recognizeSpeechInFile")]
+pub struct recognizeSpeechInFile {
+    pub audio_file: Option<InputFile>,
+    pub recognition_id: i64,
+}
+
+impl recognizeSpeechInFile {
+    pub const ID: i32 = 1158465679;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let __d0 = Default::default();
+        let __m0 = self.audio_file.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+        tl::__i64(out, self.recognition_id);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let audio_file: Option<InputFile> = Some(InputFile::read(r)?);
+        let recognition_id: i64 = r.i64()?;
+        Result::Ok(Self { audio_file, recognition_id })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"recognizeSpeechInFile\"");
+        if let Some(__o0) = &self.audio_file {
+            out.push_str(",\"audio_file\":");
+            __o0.to_json_into(out);
+        }
+        out.push_str(",\"recognition_id\":");
+        tl_json::num64q(out, self.recognition_id);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "audio_file") && !matches!(__j0, tl_json::Json::Null) {
+            value.audio_file = Some(InputFile::from_json_value(__j0)?);
+        }
+        if let Some(__j2) = tl_json::field(o, "recognition_id") {
+            value.recognition_id = tl_json::read_i64(__j2)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "recognizeSpeechInFile");
+        match &self.audio_file {
+            Some(__m0) => __m0.store_debug(s, "audio_file"),
+            None => s.store_null("audio_file"),
+        }
+        s.store_field_int("recognition_id", self.recognition_id);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "recoverAuthenticationPassword")]
 pub struct recoverAuthenticationPassword {
     pub recovery_code: String,
@@ -366583,6 +376126,108 @@ impl removeChatActionBar {
     /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
     pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
         s.store_class_begin(field_name, "removeChatActionBar");
+        s.store_field_int("chat_id", self.chat_id);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "removeCommunityChat")]
+pub struct removeCommunityChat {
+    pub community_id: i64,
+    pub chat_id: i64,
+}
+
+impl removeCommunityChat {
+    pub const ID: i32 = 898536429;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i64(out, self.community_id);
+        tl::__i64(out, self.chat_id);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let community_id: i64 = r.i64()?;
+        let chat_id: i64 = r.i64()?;
+        Result::Ok(Self { community_id, chat_id })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"removeCommunityChat\"");
+        out.push_str(",\"community_id\":");
+        tl_json::num64(out, self.community_id);
+        out.push_str(",\"chat_id\":");
+        tl_json::num64(out, self.chat_id);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "community_id") {
+            value.community_id = tl_json::read_i64(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "chat_id") {
+            value.chat_id = tl_json::read_i64(__j2)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "removeCommunityChat");
+        s.store_field_int("community_id", self.community_id);
         s.store_field_int("chat_id", self.chat_id);
         s.store_class_end();
     }
@@ -372530,6 +382175,115 @@ impl reportVideoMessageAdvertisement {
         s.store_class_begin(field_name, "reportVideoMessageAdvertisement");
         s.store_field_int("advertisement_unique_id", self.advertisement_unique_id);
         s.store_bytes_field("option_id", &self.option_id);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "reportWebProxyCarrierError")]
+pub struct reportWebProxyCarrierError {
+    pub carrier_id: i32,
+    pub error: Option<WebProxyCarrierError>,
+}
+
+impl reportWebProxyCarrierError {
+    pub const ID: i32 = -992742613;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.carrier_id);
+        let __d0 = Default::default();
+        let __m0 = self.error.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let carrier_id: i32 = r.i32()?;
+        let error: Option<WebProxyCarrierError> = Some(WebProxyCarrierError::read(r)?);
+        Result::Ok(Self { carrier_id, error })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"reportWebProxyCarrierError\"");
+        out.push_str(",\"carrier_id\":");
+        tl_json::num32(out, self.carrier_id);
+        if let Some(__o0) = &self.error {
+            out.push_str(",\"error\":");
+            __o0.to_json_into(out);
+        }
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "carrier_id") {
+            value.carrier_id = tl_json::read_i32(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "error") && !matches!(__j2, tl_json::Json::Null) {
+            value.error = Some(WebProxyCarrierError::from_json_value(__j2)?);
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "reportWebProxyCarrierError");
+        s.store_field_int("carrier_id", self.carrier_id as i64);
+        match &self.error {
+            Some(__m0) => __m0.store_debug(s, "error"),
+            None => s.store_null("error"),
+        }
         s.store_class_end();
     }
 
@@ -382900,7 +392654,7 @@ pub struct sendTonWalletTransfer {
 }
 
 impl sendTonWalletTransfer {
-    pub const ID: i32 = 173682008;
+    pub const ID: i32 = 1666990190;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -382960,7 +392714,7 @@ impl sendTonWalletTransfer {
         out.push_str(",\"address\":");
         tl_json::str(out, &self.address);
         out.push_str(",\"amount\":");
-        tl_json::num64(out, self.amount);
+        tl_json::num64q(out, self.amount);
         out.push_str(",\"comment\":");
         tl_json::str(out, &self.comment);
         out.push_str(",\"is_comment_encrypted\":");
@@ -389468,6 +399222,115 @@ impl setCommunityName {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "setCommunityNotificationSettings")]
+pub struct setCommunityNotificationSettings {
+    pub community_id: i64,
+    pub notification_settings: Option<ChatNotificationSettings>,
+}
+
+impl setCommunityNotificationSettings {
+    pub const ID: i32 = -1727991282;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i64(out, self.community_id);
+        let __d0 = Default::default();
+        let __m0 = self.notification_settings.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let community_id: i64 = r.i64()?;
+        let notification_settings: Option<ChatNotificationSettings> = Some(ChatNotificationSettings::read_bare(r)?);
+        Result::Ok(Self { community_id, notification_settings })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"setCommunityNotificationSettings\"");
+        out.push_str(",\"community_id\":");
+        tl_json::num64(out, self.community_id);
+        if let Some(__o0) = &self.notification_settings {
+            out.push_str(",\"notification_settings\":");
+            __o0.to_json_into(out);
+        }
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "community_id") {
+            value.community_id = tl_json::read_i64(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "notification_settings") && !matches!(__j2, tl_json::Json::Null) {
+            value.notification_settings = Some(ChatNotificationSettings::from_json_value(__j2)?);
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "setCommunityNotificationSettings");
+        s.store_field_int("community_id", self.community_id);
+        match &self.notification_settings {
+            Some(__m0) => __m0.store_debug(s, "notification_settings"),
+            None => s.store_null("notification_settings"),
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "setCommunityPermissions")]
 pub struct setCommunityPermissions {
     pub community_id: i64,
@@ -395391,6 +405254,115 @@ impl setProfilePhoto {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "setProfileShareTheme")]
+pub struct setProfileShareTheme {
+    pub chat_id: i64,
+    pub theme: Option<InputProfileShareTheme>,
+}
+
+impl setProfileShareTheme {
+    pub const ID: i32 = -1542396745;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i64(out, self.chat_id);
+        let __d0 = Default::default();
+        let __m0 = self.theme.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let chat_id: i64 = r.i64()?;
+        let theme: Option<InputProfileShareTheme> = Some(InputProfileShareTheme::read(r)?);
+        Result::Ok(Self { chat_id, theme })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"setProfileShareTheme\"");
+        out.push_str(",\"chat_id\":");
+        tl_json::num64(out, self.chat_id);
+        if let Some(__o0) = &self.theme {
+            out.push_str(",\"theme\":");
+            __o0.to_json_into(out);
+        }
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "chat_id") {
+            value.chat_id = tl_json::read_i64(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "theme") && !matches!(__j2, tl_json::Json::Null) {
+            value.theme = Some(InputProfileShareTheme::from_json_value(__j2)?);
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "setProfileShareTheme");
+        s.store_field_int("chat_id", self.chat_id);
+        match &self.theme {
+            Some(__m0) => __m0.store_debug(s, "theme"),
+            None => s.store_null("theme"),
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "setQuickReplyShortcutName")]
 pub struct setQuickReplyShortcutName {
     pub shortcut_id: i32,
@@ -397889,6 +407861,135 @@ impl setTonConnectSessionWalletClientId {
         s.store_class_begin(field_name, "setTonConnectSessionWalletClientId");
         s.store_field_int("session_id", self.session_id);
         s.store_field_str("wallet_client_id", &self.wallet_client_id);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "setTonWalletCardStickers")]
+pub struct setTonWalletCardStickers {
+    pub stickers: Vec<InputTonWalletCardSticker>,
+    pub background_nft_address: String,
+}
+
+impl setTonWalletCardStickers {
+    pub const ID: i32 = -768400959;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.stickers.len() as i32);
+        for __v0 in &self.stickers {
+            (*__v0).store(out);
+        }
+        tl::__string(out, &self.background_nft_address);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let __v0: Vec<InputTonWalletCardSticker> = {
+            let count: u32 = r.i32()? as u32;
+            if count as usize > r.remaining() {
+                return Result::Err("Wrong vector length");
+            }
+            let mut res = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                res.push(InputTonWalletCardSticker::read_bare(r)?);
+            }
+            res
+        };
+        let stickers: Vec<InputTonWalletCardSticker> = __v0;
+        let background_nft_address: String = r.string()?;
+        Result::Ok(Self { stickers, background_nft_address })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"setTonWalletCardStickers\"");
+        out.push_str(",\"stickers\":");
+        out.push('[');
+        let mut __first = true;
+        for __v0 in &self.stickers {
+            if !__first {
+                out.push(',');
+            }
+            __first = false;
+            (*__v0).to_json_into(out);
+        }
+        out.push(']');
+        out.push_str(",\"background_nft_address\":");
+        tl_json::str(out, &self.background_nft_address);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "stickers") {
+            value.stickers = tl_json::read_vector(__j0, InputTonWalletCardSticker::from_json_value)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "background_nft_address") {
+            value.background_nft_address = tl_json::read_string(__j2)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "setTonWalletCardStickers");
+        s.store_vector_begin("stickers", self.stickers.len());
+        for __v0 in &self.stickers {
+            __v0.store_debug(s, "");
+        }
+        s.store_class_end();
+        s.store_field_str("background_nft_address", &self.background_nft_address);
         s.store_class_end();
     }
 
@@ -403320,6 +413421,226 @@ impl toggleChatViewAsTopics {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "toggleCommunityAreChatsCollapsed")]
+pub struct toggleCommunityAreChatsCollapsed {
+    pub community_id: i64,
+    pub are_chats_collapsed: bool,
+}
+
+impl toggleCommunityAreChatsCollapsed {
+    pub const ID: i32 = -1708259775;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i64(out, self.community_id);
+        tl::__bool(out, self.are_chats_collapsed);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let community_id: i64 = r.i64()?;
+        let are_chats_collapsed: bool = r.bool()?;
+        Result::Ok(Self { community_id, are_chats_collapsed })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"toggleCommunityAreChatsCollapsed\"");
+        out.push_str(",\"community_id\":");
+        tl_json::num64(out, self.community_id);
+        out.push_str(",\"are_chats_collapsed\":");
+        tl_json::boolean(out, self.are_chats_collapsed);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "community_id") {
+            value.community_id = tl_json::read_i64(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "are_chats_collapsed") {
+            value.are_chats_collapsed = tl_json::read_bool(__j2)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "toggleCommunityAreChatsCollapsed");
+        s.store_field_int("community_id", self.community_id);
+        s.store_field_bool("are_chats_collapsed", self.are_chats_collapsed);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "toggleCommunityMemberIsBanned")]
+pub struct toggleCommunityMemberIsBanned {
+    pub community_id: i64,
+    pub member_id: Option<MessageSender>,
+    pub is_banned: bool,
+}
+
+impl toggleCommunityMemberIsBanned {
+    pub const ID: i32 = 307460053;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i64(out, self.community_id);
+        let __d0 = Default::default();
+        let __m0 = self.member_id.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+        tl::__bool(out, self.is_banned);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let community_id: i64 = r.i64()?;
+        let member_id: Option<MessageSender> = Some(MessageSender::read(r)?);
+        let is_banned: bool = r.bool()?;
+        Result::Ok(Self { community_id, member_id, is_banned })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"toggleCommunityMemberIsBanned\"");
+        out.push_str(",\"community_id\":");
+        tl_json::num64(out, self.community_id);
+        if let Some(__o0) = &self.member_id {
+            out.push_str(",\"member_id\":");
+            __o0.to_json_into(out);
+        }
+        out.push_str(",\"is_banned\":");
+        tl_json::boolean(out, self.is_banned);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "community_id") {
+            value.community_id = tl_json::read_i64(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "member_id") && !matches!(__j2, tl_json::Json::Null) {
+            value.member_id = Some(MessageSender::from_json_value(__j2)?);
+        }
+        if let Some(__j4) = tl_json::field(o, "is_banned") {
+            value.is_banned = tl_json::read_bool(__j4)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "toggleCommunityMemberIsBanned");
+        s.store_field_int("community_id", self.community_id);
+        match &self.member_id {
+            Some(__m0) => __m0.store_debug(s, "member_id"),
+            None => s.store_null("member_id"),
+        }
+        s.store_field_bool("is_banned", self.is_banned);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "toggleDirectMessagesChatTopicCanSendUnpaidMessages")]
 pub struct toggleDirectMessagesChatTopicCanSendUnpaidMessages {
     pub chat_id: i64,
@@ -405730,10 +416051,11 @@ pub struct toggleSupergroupIsForum {
     pub supergroup_id: i64,
     pub is_forum: bool,
     pub has_forum_tabs: bool,
+    pub has_forum_sidebar: bool,
 }
 
 impl toggleSupergroupIsForum {
-    pub const ID: i32 = 371064337;
+    pub const ID: i32 = -549703817;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -405744,6 +416066,7 @@ impl toggleSupergroupIsForum {
         tl::__i64(out, self.supergroup_id);
         tl::__bool(out, self.is_forum);
         tl::__bool(out, self.has_forum_tabs);
+        tl::__bool(out, self.has_forum_sidebar);
     }
 
     pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
@@ -405767,7 +416090,8 @@ impl toggleSupergroupIsForum {
         let supergroup_id: i64 = r.i64()?;
         let is_forum: bool = r.bool()?;
         let has_forum_tabs: bool = r.bool()?;
-        Result::Ok(Self { supergroup_id, is_forum, has_forum_tabs })
+        let has_forum_sidebar: bool = r.bool()?;
+        Result::Ok(Self { supergroup_id, is_forum, has_forum_tabs, has_forum_sidebar })
     }
 
     pub fn to_json(&self) -> String {
@@ -405784,6 +416108,8 @@ impl toggleSupergroupIsForum {
         tl_json::boolean(out, self.is_forum);
         out.push_str(",\"has_forum_tabs\":");
         tl_json::boolean(out, self.has_forum_tabs);
+        out.push_str(",\"has_forum_sidebar\":");
+        tl_json::boolean(out, self.has_forum_sidebar);
         out.push('}');
     }
 
@@ -405813,6 +416139,9 @@ impl toggleSupergroupIsForum {
         if let Some(__j4) = tl_json::field(o, "has_forum_tabs") {
             value.has_forum_tabs = tl_json::read_bool(__j4)?;
         }
+        if let Some(__j6) = tl_json::field(o, "has_forum_sidebar") {
+            value.has_forum_sidebar = tl_json::read_bool(__j6)?;
+        }
         Result::Ok(value)
     }
 
@@ -405823,6 +416152,7 @@ impl toggleSupergroupIsForum {
         s.store_field_int("supergroup_id", self.supergroup_id);
         s.store_field_bool("is_forum", self.is_forum);
         s.store_field_bool("has_forum_tabs", self.has_forum_tabs);
+        s.store_field_bool("has_forum_sidebar", self.has_forum_sidebar);
         s.store_class_end();
     }
 
@@ -408824,6 +419154,108 @@ impl viewVideoMessageAdvertisement {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "withdrawUpgradedGift")]
+pub struct withdrawUpgradedGift {
+    pub received_gift_id: String,
+    pub keep_on_profile: bool,
+}
+
+impl withdrawUpgradedGift {
+    pub const ID: i32 = -2103396691;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__string(out, &self.received_gift_id);
+        tl::__bool(out, self.keep_on_profile);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let received_gift_id: String = r.string()?;
+        let keep_on_profile: bool = r.bool()?;
+        Result::Ok(Self { received_gift_id, keep_on_profile })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.to_json_into(&mut out);
+        out
+    }
+
+    pub fn to_json_into(&self, out: &mut String) {
+        out.push_str("{\"@type\":\"withdrawUpgradedGift\"");
+        out.push_str(",\"received_gift_id\":");
+        tl_json::str(out, &self.received_gift_id);
+        out.push_str(",\"keep_on_profile\":");
+        tl_json::boolean(out, self.keep_on_profile);
+        out.push('}');
+    }
+
+    pub fn from_json(input: &str) -> Result<Self, String> {
+        let root = tl_json::parse_json(input)?;
+        Self::from_json_value(&root)
+    }
+
+    /// td's default-constructible `from_json(object_ptr<T>&)` path: any
+    /// object is accepted and `@type` is ignored — only the fields read.
+    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
+        match v {
+            tl_json::Json::Null => Result::Ok(Self::default()),
+            tl_json::Json::Object(o) => Self::from_json_object(o),
+            other => Result::Err(format!("Expected Object, but receive {}", other.type_name())),
+        }
+    }
+
+    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {
+        let mut value = Self::default();
+        if let Some(__j0) = tl_json::field(o, "received_gift_id") {
+            value.received_gift_id = tl_json::read_string(__j0)?;
+        }
+        if let Some(__j2) = tl_json::field(o, "keep_on_profile") {
+            value.keep_on_profile = tl_json::read_bool(__j2)?;
+        }
+        Result::Ok(value)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "withdrawUpgradedGift");
+        s.store_field_str("received_gift_id", &self.received_gift_id);
+        s.store_field_bool("keep_on_profile", self.keep_on_profile);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "writeGeneratedFilePart")]
 pub struct writeGeneratedFilePart {
     pub generation_id: i64,
@@ -408961,6 +419393,8 @@ pub enum Function {
     addChatWelcomeMessage(addChatWelcomeMessage),
     #[serde(rename = "addChecklistTasks")]
     addChecklistTasks(addChecklistTasks),
+    #[serde(rename = "addCommunityChat")]
+    addCommunityChat(addCommunityChat),
     #[serde(rename = "addContact")]
     addContact(addContact),
     #[serde(rename = "addCustomServerLanguagePack")]
@@ -409037,8 +419471,12 @@ pub enum Function {
     answerTonConnectRequest(answerTonConnectRequest),
     #[serde(rename = "answerWebAppQuery")]
     answerWebAppQuery(answerWebAppQuery),
+    #[serde(rename = "answerWidgetQuery")]
+    answerWidgetQuery(answerWidgetQuery),
     #[serde(rename = "applyPremiumGiftCode")]
     applyPremiumGiftCode(applyPremiumGiftCode),
+    #[serde(rename = "applyUnpaidMessagesToken")]
+    applyUnpaidMessagesToken(applyUnpaidMessagesToken),
     #[serde(rename = "approveSuggestedPost")]
     approveSuggestedPost(approveSuggestedPost),
     #[serde(rename = "assignStoreTransaction")]
@@ -409305,6 +419743,8 @@ pub enum Function {
     deleteFile(deleteFile),
     #[serde(rename = "deleteForumTopic")]
     deleteForumTopic(deleteForumTopic),
+    #[serde(rename = "deleteGift")]
+    deleteGift(deleteGift),
     #[serde(rename = "deleteGiftCollection")]
     deleteGiftCollection(deleteGiftCollection),
     #[serde(rename = "deleteGroupCallMessages")]
@@ -409371,6 +419811,8 @@ pub enum Function {
     disconnectWebsite(disconnectWebsite),
     #[serde(rename = "dismissWebToken")]
     dismissWebToken(dismissWebToken),
+    #[serde(rename = "displayUpgradedGift")]
+    displayUpgradedGift(displayUpgradedGift),
     #[serde(rename = "downloadFile")]
     downloadFile(downloadFile),
     #[serde(rename = "dropGiftOriginalDetails")]
@@ -409421,6 +419863,8 @@ pub enum Function {
     editInlineMessageReplyMarkup(editInlineMessageReplyMarkup),
     #[serde(rename = "editInlineMessageText")]
     editInlineMessageText(editInlineMessageText),
+    #[serde(rename = "editInlineMessageWidgetData")]
+    editInlineMessageWidgetData(editInlineMessageWidgetData),
     #[serde(rename = "editMessageCaption")]
     editMessageCaption(editMessageCaption),
     #[serde(rename = "editMessageChecklist")]
@@ -409435,6 +419879,8 @@ pub enum Function {
     editMessageSchedulingState(editMessageSchedulingState),
     #[serde(rename = "editMessageText")]
     editMessageText(editMessageText),
+    #[serde(rename = "editMessageWidgetData")]
+    editMessageWidgetData(editMessageWidgetData),
     #[serde(rename = "editProxy")]
     editProxy(editProxy),
     #[serde(rename = "editQuickReplyMessage")]
@@ -409445,10 +419891,14 @@ pub enum Function {
     editStory(editStory),
     #[serde(rename = "editStoryCover")]
     editStoryCover(editStoryCover),
+    #[serde(rename = "editStoryMusic")]
+    editStoryMusic(editStoryMusic),
     #[serde(rename = "editTextCompositionStyle")]
     editTextCompositionStyle(editTextCompositionStyle),
     #[serde(rename = "editUserStarSubscription")]
     editUserStarSubscription(editUserStarSubscription),
+    #[serde(rename = "editWidgetData")]
+    editWidgetData(editWidgetData),
     #[serde(rename = "enableProxy")]
     enableProxy(enableProxy),
     #[serde(rename = "enableTonWalletBackup")]
@@ -409463,6 +419913,10 @@ pub enum Function {
     endGroupCallScreenSharing(endGroupCallScreenSharing),
     #[serde(rename = "finishFileGeneration")]
     finishFileGeneration(finishFileGeneration),
+    #[serde(rename = "fixRecognizedRichMessageWithAi")]
+    fixRecognizedRichMessageWithAi(fixRecognizedRichMessageWithAi),
+    #[serde(rename = "fixRecognizedTextWithAi")]
+    fixRecognizedTextWithAi(fixRecognizedTextWithAi),
     #[serde(rename = "fixRichMessageWithAi")]
     fixRichMessageWithAi(fixRichMessageWithAi),
     #[serde(rename = "fixTextWithAi")]
@@ -409649,8 +420103,12 @@ pub enum Function {
     getCollectibleItemInfo(getCollectibleItemInfo),
     #[serde(rename = "getCommands")]
     getCommands(getCommands),
+    #[serde(rename = "getCommunityAddChatRequests")]
+    getCommunityAddChatRequests(getCommunityAddChatRequests),
     #[serde(rename = "getCommunityFullInfo")]
     getCommunityFullInfo(getCommunityFullInfo),
+    #[serde(rename = "getCommunityMemberChats")]
+    getCommunityMemberChats(getCommunityMemberChats),
     #[serde(rename = "getConnectedAffiliateProgram")]
     getConnectedAffiliateProgram(getConnectedAffiliateProgram),
     #[serde(rename = "getConnectedAffiliatePrograms")]
@@ -409789,6 +420247,8 @@ pub enum Function {
     getInternalLink(getInternalLink),
     #[serde(rename = "getInternalLinkType")]
     getInternalLinkType(getInternalLinkType),
+    #[serde(rename = "getJoinedCommunities")]
+    getJoinedCommunities(getJoinedCommunities),
     #[serde(rename = "getJsonString")]
     getJsonString(getJsonString),
     #[serde(rename = "getJsonValue")]
@@ -409953,6 +420413,8 @@ pub enum Function {
     getPreparedInlineMessage(getPreparedInlineMessage),
     #[serde(rename = "getPreparedKeyboardButton")]
     getPreparedKeyboardButton(getPreparedKeyboardButton),
+    #[serde(rename = "getProfileShareThemeBackdrops")]
+    getProfileShareThemeBackdrops(getProfileShareThemeBackdrops),
     #[serde(rename = "getProxies")]
     getProxies(getProxies),
     #[serde(rename = "getPublicPostSearchLimits")]
@@ -410007,6 +420469,8 @@ pub enum Function {
     getSearchedForTags(getSearchedForTags),
     #[serde(rename = "getSecretChat")]
     getSecretChat(getSecretChat),
+    #[serde(rename = "getSpeechRecognitionLanguages")]
+    getSpeechRecognitionLanguages(getSpeechRecognitionLanguages),
     #[serde(rename = "getStakeDiceState")]
     getStakeDiceState(getStakeDiceState),
     #[serde(rename = "getStarAdAccountUrl")]
@@ -410061,6 +420525,8 @@ pub enum Function {
     getSuggestedFileName(getSuggestedFileName),
     #[serde(rename = "getSuggestedStickerSetName")]
     getSuggestedStickerSetName(getSuggestedStickerSetName),
+    #[serde(rename = "getSuitableCommunityChats")]
+    getSuitableCommunityChats(getSuitableCommunityChats),
     #[serde(rename = "getSuitableDiscussionChats")]
     getSuitableDiscussionChats(getSuitableDiscussionChats),
     #[serde(rename = "getSuitablePersonalChats")]
@@ -410079,6 +420545,8 @@ pub enum Function {
     getTemporaryPasswordState(getTemporaryPasswordState),
     #[serde(rename = "getTextCompositionStyleExample")]
     getTextCompositionStyleExample(getTextCompositionStyleExample),
+    #[serde(rename = "getTextEmojiRanges")]
+    getTextEmojiRanges(getTextEmojiRanges),
     #[serde(rename = "getTextEntities")]
     getTextEntities(getTextEntities),
     #[serde(rename = "getThemeParametersJsonString")]
@@ -410101,6 +420569,8 @@ pub enum Function {
     getTonConnectSessions(getTonConnectSessions),
     #[serde(rename = "getTonTransactions")]
     getTonTransactions(getTonTransactions),
+    #[serde(rename = "getTonWalletCardBackgroundGiftCollectionNames")]
+    getTonWalletCardBackgroundGiftCollectionNames(getTonWalletCardBackgroundGiftCollectionNames),
     #[serde(rename = "getTonWalletNfts")]
     getTonWalletNfts(getTonWalletNfts),
     #[serde(rename = "getTonWalletOwnershipProofChallenge")]
@@ -410119,6 +420589,8 @@ pub enum Function {
     getTrendingStickerSets(getTrendingStickerSets),
     #[serde(rename = "getUpgradedGift")]
     getUpgradedGift(getUpgradedGift),
+    #[serde(rename = "getUpgradedGiftDepositInfo")]
+    getUpgradedGiftDepositInfo(getUpgradedGiftDepositInfo),
     #[serde(rename = "getUpgradedGiftEmojiStatuses")]
     getUpgradedGiftEmojiStatuses(getUpgradedGiftEmojiStatuses),
     #[serde(rename = "getUpgradedGiftValueInfo")]
@@ -410163,6 +420635,10 @@ pub enum Function {
     getWebAppUrl(getWebAppUrl),
     #[serde(rename = "getWebPageInstantView")]
     getWebPageInstantView(getWebPageInstantView),
+    #[serde(rename = "getWidgetPublicData")]
+    getWidgetPublicData(getWidgetPublicData),
+    #[serde(rename = "getWidgetQueryAnswer")]
+    getWidgetQueryAnswer(getWidgetQueryAnswer),
     #[serde(rename = "giftPremiumWithStars")]
     giftPremiumWithStars(giftPremiumWithStars),
     #[serde(rename = "hideContactCloseBirthdays")]
@@ -410265,10 +420741,16 @@ pub enum Function {
     processChatJoinRequest(processChatJoinRequest),
     #[serde(rename = "processChatJoinRequests")]
     processChatJoinRequests(processChatJoinRequests),
+    #[serde(rename = "processCommunityAddChatRequest")]
+    processCommunityAddChatRequest(processCommunityAddChatRequest),
+    #[serde(rename = "processCommunityAddChatRequests")]
+    processCommunityAddChatRequests(processCommunityAddChatRequests),
     #[serde(rename = "processGiftPurchaseOffer")]
     processGiftPurchaseOffer(processGiftPurchaseOffer),
     #[serde(rename = "processPushNotification")]
     processPushNotification(processPushNotification),
+    #[serde(rename = "processWebProxyCarrierMessage")]
+    processWebProxyCarrierMessage(processWebProxyCarrierMessage),
     #[serde(rename = "rateSpeechRecognition")]
     rateSpeechRecognition(rateSpeechRecognition),
     #[serde(rename = "readAllChatMentions")]
@@ -410295,6 +420777,8 @@ pub enum Function {
     readdQuickReplyShortcutMessages(readdQuickReplyShortcutMessages),
     #[serde(rename = "recognizeSpeech")]
     recognizeSpeech(recognizeSpeech),
+    #[serde(rename = "recognizeSpeechInFile")]
+    recognizeSpeechInFile(recognizeSpeechInFile),
     #[serde(rename = "recoverAuthenticationPassword")]
     recoverAuthenticationPassword(recoverAuthenticationPassword),
     #[serde(rename = "recoverPassword")]
@@ -410313,6 +420797,8 @@ pub enum Function {
     removeBusinessConnectedBotFromChat(removeBusinessConnectedBotFromChat),
     #[serde(rename = "removeChatActionBar")]
     removeChatActionBar(removeChatActionBar),
+    #[serde(rename = "removeCommunityChat")]
+    removeCommunityChat(removeCommunityChat),
     #[serde(rename = "removeContacts")]
     removeContacts(removeContacts),
     #[serde(rename = "removeFavoriteSticker")]
@@ -410419,6 +420905,8 @@ pub enum Function {
     reportSupergroupSpam(reportSupergroupSpam),
     #[serde(rename = "reportVideoMessageAdvertisement")]
     reportVideoMessageAdvertisement(reportVideoMessageAdvertisement),
+    #[serde(rename = "reportWebProxyCarrierError")]
+    reportWebProxyCarrierError(reportWebProxyCarrierError),
     #[serde(rename = "requestAuthenticationPasswordRecovery")]
     requestAuthenticationPasswordRecovery(requestAuthenticationPasswordRecovery),
     #[serde(rename = "requestPasswordRecovery")]
@@ -410711,6 +421199,8 @@ pub enum Function {
     setCommands(setCommands),
     #[serde(rename = "setCommunityName")]
     setCommunityName(setCommunityName),
+    #[serde(rename = "setCommunityNotificationSettings")]
+    setCommunityNotificationSettings(setCommunityNotificationSettings),
     #[serde(rename = "setCommunityPermissions")]
     setCommunityPermissions(setCommunityPermissions),
     #[serde(rename = "setCommunityPhoto")]
@@ -410817,6 +421307,8 @@ pub enum Function {
     setProfileAudioPosition(setProfileAudioPosition),
     #[serde(rename = "setProfilePhoto")]
     setProfilePhoto(setProfilePhoto),
+    #[serde(rename = "setProfileShareTheme")]
+    setProfileShareTheme(setProfileShareTheme),
     #[serde(rename = "setQuickReplyShortcutName")]
     setQuickReplyShortcutName(setQuickReplyShortcutName),
     #[serde(rename = "setReactionNotificationSettings")]
@@ -410861,6 +421353,8 @@ pub enum Function {
     setTdlibParameters(setTdlibParameters),
     #[serde(rename = "setTonConnectSessionWalletClientId")]
     setTonConnectSessionWalletClientId(setTonConnectSessionWalletClientId),
+    #[serde(rename = "setTonWalletCardStickers")]
+    setTonWalletCardStickers(setTonWalletCardStickers),
     #[serde(rename = "setUpgradedGiftColors")]
     setUpgradedGiftColors(setUpgradedGiftColors),
     #[serde(rename = "setUserEmojiStatus")]
@@ -410963,6 +421457,10 @@ pub enum Function {
     toggleChatIsTranslatable(toggleChatIsTranslatable),
     #[serde(rename = "toggleChatViewAsTopics")]
     toggleChatViewAsTopics(toggleChatViewAsTopics),
+    #[serde(rename = "toggleCommunityAreChatsCollapsed")]
+    toggleCommunityAreChatsCollapsed(toggleCommunityAreChatsCollapsed),
+    #[serde(rename = "toggleCommunityMemberIsBanned")]
+    toggleCommunityMemberIsBanned(toggleCommunityMemberIsBanned),
     #[serde(rename = "toggleDirectMessagesChatTopicCanSendUnpaidMessages")]
     toggleDirectMessagesChatTopicCanSendUnpaidMessages(toggleDirectMessagesChatTopicCanSendUnpaidMessages),
     #[serde(rename = "toggleDownloadIsPaused")]
@@ -411065,6 +421563,8 @@ pub enum Function {
     viewTrendingStickerSets(viewTrendingStickerSets),
     #[serde(rename = "viewVideoMessageAdvertisement")]
     viewVideoMessageAdvertisement(viewVideoMessageAdvertisement),
+    #[serde(rename = "withdrawUpgradedGift")]
+    withdrawUpgradedGift(withdrawUpgradedGift),
     #[serde(rename = "writeGeneratedFilePart")]
     writeGeneratedFilePart(writeGeneratedFilePart),
 }
@@ -411084,6 +421584,7 @@ impl Function {
             Self::addChatToList(v) => v.store_boxed(out),
             Self::addChatWelcomeMessage(v) => v.store_boxed(out),
             Self::addChecklistTasks(v) => v.store_boxed(out),
+            Self::addCommunityChat(v) => v.store_boxed(out),
             Self::addContact(v) => v.store_boxed(out),
             Self::addCustomServerLanguagePack(v) => v.store_boxed(out),
             Self::addFavoriteSticker(v) => v.store_boxed(out),
@@ -411122,7 +421623,9 @@ impl Function {
             Self::answerShippingQuery(v) => v.store_boxed(out),
             Self::answerTonConnectRequest(v) => v.store_boxed(out),
             Self::answerWebAppQuery(v) => v.store_boxed(out),
+            Self::answerWidgetQuery(v) => v.store_boxed(out),
             Self::applyPremiumGiftCode(v) => v.store_boxed(out),
+            Self::applyUnpaidMessagesToken(v) => v.store_boxed(out),
             Self::approveSuggestedPost(v) => v.store_boxed(out),
             Self::assignStoreTransaction(v) => v.store_boxed(out),
             Self::banChatMember(v) => v.store_boxed(out),
@@ -411256,6 +421759,7 @@ impl Function {
             Self::deleteEphemeralMessage(v) => v.store_boxed(out),
             Self::deleteFile(v) => v.store_boxed(out),
             Self::deleteForumTopic(v) => v.store_boxed(out),
+            Self::deleteGift(v) => v.store_boxed(out),
             Self::deleteGiftCollection(v) => v.store_boxed(out),
             Self::deleteGroupCallMessages(v) => v.store_boxed(out),
             Self::deleteGroupCallMessagesBySender(v) => v.store_boxed(out),
@@ -411289,6 +421793,7 @@ impl Function {
             Self::disconnectTonConnectSession(v) => v.store_boxed(out),
             Self::disconnectWebsite(v) => v.store_boxed(out),
             Self::dismissWebToken(v) => v.store_boxed(out),
+            Self::displayUpgradedGift(v) => v.store_boxed(out),
             Self::downloadFile(v) => v.store_boxed(out),
             Self::dropGiftOriginalDetails(v) => v.store_boxed(out),
             Self::editBotMediaPreview(v) => v.store_boxed(out),
@@ -411314,6 +421819,7 @@ impl Function {
             Self::editInlineMessageMedia(v) => v.store_boxed(out),
             Self::editInlineMessageReplyMarkup(v) => v.store_boxed(out),
             Self::editInlineMessageText(v) => v.store_boxed(out),
+            Self::editInlineMessageWidgetData(v) => v.store_boxed(out),
             Self::editMessageCaption(v) => v.store_boxed(out),
             Self::editMessageChecklist(v) => v.store_boxed(out),
             Self::editMessageLiveLocation(v) => v.store_boxed(out),
@@ -411321,13 +421827,16 @@ impl Function {
             Self::editMessageReplyMarkup(v) => v.store_boxed(out),
             Self::editMessageSchedulingState(v) => v.store_boxed(out),
             Self::editMessageText(v) => v.store_boxed(out),
+            Self::editMessageWidgetData(v) => v.store_boxed(out),
             Self::editProxy(v) => v.store_boxed(out),
             Self::editQuickReplyMessage(v) => v.store_boxed(out),
             Self::editStarSubscription(v) => v.store_boxed(out),
             Self::editStory(v) => v.store_boxed(out),
             Self::editStoryCover(v) => v.store_boxed(out),
+            Self::editStoryMusic(v) => v.store_boxed(out),
             Self::editTextCompositionStyle(v) => v.store_boxed(out),
             Self::editUserStarSubscription(v) => v.store_boxed(out),
+            Self::editWidgetData(v) => v.store_boxed(out),
             Self::enableProxy(v) => v.store_boxed(out),
             Self::enableTonWalletBackup(v) => v.store_boxed(out),
             Self::encryptGroupCallData(v) => v.store_boxed(out),
@@ -411335,6 +421844,8 @@ impl Function {
             Self::endGroupCallRecording(v) => v.store_boxed(out),
             Self::endGroupCallScreenSharing(v) => v.store_boxed(out),
             Self::finishFileGeneration(v) => v.store_boxed(out),
+            Self::fixRecognizedRichMessageWithAi(v) => v.store_boxed(out),
+            Self::fixRecognizedTextWithAi(v) => v.store_boxed(out),
             Self::fixRichMessageWithAi(v) => v.store_boxed(out),
             Self::fixTextWithAi(v) => v.store_boxed(out),
             Self::forwardMessages(v) => v.store_boxed(out),
@@ -411428,7 +421939,9 @@ impl Function {
             Self::getCloseFriends(v) => v.store_boxed(out),
             Self::getCollectibleItemInfo(v) => v.store_boxed(out),
             Self::getCommands(v) => v.store_boxed(out),
+            Self::getCommunityAddChatRequests(v) => v.store_boxed(out),
             Self::getCommunityFullInfo(v) => v.store_boxed(out),
+            Self::getCommunityMemberChats(v) => v.store_boxed(out),
             Self::getConnectedAffiliateProgram(v) => v.store_boxed(out),
             Self::getConnectedAffiliatePrograms(v) => v.store_boxed(out),
             Self::getConnectedWebsites(v) => v.store_boxed(out),
@@ -411498,6 +422011,7 @@ impl Function {
             Self::getInstalledStickerSets(v) => v.store_boxed(out),
             Self::getInternalLink(v) => v.store_boxed(out),
             Self::getInternalLinkType(v) => v.store_boxed(out),
+            Self::getJoinedCommunities(v) => v.store_boxed(out),
             Self::getJsonString(v) => v.store_boxed(out),
             Self::getJsonValue(v) => v.store_boxed(out),
             Self::getKeywordEmojis(v) => v.store_boxed(out),
@@ -411580,6 +422094,7 @@ impl Function {
             Self::getPremiumStickers(v) => v.store_boxed(out),
             Self::getPreparedInlineMessage(v) => v.store_boxed(out),
             Self::getPreparedKeyboardButton(v) => v.store_boxed(out),
+            Self::getProfileShareThemeBackdrops(v) => v.store_boxed(out),
             Self::getProxies(v) => v.store_boxed(out),
             Self::getPublicPostSearchLimits(v) => v.store_boxed(out),
             Self::getPushReceiverId(v) => v.store_boxed(out),
@@ -411607,6 +422122,7 @@ impl Function {
             Self::getSearchSponsoredChats(v) => v.store_boxed(out),
             Self::getSearchedForTags(v) => v.store_boxed(out),
             Self::getSecretChat(v) => v.store_boxed(out),
+            Self::getSpeechRecognitionLanguages(v) => v.store_boxed(out),
             Self::getStakeDiceState(v) => v.store_boxed(out),
             Self::getStarAdAccountUrl(v) => v.store_boxed(out),
             Self::getStarGiftPaymentOptions(v) => v.store_boxed(out),
@@ -411634,6 +422150,7 @@ impl Function {
             Self::getStoryStatistics(v) => v.store_boxed(out),
             Self::getSuggestedFileName(v) => v.store_boxed(out),
             Self::getSuggestedStickerSetName(v) => v.store_boxed(out),
+            Self::getSuitableCommunityChats(v) => v.store_boxed(out),
             Self::getSuitableDiscussionChats(v) => v.store_boxed(out),
             Self::getSuitablePersonalChats(v) => v.store_boxed(out),
             Self::getSupergroup(v) => v.store_boxed(out),
@@ -411643,6 +422160,7 @@ impl Function {
             Self::getSupportUser(v) => v.store_boxed(out),
             Self::getTemporaryPasswordState(v) => v.store_boxed(out),
             Self::getTextCompositionStyleExample(v) => v.store_boxed(out),
+            Self::getTextEmojiRanges(v) => v.store_boxed(out),
             Self::getTextEntities(v) => v.store_boxed(out),
             Self::getThemeParametersJsonString(v) => v.store_boxed(out),
             Self::getThemedChatEmojiStatuses(v) => v.store_boxed(out),
@@ -411654,6 +422172,7 @@ impl Function {
             Self::getTonConnectSessionPendingRequests(v) => v.store_boxed(out),
             Self::getTonConnectSessions(v) => v.store_boxed(out),
             Self::getTonTransactions(v) => v.store_boxed(out),
+            Self::getTonWalletCardBackgroundGiftCollectionNames(v) => v.store_boxed(out),
             Self::getTonWalletNfts(v) => v.store_boxed(out),
             Self::getTonWalletOwnershipProofChallenge(v) => v.store_boxed(out),
             Self::getTonWalletSecretPhrase(v) => v.store_boxed(out),
@@ -411663,6 +422182,7 @@ impl Function {
             Self::getTopChats(v) => v.store_boxed(out),
             Self::getTrendingStickerSets(v) => v.store_boxed(out),
             Self::getUpgradedGift(v) => v.store_boxed(out),
+            Self::getUpgradedGiftDepositInfo(v) => v.store_boxed(out),
             Self::getUpgradedGiftEmojiStatuses(v) => v.store_boxed(out),
             Self::getUpgradedGiftValueInfo(v) => v.store_boxed(out),
             Self::getUpgradedGiftVariants(v) => v.store_boxed(out),
@@ -411685,6 +422205,8 @@ impl Function {
             Self::getWebAppPlaceholder(v) => v.store_boxed(out),
             Self::getWebAppUrl(v) => v.store_boxed(out),
             Self::getWebPageInstantView(v) => v.store_boxed(out),
+            Self::getWidgetPublicData(v) => v.store_boxed(out),
+            Self::getWidgetQueryAnswer(v) => v.store_boxed(out),
             Self::giftPremiumWithStars(v) => v.store_boxed(out),
             Self::hideContactCloseBirthdays(v) => v.store_boxed(out),
             Self::hideSuggestedAction(v) => v.store_boxed(out),
@@ -411736,8 +422258,11 @@ impl Function {
             Self::processChatHasProtectedContentDisableRequest(v) => v.store_boxed(out),
             Self::processChatJoinRequest(v) => v.store_boxed(out),
             Self::processChatJoinRequests(v) => v.store_boxed(out),
+            Self::processCommunityAddChatRequest(v) => v.store_boxed(out),
+            Self::processCommunityAddChatRequests(v) => v.store_boxed(out),
             Self::processGiftPurchaseOffer(v) => v.store_boxed(out),
             Self::processPushNotification(v) => v.store_boxed(out),
+            Self::processWebProxyCarrierMessage(v) => v.store_boxed(out),
             Self::rateSpeechRecognition(v) => v.store_boxed(out),
             Self::readAllChatMentions(v) => v.store_boxed(out),
             Self::readAllChatPollVotes(v) => v.store_boxed(out),
@@ -411751,6 +422276,7 @@ impl Function {
             Self::readFilePart(v) => v.store_boxed(out),
             Self::readdQuickReplyShortcutMessages(v) => v.store_boxed(out),
             Self::recognizeSpeech(v) => v.store_boxed(out),
+            Self::recognizeSpeechInFile(v) => v.store_boxed(out),
             Self::recoverAuthenticationPassword(v) => v.store_boxed(out),
             Self::recoverPassword(v) => v.store_boxed(out),
             Self::refundStarPayment(v) => v.store_boxed(out),
@@ -411760,6 +422286,7 @@ impl Function {
             Self::removeAllWebBrowserSettingsExceptions(v) => v.store_boxed(out),
             Self::removeBusinessConnectedBotFromChat(v) => v.store_boxed(out),
             Self::removeChatActionBar(v) => v.store_boxed(out),
+            Self::removeCommunityChat(v) => v.store_boxed(out),
             Self::removeContacts(v) => v.store_boxed(out),
             Self::removeFavoriteSticker(v) => v.store_boxed(out),
             Self::removeFileFromDownloads(v) => v.store_boxed(out),
@@ -411813,6 +422340,7 @@ impl Function {
             Self::reportSupergroupAntiSpamFalsePositive(v) => v.store_boxed(out),
             Self::reportSupergroupSpam(v) => v.store_boxed(out),
             Self::reportVideoMessageAdvertisement(v) => v.store_boxed(out),
+            Self::reportWebProxyCarrierError(v) => v.store_boxed(out),
             Self::requestAuthenticationPasswordRecovery(v) => v.store_boxed(out),
             Self::requestPasswordRecovery(v) => v.store_boxed(out),
             Self::requestQrCodeAuthentication(v) => v.store_boxed(out),
@@ -411959,6 +422487,7 @@ impl Function {
             Self::setCloseFriends(v) => v.store_boxed(out),
             Self::setCommands(v) => v.store_boxed(out),
             Self::setCommunityName(v) => v.store_boxed(out),
+            Self::setCommunityNotificationSettings(v) => v.store_boxed(out),
             Self::setCommunityPermissions(v) => v.store_boxed(out),
             Self::setCommunityPhoto(v) => v.store_boxed(out),
             Self::setCustomEmojiStickerSetThumbnail(v) => v.store_boxed(out),
@@ -412012,6 +422541,7 @@ impl Function {
             Self::setProfileAccentColor(v) => v.store_boxed(out),
             Self::setProfileAudioPosition(v) => v.store_boxed(out),
             Self::setProfilePhoto(v) => v.store_boxed(out),
+            Self::setProfileShareTheme(v) => v.store_boxed(out),
             Self::setQuickReplyShortcutName(v) => v.store_boxed(out),
             Self::setReactionNotificationSettings(v) => v.store_boxed(out),
             Self::setReadDatePrivacySettings(v) => v.store_boxed(out),
@@ -412034,6 +422564,7 @@ impl Function {
             Self::setSupergroupUsername(v) => v.store_boxed(out),
             Self::setTdlibParameters(v) => v.store_boxed(out),
             Self::setTonConnectSessionWalletClientId(v) => v.store_boxed(out),
+            Self::setTonWalletCardStickers(v) => v.store_boxed(out),
             Self::setUpgradedGiftColors(v) => v.store_boxed(out),
             Self::setUserEmojiStatus(v) => v.store_boxed(out),
             Self::setUserNote(v) => v.store_boxed(out),
@@ -412085,6 +422616,8 @@ impl Function {
             Self::toggleChatIsPinned(v) => v.store_boxed(out),
             Self::toggleChatIsTranslatable(v) => v.store_boxed(out),
             Self::toggleChatViewAsTopics(v) => v.store_boxed(out),
+            Self::toggleCommunityAreChatsCollapsed(v) => v.store_boxed(out),
+            Self::toggleCommunityMemberIsBanned(v) => v.store_boxed(out),
             Self::toggleDirectMessagesChatTopicCanSendUnpaidMessages(v) => v.store_boxed(out),
             Self::toggleDownloadIsPaused(v) => v.store_boxed(out),
             Self::toggleForumTopicIsClosed(v) => v.store_boxed(out),
@@ -412136,6 +422669,7 @@ impl Function {
             Self::viewSponsoredChat(v) => v.store_boxed(out),
             Self::viewTrendingStickerSets(v) => v.store_boxed(out),
             Self::viewVideoMessageAdvertisement(v) => v.store_boxed(out),
+            Self::withdrawUpgradedGift(v) => v.store_boxed(out),
             Self::writeGeneratedFilePart(v) => v.store_boxed(out),
         }
     }
@@ -412159,6 +422693,7 @@ impl Function {
             self::addChatToList::ID => Result::Ok(Self::addChatToList(self::addChatToList::read_bare(r)?)),
             self::addChatWelcomeMessage::ID => Result::Ok(Self::addChatWelcomeMessage(self::addChatWelcomeMessage::read_bare(r)?)),
             self::addChecklistTasks::ID => Result::Ok(Self::addChecklistTasks(self::addChecklistTasks::read_bare(r)?)),
+            self::addCommunityChat::ID => Result::Ok(Self::addCommunityChat(self::addCommunityChat::read_bare(r)?)),
             self::addContact::ID => Result::Ok(Self::addContact(self::addContact::read_bare(r)?)),
             self::addCustomServerLanguagePack::ID => Result::Ok(Self::addCustomServerLanguagePack(self::addCustomServerLanguagePack::read_bare(r)?)),
             self::addFavoriteSticker::ID => Result::Ok(Self::addFavoriteSticker(self::addFavoriteSticker::read_bare(r)?)),
@@ -412197,7 +422732,9 @@ impl Function {
             self::answerShippingQuery::ID => Result::Ok(Self::answerShippingQuery(self::answerShippingQuery::read_bare(r)?)),
             self::answerTonConnectRequest::ID => Result::Ok(Self::answerTonConnectRequest(self::answerTonConnectRequest::read_bare(r)?)),
             self::answerWebAppQuery::ID => Result::Ok(Self::answerWebAppQuery(self::answerWebAppQuery::read_bare(r)?)),
+            self::answerWidgetQuery::ID => Result::Ok(Self::answerWidgetQuery(self::answerWidgetQuery::read_bare(r)?)),
             self::applyPremiumGiftCode::ID => Result::Ok(Self::applyPremiumGiftCode(self::applyPremiumGiftCode::read_bare(r)?)),
+            self::applyUnpaidMessagesToken::ID => Result::Ok(Self::applyUnpaidMessagesToken(self::applyUnpaidMessagesToken::read_bare(r)?)),
             self::approveSuggestedPost::ID => Result::Ok(Self::approveSuggestedPost(self::approveSuggestedPost::read_bare(r)?)),
             self::assignStoreTransaction::ID => Result::Ok(Self::assignStoreTransaction(self::assignStoreTransaction::read_bare(r)?)),
             self::banChatMember::ID => Result::Ok(Self::banChatMember(self::banChatMember::read_bare(r)?)),
@@ -412331,6 +422868,7 @@ impl Function {
             self::deleteEphemeralMessage::ID => Result::Ok(Self::deleteEphemeralMessage(self::deleteEphemeralMessage::read_bare(r)?)),
             self::deleteFile::ID => Result::Ok(Self::deleteFile(self::deleteFile::read_bare(r)?)),
             self::deleteForumTopic::ID => Result::Ok(Self::deleteForumTopic(self::deleteForumTopic::read_bare(r)?)),
+            self::deleteGift::ID => Result::Ok(Self::deleteGift(self::deleteGift::read_bare(r)?)),
             self::deleteGiftCollection::ID => Result::Ok(Self::deleteGiftCollection(self::deleteGiftCollection::read_bare(r)?)),
             self::deleteGroupCallMessages::ID => Result::Ok(Self::deleteGroupCallMessages(self::deleteGroupCallMessages::read_bare(r)?)),
             self::deleteGroupCallMessagesBySender::ID => Result::Ok(Self::deleteGroupCallMessagesBySender(self::deleteGroupCallMessagesBySender::read_bare(r)?)),
@@ -412364,6 +422902,7 @@ impl Function {
             self::disconnectTonConnectSession::ID => Result::Ok(Self::disconnectTonConnectSession(self::disconnectTonConnectSession::read_bare(r)?)),
             self::disconnectWebsite::ID => Result::Ok(Self::disconnectWebsite(self::disconnectWebsite::read_bare(r)?)),
             self::dismissWebToken::ID => Result::Ok(Self::dismissWebToken(self::dismissWebToken::read_bare(r)?)),
+            self::displayUpgradedGift::ID => Result::Ok(Self::displayUpgradedGift(self::displayUpgradedGift::read_bare(r)?)),
             self::downloadFile::ID => Result::Ok(Self::downloadFile(self::downloadFile::read_bare(r)?)),
             self::dropGiftOriginalDetails::ID => Result::Ok(Self::dropGiftOriginalDetails(self::dropGiftOriginalDetails::read_bare(r)?)),
             self::editBotMediaPreview::ID => Result::Ok(Self::editBotMediaPreview(self::editBotMediaPreview::read_bare(r)?)),
@@ -412389,6 +422928,7 @@ impl Function {
             self::editInlineMessageMedia::ID => Result::Ok(Self::editInlineMessageMedia(self::editInlineMessageMedia::read_bare(r)?)),
             self::editInlineMessageReplyMarkup::ID => Result::Ok(Self::editInlineMessageReplyMarkup(self::editInlineMessageReplyMarkup::read_bare(r)?)),
             self::editInlineMessageText::ID => Result::Ok(Self::editInlineMessageText(self::editInlineMessageText::read_bare(r)?)),
+            self::editInlineMessageWidgetData::ID => Result::Ok(Self::editInlineMessageWidgetData(self::editInlineMessageWidgetData::read_bare(r)?)),
             self::editMessageCaption::ID => Result::Ok(Self::editMessageCaption(self::editMessageCaption::read_bare(r)?)),
             self::editMessageChecklist::ID => Result::Ok(Self::editMessageChecklist(self::editMessageChecklist::read_bare(r)?)),
             self::editMessageLiveLocation::ID => Result::Ok(Self::editMessageLiveLocation(self::editMessageLiveLocation::read_bare(r)?)),
@@ -412396,13 +422936,16 @@ impl Function {
             self::editMessageReplyMarkup::ID => Result::Ok(Self::editMessageReplyMarkup(self::editMessageReplyMarkup::read_bare(r)?)),
             self::editMessageSchedulingState::ID => Result::Ok(Self::editMessageSchedulingState(self::editMessageSchedulingState::read_bare(r)?)),
             self::editMessageText::ID => Result::Ok(Self::editMessageText(self::editMessageText::read_bare(r)?)),
+            self::editMessageWidgetData::ID => Result::Ok(Self::editMessageWidgetData(self::editMessageWidgetData::read_bare(r)?)),
             self::editProxy::ID => Result::Ok(Self::editProxy(self::editProxy::read_bare(r)?)),
             self::editQuickReplyMessage::ID => Result::Ok(Self::editQuickReplyMessage(self::editQuickReplyMessage::read_bare(r)?)),
             self::editStarSubscription::ID => Result::Ok(Self::editStarSubscription(self::editStarSubscription::read_bare(r)?)),
             self::editStory::ID => Result::Ok(Self::editStory(self::editStory::read_bare(r)?)),
             self::editStoryCover::ID => Result::Ok(Self::editStoryCover(self::editStoryCover::read_bare(r)?)),
+            self::editStoryMusic::ID => Result::Ok(Self::editStoryMusic(self::editStoryMusic::read_bare(r)?)),
             self::editTextCompositionStyle::ID => Result::Ok(Self::editTextCompositionStyle(self::editTextCompositionStyle::read_bare(r)?)),
             self::editUserStarSubscription::ID => Result::Ok(Self::editUserStarSubscription(self::editUserStarSubscription::read_bare(r)?)),
+            self::editWidgetData::ID => Result::Ok(Self::editWidgetData(self::editWidgetData::read_bare(r)?)),
             self::enableProxy::ID => Result::Ok(Self::enableProxy(self::enableProxy::read_bare(r)?)),
             self::enableTonWalletBackup::ID => Result::Ok(Self::enableTonWalletBackup(self::enableTonWalletBackup::read_bare(r)?)),
             self::encryptGroupCallData::ID => Result::Ok(Self::encryptGroupCallData(self::encryptGroupCallData::read_bare(r)?)),
@@ -412410,6 +422953,8 @@ impl Function {
             self::endGroupCallRecording::ID => Result::Ok(Self::endGroupCallRecording(self::endGroupCallRecording::read_bare(r)?)),
             self::endGroupCallScreenSharing::ID => Result::Ok(Self::endGroupCallScreenSharing(self::endGroupCallScreenSharing::read_bare(r)?)),
             self::finishFileGeneration::ID => Result::Ok(Self::finishFileGeneration(self::finishFileGeneration::read_bare(r)?)),
+            self::fixRecognizedRichMessageWithAi::ID => Result::Ok(Self::fixRecognizedRichMessageWithAi(self::fixRecognizedRichMessageWithAi::read_bare(r)?)),
+            self::fixRecognizedTextWithAi::ID => Result::Ok(Self::fixRecognizedTextWithAi(self::fixRecognizedTextWithAi::read_bare(r)?)),
             self::fixRichMessageWithAi::ID => Result::Ok(Self::fixRichMessageWithAi(self::fixRichMessageWithAi::read_bare(r)?)),
             self::fixTextWithAi::ID => Result::Ok(Self::fixTextWithAi(self::fixTextWithAi::read_bare(r)?)),
             self::forwardMessages::ID => Result::Ok(Self::forwardMessages(self::forwardMessages::read_bare(r)?)),
@@ -412503,7 +423048,9 @@ impl Function {
             self::getCloseFriends::ID => Result::Ok(Self::getCloseFriends(self::getCloseFriends::read_bare(r)?)),
             self::getCollectibleItemInfo::ID => Result::Ok(Self::getCollectibleItemInfo(self::getCollectibleItemInfo::read_bare(r)?)),
             self::getCommands::ID => Result::Ok(Self::getCommands(self::getCommands::read_bare(r)?)),
+            self::getCommunityAddChatRequests::ID => Result::Ok(Self::getCommunityAddChatRequests(self::getCommunityAddChatRequests::read_bare(r)?)),
             self::getCommunityFullInfo::ID => Result::Ok(Self::getCommunityFullInfo(self::getCommunityFullInfo::read_bare(r)?)),
+            self::getCommunityMemberChats::ID => Result::Ok(Self::getCommunityMemberChats(self::getCommunityMemberChats::read_bare(r)?)),
             self::getConnectedAffiliateProgram::ID => Result::Ok(Self::getConnectedAffiliateProgram(self::getConnectedAffiliateProgram::read_bare(r)?)),
             self::getConnectedAffiliatePrograms::ID => Result::Ok(Self::getConnectedAffiliatePrograms(self::getConnectedAffiliatePrograms::read_bare(r)?)),
             self::getConnectedWebsites::ID => Result::Ok(Self::getConnectedWebsites(self::getConnectedWebsites::read_bare(r)?)),
@@ -412573,6 +423120,7 @@ impl Function {
             self::getInstalledStickerSets::ID => Result::Ok(Self::getInstalledStickerSets(self::getInstalledStickerSets::read_bare(r)?)),
             self::getInternalLink::ID => Result::Ok(Self::getInternalLink(self::getInternalLink::read_bare(r)?)),
             self::getInternalLinkType::ID => Result::Ok(Self::getInternalLinkType(self::getInternalLinkType::read_bare(r)?)),
+            self::getJoinedCommunities::ID => Result::Ok(Self::getJoinedCommunities(self::getJoinedCommunities::read_bare(r)?)),
             self::getJsonString::ID => Result::Ok(Self::getJsonString(self::getJsonString::read_bare(r)?)),
             self::getJsonValue::ID => Result::Ok(Self::getJsonValue(self::getJsonValue::read_bare(r)?)),
             self::getKeywordEmojis::ID => Result::Ok(Self::getKeywordEmojis(self::getKeywordEmojis::read_bare(r)?)),
@@ -412655,6 +423203,7 @@ impl Function {
             self::getPremiumStickers::ID => Result::Ok(Self::getPremiumStickers(self::getPremiumStickers::read_bare(r)?)),
             self::getPreparedInlineMessage::ID => Result::Ok(Self::getPreparedInlineMessage(self::getPreparedInlineMessage::read_bare(r)?)),
             self::getPreparedKeyboardButton::ID => Result::Ok(Self::getPreparedKeyboardButton(self::getPreparedKeyboardButton::read_bare(r)?)),
+            self::getProfileShareThemeBackdrops::ID => Result::Ok(Self::getProfileShareThemeBackdrops(self::getProfileShareThemeBackdrops::read_bare(r)?)),
             self::getProxies::ID => Result::Ok(Self::getProxies(self::getProxies::read_bare(r)?)),
             self::getPublicPostSearchLimits::ID => Result::Ok(Self::getPublicPostSearchLimits(self::getPublicPostSearchLimits::read_bare(r)?)),
             self::getPushReceiverId::ID => Result::Ok(Self::getPushReceiverId(self::getPushReceiverId::read_bare(r)?)),
@@ -412682,6 +423231,7 @@ impl Function {
             self::getSearchSponsoredChats::ID => Result::Ok(Self::getSearchSponsoredChats(self::getSearchSponsoredChats::read_bare(r)?)),
             self::getSearchedForTags::ID => Result::Ok(Self::getSearchedForTags(self::getSearchedForTags::read_bare(r)?)),
             self::getSecretChat::ID => Result::Ok(Self::getSecretChat(self::getSecretChat::read_bare(r)?)),
+            self::getSpeechRecognitionLanguages::ID => Result::Ok(Self::getSpeechRecognitionLanguages(self::getSpeechRecognitionLanguages::read_bare(r)?)),
             self::getStakeDiceState::ID => Result::Ok(Self::getStakeDiceState(self::getStakeDiceState::read_bare(r)?)),
             self::getStarAdAccountUrl::ID => Result::Ok(Self::getStarAdAccountUrl(self::getStarAdAccountUrl::read_bare(r)?)),
             self::getStarGiftPaymentOptions::ID => Result::Ok(Self::getStarGiftPaymentOptions(self::getStarGiftPaymentOptions::read_bare(r)?)),
@@ -412709,6 +423259,7 @@ impl Function {
             self::getStoryStatistics::ID => Result::Ok(Self::getStoryStatistics(self::getStoryStatistics::read_bare(r)?)),
             self::getSuggestedFileName::ID => Result::Ok(Self::getSuggestedFileName(self::getSuggestedFileName::read_bare(r)?)),
             self::getSuggestedStickerSetName::ID => Result::Ok(Self::getSuggestedStickerSetName(self::getSuggestedStickerSetName::read_bare(r)?)),
+            self::getSuitableCommunityChats::ID => Result::Ok(Self::getSuitableCommunityChats(self::getSuitableCommunityChats::read_bare(r)?)),
             self::getSuitableDiscussionChats::ID => Result::Ok(Self::getSuitableDiscussionChats(self::getSuitableDiscussionChats::read_bare(r)?)),
             self::getSuitablePersonalChats::ID => Result::Ok(Self::getSuitablePersonalChats(self::getSuitablePersonalChats::read_bare(r)?)),
             self::getSupergroup::ID => Result::Ok(Self::getSupergroup(self::getSupergroup::read_bare(r)?)),
@@ -412718,6 +423269,7 @@ impl Function {
             self::getSupportUser::ID => Result::Ok(Self::getSupportUser(self::getSupportUser::read_bare(r)?)),
             self::getTemporaryPasswordState::ID => Result::Ok(Self::getTemporaryPasswordState(self::getTemporaryPasswordState::read_bare(r)?)),
             self::getTextCompositionStyleExample::ID => Result::Ok(Self::getTextCompositionStyleExample(self::getTextCompositionStyleExample::read_bare(r)?)),
+            self::getTextEmojiRanges::ID => Result::Ok(Self::getTextEmojiRanges(self::getTextEmojiRanges::read_bare(r)?)),
             self::getTextEntities::ID => Result::Ok(Self::getTextEntities(self::getTextEntities::read_bare(r)?)),
             self::getThemeParametersJsonString::ID => Result::Ok(Self::getThemeParametersJsonString(self::getThemeParametersJsonString::read_bare(r)?)),
             self::getThemedChatEmojiStatuses::ID => Result::Ok(Self::getThemedChatEmojiStatuses(self::getThemedChatEmojiStatuses::read_bare(r)?)),
@@ -412729,6 +423281,7 @@ impl Function {
             self::getTonConnectSessionPendingRequests::ID => Result::Ok(Self::getTonConnectSessionPendingRequests(self::getTonConnectSessionPendingRequests::read_bare(r)?)),
             self::getTonConnectSessions::ID => Result::Ok(Self::getTonConnectSessions(self::getTonConnectSessions::read_bare(r)?)),
             self::getTonTransactions::ID => Result::Ok(Self::getTonTransactions(self::getTonTransactions::read_bare(r)?)),
+            self::getTonWalletCardBackgroundGiftCollectionNames::ID => Result::Ok(Self::getTonWalletCardBackgroundGiftCollectionNames(self::getTonWalletCardBackgroundGiftCollectionNames::read_bare(r)?)),
             self::getTonWalletNfts::ID => Result::Ok(Self::getTonWalletNfts(self::getTonWalletNfts::read_bare(r)?)),
             self::getTonWalletOwnershipProofChallenge::ID => Result::Ok(Self::getTonWalletOwnershipProofChallenge(self::getTonWalletOwnershipProofChallenge::read_bare(r)?)),
             self::getTonWalletSecretPhrase::ID => Result::Ok(Self::getTonWalletSecretPhrase(self::getTonWalletSecretPhrase::read_bare(r)?)),
@@ -412738,6 +423291,7 @@ impl Function {
             self::getTopChats::ID => Result::Ok(Self::getTopChats(self::getTopChats::read_bare(r)?)),
             self::getTrendingStickerSets::ID => Result::Ok(Self::getTrendingStickerSets(self::getTrendingStickerSets::read_bare(r)?)),
             self::getUpgradedGift::ID => Result::Ok(Self::getUpgradedGift(self::getUpgradedGift::read_bare(r)?)),
+            self::getUpgradedGiftDepositInfo::ID => Result::Ok(Self::getUpgradedGiftDepositInfo(self::getUpgradedGiftDepositInfo::read_bare(r)?)),
             self::getUpgradedGiftEmojiStatuses::ID => Result::Ok(Self::getUpgradedGiftEmojiStatuses(self::getUpgradedGiftEmojiStatuses::read_bare(r)?)),
             self::getUpgradedGiftValueInfo::ID => Result::Ok(Self::getUpgradedGiftValueInfo(self::getUpgradedGiftValueInfo::read_bare(r)?)),
             self::getUpgradedGiftVariants::ID => Result::Ok(Self::getUpgradedGiftVariants(self::getUpgradedGiftVariants::read_bare(r)?)),
@@ -412760,6 +423314,8 @@ impl Function {
             self::getWebAppPlaceholder::ID => Result::Ok(Self::getWebAppPlaceholder(self::getWebAppPlaceholder::read_bare(r)?)),
             self::getWebAppUrl::ID => Result::Ok(Self::getWebAppUrl(self::getWebAppUrl::read_bare(r)?)),
             self::getWebPageInstantView::ID => Result::Ok(Self::getWebPageInstantView(self::getWebPageInstantView::read_bare(r)?)),
+            self::getWidgetPublicData::ID => Result::Ok(Self::getWidgetPublicData(self::getWidgetPublicData::read_bare(r)?)),
+            self::getWidgetQueryAnswer::ID => Result::Ok(Self::getWidgetQueryAnswer(self::getWidgetQueryAnswer::read_bare(r)?)),
             self::giftPremiumWithStars::ID => Result::Ok(Self::giftPremiumWithStars(self::giftPremiumWithStars::read_bare(r)?)),
             self::hideContactCloseBirthdays::ID => Result::Ok(Self::hideContactCloseBirthdays(self::hideContactCloseBirthdays::read_bare(r)?)),
             self::hideSuggestedAction::ID => Result::Ok(Self::hideSuggestedAction(self::hideSuggestedAction::read_bare(r)?)),
@@ -412811,8 +423367,11 @@ impl Function {
             self::processChatHasProtectedContentDisableRequest::ID => Result::Ok(Self::processChatHasProtectedContentDisableRequest(self::processChatHasProtectedContentDisableRequest::read_bare(r)?)),
             self::processChatJoinRequest::ID => Result::Ok(Self::processChatJoinRequest(self::processChatJoinRequest::read_bare(r)?)),
             self::processChatJoinRequests::ID => Result::Ok(Self::processChatJoinRequests(self::processChatJoinRequests::read_bare(r)?)),
+            self::processCommunityAddChatRequest::ID => Result::Ok(Self::processCommunityAddChatRequest(self::processCommunityAddChatRequest::read_bare(r)?)),
+            self::processCommunityAddChatRequests::ID => Result::Ok(Self::processCommunityAddChatRequests(self::processCommunityAddChatRequests::read_bare(r)?)),
             self::processGiftPurchaseOffer::ID => Result::Ok(Self::processGiftPurchaseOffer(self::processGiftPurchaseOffer::read_bare(r)?)),
             self::processPushNotification::ID => Result::Ok(Self::processPushNotification(self::processPushNotification::read_bare(r)?)),
+            self::processWebProxyCarrierMessage::ID => Result::Ok(Self::processWebProxyCarrierMessage(self::processWebProxyCarrierMessage::read_bare(r)?)),
             self::rateSpeechRecognition::ID => Result::Ok(Self::rateSpeechRecognition(self::rateSpeechRecognition::read_bare(r)?)),
             self::readAllChatMentions::ID => Result::Ok(Self::readAllChatMentions(self::readAllChatMentions::read_bare(r)?)),
             self::readAllChatPollVotes::ID => Result::Ok(Self::readAllChatPollVotes(self::readAllChatPollVotes::read_bare(r)?)),
@@ -412826,6 +423385,7 @@ impl Function {
             self::readFilePart::ID => Result::Ok(Self::readFilePart(self::readFilePart::read_bare(r)?)),
             self::readdQuickReplyShortcutMessages::ID => Result::Ok(Self::readdQuickReplyShortcutMessages(self::readdQuickReplyShortcutMessages::read_bare(r)?)),
             self::recognizeSpeech::ID => Result::Ok(Self::recognizeSpeech(self::recognizeSpeech::read_bare(r)?)),
+            self::recognizeSpeechInFile::ID => Result::Ok(Self::recognizeSpeechInFile(self::recognizeSpeechInFile::read_bare(r)?)),
             self::recoverAuthenticationPassword::ID => Result::Ok(Self::recoverAuthenticationPassword(self::recoverAuthenticationPassword::read_bare(r)?)),
             self::recoverPassword::ID => Result::Ok(Self::recoverPassword(self::recoverPassword::read_bare(r)?)),
             self::refundStarPayment::ID => Result::Ok(Self::refundStarPayment(self::refundStarPayment::read_bare(r)?)),
@@ -412835,6 +423395,7 @@ impl Function {
             self::removeAllWebBrowserSettingsExceptions::ID => Result::Ok(Self::removeAllWebBrowserSettingsExceptions(self::removeAllWebBrowserSettingsExceptions::read_bare(r)?)),
             self::removeBusinessConnectedBotFromChat::ID => Result::Ok(Self::removeBusinessConnectedBotFromChat(self::removeBusinessConnectedBotFromChat::read_bare(r)?)),
             self::removeChatActionBar::ID => Result::Ok(Self::removeChatActionBar(self::removeChatActionBar::read_bare(r)?)),
+            self::removeCommunityChat::ID => Result::Ok(Self::removeCommunityChat(self::removeCommunityChat::read_bare(r)?)),
             self::removeContacts::ID => Result::Ok(Self::removeContacts(self::removeContacts::read_bare(r)?)),
             self::removeFavoriteSticker::ID => Result::Ok(Self::removeFavoriteSticker(self::removeFavoriteSticker::read_bare(r)?)),
             self::removeFileFromDownloads::ID => Result::Ok(Self::removeFileFromDownloads(self::removeFileFromDownloads::read_bare(r)?)),
@@ -412888,6 +423449,7 @@ impl Function {
             self::reportSupergroupAntiSpamFalsePositive::ID => Result::Ok(Self::reportSupergroupAntiSpamFalsePositive(self::reportSupergroupAntiSpamFalsePositive::read_bare(r)?)),
             self::reportSupergroupSpam::ID => Result::Ok(Self::reportSupergroupSpam(self::reportSupergroupSpam::read_bare(r)?)),
             self::reportVideoMessageAdvertisement::ID => Result::Ok(Self::reportVideoMessageAdvertisement(self::reportVideoMessageAdvertisement::read_bare(r)?)),
+            self::reportWebProxyCarrierError::ID => Result::Ok(Self::reportWebProxyCarrierError(self::reportWebProxyCarrierError::read_bare(r)?)),
             self::requestAuthenticationPasswordRecovery::ID => Result::Ok(Self::requestAuthenticationPasswordRecovery(self::requestAuthenticationPasswordRecovery::read_bare(r)?)),
             self::requestPasswordRecovery::ID => Result::Ok(Self::requestPasswordRecovery(self::requestPasswordRecovery::read_bare(r)?)),
             self::requestQrCodeAuthentication::ID => Result::Ok(Self::requestQrCodeAuthentication(self::requestQrCodeAuthentication::read_bare(r)?)),
@@ -413034,6 +423596,7 @@ impl Function {
             self::setCloseFriends::ID => Result::Ok(Self::setCloseFriends(self::setCloseFriends::read_bare(r)?)),
             self::setCommands::ID => Result::Ok(Self::setCommands(self::setCommands::read_bare(r)?)),
             self::setCommunityName::ID => Result::Ok(Self::setCommunityName(self::setCommunityName::read_bare(r)?)),
+            self::setCommunityNotificationSettings::ID => Result::Ok(Self::setCommunityNotificationSettings(self::setCommunityNotificationSettings::read_bare(r)?)),
             self::setCommunityPermissions::ID => Result::Ok(Self::setCommunityPermissions(self::setCommunityPermissions::read_bare(r)?)),
             self::setCommunityPhoto::ID => Result::Ok(Self::setCommunityPhoto(self::setCommunityPhoto::read_bare(r)?)),
             self::setCustomEmojiStickerSetThumbnail::ID => Result::Ok(Self::setCustomEmojiStickerSetThumbnail(self::setCustomEmojiStickerSetThumbnail::read_bare(r)?)),
@@ -413087,6 +423650,7 @@ impl Function {
             self::setProfileAccentColor::ID => Result::Ok(Self::setProfileAccentColor(self::setProfileAccentColor::read_bare(r)?)),
             self::setProfileAudioPosition::ID => Result::Ok(Self::setProfileAudioPosition(self::setProfileAudioPosition::read_bare(r)?)),
             self::setProfilePhoto::ID => Result::Ok(Self::setProfilePhoto(self::setProfilePhoto::read_bare(r)?)),
+            self::setProfileShareTheme::ID => Result::Ok(Self::setProfileShareTheme(self::setProfileShareTheme::read_bare(r)?)),
             self::setQuickReplyShortcutName::ID => Result::Ok(Self::setQuickReplyShortcutName(self::setQuickReplyShortcutName::read_bare(r)?)),
             self::setReactionNotificationSettings::ID => Result::Ok(Self::setReactionNotificationSettings(self::setReactionNotificationSettings::read_bare(r)?)),
             self::setReadDatePrivacySettings::ID => Result::Ok(Self::setReadDatePrivacySettings(self::setReadDatePrivacySettings::read_bare(r)?)),
@@ -413109,6 +423673,7 @@ impl Function {
             self::setSupergroupUsername::ID => Result::Ok(Self::setSupergroupUsername(self::setSupergroupUsername::read_bare(r)?)),
             self::setTdlibParameters::ID => Result::Ok(Self::setTdlibParameters(self::setTdlibParameters::read_bare(r)?)),
             self::setTonConnectSessionWalletClientId::ID => Result::Ok(Self::setTonConnectSessionWalletClientId(self::setTonConnectSessionWalletClientId::read_bare(r)?)),
+            self::setTonWalletCardStickers::ID => Result::Ok(Self::setTonWalletCardStickers(self::setTonWalletCardStickers::read_bare(r)?)),
             self::setUpgradedGiftColors::ID => Result::Ok(Self::setUpgradedGiftColors(self::setUpgradedGiftColors::read_bare(r)?)),
             self::setUserEmojiStatus::ID => Result::Ok(Self::setUserEmojiStatus(self::setUserEmojiStatus::read_bare(r)?)),
             self::setUserNote::ID => Result::Ok(Self::setUserNote(self::setUserNote::read_bare(r)?)),
@@ -413160,6 +423725,8 @@ impl Function {
             self::toggleChatIsPinned::ID => Result::Ok(Self::toggleChatIsPinned(self::toggleChatIsPinned::read_bare(r)?)),
             self::toggleChatIsTranslatable::ID => Result::Ok(Self::toggleChatIsTranslatable(self::toggleChatIsTranslatable::read_bare(r)?)),
             self::toggleChatViewAsTopics::ID => Result::Ok(Self::toggleChatViewAsTopics(self::toggleChatViewAsTopics::read_bare(r)?)),
+            self::toggleCommunityAreChatsCollapsed::ID => Result::Ok(Self::toggleCommunityAreChatsCollapsed(self::toggleCommunityAreChatsCollapsed::read_bare(r)?)),
+            self::toggleCommunityMemberIsBanned::ID => Result::Ok(Self::toggleCommunityMemberIsBanned(self::toggleCommunityMemberIsBanned::read_bare(r)?)),
             self::toggleDirectMessagesChatTopicCanSendUnpaidMessages::ID => Result::Ok(Self::toggleDirectMessagesChatTopicCanSendUnpaidMessages(self::toggleDirectMessagesChatTopicCanSendUnpaidMessages::read_bare(r)?)),
             self::toggleDownloadIsPaused::ID => Result::Ok(Self::toggleDownloadIsPaused(self::toggleDownloadIsPaused::read_bare(r)?)),
             self::toggleForumTopicIsClosed::ID => Result::Ok(Self::toggleForumTopicIsClosed(self::toggleForumTopicIsClosed::read_bare(r)?)),
@@ -413211,6 +423778,7 @@ impl Function {
             self::viewSponsoredChat::ID => Result::Ok(Self::viewSponsoredChat(self::viewSponsoredChat::read_bare(r)?)),
             self::viewTrendingStickerSets::ID => Result::Ok(Self::viewTrendingStickerSets(self::viewTrendingStickerSets::read_bare(r)?)),
             self::viewVideoMessageAdvertisement::ID => Result::Ok(Self::viewVideoMessageAdvertisement(self::viewVideoMessageAdvertisement::read_bare(r)?)),
+            self::withdrawUpgradedGift::ID => Result::Ok(Self::withdrawUpgradedGift(self::withdrawUpgradedGift::read_bare(r)?)),
             self::writeGeneratedFilePart::ID => Result::Ok(Self::writeGeneratedFilePart(self::writeGeneratedFilePart::read_bare(r)?)),
             _ => Result::Err("Unknown constructor"),
         }
@@ -413236,6 +423804,7 @@ impl Function {
             Self::addChatToList(v) => v.to_json_into(out),
             Self::addChatWelcomeMessage(v) => v.to_json_into(out),
             Self::addChecklistTasks(v) => v.to_json_into(out),
+            Self::addCommunityChat(v) => v.to_json_into(out),
             Self::addContact(v) => v.to_json_into(out),
             Self::addCustomServerLanguagePack(v) => v.to_json_into(out),
             Self::addFavoriteSticker(v) => v.to_json_into(out),
@@ -413274,7 +423843,9 @@ impl Function {
             Self::answerShippingQuery(v) => v.to_json_into(out),
             Self::answerTonConnectRequest(v) => v.to_json_into(out),
             Self::answerWebAppQuery(v) => v.to_json_into(out),
+            Self::answerWidgetQuery(v) => v.to_json_into(out),
             Self::applyPremiumGiftCode(v) => v.to_json_into(out),
+            Self::applyUnpaidMessagesToken(v) => v.to_json_into(out),
             Self::approveSuggestedPost(v) => v.to_json_into(out),
             Self::assignStoreTransaction(v) => v.to_json_into(out),
             Self::banChatMember(v) => v.to_json_into(out),
@@ -413408,6 +423979,7 @@ impl Function {
             Self::deleteEphemeralMessage(v) => v.to_json_into(out),
             Self::deleteFile(v) => v.to_json_into(out),
             Self::deleteForumTopic(v) => v.to_json_into(out),
+            Self::deleteGift(v) => v.to_json_into(out),
             Self::deleteGiftCollection(v) => v.to_json_into(out),
             Self::deleteGroupCallMessages(v) => v.to_json_into(out),
             Self::deleteGroupCallMessagesBySender(v) => v.to_json_into(out),
@@ -413441,6 +424013,7 @@ impl Function {
             Self::disconnectTonConnectSession(v) => v.to_json_into(out),
             Self::disconnectWebsite(v) => v.to_json_into(out),
             Self::dismissWebToken(v) => v.to_json_into(out),
+            Self::displayUpgradedGift(v) => v.to_json_into(out),
             Self::downloadFile(v) => v.to_json_into(out),
             Self::dropGiftOriginalDetails(v) => v.to_json_into(out),
             Self::editBotMediaPreview(v) => v.to_json_into(out),
@@ -413466,6 +424039,7 @@ impl Function {
             Self::editInlineMessageMedia(v) => v.to_json_into(out),
             Self::editInlineMessageReplyMarkup(v) => v.to_json_into(out),
             Self::editInlineMessageText(v) => v.to_json_into(out),
+            Self::editInlineMessageWidgetData(v) => v.to_json_into(out),
             Self::editMessageCaption(v) => v.to_json_into(out),
             Self::editMessageChecklist(v) => v.to_json_into(out),
             Self::editMessageLiveLocation(v) => v.to_json_into(out),
@@ -413473,13 +424047,16 @@ impl Function {
             Self::editMessageReplyMarkup(v) => v.to_json_into(out),
             Self::editMessageSchedulingState(v) => v.to_json_into(out),
             Self::editMessageText(v) => v.to_json_into(out),
+            Self::editMessageWidgetData(v) => v.to_json_into(out),
             Self::editProxy(v) => v.to_json_into(out),
             Self::editQuickReplyMessage(v) => v.to_json_into(out),
             Self::editStarSubscription(v) => v.to_json_into(out),
             Self::editStory(v) => v.to_json_into(out),
             Self::editStoryCover(v) => v.to_json_into(out),
+            Self::editStoryMusic(v) => v.to_json_into(out),
             Self::editTextCompositionStyle(v) => v.to_json_into(out),
             Self::editUserStarSubscription(v) => v.to_json_into(out),
+            Self::editWidgetData(v) => v.to_json_into(out),
             Self::enableProxy(v) => v.to_json_into(out),
             Self::enableTonWalletBackup(v) => v.to_json_into(out),
             Self::encryptGroupCallData(v) => v.to_json_into(out),
@@ -413487,6 +424064,8 @@ impl Function {
             Self::endGroupCallRecording(v) => v.to_json_into(out),
             Self::endGroupCallScreenSharing(v) => v.to_json_into(out),
             Self::finishFileGeneration(v) => v.to_json_into(out),
+            Self::fixRecognizedRichMessageWithAi(v) => v.to_json_into(out),
+            Self::fixRecognizedTextWithAi(v) => v.to_json_into(out),
             Self::fixRichMessageWithAi(v) => v.to_json_into(out),
             Self::fixTextWithAi(v) => v.to_json_into(out),
             Self::forwardMessages(v) => v.to_json_into(out),
@@ -413580,7 +424159,9 @@ impl Function {
             Self::getCloseFriends(v) => v.to_json_into(out),
             Self::getCollectibleItemInfo(v) => v.to_json_into(out),
             Self::getCommands(v) => v.to_json_into(out),
+            Self::getCommunityAddChatRequests(v) => v.to_json_into(out),
             Self::getCommunityFullInfo(v) => v.to_json_into(out),
+            Self::getCommunityMemberChats(v) => v.to_json_into(out),
             Self::getConnectedAffiliateProgram(v) => v.to_json_into(out),
             Self::getConnectedAffiliatePrograms(v) => v.to_json_into(out),
             Self::getConnectedWebsites(v) => v.to_json_into(out),
@@ -413650,6 +424231,7 @@ impl Function {
             Self::getInstalledStickerSets(v) => v.to_json_into(out),
             Self::getInternalLink(v) => v.to_json_into(out),
             Self::getInternalLinkType(v) => v.to_json_into(out),
+            Self::getJoinedCommunities(v) => v.to_json_into(out),
             Self::getJsonString(v) => v.to_json_into(out),
             Self::getJsonValue(v) => v.to_json_into(out),
             Self::getKeywordEmojis(v) => v.to_json_into(out),
@@ -413732,6 +424314,7 @@ impl Function {
             Self::getPremiumStickers(v) => v.to_json_into(out),
             Self::getPreparedInlineMessage(v) => v.to_json_into(out),
             Self::getPreparedKeyboardButton(v) => v.to_json_into(out),
+            Self::getProfileShareThemeBackdrops(v) => v.to_json_into(out),
             Self::getProxies(v) => v.to_json_into(out),
             Self::getPublicPostSearchLimits(v) => v.to_json_into(out),
             Self::getPushReceiverId(v) => v.to_json_into(out),
@@ -413759,6 +424342,7 @@ impl Function {
             Self::getSearchSponsoredChats(v) => v.to_json_into(out),
             Self::getSearchedForTags(v) => v.to_json_into(out),
             Self::getSecretChat(v) => v.to_json_into(out),
+            Self::getSpeechRecognitionLanguages(v) => v.to_json_into(out),
             Self::getStakeDiceState(v) => v.to_json_into(out),
             Self::getStarAdAccountUrl(v) => v.to_json_into(out),
             Self::getStarGiftPaymentOptions(v) => v.to_json_into(out),
@@ -413786,6 +424370,7 @@ impl Function {
             Self::getStoryStatistics(v) => v.to_json_into(out),
             Self::getSuggestedFileName(v) => v.to_json_into(out),
             Self::getSuggestedStickerSetName(v) => v.to_json_into(out),
+            Self::getSuitableCommunityChats(v) => v.to_json_into(out),
             Self::getSuitableDiscussionChats(v) => v.to_json_into(out),
             Self::getSuitablePersonalChats(v) => v.to_json_into(out),
             Self::getSupergroup(v) => v.to_json_into(out),
@@ -413795,6 +424380,7 @@ impl Function {
             Self::getSupportUser(v) => v.to_json_into(out),
             Self::getTemporaryPasswordState(v) => v.to_json_into(out),
             Self::getTextCompositionStyleExample(v) => v.to_json_into(out),
+            Self::getTextEmojiRanges(v) => v.to_json_into(out),
             Self::getTextEntities(v) => v.to_json_into(out),
             Self::getThemeParametersJsonString(v) => v.to_json_into(out),
             Self::getThemedChatEmojiStatuses(v) => v.to_json_into(out),
@@ -413806,6 +424392,7 @@ impl Function {
             Self::getTonConnectSessionPendingRequests(v) => v.to_json_into(out),
             Self::getTonConnectSessions(v) => v.to_json_into(out),
             Self::getTonTransactions(v) => v.to_json_into(out),
+            Self::getTonWalletCardBackgroundGiftCollectionNames(v) => v.to_json_into(out),
             Self::getTonWalletNfts(v) => v.to_json_into(out),
             Self::getTonWalletOwnershipProofChallenge(v) => v.to_json_into(out),
             Self::getTonWalletSecretPhrase(v) => v.to_json_into(out),
@@ -413815,6 +424402,7 @@ impl Function {
             Self::getTopChats(v) => v.to_json_into(out),
             Self::getTrendingStickerSets(v) => v.to_json_into(out),
             Self::getUpgradedGift(v) => v.to_json_into(out),
+            Self::getUpgradedGiftDepositInfo(v) => v.to_json_into(out),
             Self::getUpgradedGiftEmojiStatuses(v) => v.to_json_into(out),
             Self::getUpgradedGiftValueInfo(v) => v.to_json_into(out),
             Self::getUpgradedGiftVariants(v) => v.to_json_into(out),
@@ -413837,6 +424425,8 @@ impl Function {
             Self::getWebAppPlaceholder(v) => v.to_json_into(out),
             Self::getWebAppUrl(v) => v.to_json_into(out),
             Self::getWebPageInstantView(v) => v.to_json_into(out),
+            Self::getWidgetPublicData(v) => v.to_json_into(out),
+            Self::getWidgetQueryAnswer(v) => v.to_json_into(out),
             Self::giftPremiumWithStars(v) => v.to_json_into(out),
             Self::hideContactCloseBirthdays(v) => v.to_json_into(out),
             Self::hideSuggestedAction(v) => v.to_json_into(out),
@@ -413888,8 +424478,11 @@ impl Function {
             Self::processChatHasProtectedContentDisableRequest(v) => v.to_json_into(out),
             Self::processChatJoinRequest(v) => v.to_json_into(out),
             Self::processChatJoinRequests(v) => v.to_json_into(out),
+            Self::processCommunityAddChatRequest(v) => v.to_json_into(out),
+            Self::processCommunityAddChatRequests(v) => v.to_json_into(out),
             Self::processGiftPurchaseOffer(v) => v.to_json_into(out),
             Self::processPushNotification(v) => v.to_json_into(out),
+            Self::processWebProxyCarrierMessage(v) => v.to_json_into(out),
             Self::rateSpeechRecognition(v) => v.to_json_into(out),
             Self::readAllChatMentions(v) => v.to_json_into(out),
             Self::readAllChatPollVotes(v) => v.to_json_into(out),
@@ -413903,6 +424496,7 @@ impl Function {
             Self::readFilePart(v) => v.to_json_into(out),
             Self::readdQuickReplyShortcutMessages(v) => v.to_json_into(out),
             Self::recognizeSpeech(v) => v.to_json_into(out),
+            Self::recognizeSpeechInFile(v) => v.to_json_into(out),
             Self::recoverAuthenticationPassword(v) => v.to_json_into(out),
             Self::recoverPassword(v) => v.to_json_into(out),
             Self::refundStarPayment(v) => v.to_json_into(out),
@@ -413912,6 +424506,7 @@ impl Function {
             Self::removeAllWebBrowserSettingsExceptions(v) => v.to_json_into(out),
             Self::removeBusinessConnectedBotFromChat(v) => v.to_json_into(out),
             Self::removeChatActionBar(v) => v.to_json_into(out),
+            Self::removeCommunityChat(v) => v.to_json_into(out),
             Self::removeContacts(v) => v.to_json_into(out),
             Self::removeFavoriteSticker(v) => v.to_json_into(out),
             Self::removeFileFromDownloads(v) => v.to_json_into(out),
@@ -413965,6 +424560,7 @@ impl Function {
             Self::reportSupergroupAntiSpamFalsePositive(v) => v.to_json_into(out),
             Self::reportSupergroupSpam(v) => v.to_json_into(out),
             Self::reportVideoMessageAdvertisement(v) => v.to_json_into(out),
+            Self::reportWebProxyCarrierError(v) => v.to_json_into(out),
             Self::requestAuthenticationPasswordRecovery(v) => v.to_json_into(out),
             Self::requestPasswordRecovery(v) => v.to_json_into(out),
             Self::requestQrCodeAuthentication(v) => v.to_json_into(out),
@@ -414111,6 +424707,7 @@ impl Function {
             Self::setCloseFriends(v) => v.to_json_into(out),
             Self::setCommands(v) => v.to_json_into(out),
             Self::setCommunityName(v) => v.to_json_into(out),
+            Self::setCommunityNotificationSettings(v) => v.to_json_into(out),
             Self::setCommunityPermissions(v) => v.to_json_into(out),
             Self::setCommunityPhoto(v) => v.to_json_into(out),
             Self::setCustomEmojiStickerSetThumbnail(v) => v.to_json_into(out),
@@ -414164,6 +424761,7 @@ impl Function {
             Self::setProfileAccentColor(v) => v.to_json_into(out),
             Self::setProfileAudioPosition(v) => v.to_json_into(out),
             Self::setProfilePhoto(v) => v.to_json_into(out),
+            Self::setProfileShareTheme(v) => v.to_json_into(out),
             Self::setQuickReplyShortcutName(v) => v.to_json_into(out),
             Self::setReactionNotificationSettings(v) => v.to_json_into(out),
             Self::setReadDatePrivacySettings(v) => v.to_json_into(out),
@@ -414186,6 +424784,7 @@ impl Function {
             Self::setSupergroupUsername(v) => v.to_json_into(out),
             Self::setTdlibParameters(v) => v.to_json_into(out),
             Self::setTonConnectSessionWalletClientId(v) => v.to_json_into(out),
+            Self::setTonWalletCardStickers(v) => v.to_json_into(out),
             Self::setUpgradedGiftColors(v) => v.to_json_into(out),
             Self::setUserEmojiStatus(v) => v.to_json_into(out),
             Self::setUserNote(v) => v.to_json_into(out),
@@ -414237,6 +424836,8 @@ impl Function {
             Self::toggleChatIsPinned(v) => v.to_json_into(out),
             Self::toggleChatIsTranslatable(v) => v.to_json_into(out),
             Self::toggleChatViewAsTopics(v) => v.to_json_into(out),
+            Self::toggleCommunityAreChatsCollapsed(v) => v.to_json_into(out),
+            Self::toggleCommunityMemberIsBanned(v) => v.to_json_into(out),
             Self::toggleDirectMessagesChatTopicCanSendUnpaidMessages(v) => v.to_json_into(out),
             Self::toggleDownloadIsPaused(v) => v.to_json_into(out),
             Self::toggleForumTopicIsClosed(v) => v.to_json_into(out),
@@ -414288,6 +424889,7 @@ impl Function {
             Self::viewSponsoredChat(v) => v.to_json_into(out),
             Self::viewTrendingStickerSets(v) => v.to_json_into(out),
             Self::viewVideoMessageAdvertisement(v) => v.to_json_into(out),
+            Self::withdrawUpgradedGift(v) => v.to_json_into(out),
             Self::writeGeneratedFilePart(v) => v.to_json_into(out),
         }
     }
@@ -414332,6 +424934,9 @@ impl Function {
     }
     fn __json_new_addChecklistTasks(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::addChecklistTasks(self::addChecklistTasks::from_json_object(o)?))
+    }
+    fn __json_new_addCommunityChat(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::addCommunityChat(self::addCommunityChat::from_json_object(o)?))
     }
     fn __json_new_addContact(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::addContact(self::addContact::from_json_object(o)?))
@@ -414447,8 +425052,14 @@ impl Function {
     fn __json_new_answerWebAppQuery(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::answerWebAppQuery(self::answerWebAppQuery::from_json_object(o)?))
     }
+    fn __json_new_answerWidgetQuery(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::answerWidgetQuery(self::answerWidgetQuery::from_json_object(o)?))
+    }
     fn __json_new_applyPremiumGiftCode(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::applyPremiumGiftCode(self::applyPremiumGiftCode::from_json_object(o)?))
+    }
+    fn __json_new_applyUnpaidMessagesToken(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::applyUnpaidMessagesToken(self::applyUnpaidMessagesToken::from_json_object(o)?))
     }
     fn __json_new_approveSuggestedPost(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::approveSuggestedPost(self::approveSuggestedPost::from_json_object(o)?))
@@ -414849,6 +425460,9 @@ impl Function {
     fn __json_new_deleteForumTopic(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::deleteForumTopic(self::deleteForumTopic::from_json_object(o)?))
     }
+    fn __json_new_deleteGift(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::deleteGift(self::deleteGift::from_json_object(o)?))
+    }
     fn __json_new_deleteGiftCollection(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::deleteGiftCollection(self::deleteGiftCollection::from_json_object(o)?))
     }
@@ -414948,6 +425562,9 @@ impl Function {
     fn __json_new_dismissWebToken(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::dismissWebToken(self::dismissWebToken::from_json_object(o)?))
     }
+    fn __json_new_displayUpgradedGift(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::displayUpgradedGift(self::displayUpgradedGift::from_json_object(o)?))
+    }
     fn __json_new_downloadFile(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::downloadFile(self::downloadFile::from_json_object(o)?))
     }
@@ -415023,6 +425640,9 @@ impl Function {
     fn __json_new_editInlineMessageText(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::editInlineMessageText(self::editInlineMessageText::from_json_object(o)?))
     }
+    fn __json_new_editInlineMessageWidgetData(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::editInlineMessageWidgetData(self::editInlineMessageWidgetData::from_json_object(o)?))
+    }
     fn __json_new_editMessageCaption(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::editMessageCaption(self::editMessageCaption::from_json_object(o)?))
     }
@@ -415044,6 +425664,9 @@ impl Function {
     fn __json_new_editMessageText(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::editMessageText(self::editMessageText::from_json_object(o)?))
     }
+    fn __json_new_editMessageWidgetData(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::editMessageWidgetData(self::editMessageWidgetData::from_json_object(o)?))
+    }
     fn __json_new_editProxy(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::editProxy(self::editProxy::from_json_object(o)?))
     }
@@ -415059,11 +425682,17 @@ impl Function {
     fn __json_new_editStoryCover(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::editStoryCover(self::editStoryCover::from_json_object(o)?))
     }
+    fn __json_new_editStoryMusic(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::editStoryMusic(self::editStoryMusic::from_json_object(o)?))
+    }
     fn __json_new_editTextCompositionStyle(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::editTextCompositionStyle(self::editTextCompositionStyle::from_json_object(o)?))
     }
     fn __json_new_editUserStarSubscription(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::editUserStarSubscription(self::editUserStarSubscription::from_json_object(o)?))
+    }
+    fn __json_new_editWidgetData(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::editWidgetData(self::editWidgetData::from_json_object(o)?))
     }
     fn __json_new_enableProxy(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::enableProxy(self::enableProxy::from_json_object(o)?))
@@ -415085,6 +425714,12 @@ impl Function {
     }
     fn __json_new_finishFileGeneration(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::finishFileGeneration(self::finishFileGeneration::from_json_object(o)?))
+    }
+    fn __json_new_fixRecognizedRichMessageWithAi(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::fixRecognizedRichMessageWithAi(self::fixRecognizedRichMessageWithAi::from_json_object(o)?))
+    }
+    fn __json_new_fixRecognizedTextWithAi(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::fixRecognizedTextWithAi(self::fixRecognizedTextWithAi::from_json_object(o)?))
     }
     fn __json_new_fixRichMessageWithAi(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::fixRichMessageWithAi(self::fixRichMessageWithAi::from_json_object(o)?))
@@ -415365,8 +426000,14 @@ impl Function {
     fn __json_new_getCommands(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::getCommands(self::getCommands::from_json_object(o)?))
     }
+    fn __json_new_getCommunityAddChatRequests(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::getCommunityAddChatRequests(self::getCommunityAddChatRequests::from_json_object(o)?))
+    }
     fn __json_new_getCommunityFullInfo(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::getCommunityFullInfo(self::getCommunityFullInfo::from_json_object(o)?))
+    }
+    fn __json_new_getCommunityMemberChats(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::getCommunityMemberChats(self::getCommunityMemberChats::from_json_object(o)?))
     }
     fn __json_new_getConnectedAffiliateProgram(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::getConnectedAffiliateProgram(self::getConnectedAffiliateProgram::from_json_object(o)?))
@@ -415574,6 +426215,9 @@ impl Function {
     }
     fn __json_new_getInternalLinkType(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::getInternalLinkType(self::getInternalLinkType::from_json_object(o)?))
+    }
+    fn __json_new_getJoinedCommunities(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::getJoinedCommunities(self::getJoinedCommunities::from_json_object(o)?))
     }
     fn __json_new_getJsonString(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::getJsonString(self::getJsonString::from_json_object(o)?))
@@ -415821,6 +426465,9 @@ impl Function {
     fn __json_new_getPreparedKeyboardButton(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::getPreparedKeyboardButton(self::getPreparedKeyboardButton::from_json_object(o)?))
     }
+    fn __json_new_getProfileShareThemeBackdrops(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::getProfileShareThemeBackdrops(self::getProfileShareThemeBackdrops::from_json_object(o)?))
+    }
     fn __json_new_getProxies(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::getProxies(self::getProxies::from_json_object(o)?))
     }
@@ -415901,6 +426548,9 @@ impl Function {
     }
     fn __json_new_getSecretChat(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::getSecretChat(self::getSecretChat::from_json_object(o)?))
+    }
+    fn __json_new_getSpeechRecognitionLanguages(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::getSpeechRecognitionLanguages(self::getSpeechRecognitionLanguages::from_json_object(o)?))
     }
     fn __json_new_getStakeDiceState(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::getStakeDiceState(self::getStakeDiceState::from_json_object(o)?))
@@ -415983,6 +426633,9 @@ impl Function {
     fn __json_new_getSuggestedStickerSetName(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::getSuggestedStickerSetName(self::getSuggestedStickerSetName::from_json_object(o)?))
     }
+    fn __json_new_getSuitableCommunityChats(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::getSuitableCommunityChats(self::getSuitableCommunityChats::from_json_object(o)?))
+    }
     fn __json_new_getSuitableDiscussionChats(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::getSuitableDiscussionChats(self::getSuitableDiscussionChats::from_json_object(o)?))
     }
@@ -416009,6 +426662,9 @@ impl Function {
     }
     fn __json_new_getTextCompositionStyleExample(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::getTextCompositionStyleExample(self::getTextCompositionStyleExample::from_json_object(o)?))
+    }
+    fn __json_new_getTextEmojiRanges(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::getTextEmojiRanges(self::getTextEmojiRanges::from_json_object(o)?))
     }
     fn __json_new_getTextEntities(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::getTextEntities(self::getTextEntities::from_json_object(o)?))
@@ -416043,6 +426699,9 @@ impl Function {
     fn __json_new_getTonTransactions(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::getTonTransactions(self::getTonTransactions::from_json_object(o)?))
     }
+    fn __json_new_getTonWalletCardBackgroundGiftCollectionNames(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::getTonWalletCardBackgroundGiftCollectionNames(self::getTonWalletCardBackgroundGiftCollectionNames::from_json_object(o)?))
+    }
     fn __json_new_getTonWalletNfts(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::getTonWalletNfts(self::getTonWalletNfts::from_json_object(o)?))
     }
@@ -416069,6 +426728,9 @@ impl Function {
     }
     fn __json_new_getUpgradedGift(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::getUpgradedGift(self::getUpgradedGift::from_json_object(o)?))
+    }
+    fn __json_new_getUpgradedGiftDepositInfo(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::getUpgradedGiftDepositInfo(self::getUpgradedGiftDepositInfo::from_json_object(o)?))
     }
     fn __json_new_getUpgradedGiftEmojiStatuses(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::getUpgradedGiftEmojiStatuses(self::getUpgradedGiftEmojiStatuses::from_json_object(o)?))
@@ -416135,6 +426797,12 @@ impl Function {
     }
     fn __json_new_getWebPageInstantView(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::getWebPageInstantView(self::getWebPageInstantView::from_json_object(o)?))
+    }
+    fn __json_new_getWidgetPublicData(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::getWidgetPublicData(self::getWidgetPublicData::from_json_object(o)?))
+    }
+    fn __json_new_getWidgetQueryAnswer(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::getWidgetQueryAnswer(self::getWidgetQueryAnswer::from_json_object(o)?))
     }
     fn __json_new_giftPremiumWithStars(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::giftPremiumWithStars(self::giftPremiumWithStars::from_json_object(o)?))
@@ -416289,11 +426957,20 @@ impl Function {
     fn __json_new_processChatJoinRequests(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::processChatJoinRequests(self::processChatJoinRequests::from_json_object(o)?))
     }
+    fn __json_new_processCommunityAddChatRequest(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::processCommunityAddChatRequest(self::processCommunityAddChatRequest::from_json_object(o)?))
+    }
+    fn __json_new_processCommunityAddChatRequests(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::processCommunityAddChatRequests(self::processCommunityAddChatRequests::from_json_object(o)?))
+    }
     fn __json_new_processGiftPurchaseOffer(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::processGiftPurchaseOffer(self::processGiftPurchaseOffer::from_json_object(o)?))
     }
     fn __json_new_processPushNotification(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::processPushNotification(self::processPushNotification::from_json_object(o)?))
+    }
+    fn __json_new_processWebProxyCarrierMessage(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::processWebProxyCarrierMessage(self::processWebProxyCarrierMessage::from_json_object(o)?))
     }
     fn __json_new_rateSpeechRecognition(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::rateSpeechRecognition(self::rateSpeechRecognition::from_json_object(o)?))
@@ -416334,6 +427011,9 @@ impl Function {
     fn __json_new_recognizeSpeech(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::recognizeSpeech(self::recognizeSpeech::from_json_object(o)?))
     }
+    fn __json_new_recognizeSpeechInFile(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::recognizeSpeechInFile(self::recognizeSpeechInFile::from_json_object(o)?))
+    }
     fn __json_new_recoverAuthenticationPassword(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::recoverAuthenticationPassword(self::recoverAuthenticationPassword::from_json_object(o)?))
     }
@@ -416360,6 +427040,9 @@ impl Function {
     }
     fn __json_new_removeChatActionBar(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::removeChatActionBar(self::removeChatActionBar::from_json_object(o)?))
+    }
+    fn __json_new_removeCommunityChat(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::removeCommunityChat(self::removeCommunityChat::from_json_object(o)?))
     }
     fn __json_new_removeContacts(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::removeContacts(self::removeContacts::from_json_object(o)?))
@@ -416519,6 +427202,9 @@ impl Function {
     }
     fn __json_new_reportVideoMessageAdvertisement(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::reportVideoMessageAdvertisement(self::reportVideoMessageAdvertisement::from_json_object(o)?))
+    }
+    fn __json_new_reportWebProxyCarrierError(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::reportWebProxyCarrierError(self::reportWebProxyCarrierError::from_json_object(o)?))
     }
     fn __json_new_requestAuthenticationPasswordRecovery(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::requestAuthenticationPasswordRecovery(self::requestAuthenticationPasswordRecovery::from_json_object(o)?))
@@ -416958,6 +427644,9 @@ impl Function {
     fn __json_new_setCommunityName(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::setCommunityName(self::setCommunityName::from_json_object(o)?))
     }
+    fn __json_new_setCommunityNotificationSettings(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::setCommunityNotificationSettings(self::setCommunityNotificationSettings::from_json_object(o)?))
+    }
     fn __json_new_setCommunityPermissions(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::setCommunityPermissions(self::setCommunityPermissions::from_json_object(o)?))
     }
@@ -417117,6 +427806,9 @@ impl Function {
     fn __json_new_setProfilePhoto(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::setProfilePhoto(self::setProfilePhoto::from_json_object(o)?))
     }
+    fn __json_new_setProfileShareTheme(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::setProfileShareTheme(self::setProfileShareTheme::from_json_object(o)?))
+    }
     fn __json_new_setQuickReplyShortcutName(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::setQuickReplyShortcutName(self::setQuickReplyShortcutName::from_json_object(o)?))
     }
@@ -417182,6 +427874,9 @@ impl Function {
     }
     fn __json_new_setTonConnectSessionWalletClientId(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::setTonConnectSessionWalletClientId(self::setTonConnectSessionWalletClientId::from_json_object(o)?))
+    }
+    fn __json_new_setTonWalletCardStickers(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::setTonWalletCardStickers(self::setTonWalletCardStickers::from_json_object(o)?))
     }
     fn __json_new_setUpgradedGiftColors(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::setUpgradedGiftColors(self::setUpgradedGiftColors::from_json_object(o)?))
@@ -417336,6 +428031,12 @@ impl Function {
     fn __json_new_toggleChatViewAsTopics(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::toggleChatViewAsTopics(self::toggleChatViewAsTopics::from_json_object(o)?))
     }
+    fn __json_new_toggleCommunityAreChatsCollapsed(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::toggleCommunityAreChatsCollapsed(self::toggleCommunityAreChatsCollapsed::from_json_object(o)?))
+    }
+    fn __json_new_toggleCommunityMemberIsBanned(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::toggleCommunityMemberIsBanned(self::toggleCommunityMemberIsBanned::from_json_object(o)?))
+    }
     fn __json_new_toggleDirectMessagesChatTopicCanSendUnpaidMessages(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::toggleDirectMessagesChatTopicCanSendUnpaidMessages(self::toggleDirectMessagesChatTopicCanSendUnpaidMessages::from_json_object(o)?))
     }
@@ -417489,6 +428190,9 @@ impl Function {
     fn __json_new_viewVideoMessageAdvertisement(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::viewVideoMessageAdvertisement(self::viewVideoMessageAdvertisement::from_json_object(o)?))
     }
+    fn __json_new_withdrawUpgradedGift(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::withdrawUpgradedGift(self::withdrawUpgradedGift::from_json_object(o)?))
+    }
     fn __json_new_writeGeneratedFilePart(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::writeGeneratedFilePart(self::writeGeneratedFilePart::from_json_object(o)?))
     }
@@ -417519,6 +428223,7 @@ impl Function {
                 "addChatToList" => Self::__json_new_addChatToList(o),
                 "addChatWelcomeMessage" => Self::__json_new_addChatWelcomeMessage(o),
                 "addChecklistTasks" => Self::__json_new_addChecklistTasks(o),
+                "addCommunityChat" => Self::__json_new_addCommunityChat(o),
                 "addContact" => Self::__json_new_addContact(o),
                 "addCustomServerLanguagePack" => Self::__json_new_addCustomServerLanguagePack(o),
                 "addFavoriteSticker" => Self::__json_new_addFavoriteSticker(o),
@@ -417557,7 +428262,9 @@ impl Function {
                 "answerShippingQuery" => Self::__json_new_answerShippingQuery(o),
                 "answerTonConnectRequest" => Self::__json_new_answerTonConnectRequest(o),
                 "answerWebAppQuery" => Self::__json_new_answerWebAppQuery(o),
+                "answerWidgetQuery" => Self::__json_new_answerWidgetQuery(o),
                 "applyPremiumGiftCode" => Self::__json_new_applyPremiumGiftCode(o),
+                "applyUnpaidMessagesToken" => Self::__json_new_applyUnpaidMessagesToken(o),
                 "approveSuggestedPost" => Self::__json_new_approveSuggestedPost(o),
                 "assignStoreTransaction" => Self::__json_new_assignStoreTransaction(o),
                 "banChatMember" => Self::__json_new_banChatMember(o),
@@ -417691,6 +428398,7 @@ impl Function {
                 "deleteEphemeralMessage" => Self::__json_new_deleteEphemeralMessage(o),
                 "deleteFile" => Self::__json_new_deleteFile(o),
                 "deleteForumTopic" => Self::__json_new_deleteForumTopic(o),
+                "deleteGift" => Self::__json_new_deleteGift(o),
                 "deleteGiftCollection" => Self::__json_new_deleteGiftCollection(o),
                 "deleteGroupCallMessages" => Self::__json_new_deleteGroupCallMessages(o),
                 "deleteGroupCallMessagesBySender" => Self::__json_new_deleteGroupCallMessagesBySender(o),
@@ -417724,6 +428432,7 @@ impl Function {
                 "disconnectTonConnectSession" => Self::__json_new_disconnectTonConnectSession(o),
                 "disconnectWebsite" => Self::__json_new_disconnectWebsite(o),
                 "dismissWebToken" => Self::__json_new_dismissWebToken(o),
+                "displayUpgradedGift" => Self::__json_new_displayUpgradedGift(o),
                 "downloadFile" => Self::__json_new_downloadFile(o),
                 "dropGiftOriginalDetails" => Self::__json_new_dropGiftOriginalDetails(o),
                 "editBotMediaPreview" => Self::__json_new_editBotMediaPreview(o),
@@ -417749,6 +428458,7 @@ impl Function {
                 "editInlineMessageMedia" => Self::__json_new_editInlineMessageMedia(o),
                 "editInlineMessageReplyMarkup" => Self::__json_new_editInlineMessageReplyMarkup(o),
                 "editInlineMessageText" => Self::__json_new_editInlineMessageText(o),
+                "editInlineMessageWidgetData" => Self::__json_new_editInlineMessageWidgetData(o),
                 "editMessageCaption" => Self::__json_new_editMessageCaption(o),
                 "editMessageChecklist" => Self::__json_new_editMessageChecklist(o),
                 "editMessageLiveLocation" => Self::__json_new_editMessageLiveLocation(o),
@@ -417756,13 +428466,16 @@ impl Function {
                 "editMessageReplyMarkup" => Self::__json_new_editMessageReplyMarkup(o),
                 "editMessageSchedulingState" => Self::__json_new_editMessageSchedulingState(o),
                 "editMessageText" => Self::__json_new_editMessageText(o),
+                "editMessageWidgetData" => Self::__json_new_editMessageWidgetData(o),
                 "editProxy" => Self::__json_new_editProxy(o),
                 "editQuickReplyMessage" => Self::__json_new_editQuickReplyMessage(o),
                 "editStarSubscription" => Self::__json_new_editStarSubscription(o),
                 "editStory" => Self::__json_new_editStory(o),
                 "editStoryCover" => Self::__json_new_editStoryCover(o),
+                "editStoryMusic" => Self::__json_new_editStoryMusic(o),
                 "editTextCompositionStyle" => Self::__json_new_editTextCompositionStyle(o),
                 "editUserStarSubscription" => Self::__json_new_editUserStarSubscription(o),
+                "editWidgetData" => Self::__json_new_editWidgetData(o),
                 "enableProxy" => Self::__json_new_enableProxy(o),
                 "enableTonWalletBackup" => Self::__json_new_enableTonWalletBackup(o),
                 "encryptGroupCallData" => Self::__json_new_encryptGroupCallData(o),
@@ -417770,6 +428483,8 @@ impl Function {
                 "endGroupCallRecording" => Self::__json_new_endGroupCallRecording(o),
                 "endGroupCallScreenSharing" => Self::__json_new_endGroupCallScreenSharing(o),
                 "finishFileGeneration" => Self::__json_new_finishFileGeneration(o),
+                "fixRecognizedRichMessageWithAi" => Self::__json_new_fixRecognizedRichMessageWithAi(o),
+                "fixRecognizedTextWithAi" => Self::__json_new_fixRecognizedTextWithAi(o),
                 "fixRichMessageWithAi" => Self::__json_new_fixRichMessageWithAi(o),
                 "fixTextWithAi" => Self::__json_new_fixTextWithAi(o),
                 "forwardMessages" => Self::__json_new_forwardMessages(o),
@@ -417863,7 +428578,9 @@ impl Function {
                 "getCloseFriends" => Self::__json_new_getCloseFriends(o),
                 "getCollectibleItemInfo" => Self::__json_new_getCollectibleItemInfo(o),
                 "getCommands" => Self::__json_new_getCommands(o),
+                "getCommunityAddChatRequests" => Self::__json_new_getCommunityAddChatRequests(o),
                 "getCommunityFullInfo" => Self::__json_new_getCommunityFullInfo(o),
+                "getCommunityMemberChats" => Self::__json_new_getCommunityMemberChats(o),
                 "getConnectedAffiliateProgram" => Self::__json_new_getConnectedAffiliateProgram(o),
                 "getConnectedAffiliatePrograms" => Self::__json_new_getConnectedAffiliatePrograms(o),
                 "getConnectedWebsites" => Self::__json_new_getConnectedWebsites(o),
@@ -417933,6 +428650,7 @@ impl Function {
                 "getInstalledStickerSets" => Self::__json_new_getInstalledStickerSets(o),
                 "getInternalLink" => Self::__json_new_getInternalLink(o),
                 "getInternalLinkType" => Self::__json_new_getInternalLinkType(o),
+                "getJoinedCommunities" => Self::__json_new_getJoinedCommunities(o),
                 "getJsonString" => Self::__json_new_getJsonString(o),
                 "getJsonValue" => Self::__json_new_getJsonValue(o),
                 "getKeywordEmojis" => Self::__json_new_getKeywordEmojis(o),
@@ -418015,6 +428733,7 @@ impl Function {
                 "getPremiumStickers" => Self::__json_new_getPremiumStickers(o),
                 "getPreparedInlineMessage" => Self::__json_new_getPreparedInlineMessage(o),
                 "getPreparedKeyboardButton" => Self::__json_new_getPreparedKeyboardButton(o),
+                "getProfileShareThemeBackdrops" => Self::__json_new_getProfileShareThemeBackdrops(o),
                 "getProxies" => Self::__json_new_getProxies(o),
                 "getPublicPostSearchLimits" => Self::__json_new_getPublicPostSearchLimits(o),
                 "getPushReceiverId" => Self::__json_new_getPushReceiverId(o),
@@ -418042,6 +428761,7 @@ impl Function {
                 "getSearchSponsoredChats" => Self::__json_new_getSearchSponsoredChats(o),
                 "getSearchedForTags" => Self::__json_new_getSearchedForTags(o),
                 "getSecretChat" => Self::__json_new_getSecretChat(o),
+                "getSpeechRecognitionLanguages" => Self::__json_new_getSpeechRecognitionLanguages(o),
                 "getStakeDiceState" => Self::__json_new_getStakeDiceState(o),
                 "getStarAdAccountUrl" => Self::__json_new_getStarAdAccountUrl(o),
                 "getStarGiftPaymentOptions" => Self::__json_new_getStarGiftPaymentOptions(o),
@@ -418069,6 +428789,7 @@ impl Function {
                 "getStoryStatistics" => Self::__json_new_getStoryStatistics(o),
                 "getSuggestedFileName" => Self::__json_new_getSuggestedFileName(o),
                 "getSuggestedStickerSetName" => Self::__json_new_getSuggestedStickerSetName(o),
+                "getSuitableCommunityChats" => Self::__json_new_getSuitableCommunityChats(o),
                 "getSuitableDiscussionChats" => Self::__json_new_getSuitableDiscussionChats(o),
                 "getSuitablePersonalChats" => Self::__json_new_getSuitablePersonalChats(o),
                 "getSupergroup" => Self::__json_new_getSupergroup(o),
@@ -418078,6 +428799,7 @@ impl Function {
                 "getSupportUser" => Self::__json_new_getSupportUser(o),
                 "getTemporaryPasswordState" => Self::__json_new_getTemporaryPasswordState(o),
                 "getTextCompositionStyleExample" => Self::__json_new_getTextCompositionStyleExample(o),
+                "getTextEmojiRanges" => Self::__json_new_getTextEmojiRanges(o),
                 "getTextEntities" => Self::__json_new_getTextEntities(o),
                 "getThemeParametersJsonString" => Self::__json_new_getThemeParametersJsonString(o),
                 "getThemedChatEmojiStatuses" => Self::__json_new_getThemedChatEmojiStatuses(o),
@@ -418089,6 +428811,7 @@ impl Function {
                 "getTonConnectSessionPendingRequests" => Self::__json_new_getTonConnectSessionPendingRequests(o),
                 "getTonConnectSessions" => Self::__json_new_getTonConnectSessions(o),
                 "getTonTransactions" => Self::__json_new_getTonTransactions(o),
+                "getTonWalletCardBackgroundGiftCollectionNames" => Self::__json_new_getTonWalletCardBackgroundGiftCollectionNames(o),
                 "getTonWalletNfts" => Self::__json_new_getTonWalletNfts(o),
                 "getTonWalletOwnershipProofChallenge" => Self::__json_new_getTonWalletOwnershipProofChallenge(o),
                 "getTonWalletSecretPhrase" => Self::__json_new_getTonWalletSecretPhrase(o),
@@ -418098,6 +428821,7 @@ impl Function {
                 "getTopChats" => Self::__json_new_getTopChats(o),
                 "getTrendingStickerSets" => Self::__json_new_getTrendingStickerSets(o),
                 "getUpgradedGift" => Self::__json_new_getUpgradedGift(o),
+                "getUpgradedGiftDepositInfo" => Self::__json_new_getUpgradedGiftDepositInfo(o),
                 "getUpgradedGiftEmojiStatuses" => Self::__json_new_getUpgradedGiftEmojiStatuses(o),
                 "getUpgradedGiftValueInfo" => Self::__json_new_getUpgradedGiftValueInfo(o),
                 "getUpgradedGiftVariants" => Self::__json_new_getUpgradedGiftVariants(o),
@@ -418120,6 +428844,8 @@ impl Function {
                 "getWebAppPlaceholder" => Self::__json_new_getWebAppPlaceholder(o),
                 "getWebAppUrl" => Self::__json_new_getWebAppUrl(o),
                 "getWebPageInstantView" => Self::__json_new_getWebPageInstantView(o),
+                "getWidgetPublicData" => Self::__json_new_getWidgetPublicData(o),
+                "getWidgetQueryAnswer" => Self::__json_new_getWidgetQueryAnswer(o),
                 "giftPremiumWithStars" => Self::__json_new_giftPremiumWithStars(o),
                 "hideContactCloseBirthdays" => Self::__json_new_hideContactCloseBirthdays(o),
                 "hideSuggestedAction" => Self::__json_new_hideSuggestedAction(o),
@@ -418171,8 +428897,11 @@ impl Function {
                 "processChatHasProtectedContentDisableRequest" => Self::__json_new_processChatHasProtectedContentDisableRequest(o),
                 "processChatJoinRequest" => Self::__json_new_processChatJoinRequest(o),
                 "processChatJoinRequests" => Self::__json_new_processChatJoinRequests(o),
+                "processCommunityAddChatRequest" => Self::__json_new_processCommunityAddChatRequest(o),
+                "processCommunityAddChatRequests" => Self::__json_new_processCommunityAddChatRequests(o),
                 "processGiftPurchaseOffer" => Self::__json_new_processGiftPurchaseOffer(o),
                 "processPushNotification" => Self::__json_new_processPushNotification(o),
+                "processWebProxyCarrierMessage" => Self::__json_new_processWebProxyCarrierMessage(o),
                 "rateSpeechRecognition" => Self::__json_new_rateSpeechRecognition(o),
                 "readAllChatMentions" => Self::__json_new_readAllChatMentions(o),
                 "readAllChatPollVotes" => Self::__json_new_readAllChatPollVotes(o),
@@ -418186,6 +428915,7 @@ impl Function {
                 "readFilePart" => Self::__json_new_readFilePart(o),
                 "readdQuickReplyShortcutMessages" => Self::__json_new_readdQuickReplyShortcutMessages(o),
                 "recognizeSpeech" => Self::__json_new_recognizeSpeech(o),
+                "recognizeSpeechInFile" => Self::__json_new_recognizeSpeechInFile(o),
                 "recoverAuthenticationPassword" => Self::__json_new_recoverAuthenticationPassword(o),
                 "recoverPassword" => Self::__json_new_recoverPassword(o),
                 "refundStarPayment" => Self::__json_new_refundStarPayment(o),
@@ -418195,6 +428925,7 @@ impl Function {
                 "removeAllWebBrowserSettingsExceptions" => Self::__json_new_removeAllWebBrowserSettingsExceptions(o),
                 "removeBusinessConnectedBotFromChat" => Self::__json_new_removeBusinessConnectedBotFromChat(o),
                 "removeChatActionBar" => Self::__json_new_removeChatActionBar(o),
+                "removeCommunityChat" => Self::__json_new_removeCommunityChat(o),
                 "removeContacts" => Self::__json_new_removeContacts(o),
                 "removeFavoriteSticker" => Self::__json_new_removeFavoriteSticker(o),
                 "removeFileFromDownloads" => Self::__json_new_removeFileFromDownloads(o),
@@ -418248,6 +428979,7 @@ impl Function {
                 "reportSupergroupAntiSpamFalsePositive" => Self::__json_new_reportSupergroupAntiSpamFalsePositive(o),
                 "reportSupergroupSpam" => Self::__json_new_reportSupergroupSpam(o),
                 "reportVideoMessageAdvertisement" => Self::__json_new_reportVideoMessageAdvertisement(o),
+                "reportWebProxyCarrierError" => Self::__json_new_reportWebProxyCarrierError(o),
                 "requestAuthenticationPasswordRecovery" => Self::__json_new_requestAuthenticationPasswordRecovery(o),
                 "requestPasswordRecovery" => Self::__json_new_requestPasswordRecovery(o),
                 "requestQrCodeAuthentication" => Self::__json_new_requestQrCodeAuthentication(o),
@@ -418394,6 +429126,7 @@ impl Function {
                 "setCloseFriends" => Self::__json_new_setCloseFriends(o),
                 "setCommands" => Self::__json_new_setCommands(o),
                 "setCommunityName" => Self::__json_new_setCommunityName(o),
+                "setCommunityNotificationSettings" => Self::__json_new_setCommunityNotificationSettings(o),
                 "setCommunityPermissions" => Self::__json_new_setCommunityPermissions(o),
                 "setCommunityPhoto" => Self::__json_new_setCommunityPhoto(o),
                 "setCustomEmojiStickerSetThumbnail" => Self::__json_new_setCustomEmojiStickerSetThumbnail(o),
@@ -418447,6 +429180,7 @@ impl Function {
                 "setProfileAccentColor" => Self::__json_new_setProfileAccentColor(o),
                 "setProfileAudioPosition" => Self::__json_new_setProfileAudioPosition(o),
                 "setProfilePhoto" => Self::__json_new_setProfilePhoto(o),
+                "setProfileShareTheme" => Self::__json_new_setProfileShareTheme(o),
                 "setQuickReplyShortcutName" => Self::__json_new_setQuickReplyShortcutName(o),
                 "setReactionNotificationSettings" => Self::__json_new_setReactionNotificationSettings(o),
                 "setReadDatePrivacySettings" => Self::__json_new_setReadDatePrivacySettings(o),
@@ -418469,6 +429203,7 @@ impl Function {
                 "setSupergroupUsername" => Self::__json_new_setSupergroupUsername(o),
                 "setTdlibParameters" => Self::__json_new_setTdlibParameters(o),
                 "setTonConnectSessionWalletClientId" => Self::__json_new_setTonConnectSessionWalletClientId(o),
+                "setTonWalletCardStickers" => Self::__json_new_setTonWalletCardStickers(o),
                 "setUpgradedGiftColors" => Self::__json_new_setUpgradedGiftColors(o),
                 "setUserEmojiStatus" => Self::__json_new_setUserEmojiStatus(o),
                 "setUserNote" => Self::__json_new_setUserNote(o),
@@ -418520,6 +429255,8 @@ impl Function {
                 "toggleChatIsPinned" => Self::__json_new_toggleChatIsPinned(o),
                 "toggleChatIsTranslatable" => Self::__json_new_toggleChatIsTranslatable(o),
                 "toggleChatViewAsTopics" => Self::__json_new_toggleChatViewAsTopics(o),
+                "toggleCommunityAreChatsCollapsed" => Self::__json_new_toggleCommunityAreChatsCollapsed(o),
+                "toggleCommunityMemberIsBanned" => Self::__json_new_toggleCommunityMemberIsBanned(o),
                 "toggleDirectMessagesChatTopicCanSendUnpaidMessages" => Self::__json_new_toggleDirectMessagesChatTopicCanSendUnpaidMessages(o),
                 "toggleDownloadIsPaused" => Self::__json_new_toggleDownloadIsPaused(o),
                 "toggleForumTopicIsClosed" => Self::__json_new_toggleForumTopicIsClosed(o),
@@ -418571,6 +429308,7 @@ impl Function {
                 "viewSponsoredChat" => Self::__json_new_viewSponsoredChat(o),
                 "viewTrendingStickerSets" => Self::__json_new_viewTrendingStickerSets(o),
                 "viewVideoMessageAdvertisement" => Self::__json_new_viewVideoMessageAdvertisement(o),
+                "withdrawUpgradedGift" => Self::__json_new_withdrawUpgradedGift(o),
                 "writeGeneratedFilePart" => Self::__json_new_writeGeneratedFilePart(o),
                 _ => Result::Err(format!("Unknown class \"{s}\"")),
             },
@@ -418587,6 +429325,7 @@ impl Function {
                 self::addChatToList::ID => Self::__json_new_addChatToList(o),
                 self::addChatWelcomeMessage::ID => Self::__json_new_addChatWelcomeMessage(o),
                 self::addChecklistTasks::ID => Self::__json_new_addChecklistTasks(o),
+                self::addCommunityChat::ID => Self::__json_new_addCommunityChat(o),
                 self::addContact::ID => Self::__json_new_addContact(o),
                 self::addCustomServerLanguagePack::ID => Self::__json_new_addCustomServerLanguagePack(o),
                 self::addFavoriteSticker::ID => Self::__json_new_addFavoriteSticker(o),
@@ -418625,7 +429364,9 @@ impl Function {
                 self::answerShippingQuery::ID => Self::__json_new_answerShippingQuery(o),
                 self::answerTonConnectRequest::ID => Self::__json_new_answerTonConnectRequest(o),
                 self::answerWebAppQuery::ID => Self::__json_new_answerWebAppQuery(o),
+                self::answerWidgetQuery::ID => Self::__json_new_answerWidgetQuery(o),
                 self::applyPremiumGiftCode::ID => Self::__json_new_applyPremiumGiftCode(o),
+                self::applyUnpaidMessagesToken::ID => Self::__json_new_applyUnpaidMessagesToken(o),
                 self::approveSuggestedPost::ID => Self::__json_new_approveSuggestedPost(o),
                 self::assignStoreTransaction::ID => Self::__json_new_assignStoreTransaction(o),
                 self::banChatMember::ID => Self::__json_new_banChatMember(o),
@@ -418759,6 +429500,7 @@ impl Function {
                 self::deleteEphemeralMessage::ID => Self::__json_new_deleteEphemeralMessage(o),
                 self::deleteFile::ID => Self::__json_new_deleteFile(o),
                 self::deleteForumTopic::ID => Self::__json_new_deleteForumTopic(o),
+                self::deleteGift::ID => Self::__json_new_deleteGift(o),
                 self::deleteGiftCollection::ID => Self::__json_new_deleteGiftCollection(o),
                 self::deleteGroupCallMessages::ID => Self::__json_new_deleteGroupCallMessages(o),
                 self::deleteGroupCallMessagesBySender::ID => Self::__json_new_deleteGroupCallMessagesBySender(o),
@@ -418792,6 +429534,7 @@ impl Function {
                 self::disconnectTonConnectSession::ID => Self::__json_new_disconnectTonConnectSession(o),
                 self::disconnectWebsite::ID => Self::__json_new_disconnectWebsite(o),
                 self::dismissWebToken::ID => Self::__json_new_dismissWebToken(o),
+                self::displayUpgradedGift::ID => Self::__json_new_displayUpgradedGift(o),
                 self::downloadFile::ID => Self::__json_new_downloadFile(o),
                 self::dropGiftOriginalDetails::ID => Self::__json_new_dropGiftOriginalDetails(o),
                 self::editBotMediaPreview::ID => Self::__json_new_editBotMediaPreview(o),
@@ -418817,6 +429560,7 @@ impl Function {
                 self::editInlineMessageMedia::ID => Self::__json_new_editInlineMessageMedia(o),
                 self::editInlineMessageReplyMarkup::ID => Self::__json_new_editInlineMessageReplyMarkup(o),
                 self::editInlineMessageText::ID => Self::__json_new_editInlineMessageText(o),
+                self::editInlineMessageWidgetData::ID => Self::__json_new_editInlineMessageWidgetData(o),
                 self::editMessageCaption::ID => Self::__json_new_editMessageCaption(o),
                 self::editMessageChecklist::ID => Self::__json_new_editMessageChecklist(o),
                 self::editMessageLiveLocation::ID => Self::__json_new_editMessageLiveLocation(o),
@@ -418824,13 +429568,16 @@ impl Function {
                 self::editMessageReplyMarkup::ID => Self::__json_new_editMessageReplyMarkup(o),
                 self::editMessageSchedulingState::ID => Self::__json_new_editMessageSchedulingState(o),
                 self::editMessageText::ID => Self::__json_new_editMessageText(o),
+                self::editMessageWidgetData::ID => Self::__json_new_editMessageWidgetData(o),
                 self::editProxy::ID => Self::__json_new_editProxy(o),
                 self::editQuickReplyMessage::ID => Self::__json_new_editQuickReplyMessage(o),
                 self::editStarSubscription::ID => Self::__json_new_editStarSubscription(o),
                 self::editStory::ID => Self::__json_new_editStory(o),
                 self::editStoryCover::ID => Self::__json_new_editStoryCover(o),
+                self::editStoryMusic::ID => Self::__json_new_editStoryMusic(o),
                 self::editTextCompositionStyle::ID => Self::__json_new_editTextCompositionStyle(o),
                 self::editUserStarSubscription::ID => Self::__json_new_editUserStarSubscription(o),
+                self::editWidgetData::ID => Self::__json_new_editWidgetData(o),
                 self::enableProxy::ID => Self::__json_new_enableProxy(o),
                 self::enableTonWalletBackup::ID => Self::__json_new_enableTonWalletBackup(o),
                 self::encryptGroupCallData::ID => Self::__json_new_encryptGroupCallData(o),
@@ -418838,6 +429585,8 @@ impl Function {
                 self::endGroupCallRecording::ID => Self::__json_new_endGroupCallRecording(o),
                 self::endGroupCallScreenSharing::ID => Self::__json_new_endGroupCallScreenSharing(o),
                 self::finishFileGeneration::ID => Self::__json_new_finishFileGeneration(o),
+                self::fixRecognizedRichMessageWithAi::ID => Self::__json_new_fixRecognizedRichMessageWithAi(o),
+                self::fixRecognizedTextWithAi::ID => Self::__json_new_fixRecognizedTextWithAi(o),
                 self::fixRichMessageWithAi::ID => Self::__json_new_fixRichMessageWithAi(o),
                 self::fixTextWithAi::ID => Self::__json_new_fixTextWithAi(o),
                 self::forwardMessages::ID => Self::__json_new_forwardMessages(o),
@@ -418931,7 +429680,9 @@ impl Function {
                 self::getCloseFriends::ID => Self::__json_new_getCloseFriends(o),
                 self::getCollectibleItemInfo::ID => Self::__json_new_getCollectibleItemInfo(o),
                 self::getCommands::ID => Self::__json_new_getCommands(o),
+                self::getCommunityAddChatRequests::ID => Self::__json_new_getCommunityAddChatRequests(o),
                 self::getCommunityFullInfo::ID => Self::__json_new_getCommunityFullInfo(o),
+                self::getCommunityMemberChats::ID => Self::__json_new_getCommunityMemberChats(o),
                 self::getConnectedAffiliateProgram::ID => Self::__json_new_getConnectedAffiliateProgram(o),
                 self::getConnectedAffiliatePrograms::ID => Self::__json_new_getConnectedAffiliatePrograms(o),
                 self::getConnectedWebsites::ID => Self::__json_new_getConnectedWebsites(o),
@@ -419001,6 +429752,7 @@ impl Function {
                 self::getInstalledStickerSets::ID => Self::__json_new_getInstalledStickerSets(o),
                 self::getInternalLink::ID => Self::__json_new_getInternalLink(o),
                 self::getInternalLinkType::ID => Self::__json_new_getInternalLinkType(o),
+                self::getJoinedCommunities::ID => Self::__json_new_getJoinedCommunities(o),
                 self::getJsonString::ID => Self::__json_new_getJsonString(o),
                 self::getJsonValue::ID => Self::__json_new_getJsonValue(o),
                 self::getKeywordEmojis::ID => Self::__json_new_getKeywordEmojis(o),
@@ -419083,6 +429835,7 @@ impl Function {
                 self::getPremiumStickers::ID => Self::__json_new_getPremiumStickers(o),
                 self::getPreparedInlineMessage::ID => Self::__json_new_getPreparedInlineMessage(o),
                 self::getPreparedKeyboardButton::ID => Self::__json_new_getPreparedKeyboardButton(o),
+                self::getProfileShareThemeBackdrops::ID => Self::__json_new_getProfileShareThemeBackdrops(o),
                 self::getProxies::ID => Self::__json_new_getProxies(o),
                 self::getPublicPostSearchLimits::ID => Self::__json_new_getPublicPostSearchLimits(o),
                 self::getPushReceiverId::ID => Self::__json_new_getPushReceiverId(o),
@@ -419110,6 +429863,7 @@ impl Function {
                 self::getSearchSponsoredChats::ID => Self::__json_new_getSearchSponsoredChats(o),
                 self::getSearchedForTags::ID => Self::__json_new_getSearchedForTags(o),
                 self::getSecretChat::ID => Self::__json_new_getSecretChat(o),
+                self::getSpeechRecognitionLanguages::ID => Self::__json_new_getSpeechRecognitionLanguages(o),
                 self::getStakeDiceState::ID => Self::__json_new_getStakeDiceState(o),
                 self::getStarAdAccountUrl::ID => Self::__json_new_getStarAdAccountUrl(o),
                 self::getStarGiftPaymentOptions::ID => Self::__json_new_getStarGiftPaymentOptions(o),
@@ -419137,6 +429891,7 @@ impl Function {
                 self::getStoryStatistics::ID => Self::__json_new_getStoryStatistics(o),
                 self::getSuggestedFileName::ID => Self::__json_new_getSuggestedFileName(o),
                 self::getSuggestedStickerSetName::ID => Self::__json_new_getSuggestedStickerSetName(o),
+                self::getSuitableCommunityChats::ID => Self::__json_new_getSuitableCommunityChats(o),
                 self::getSuitableDiscussionChats::ID => Self::__json_new_getSuitableDiscussionChats(o),
                 self::getSuitablePersonalChats::ID => Self::__json_new_getSuitablePersonalChats(o),
                 self::getSupergroup::ID => Self::__json_new_getSupergroup(o),
@@ -419146,6 +429901,7 @@ impl Function {
                 self::getSupportUser::ID => Self::__json_new_getSupportUser(o),
                 self::getTemporaryPasswordState::ID => Self::__json_new_getTemporaryPasswordState(o),
                 self::getTextCompositionStyleExample::ID => Self::__json_new_getTextCompositionStyleExample(o),
+                self::getTextEmojiRanges::ID => Self::__json_new_getTextEmojiRanges(o),
                 self::getTextEntities::ID => Self::__json_new_getTextEntities(o),
                 self::getThemeParametersJsonString::ID => Self::__json_new_getThemeParametersJsonString(o),
                 self::getThemedChatEmojiStatuses::ID => Self::__json_new_getThemedChatEmojiStatuses(o),
@@ -419157,6 +429913,7 @@ impl Function {
                 self::getTonConnectSessionPendingRequests::ID => Self::__json_new_getTonConnectSessionPendingRequests(o),
                 self::getTonConnectSessions::ID => Self::__json_new_getTonConnectSessions(o),
                 self::getTonTransactions::ID => Self::__json_new_getTonTransactions(o),
+                self::getTonWalletCardBackgroundGiftCollectionNames::ID => Self::__json_new_getTonWalletCardBackgroundGiftCollectionNames(o),
                 self::getTonWalletNfts::ID => Self::__json_new_getTonWalletNfts(o),
                 self::getTonWalletOwnershipProofChallenge::ID => Self::__json_new_getTonWalletOwnershipProofChallenge(o),
                 self::getTonWalletSecretPhrase::ID => Self::__json_new_getTonWalletSecretPhrase(o),
@@ -419166,6 +429923,7 @@ impl Function {
                 self::getTopChats::ID => Self::__json_new_getTopChats(o),
                 self::getTrendingStickerSets::ID => Self::__json_new_getTrendingStickerSets(o),
                 self::getUpgradedGift::ID => Self::__json_new_getUpgradedGift(o),
+                self::getUpgradedGiftDepositInfo::ID => Self::__json_new_getUpgradedGiftDepositInfo(o),
                 self::getUpgradedGiftEmojiStatuses::ID => Self::__json_new_getUpgradedGiftEmojiStatuses(o),
                 self::getUpgradedGiftValueInfo::ID => Self::__json_new_getUpgradedGiftValueInfo(o),
                 self::getUpgradedGiftVariants::ID => Self::__json_new_getUpgradedGiftVariants(o),
@@ -419188,6 +429946,8 @@ impl Function {
                 self::getWebAppPlaceholder::ID => Self::__json_new_getWebAppPlaceholder(o),
                 self::getWebAppUrl::ID => Self::__json_new_getWebAppUrl(o),
                 self::getWebPageInstantView::ID => Self::__json_new_getWebPageInstantView(o),
+                self::getWidgetPublicData::ID => Self::__json_new_getWidgetPublicData(o),
+                self::getWidgetQueryAnswer::ID => Self::__json_new_getWidgetQueryAnswer(o),
                 self::giftPremiumWithStars::ID => Self::__json_new_giftPremiumWithStars(o),
                 self::hideContactCloseBirthdays::ID => Self::__json_new_hideContactCloseBirthdays(o),
                 self::hideSuggestedAction::ID => Self::__json_new_hideSuggestedAction(o),
@@ -419239,8 +429999,11 @@ impl Function {
                 self::processChatHasProtectedContentDisableRequest::ID => Self::__json_new_processChatHasProtectedContentDisableRequest(o),
                 self::processChatJoinRequest::ID => Self::__json_new_processChatJoinRequest(o),
                 self::processChatJoinRequests::ID => Self::__json_new_processChatJoinRequests(o),
+                self::processCommunityAddChatRequest::ID => Self::__json_new_processCommunityAddChatRequest(o),
+                self::processCommunityAddChatRequests::ID => Self::__json_new_processCommunityAddChatRequests(o),
                 self::processGiftPurchaseOffer::ID => Self::__json_new_processGiftPurchaseOffer(o),
                 self::processPushNotification::ID => Self::__json_new_processPushNotification(o),
+                self::processWebProxyCarrierMessage::ID => Self::__json_new_processWebProxyCarrierMessage(o),
                 self::rateSpeechRecognition::ID => Self::__json_new_rateSpeechRecognition(o),
                 self::readAllChatMentions::ID => Self::__json_new_readAllChatMentions(o),
                 self::readAllChatPollVotes::ID => Self::__json_new_readAllChatPollVotes(o),
@@ -419254,6 +430017,7 @@ impl Function {
                 self::readFilePart::ID => Self::__json_new_readFilePart(o),
                 self::readdQuickReplyShortcutMessages::ID => Self::__json_new_readdQuickReplyShortcutMessages(o),
                 self::recognizeSpeech::ID => Self::__json_new_recognizeSpeech(o),
+                self::recognizeSpeechInFile::ID => Self::__json_new_recognizeSpeechInFile(o),
                 self::recoverAuthenticationPassword::ID => Self::__json_new_recoverAuthenticationPassword(o),
                 self::recoverPassword::ID => Self::__json_new_recoverPassword(o),
                 self::refundStarPayment::ID => Self::__json_new_refundStarPayment(o),
@@ -419263,6 +430027,7 @@ impl Function {
                 self::removeAllWebBrowserSettingsExceptions::ID => Self::__json_new_removeAllWebBrowserSettingsExceptions(o),
                 self::removeBusinessConnectedBotFromChat::ID => Self::__json_new_removeBusinessConnectedBotFromChat(o),
                 self::removeChatActionBar::ID => Self::__json_new_removeChatActionBar(o),
+                self::removeCommunityChat::ID => Self::__json_new_removeCommunityChat(o),
                 self::removeContacts::ID => Self::__json_new_removeContacts(o),
                 self::removeFavoriteSticker::ID => Self::__json_new_removeFavoriteSticker(o),
                 self::removeFileFromDownloads::ID => Self::__json_new_removeFileFromDownloads(o),
@@ -419316,6 +430081,7 @@ impl Function {
                 self::reportSupergroupAntiSpamFalsePositive::ID => Self::__json_new_reportSupergroupAntiSpamFalsePositive(o),
                 self::reportSupergroupSpam::ID => Self::__json_new_reportSupergroupSpam(o),
                 self::reportVideoMessageAdvertisement::ID => Self::__json_new_reportVideoMessageAdvertisement(o),
+                self::reportWebProxyCarrierError::ID => Self::__json_new_reportWebProxyCarrierError(o),
                 self::requestAuthenticationPasswordRecovery::ID => Self::__json_new_requestAuthenticationPasswordRecovery(o),
                 self::requestPasswordRecovery::ID => Self::__json_new_requestPasswordRecovery(o),
                 self::requestQrCodeAuthentication::ID => Self::__json_new_requestQrCodeAuthentication(o),
@@ -419462,6 +430228,7 @@ impl Function {
                 self::setCloseFriends::ID => Self::__json_new_setCloseFriends(o),
                 self::setCommands::ID => Self::__json_new_setCommands(o),
                 self::setCommunityName::ID => Self::__json_new_setCommunityName(o),
+                self::setCommunityNotificationSettings::ID => Self::__json_new_setCommunityNotificationSettings(o),
                 self::setCommunityPermissions::ID => Self::__json_new_setCommunityPermissions(o),
                 self::setCommunityPhoto::ID => Self::__json_new_setCommunityPhoto(o),
                 self::setCustomEmojiStickerSetThumbnail::ID => Self::__json_new_setCustomEmojiStickerSetThumbnail(o),
@@ -419515,6 +430282,7 @@ impl Function {
                 self::setProfileAccentColor::ID => Self::__json_new_setProfileAccentColor(o),
                 self::setProfileAudioPosition::ID => Self::__json_new_setProfileAudioPosition(o),
                 self::setProfilePhoto::ID => Self::__json_new_setProfilePhoto(o),
+                self::setProfileShareTheme::ID => Self::__json_new_setProfileShareTheme(o),
                 self::setQuickReplyShortcutName::ID => Self::__json_new_setQuickReplyShortcutName(o),
                 self::setReactionNotificationSettings::ID => Self::__json_new_setReactionNotificationSettings(o),
                 self::setReadDatePrivacySettings::ID => Self::__json_new_setReadDatePrivacySettings(o),
@@ -419537,6 +430305,7 @@ impl Function {
                 self::setSupergroupUsername::ID => Self::__json_new_setSupergroupUsername(o),
                 self::setTdlibParameters::ID => Self::__json_new_setTdlibParameters(o),
                 self::setTonConnectSessionWalletClientId::ID => Self::__json_new_setTonConnectSessionWalletClientId(o),
+                self::setTonWalletCardStickers::ID => Self::__json_new_setTonWalletCardStickers(o),
                 self::setUpgradedGiftColors::ID => Self::__json_new_setUpgradedGiftColors(o),
                 self::setUserEmojiStatus::ID => Self::__json_new_setUserEmojiStatus(o),
                 self::setUserNote::ID => Self::__json_new_setUserNote(o),
@@ -419588,6 +430357,8 @@ impl Function {
                 self::toggleChatIsPinned::ID => Self::__json_new_toggleChatIsPinned(o),
                 self::toggleChatIsTranslatable::ID => Self::__json_new_toggleChatIsTranslatable(o),
                 self::toggleChatViewAsTopics::ID => Self::__json_new_toggleChatViewAsTopics(o),
+                self::toggleCommunityAreChatsCollapsed::ID => Self::__json_new_toggleCommunityAreChatsCollapsed(o),
+                self::toggleCommunityMemberIsBanned::ID => Self::__json_new_toggleCommunityMemberIsBanned(o),
                 self::toggleDirectMessagesChatTopicCanSendUnpaidMessages::ID => Self::__json_new_toggleDirectMessagesChatTopicCanSendUnpaidMessages(o),
                 self::toggleDownloadIsPaused::ID => Self::__json_new_toggleDownloadIsPaused(o),
                 self::toggleForumTopicIsClosed::ID => Self::__json_new_toggleForumTopicIsClosed(o),
@@ -419639,6 +430410,7 @@ impl Function {
                 self::viewSponsoredChat::ID => Self::__json_new_viewSponsoredChat(o),
                 self::viewTrendingStickerSets::ID => Self::__json_new_viewTrendingStickerSets(o),
                 self::viewVideoMessageAdvertisement::ID => Self::__json_new_viewVideoMessageAdvertisement(o),
+                self::withdrawUpgradedGift::ID => Self::__json_new_withdrawUpgradedGift(o),
                 self::writeGeneratedFilePart::ID => Self::__json_new_writeGeneratedFilePart(o),
                 id => Result::Err(format!("Unknown constructor 0x{:08x}", id as u32)),
             },
@@ -419660,6 +430432,7 @@ impl Function {
             Self::addChatToList(v) => v.store_debug(s, field_name),
             Self::addChatWelcomeMessage(v) => v.store_debug(s, field_name),
             Self::addChecklistTasks(v) => v.store_debug(s, field_name),
+            Self::addCommunityChat(v) => v.store_debug(s, field_name),
             Self::addContact(v) => v.store_debug(s, field_name),
             Self::addCustomServerLanguagePack(v) => v.store_debug(s, field_name),
             Self::addFavoriteSticker(v) => v.store_debug(s, field_name),
@@ -419698,7 +430471,9 @@ impl Function {
             Self::answerShippingQuery(v) => v.store_debug(s, field_name),
             Self::answerTonConnectRequest(v) => v.store_debug(s, field_name),
             Self::answerWebAppQuery(v) => v.store_debug(s, field_name),
+            Self::answerWidgetQuery(v) => v.store_debug(s, field_name),
             Self::applyPremiumGiftCode(v) => v.store_debug(s, field_name),
+            Self::applyUnpaidMessagesToken(v) => v.store_debug(s, field_name),
             Self::approveSuggestedPost(v) => v.store_debug(s, field_name),
             Self::assignStoreTransaction(v) => v.store_debug(s, field_name),
             Self::banChatMember(v) => v.store_debug(s, field_name),
@@ -419832,6 +430607,7 @@ impl Function {
             Self::deleteEphemeralMessage(v) => v.store_debug(s, field_name),
             Self::deleteFile(v) => v.store_debug(s, field_name),
             Self::deleteForumTopic(v) => v.store_debug(s, field_name),
+            Self::deleteGift(v) => v.store_debug(s, field_name),
             Self::deleteGiftCollection(v) => v.store_debug(s, field_name),
             Self::deleteGroupCallMessages(v) => v.store_debug(s, field_name),
             Self::deleteGroupCallMessagesBySender(v) => v.store_debug(s, field_name),
@@ -419865,6 +430641,7 @@ impl Function {
             Self::disconnectTonConnectSession(v) => v.store_debug(s, field_name),
             Self::disconnectWebsite(v) => v.store_debug(s, field_name),
             Self::dismissWebToken(v) => v.store_debug(s, field_name),
+            Self::displayUpgradedGift(v) => v.store_debug(s, field_name),
             Self::downloadFile(v) => v.store_debug(s, field_name),
             Self::dropGiftOriginalDetails(v) => v.store_debug(s, field_name),
             Self::editBotMediaPreview(v) => v.store_debug(s, field_name),
@@ -419890,6 +430667,7 @@ impl Function {
             Self::editInlineMessageMedia(v) => v.store_debug(s, field_name),
             Self::editInlineMessageReplyMarkup(v) => v.store_debug(s, field_name),
             Self::editInlineMessageText(v) => v.store_debug(s, field_name),
+            Self::editInlineMessageWidgetData(v) => v.store_debug(s, field_name),
             Self::editMessageCaption(v) => v.store_debug(s, field_name),
             Self::editMessageChecklist(v) => v.store_debug(s, field_name),
             Self::editMessageLiveLocation(v) => v.store_debug(s, field_name),
@@ -419897,13 +430675,16 @@ impl Function {
             Self::editMessageReplyMarkup(v) => v.store_debug(s, field_name),
             Self::editMessageSchedulingState(v) => v.store_debug(s, field_name),
             Self::editMessageText(v) => v.store_debug(s, field_name),
+            Self::editMessageWidgetData(v) => v.store_debug(s, field_name),
             Self::editProxy(v) => v.store_debug(s, field_name),
             Self::editQuickReplyMessage(v) => v.store_debug(s, field_name),
             Self::editStarSubscription(v) => v.store_debug(s, field_name),
             Self::editStory(v) => v.store_debug(s, field_name),
             Self::editStoryCover(v) => v.store_debug(s, field_name),
+            Self::editStoryMusic(v) => v.store_debug(s, field_name),
             Self::editTextCompositionStyle(v) => v.store_debug(s, field_name),
             Self::editUserStarSubscription(v) => v.store_debug(s, field_name),
+            Self::editWidgetData(v) => v.store_debug(s, field_name),
             Self::enableProxy(v) => v.store_debug(s, field_name),
             Self::enableTonWalletBackup(v) => v.store_debug(s, field_name),
             Self::encryptGroupCallData(v) => v.store_debug(s, field_name),
@@ -419911,6 +430692,8 @@ impl Function {
             Self::endGroupCallRecording(v) => v.store_debug(s, field_name),
             Self::endGroupCallScreenSharing(v) => v.store_debug(s, field_name),
             Self::finishFileGeneration(v) => v.store_debug(s, field_name),
+            Self::fixRecognizedRichMessageWithAi(v) => v.store_debug(s, field_name),
+            Self::fixRecognizedTextWithAi(v) => v.store_debug(s, field_name),
             Self::fixRichMessageWithAi(v) => v.store_debug(s, field_name),
             Self::fixTextWithAi(v) => v.store_debug(s, field_name),
             Self::forwardMessages(v) => v.store_debug(s, field_name),
@@ -420004,7 +430787,9 @@ impl Function {
             Self::getCloseFriends(v) => v.store_debug(s, field_name),
             Self::getCollectibleItemInfo(v) => v.store_debug(s, field_name),
             Self::getCommands(v) => v.store_debug(s, field_name),
+            Self::getCommunityAddChatRequests(v) => v.store_debug(s, field_name),
             Self::getCommunityFullInfo(v) => v.store_debug(s, field_name),
+            Self::getCommunityMemberChats(v) => v.store_debug(s, field_name),
             Self::getConnectedAffiliateProgram(v) => v.store_debug(s, field_name),
             Self::getConnectedAffiliatePrograms(v) => v.store_debug(s, field_name),
             Self::getConnectedWebsites(v) => v.store_debug(s, field_name),
@@ -420074,6 +430859,7 @@ impl Function {
             Self::getInstalledStickerSets(v) => v.store_debug(s, field_name),
             Self::getInternalLink(v) => v.store_debug(s, field_name),
             Self::getInternalLinkType(v) => v.store_debug(s, field_name),
+            Self::getJoinedCommunities(v) => v.store_debug(s, field_name),
             Self::getJsonString(v) => v.store_debug(s, field_name),
             Self::getJsonValue(v) => v.store_debug(s, field_name),
             Self::getKeywordEmojis(v) => v.store_debug(s, field_name),
@@ -420156,6 +430942,7 @@ impl Function {
             Self::getPremiumStickers(v) => v.store_debug(s, field_name),
             Self::getPreparedInlineMessage(v) => v.store_debug(s, field_name),
             Self::getPreparedKeyboardButton(v) => v.store_debug(s, field_name),
+            Self::getProfileShareThemeBackdrops(v) => v.store_debug(s, field_name),
             Self::getProxies(v) => v.store_debug(s, field_name),
             Self::getPublicPostSearchLimits(v) => v.store_debug(s, field_name),
             Self::getPushReceiverId(v) => v.store_debug(s, field_name),
@@ -420183,6 +430970,7 @@ impl Function {
             Self::getSearchSponsoredChats(v) => v.store_debug(s, field_name),
             Self::getSearchedForTags(v) => v.store_debug(s, field_name),
             Self::getSecretChat(v) => v.store_debug(s, field_name),
+            Self::getSpeechRecognitionLanguages(v) => v.store_debug(s, field_name),
             Self::getStakeDiceState(v) => v.store_debug(s, field_name),
             Self::getStarAdAccountUrl(v) => v.store_debug(s, field_name),
             Self::getStarGiftPaymentOptions(v) => v.store_debug(s, field_name),
@@ -420210,6 +430998,7 @@ impl Function {
             Self::getStoryStatistics(v) => v.store_debug(s, field_name),
             Self::getSuggestedFileName(v) => v.store_debug(s, field_name),
             Self::getSuggestedStickerSetName(v) => v.store_debug(s, field_name),
+            Self::getSuitableCommunityChats(v) => v.store_debug(s, field_name),
             Self::getSuitableDiscussionChats(v) => v.store_debug(s, field_name),
             Self::getSuitablePersonalChats(v) => v.store_debug(s, field_name),
             Self::getSupergroup(v) => v.store_debug(s, field_name),
@@ -420219,6 +431008,7 @@ impl Function {
             Self::getSupportUser(v) => v.store_debug(s, field_name),
             Self::getTemporaryPasswordState(v) => v.store_debug(s, field_name),
             Self::getTextCompositionStyleExample(v) => v.store_debug(s, field_name),
+            Self::getTextEmojiRanges(v) => v.store_debug(s, field_name),
             Self::getTextEntities(v) => v.store_debug(s, field_name),
             Self::getThemeParametersJsonString(v) => v.store_debug(s, field_name),
             Self::getThemedChatEmojiStatuses(v) => v.store_debug(s, field_name),
@@ -420230,6 +431020,7 @@ impl Function {
             Self::getTonConnectSessionPendingRequests(v) => v.store_debug(s, field_name),
             Self::getTonConnectSessions(v) => v.store_debug(s, field_name),
             Self::getTonTransactions(v) => v.store_debug(s, field_name),
+            Self::getTonWalletCardBackgroundGiftCollectionNames(v) => v.store_debug(s, field_name),
             Self::getTonWalletNfts(v) => v.store_debug(s, field_name),
             Self::getTonWalletOwnershipProofChallenge(v) => v.store_debug(s, field_name),
             Self::getTonWalletSecretPhrase(v) => v.store_debug(s, field_name),
@@ -420239,6 +431030,7 @@ impl Function {
             Self::getTopChats(v) => v.store_debug(s, field_name),
             Self::getTrendingStickerSets(v) => v.store_debug(s, field_name),
             Self::getUpgradedGift(v) => v.store_debug(s, field_name),
+            Self::getUpgradedGiftDepositInfo(v) => v.store_debug(s, field_name),
             Self::getUpgradedGiftEmojiStatuses(v) => v.store_debug(s, field_name),
             Self::getUpgradedGiftValueInfo(v) => v.store_debug(s, field_name),
             Self::getUpgradedGiftVariants(v) => v.store_debug(s, field_name),
@@ -420261,6 +431053,8 @@ impl Function {
             Self::getWebAppPlaceholder(v) => v.store_debug(s, field_name),
             Self::getWebAppUrl(v) => v.store_debug(s, field_name),
             Self::getWebPageInstantView(v) => v.store_debug(s, field_name),
+            Self::getWidgetPublicData(v) => v.store_debug(s, field_name),
+            Self::getWidgetQueryAnswer(v) => v.store_debug(s, field_name),
             Self::giftPremiumWithStars(v) => v.store_debug(s, field_name),
             Self::hideContactCloseBirthdays(v) => v.store_debug(s, field_name),
             Self::hideSuggestedAction(v) => v.store_debug(s, field_name),
@@ -420312,8 +431106,11 @@ impl Function {
             Self::processChatHasProtectedContentDisableRequest(v) => v.store_debug(s, field_name),
             Self::processChatJoinRequest(v) => v.store_debug(s, field_name),
             Self::processChatJoinRequests(v) => v.store_debug(s, field_name),
+            Self::processCommunityAddChatRequest(v) => v.store_debug(s, field_name),
+            Self::processCommunityAddChatRequests(v) => v.store_debug(s, field_name),
             Self::processGiftPurchaseOffer(v) => v.store_debug(s, field_name),
             Self::processPushNotification(v) => v.store_debug(s, field_name),
+            Self::processWebProxyCarrierMessage(v) => v.store_debug(s, field_name),
             Self::rateSpeechRecognition(v) => v.store_debug(s, field_name),
             Self::readAllChatMentions(v) => v.store_debug(s, field_name),
             Self::readAllChatPollVotes(v) => v.store_debug(s, field_name),
@@ -420327,6 +431124,7 @@ impl Function {
             Self::readFilePart(v) => v.store_debug(s, field_name),
             Self::readdQuickReplyShortcutMessages(v) => v.store_debug(s, field_name),
             Self::recognizeSpeech(v) => v.store_debug(s, field_name),
+            Self::recognizeSpeechInFile(v) => v.store_debug(s, field_name),
             Self::recoverAuthenticationPassword(v) => v.store_debug(s, field_name),
             Self::recoverPassword(v) => v.store_debug(s, field_name),
             Self::refundStarPayment(v) => v.store_debug(s, field_name),
@@ -420336,6 +431134,7 @@ impl Function {
             Self::removeAllWebBrowserSettingsExceptions(v) => v.store_debug(s, field_name),
             Self::removeBusinessConnectedBotFromChat(v) => v.store_debug(s, field_name),
             Self::removeChatActionBar(v) => v.store_debug(s, field_name),
+            Self::removeCommunityChat(v) => v.store_debug(s, field_name),
             Self::removeContacts(v) => v.store_debug(s, field_name),
             Self::removeFavoriteSticker(v) => v.store_debug(s, field_name),
             Self::removeFileFromDownloads(v) => v.store_debug(s, field_name),
@@ -420389,6 +431188,7 @@ impl Function {
             Self::reportSupergroupAntiSpamFalsePositive(v) => v.store_debug(s, field_name),
             Self::reportSupergroupSpam(v) => v.store_debug(s, field_name),
             Self::reportVideoMessageAdvertisement(v) => v.store_debug(s, field_name),
+            Self::reportWebProxyCarrierError(v) => v.store_debug(s, field_name),
             Self::requestAuthenticationPasswordRecovery(v) => v.store_debug(s, field_name),
             Self::requestPasswordRecovery(v) => v.store_debug(s, field_name),
             Self::requestQrCodeAuthentication(v) => v.store_debug(s, field_name),
@@ -420535,6 +431335,7 @@ impl Function {
             Self::setCloseFriends(v) => v.store_debug(s, field_name),
             Self::setCommands(v) => v.store_debug(s, field_name),
             Self::setCommunityName(v) => v.store_debug(s, field_name),
+            Self::setCommunityNotificationSettings(v) => v.store_debug(s, field_name),
             Self::setCommunityPermissions(v) => v.store_debug(s, field_name),
             Self::setCommunityPhoto(v) => v.store_debug(s, field_name),
             Self::setCustomEmojiStickerSetThumbnail(v) => v.store_debug(s, field_name),
@@ -420588,6 +431389,7 @@ impl Function {
             Self::setProfileAccentColor(v) => v.store_debug(s, field_name),
             Self::setProfileAudioPosition(v) => v.store_debug(s, field_name),
             Self::setProfilePhoto(v) => v.store_debug(s, field_name),
+            Self::setProfileShareTheme(v) => v.store_debug(s, field_name),
             Self::setQuickReplyShortcutName(v) => v.store_debug(s, field_name),
             Self::setReactionNotificationSettings(v) => v.store_debug(s, field_name),
             Self::setReadDatePrivacySettings(v) => v.store_debug(s, field_name),
@@ -420610,6 +431412,7 @@ impl Function {
             Self::setSupergroupUsername(v) => v.store_debug(s, field_name),
             Self::setTdlibParameters(v) => v.store_debug(s, field_name),
             Self::setTonConnectSessionWalletClientId(v) => v.store_debug(s, field_name),
+            Self::setTonWalletCardStickers(v) => v.store_debug(s, field_name),
             Self::setUpgradedGiftColors(v) => v.store_debug(s, field_name),
             Self::setUserEmojiStatus(v) => v.store_debug(s, field_name),
             Self::setUserNote(v) => v.store_debug(s, field_name),
@@ -420661,6 +431464,8 @@ impl Function {
             Self::toggleChatIsPinned(v) => v.store_debug(s, field_name),
             Self::toggleChatIsTranslatable(v) => v.store_debug(s, field_name),
             Self::toggleChatViewAsTopics(v) => v.store_debug(s, field_name),
+            Self::toggleCommunityAreChatsCollapsed(v) => v.store_debug(s, field_name),
+            Self::toggleCommunityMemberIsBanned(v) => v.store_debug(s, field_name),
             Self::toggleDirectMessagesChatTopicCanSendUnpaidMessages(v) => v.store_debug(s, field_name),
             Self::toggleDownloadIsPaused(v) => v.store_debug(s, field_name),
             Self::toggleForumTopicIsClosed(v) => v.store_debug(s, field_name),
@@ -420712,6 +431517,7 @@ impl Function {
             Self::viewSponsoredChat(v) => v.store_debug(s, field_name),
             Self::viewTrendingStickerSets(v) => v.store_debug(s, field_name),
             Self::viewVideoMessageAdvertisement(v) => v.store_debug(s, field_name),
+            Self::withdrawUpgradedGift(v) => v.store_debug(s, field_name),
             Self::writeGeneratedFilePart(v) => v.store_debug(s, field_name),
         }
     }
@@ -420762,6 +431568,7 @@ pub enum Object {
     animation(Animation),
     animations(Animations),
     archiveChatListSettings(ArchiveChatListSettings),
+    areaPosition(AreaPosition),
     attachmentMenuBot(AttachmentMenuBot),
     attachmentMenuBotColor(AttachmentMenuBotColor),
     attributeCraftPersistenceProbability(AttributeCraftPersistenceProbability),
@@ -421130,11 +431937,15 @@ pub enum Object {
     collectibleItemInfo(CollectibleItemInfo),
     collectibleItemTypeUsername(collectibleItemTypeUsername),
     collectibleItemTypePhoneNumber(collectibleItemTypePhoneNumber),
+    communities(Communities),
     community(Community),
+    communityAddChatRequest(CommunityAddChatRequest),
+    communityAddChatRequests(CommunityAddChatRequests),
     communityAdministratorRights(CommunityAdministratorRights),
     communityChat(CommunityChat),
     communityFullInfo(CommunityFullInfo),
     communityId(CommunityId),
+    communityMemberChats(CommunityMemberChats),
     communityMemberStatusCreator(communityMemberStatusCreator),
     communityMemberStatusAdministrator(communityMemberStatusAdministrator),
     communityMemberStatusMember(communityMemberStatusMember),
@@ -421226,6 +432037,8 @@ pub enum Object {
     emojiStatusTypeCustomEmoji(emojiStatusTypeCustomEmoji),
     emojiStatusTypeUpgradedGift(emojiStatusTypeUpgradedGift),
     emojiStatuses(EmojiStatuses),
+    emojiTypeRegular(emojiTypeRegular),
+    emojiTypeCustomEmoji(emojiTypeCustomEmoji),
     emojis(Emojis),
     encryptedCredentials(EncryptedCredentials),
     encryptedPassportElement(EncryptedPassportElement),
@@ -421448,6 +432261,8 @@ pub enum Object {
     inputMessageStakeDice(inputMessageStakeDice),
     inputMessageStory(inputMessageStory),
     inputMessageChecklist(inputMessageChecklist),
+    inputMessageWidget(inputMessageWidget),
+    inputMessageSharedWidget(inputMessageSharedWidget),
     inputMessageForwarded(inputMessageForwarded),
     inputMessageReplyToMessage(inputMessageReplyToMessage),
     inputMessageReplyToExternalMessage(inputMessageReplyToExternalMessage),
@@ -421518,12 +432333,13 @@ pub enum Object {
     inputPollOption(InputPollOption),
     inputPollTypeRegular(inputPollTypeRegular),
     inputPollTypeQuiz(inputPollTypeQuiz),
+    inputProfileShareThemeEmoji(inputProfileShareThemeEmoji),
+    inputProfileShareThemeUpgradedGift(inputProfileShareThemeUpgradedGift),
     inputRichMessage(InputRichMessage),
     inputRichMessageMedia(InputRichMessageMedia),
     inputSticker(InputSticker),
     inputStoryArea(InputStoryArea),
     inputStoryAreaTypeLocation(inputStoryAreaTypeLocation),
-    inputStoryAreaTypeFoundVenue(inputStoryAreaTypeFoundVenue),
     inputStoryAreaTypePreviousVenue(inputStoryAreaTypePreviousVenue),
     inputStoryAreaTypeSuggestedReaction(inputStoryAreaTypeSuggestedReaction),
     inputStoryAreaTypeMessage(inputStoryAreaTypeMessage),
@@ -421536,6 +432352,7 @@ pub enum Object {
     inputSuggestedPostInfo(InputSuggestedPostInfo),
     inputTextQuote(InputTextQuote),
     inputThumbnail(InputThumbnail),
+    inputTonWalletCardSticker(InputTonWalletCardSticker),
     inputVideo(InputVideo),
     inputVideoNote(InputVideoNote),
     inputVoiceNote(InputVoiceNote),
@@ -421723,6 +432540,7 @@ pub enum Object {
     messagePoll(messagePoll),
     messageStakeDice(messageStakeDice),
     messageStory(messageStory),
+    messageWidget(messageWidget),
     messageChecklist(messageChecklist),
     messageInvoice(messageInvoice),
     messageCall(messageCall),
@@ -421788,6 +432606,7 @@ pub enum Object {
     messagePaidMessagesRefunded(messagePaidMessagesRefunded),
     messagePaidMessagePriceChanged(messagePaidMessagePriceChanged),
     messageDirectMessagePriceChanged(messageDirectMessagePriceChanged),
+    messageUnpaidMessagesAllowedByLink(messageUnpaidMessagesAllowedByLink),
     messageChecklistTasksDone(messageChecklistTasksDone),
     messageChecklistTasksAdded(messageChecklistTasksAdded),
     messageSuggestedPostApprovalFailed(messageSuggestedPostApprovalFailed),
@@ -422131,6 +432950,10 @@ pub enum Object {
     profileAccentColor(ProfileAccentColor),
     profileAccentColors(ProfileAccentColors),
     profilePhoto(ProfilePhoto),
+    profileShareThemeEmoji(profileShareThemeEmoji),
+    profileShareThemeUpgradedGift(profileShareThemeUpgradedGift),
+    profileShareThemeBackdrop(ProfileShareThemeBackdrop),
+    profileShareThemeBackdrops(ProfileShareThemeBackdrops),
     profileTabPosts(profileTabPosts),
     profileTabGifts(profileTabGifts),
     profileTabMedia(profileTabMedia),
@@ -422143,6 +432966,7 @@ pub enum Object {
     proxyTypeSocks5(proxyTypeSocks5),
     proxyTypeHttp(proxyTypeHttp),
     proxyTypeMtproto(proxyTypeMtproto),
+    proxyTypeWeb(proxyTypeWeb),
     publicChatTypeHasUsername(publicChatTypeHasUsername),
     publicChatTypeIsLocationBased(publicChatTypeIsLocationBased),
     publicForwardMessage(publicForwardMessage),
@@ -422376,6 +433200,7 @@ pub enum Object {
     sharedChat(SharedChat),
     sharedUser(SharedUser),
     shippingOption(ShippingOption),
+    speechRecognitionLanguages(SpeechRecognitionLanguages),
     speechRecognitionResultPending(speechRecognitionResultPending),
     speechRecognitionResultText(speechRecognitionResultText),
     speechRecognitionResultError(speechRecognitionResultError),
@@ -422483,7 +433308,6 @@ pub enum Object {
     storyAlbum(StoryAlbum),
     storyAlbums(StoryAlbums),
     storyArea(StoryArea),
-    storyAreaPosition(StoryAreaPosition),
     storyAreaTypeLocation(storyAreaTypeLocation),
     storyAreaTypeVenue(storyAreaTypeVenue),
     storyAreaTypeSuggestedReaction(storyAreaTypeSuggestedReaction),
@@ -422612,6 +433436,8 @@ pub enum Object {
     textParseModeMarkdown(textParseModeMarkdown),
     textParseModeHTML(textParseModeHTML),
     textQuote(TextQuote),
+    textRange(TextRange),
+    textRanges(TextRanges),
     themeParameters(ThemeParameters),
     themeSettings(ThemeSettings),
     thumbnail(Thumbnail),
@@ -422628,6 +433454,7 @@ pub enum Object {
     tonCenterApiRequestTypePost(tonCenterApiRequestTypePost),
     tonCenterStreamingApiUrl(TonCenterStreamingApiUrl),
     tonConnectChallenge(TonConnectChallenge),
+    tonConnectConnectData(TonConnectConnectData),
     tonConnectConnectItemAddress(tonConnectConnectItemAddress),
     tonConnectConnectItemProof(tonConnectConnectItemProof),
     tonConnectConnectRequest(TonConnectConnectRequest),
@@ -422661,9 +433488,12 @@ pub enum Object {
     tonTransactionTypeStakeDicePayout(tonTransactionTypeStakeDicePayout),
     tonTransactionTypeUnsupported(tonTransactionTypeUnsupported),
     tonTransactions(TonTransactions),
+    tonWalletCard(TonWalletCard),
+    tonWalletCardSticker(TonWalletCardSticker),
     tonWalletGaslessTransfersInfo(TonWalletGaslessTransfersInfo),
     tonWalletOwnershipProof(TonWalletOwnershipProof),
     tonWalletOwnershipProofChallenge(TonWalletOwnershipProofChallenge),
+    tonWalletSecretPhrase(TonWalletSecretPhrase),
     tonWalletState(TonWalletState),
     tonWalletTransaction(TonWalletTransaction),
     tonWalletTransactionStateSucceeded(tonWalletTransactionStateSucceeded),
@@ -422671,6 +433501,7 @@ pub enum Object {
     tonWalletTransactionTypeOnRampDeposit(tonWalletTransactionTypeOnRampDeposit),
     tonWalletTransactionTypeTransfer(tonWalletTransactionTypeTransfer),
     tonWalletTransactionTypeNftTransfer(tonWalletTransactionTypeNftTransfer),
+    tonWalletTransactionTypeTelegramGiftTransfer(tonWalletTransactionTypeTelegramGiftTransfer),
     tonWalletTransactionTypeKeyChange(tonWalletTransactionTypeKeyChange),
     tonWalletTransactions(TonWalletTransactions),
     tonWalletTransferReceiverUser(tonWalletTransferReceiverUser),
@@ -422828,6 +433659,9 @@ pub enum Object {
     updateWebBrowserSettings(updateWebBrowserSettings),
     updateLanguagePackStrings(updateLanguagePackStrings),
     updateConnectionState(updateConnectionState),
+    updateWebProxyCarrierOpened(updateWebProxyCarrierOpened),
+    updateWebProxyCarrierData(updateWebProxyCarrierData),
+    updateWebProxyCarrierClosed(updateWebProxyCarrierClosed),
     updateFreezeState(updateFreezeState),
     updateAgeVerificationParameters(updateAgeVerificationParameters),
     updateTermsOfService(updateTermsOfService),
@@ -422850,6 +433684,7 @@ pub enum Object {
     updateStarRevenueStatus(updateStarRevenueStatus),
     updateGramRevenueStatus(updateGramRevenueStatus),
     updateSpeechRecognitionTrial(updateSpeechRecognitionTrial),
+    updateSpeechRecognitionInFile(updateSpeechRecognitionInFile),
     updateGroupCallMessageLevels(updateGroupCallMessageLevels),
     updateDiceEmojis(updateDiceEmojis),
     updateStakeDiceState(updateStakeDiceState),
@@ -422870,6 +433705,9 @@ pub enum Object {
     updateNewCallbackQuery(updateNewCallbackQuery),
     updateNewInlineCallbackQuery(updateNewInlineCallbackQuery),
     updateNewBusinessCallbackQuery(updateNewBusinessCallbackQuery),
+    updateNewWidgetQuery(updateNewWidgetQuery),
+    updateNewInlineWidgetQuery(updateNewInlineWidgetQuery),
+    updateNewWidgetCopyQuery(updateNewWidgetCopyQuery),
     updateNewShippingQuery(updateNewShippingQuery),
     updateNewPreCheckoutQuery(updateNewPreCheckoutQuery),
     updateNewCustomEvent(updateNewCustomEvent),
@@ -422898,7 +433736,9 @@ pub enum Object {
     upgradedGiftBackdrop(UpgradedGiftBackdrop),
     upgradedGiftBackdropColors(UpgradedGiftBackdropColors),
     upgradedGiftBackdropCount(UpgradedGiftBackdropCount),
+    upgradedGiftCollectionNames(UpgradedGiftCollectionNames),
     upgradedGiftColors(UpgradedGiftColors),
+    upgradedGiftDepositInfo(UpgradedGiftDepositInfo),
     upgradedGiftModel(UpgradedGiftModel),
     upgradedGiftModelCount(UpgradedGiftModelCount),
     upgradedGiftOriginUpgrade(upgradedGiftOriginUpgrade),
@@ -422983,7 +433823,21 @@ pub enum Object {
     webBrowserTypeInApp(webBrowserTypeInApp),
     webDomainException(WebDomainException),
     webPageInstantView(WebPageInstantView),
+    webProxyCarrier(WebProxyCarrier),
+    webProxyCarrierErrorUnsupported(webProxyCarrierErrorUnsupported),
+    webProxyCarrierErrorPaused(webProxyCarrierErrorPaused),
+    webProxyCarrierErrorLoadFailed(webProxyCarrierErrorLoadFailed),
+    webProxyCarrierErrorTerminated(webProxyCarrierErrorTerminated),
+    webProxyCarrierErrorRefused(webProxyCarrierErrorRefused),
+    webProxyCarrierMessageText(webProxyCarrierMessageText),
+    webProxyCarrierMessageBinary(webProxyCarrierMessageBinary),
     welcomeMessage(WelcomeMessage),
+    widgetPublicData(WidgetPublicData),
+    widgetQueryAnswer(WidgetQueryAnswer),
+    widgetQueryTypeData(widgetQueryTypeData),
+    widgetQueryTypeSignData(widgetQueryTypeSignData),
+    widgetQueryTypeSentTransaction(widgetQueryTypeSentTransaction),
+    widgetQueryWallet(WidgetQueryWallet),
 }
 
 impl Object {
@@ -423025,6 +433879,7 @@ impl Object {
             Self::animation(v) => v.to_json_into(out),
             Self::animations(v) => v.to_json_into(out),
             Self::archiveChatListSettings(v) => v.to_json_into(out),
+            Self::areaPosition(v) => v.to_json_into(out),
             Self::attachmentMenuBot(v) => v.to_json_into(out),
             Self::attachmentMenuBotColor(v) => v.to_json_into(out),
             Self::attributeCraftPersistenceProbability(v) => v.to_json_into(out),
@@ -423393,11 +434248,15 @@ impl Object {
             Self::collectibleItemInfo(v) => v.to_json_into(out),
             Self::collectibleItemTypeUsername(v) => v.to_json_into(out),
             Self::collectibleItemTypePhoneNumber(v) => v.to_json_into(out),
+            Self::communities(v) => v.to_json_into(out),
             Self::community(v) => v.to_json_into(out),
+            Self::communityAddChatRequest(v) => v.to_json_into(out),
+            Self::communityAddChatRequests(v) => v.to_json_into(out),
             Self::communityAdministratorRights(v) => v.to_json_into(out),
             Self::communityChat(v) => v.to_json_into(out),
             Self::communityFullInfo(v) => v.to_json_into(out),
             Self::communityId(v) => v.to_json_into(out),
+            Self::communityMemberChats(v) => v.to_json_into(out),
             Self::communityMemberStatusCreator(v) => v.to_json_into(out),
             Self::communityMemberStatusAdministrator(v) => v.to_json_into(out),
             Self::communityMemberStatusMember(v) => v.to_json_into(out),
@@ -423489,6 +434348,8 @@ impl Object {
             Self::emojiStatusTypeCustomEmoji(v) => v.to_json_into(out),
             Self::emojiStatusTypeUpgradedGift(v) => v.to_json_into(out),
             Self::emojiStatuses(v) => v.to_json_into(out),
+            Self::emojiTypeRegular(v) => v.to_json_into(out),
+            Self::emojiTypeCustomEmoji(v) => v.to_json_into(out),
             Self::emojis(v) => v.to_json_into(out),
             Self::encryptedCredentials(v) => v.to_json_into(out),
             Self::encryptedPassportElement(v) => v.to_json_into(out),
@@ -423711,6 +434572,8 @@ impl Object {
             Self::inputMessageStakeDice(v) => v.to_json_into(out),
             Self::inputMessageStory(v) => v.to_json_into(out),
             Self::inputMessageChecklist(v) => v.to_json_into(out),
+            Self::inputMessageWidget(v) => v.to_json_into(out),
+            Self::inputMessageSharedWidget(v) => v.to_json_into(out),
             Self::inputMessageForwarded(v) => v.to_json_into(out),
             Self::inputMessageReplyToMessage(v) => v.to_json_into(out),
             Self::inputMessageReplyToExternalMessage(v) => v.to_json_into(out),
@@ -423781,12 +434644,13 @@ impl Object {
             Self::inputPollOption(v) => v.to_json_into(out),
             Self::inputPollTypeRegular(v) => v.to_json_into(out),
             Self::inputPollTypeQuiz(v) => v.to_json_into(out),
+            Self::inputProfileShareThemeEmoji(v) => v.to_json_into(out),
+            Self::inputProfileShareThemeUpgradedGift(v) => v.to_json_into(out),
             Self::inputRichMessage(v) => v.to_json_into(out),
             Self::inputRichMessageMedia(v) => v.to_json_into(out),
             Self::inputSticker(v) => v.to_json_into(out),
             Self::inputStoryArea(v) => v.to_json_into(out),
             Self::inputStoryAreaTypeLocation(v) => v.to_json_into(out),
-            Self::inputStoryAreaTypeFoundVenue(v) => v.to_json_into(out),
             Self::inputStoryAreaTypePreviousVenue(v) => v.to_json_into(out),
             Self::inputStoryAreaTypeSuggestedReaction(v) => v.to_json_into(out),
             Self::inputStoryAreaTypeMessage(v) => v.to_json_into(out),
@@ -423799,6 +434663,7 @@ impl Object {
             Self::inputSuggestedPostInfo(v) => v.to_json_into(out),
             Self::inputTextQuote(v) => v.to_json_into(out),
             Self::inputThumbnail(v) => v.to_json_into(out),
+            Self::inputTonWalletCardSticker(v) => v.to_json_into(out),
             Self::inputVideo(v) => v.to_json_into(out),
             Self::inputVideoNote(v) => v.to_json_into(out),
             Self::inputVoiceNote(v) => v.to_json_into(out),
@@ -423986,6 +434851,7 @@ impl Object {
             Self::messagePoll(v) => v.to_json_into(out),
             Self::messageStakeDice(v) => v.to_json_into(out),
             Self::messageStory(v) => v.to_json_into(out),
+            Self::messageWidget(v) => v.to_json_into(out),
             Self::messageChecklist(v) => v.to_json_into(out),
             Self::messageInvoice(v) => v.to_json_into(out),
             Self::messageCall(v) => v.to_json_into(out),
@@ -424051,6 +434917,7 @@ impl Object {
             Self::messagePaidMessagesRefunded(v) => v.to_json_into(out),
             Self::messagePaidMessagePriceChanged(v) => v.to_json_into(out),
             Self::messageDirectMessagePriceChanged(v) => v.to_json_into(out),
+            Self::messageUnpaidMessagesAllowedByLink(v) => v.to_json_into(out),
             Self::messageChecklistTasksDone(v) => v.to_json_into(out),
             Self::messageChecklistTasksAdded(v) => v.to_json_into(out),
             Self::messageSuggestedPostApprovalFailed(v) => v.to_json_into(out),
@@ -424394,6 +435261,10 @@ impl Object {
             Self::profileAccentColor(v) => v.to_json_into(out),
             Self::profileAccentColors(v) => v.to_json_into(out),
             Self::profilePhoto(v) => v.to_json_into(out),
+            Self::profileShareThemeEmoji(v) => v.to_json_into(out),
+            Self::profileShareThemeUpgradedGift(v) => v.to_json_into(out),
+            Self::profileShareThemeBackdrop(v) => v.to_json_into(out),
+            Self::profileShareThemeBackdrops(v) => v.to_json_into(out),
             Self::profileTabPosts(v) => v.to_json_into(out),
             Self::profileTabGifts(v) => v.to_json_into(out),
             Self::profileTabMedia(v) => v.to_json_into(out),
@@ -424406,6 +435277,7 @@ impl Object {
             Self::proxyTypeSocks5(v) => v.to_json_into(out),
             Self::proxyTypeHttp(v) => v.to_json_into(out),
             Self::proxyTypeMtproto(v) => v.to_json_into(out),
+            Self::proxyTypeWeb(v) => v.to_json_into(out),
             Self::publicChatTypeHasUsername(v) => v.to_json_into(out),
             Self::publicChatTypeIsLocationBased(v) => v.to_json_into(out),
             Self::publicForwardMessage(v) => v.to_json_into(out),
@@ -424639,6 +435511,7 @@ impl Object {
             Self::sharedChat(v) => v.to_json_into(out),
             Self::sharedUser(v) => v.to_json_into(out),
             Self::shippingOption(v) => v.to_json_into(out),
+            Self::speechRecognitionLanguages(v) => v.to_json_into(out),
             Self::speechRecognitionResultPending(v) => v.to_json_into(out),
             Self::speechRecognitionResultText(v) => v.to_json_into(out),
             Self::speechRecognitionResultError(v) => v.to_json_into(out),
@@ -424746,7 +435619,6 @@ impl Object {
             Self::storyAlbum(v) => v.to_json_into(out),
             Self::storyAlbums(v) => v.to_json_into(out),
             Self::storyArea(v) => v.to_json_into(out),
-            Self::storyAreaPosition(v) => v.to_json_into(out),
             Self::storyAreaTypeLocation(v) => v.to_json_into(out),
             Self::storyAreaTypeVenue(v) => v.to_json_into(out),
             Self::storyAreaTypeSuggestedReaction(v) => v.to_json_into(out),
@@ -424875,6 +435747,8 @@ impl Object {
             Self::textParseModeMarkdown(v) => v.to_json_into(out),
             Self::textParseModeHTML(v) => v.to_json_into(out),
             Self::textQuote(v) => v.to_json_into(out),
+            Self::textRange(v) => v.to_json_into(out),
+            Self::textRanges(v) => v.to_json_into(out),
             Self::themeParameters(v) => v.to_json_into(out),
             Self::themeSettings(v) => v.to_json_into(out),
             Self::thumbnail(v) => v.to_json_into(out),
@@ -424891,6 +435765,7 @@ impl Object {
             Self::tonCenterApiRequestTypePost(v) => v.to_json_into(out),
             Self::tonCenterStreamingApiUrl(v) => v.to_json_into(out),
             Self::tonConnectChallenge(v) => v.to_json_into(out),
+            Self::tonConnectConnectData(v) => v.to_json_into(out),
             Self::tonConnectConnectItemAddress(v) => v.to_json_into(out),
             Self::tonConnectConnectItemProof(v) => v.to_json_into(out),
             Self::tonConnectConnectRequest(v) => v.to_json_into(out),
@@ -424924,9 +435799,12 @@ impl Object {
             Self::tonTransactionTypeStakeDicePayout(v) => v.to_json_into(out),
             Self::tonTransactionTypeUnsupported(v) => v.to_json_into(out),
             Self::tonTransactions(v) => v.to_json_into(out),
+            Self::tonWalletCard(v) => v.to_json_into(out),
+            Self::tonWalletCardSticker(v) => v.to_json_into(out),
             Self::tonWalletGaslessTransfersInfo(v) => v.to_json_into(out),
             Self::tonWalletOwnershipProof(v) => v.to_json_into(out),
             Self::tonWalletOwnershipProofChallenge(v) => v.to_json_into(out),
+            Self::tonWalletSecretPhrase(v) => v.to_json_into(out),
             Self::tonWalletState(v) => v.to_json_into(out),
             Self::tonWalletTransaction(v) => v.to_json_into(out),
             Self::tonWalletTransactionStateSucceeded(v) => v.to_json_into(out),
@@ -424934,6 +435812,7 @@ impl Object {
             Self::tonWalletTransactionTypeOnRampDeposit(v) => v.to_json_into(out),
             Self::tonWalletTransactionTypeTransfer(v) => v.to_json_into(out),
             Self::tonWalletTransactionTypeNftTransfer(v) => v.to_json_into(out),
+            Self::tonWalletTransactionTypeTelegramGiftTransfer(v) => v.to_json_into(out),
             Self::tonWalletTransactionTypeKeyChange(v) => v.to_json_into(out),
             Self::tonWalletTransactions(v) => v.to_json_into(out),
             Self::tonWalletTransferReceiverUser(v) => v.to_json_into(out),
@@ -425091,6 +435970,9 @@ impl Object {
             Self::updateWebBrowserSettings(v) => v.to_json_into(out),
             Self::updateLanguagePackStrings(v) => v.to_json_into(out),
             Self::updateConnectionState(v) => v.to_json_into(out),
+            Self::updateWebProxyCarrierOpened(v) => v.to_json_into(out),
+            Self::updateWebProxyCarrierData(v) => v.to_json_into(out),
+            Self::updateWebProxyCarrierClosed(v) => v.to_json_into(out),
             Self::updateFreezeState(v) => v.to_json_into(out),
             Self::updateAgeVerificationParameters(v) => v.to_json_into(out),
             Self::updateTermsOfService(v) => v.to_json_into(out),
@@ -425113,6 +435995,7 @@ impl Object {
             Self::updateStarRevenueStatus(v) => v.to_json_into(out),
             Self::updateGramRevenueStatus(v) => v.to_json_into(out),
             Self::updateSpeechRecognitionTrial(v) => v.to_json_into(out),
+            Self::updateSpeechRecognitionInFile(v) => v.to_json_into(out),
             Self::updateGroupCallMessageLevels(v) => v.to_json_into(out),
             Self::updateDiceEmojis(v) => v.to_json_into(out),
             Self::updateStakeDiceState(v) => v.to_json_into(out),
@@ -425133,6 +436016,9 @@ impl Object {
             Self::updateNewCallbackQuery(v) => v.to_json_into(out),
             Self::updateNewInlineCallbackQuery(v) => v.to_json_into(out),
             Self::updateNewBusinessCallbackQuery(v) => v.to_json_into(out),
+            Self::updateNewWidgetQuery(v) => v.to_json_into(out),
+            Self::updateNewInlineWidgetQuery(v) => v.to_json_into(out),
+            Self::updateNewWidgetCopyQuery(v) => v.to_json_into(out),
             Self::updateNewShippingQuery(v) => v.to_json_into(out),
             Self::updateNewPreCheckoutQuery(v) => v.to_json_into(out),
             Self::updateNewCustomEvent(v) => v.to_json_into(out),
@@ -425161,7 +436047,9 @@ impl Object {
             Self::upgradedGiftBackdrop(v) => v.to_json_into(out),
             Self::upgradedGiftBackdropColors(v) => v.to_json_into(out),
             Self::upgradedGiftBackdropCount(v) => v.to_json_into(out),
+            Self::upgradedGiftCollectionNames(v) => v.to_json_into(out),
             Self::upgradedGiftColors(v) => v.to_json_into(out),
+            Self::upgradedGiftDepositInfo(v) => v.to_json_into(out),
             Self::upgradedGiftModel(v) => v.to_json_into(out),
             Self::upgradedGiftModelCount(v) => v.to_json_into(out),
             Self::upgradedGiftOriginUpgrade(v) => v.to_json_into(out),
@@ -425246,7 +436134,21 @@ impl Object {
             Self::webBrowserTypeInApp(v) => v.to_json_into(out),
             Self::webDomainException(v) => v.to_json_into(out),
             Self::webPageInstantView(v) => v.to_json_into(out),
+            Self::webProxyCarrier(v) => v.to_json_into(out),
+            Self::webProxyCarrierErrorUnsupported(v) => v.to_json_into(out),
+            Self::webProxyCarrierErrorPaused(v) => v.to_json_into(out),
+            Self::webProxyCarrierErrorLoadFailed(v) => v.to_json_into(out),
+            Self::webProxyCarrierErrorTerminated(v) => v.to_json_into(out),
+            Self::webProxyCarrierErrorRefused(v) => v.to_json_into(out),
+            Self::webProxyCarrierMessageText(v) => v.to_json_into(out),
+            Self::webProxyCarrierMessageBinary(v) => v.to_json_into(out),
             Self::welcomeMessage(v) => v.to_json_into(out),
+            Self::widgetPublicData(v) => v.to_json_into(out),
+            Self::widgetQueryAnswer(v) => v.to_json_into(out),
+            Self::widgetQueryTypeData(v) => v.to_json_into(out),
+            Self::widgetQueryTypeSignData(v) => v.to_json_into(out),
+            Self::widgetQueryTypeSentTransaction(v) => v.to_json_into(out),
+            Self::widgetQueryWallet(v) => v.to_json_into(out),
         }
     }
 
@@ -425344,6 +436246,9 @@ impl Object {
     }
     fn __json_new_archiveChatListSettings(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::archiveChatListSettings(self::ArchiveChatListSettings::from_json_object(o)?))
+    }
+    fn __json_new_areaPosition(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::areaPosition(self::AreaPosition::from_json_object(o)?))
     }
     fn __json_new_attachmentMenuBot(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::attachmentMenuBot(self::AttachmentMenuBot::from_json_object(o)?))
@@ -426449,8 +437354,17 @@ impl Object {
     fn __json_new_collectibleItemTypePhoneNumber(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::collectibleItemTypePhoneNumber(self::collectibleItemTypePhoneNumber::from_json_object(o)?))
     }
+    fn __json_new_communities(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::communities(self::Communities::from_json_object(o)?))
+    }
     fn __json_new_community(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::community(self::Community::from_json_object(o)?))
+    }
+    fn __json_new_communityAddChatRequest(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::communityAddChatRequest(self::CommunityAddChatRequest::from_json_object(o)?))
+    }
+    fn __json_new_communityAddChatRequests(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::communityAddChatRequests(self::CommunityAddChatRequests::from_json_object(o)?))
     }
     fn __json_new_communityAdministratorRights(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::communityAdministratorRights(self::CommunityAdministratorRights::from_json_object(o)?))
@@ -426463,6 +437377,9 @@ impl Object {
     }
     fn __json_new_communityId(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::communityId(self::CommunityId::from_json_object(o)?))
+    }
+    fn __json_new_communityMemberChats(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::communityMemberChats(self::CommunityMemberChats::from_json_object(o)?))
     }
     fn __json_new_communityMemberStatusCreator(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::communityMemberStatusCreator(self::communityMemberStatusCreator::from_json_object(o)?))
@@ -426736,6 +437653,12 @@ impl Object {
     }
     fn __json_new_emojiStatuses(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::emojiStatuses(self::EmojiStatuses::from_json_object(o)?))
+    }
+    fn __json_new_emojiTypeRegular(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::emojiTypeRegular(self::emojiTypeRegular::from_json_object(o)?))
+    }
+    fn __json_new_emojiTypeCustomEmoji(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::emojiTypeCustomEmoji(self::emojiTypeCustomEmoji::from_json_object(o)?))
     }
     fn __json_new_emojis(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::emojis(self::Emojis::from_json_object(o)?))
@@ -427403,6 +438326,12 @@ impl Object {
     fn __json_new_inputMessageChecklist(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::inputMessageChecklist(self::inputMessageChecklist::from_json_object(o)?))
     }
+    fn __json_new_inputMessageWidget(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::inputMessageWidget(self::inputMessageWidget::from_json_object(o)?))
+    }
+    fn __json_new_inputMessageSharedWidget(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::inputMessageSharedWidget(self::inputMessageSharedWidget::from_json_object(o)?))
+    }
     fn __json_new_inputMessageForwarded(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::inputMessageForwarded(self::inputMessageForwarded::from_json_object(o)?))
     }
@@ -427613,6 +438542,12 @@ impl Object {
     fn __json_new_inputPollTypeQuiz(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::inputPollTypeQuiz(self::inputPollTypeQuiz::from_json_object(o)?))
     }
+    fn __json_new_inputProfileShareThemeEmoji(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::inputProfileShareThemeEmoji(self::inputProfileShareThemeEmoji::from_json_object(o)?))
+    }
+    fn __json_new_inputProfileShareThemeUpgradedGift(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::inputProfileShareThemeUpgradedGift(self::inputProfileShareThemeUpgradedGift::from_json_object(o)?))
+    }
     fn __json_new_inputRichMessage(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::inputRichMessage(self::InputRichMessage::from_json_object(o)?))
     }
@@ -427627,9 +438562,6 @@ impl Object {
     }
     fn __json_new_inputStoryAreaTypeLocation(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::inputStoryAreaTypeLocation(self::inputStoryAreaTypeLocation::from_json_object(o)?))
-    }
-    fn __json_new_inputStoryAreaTypeFoundVenue(o: &tl_json::Object) -> Result<Self, String> {
-        Result::Ok(Self::inputStoryAreaTypeFoundVenue(self::inputStoryAreaTypeFoundVenue::from_json_object(o)?))
     }
     fn __json_new_inputStoryAreaTypePreviousVenue(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::inputStoryAreaTypePreviousVenue(self::inputStoryAreaTypePreviousVenue::from_json_object(o)?))
@@ -427666,6 +438598,9 @@ impl Object {
     }
     fn __json_new_inputThumbnail(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::inputThumbnail(self::InputThumbnail::from_json_object(o)?))
+    }
+    fn __json_new_inputTonWalletCardSticker(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::inputTonWalletCardSticker(self::InputTonWalletCardSticker::from_json_object(o)?))
     }
     fn __json_new_inputVideo(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::inputVideo(self::InputVideo::from_json_object(o)?))
@@ -428228,6 +439163,9 @@ impl Object {
     fn __json_new_messageStory(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::messageStory(self::messageStory::from_json_object(o)?))
     }
+    fn __json_new_messageWidget(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::messageWidget(self::messageWidget::from_json_object(o)?))
+    }
     fn __json_new_messageChecklist(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::messageChecklist(self::messageChecklist::from_json_object(o)?))
     }
@@ -428422,6 +439360,9 @@ impl Object {
     }
     fn __json_new_messageDirectMessagePriceChanged(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::messageDirectMessagePriceChanged(self::messageDirectMessagePriceChanged::from_json_object(o)?))
+    }
+    fn __json_new_messageUnpaidMessagesAllowedByLink(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::messageUnpaidMessagesAllowedByLink(self::messageUnpaidMessagesAllowedByLink::from_json_object(o)?))
     }
     fn __json_new_messageChecklistTasksDone(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::messageChecklistTasksDone(self::messageChecklistTasksDone::from_json_object(o)?))
@@ -429452,6 +440393,18 @@ impl Object {
     fn __json_new_profilePhoto(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::profilePhoto(self::ProfilePhoto::from_json_object(o)?))
     }
+    fn __json_new_profileShareThemeEmoji(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::profileShareThemeEmoji(self::profileShareThemeEmoji::from_json_object(o)?))
+    }
+    fn __json_new_profileShareThemeUpgradedGift(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::profileShareThemeUpgradedGift(self::profileShareThemeUpgradedGift::from_json_object(o)?))
+    }
+    fn __json_new_profileShareThemeBackdrop(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::profileShareThemeBackdrop(self::ProfileShareThemeBackdrop::from_json_object(o)?))
+    }
+    fn __json_new_profileShareThemeBackdrops(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::profileShareThemeBackdrops(self::ProfileShareThemeBackdrops::from_json_object(o)?))
+    }
     fn __json_new_profileTabPosts(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::profileTabPosts(self::profileTabPosts::from_json_object(o)?))
     }
@@ -429487,6 +440440,9 @@ impl Object {
     }
     fn __json_new_proxyTypeMtproto(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::proxyTypeMtproto(self::proxyTypeMtproto::from_json_object(o)?))
+    }
+    fn __json_new_proxyTypeWeb(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::proxyTypeWeb(self::proxyTypeWeb::from_json_object(o)?))
     }
     fn __json_new_publicChatTypeHasUsername(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::publicChatTypeHasUsername(self::publicChatTypeHasUsername::from_json_object(o)?))
@@ -430187,6 +441143,9 @@ impl Object {
     fn __json_new_shippingOption(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::shippingOption(self::ShippingOption::from_json_object(o)?))
     }
+    fn __json_new_speechRecognitionLanguages(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::speechRecognitionLanguages(self::SpeechRecognitionLanguages::from_json_object(o)?))
+    }
     fn __json_new_speechRecognitionResultPending(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::speechRecognitionResultPending(self::speechRecognitionResultPending::from_json_object(o)?))
     }
@@ -430507,9 +441466,6 @@ impl Object {
     }
     fn __json_new_storyArea(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::storyArea(self::StoryArea::from_json_object(o)?))
-    }
-    fn __json_new_storyAreaPosition(o: &tl_json::Object) -> Result<Self, String> {
-        Result::Ok(Self::storyAreaPosition(self::StoryAreaPosition::from_json_object(o)?))
     }
     fn __json_new_storyAreaTypeLocation(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::storyAreaTypeLocation(self::storyAreaTypeLocation::from_json_object(o)?))
@@ -430895,6 +441851,12 @@ impl Object {
     fn __json_new_textQuote(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::textQuote(self::TextQuote::from_json_object(o)?))
     }
+    fn __json_new_textRange(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::textRange(self::TextRange::from_json_object(o)?))
+    }
+    fn __json_new_textRanges(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::textRanges(self::TextRanges::from_json_object(o)?))
+    }
     fn __json_new_themeParameters(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::themeParameters(self::ThemeParameters::from_json_object(o)?))
     }
@@ -430942,6 +441904,9 @@ impl Object {
     }
     fn __json_new_tonConnectChallenge(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::tonConnectChallenge(self::TonConnectChallenge::from_json_object(o)?))
+    }
+    fn __json_new_tonConnectConnectData(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::tonConnectConnectData(self::TonConnectConnectData::from_json_object(o)?))
     }
     fn __json_new_tonConnectConnectItemAddress(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::tonConnectConnectItemAddress(self::tonConnectConnectItemAddress::from_json_object(o)?))
@@ -431042,6 +442007,12 @@ impl Object {
     fn __json_new_tonTransactions(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::tonTransactions(self::TonTransactions::from_json_object(o)?))
     }
+    fn __json_new_tonWalletCard(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::tonWalletCard(self::TonWalletCard::from_json_object(o)?))
+    }
+    fn __json_new_tonWalletCardSticker(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::tonWalletCardSticker(self::TonWalletCardSticker::from_json_object(o)?))
+    }
     fn __json_new_tonWalletGaslessTransfersInfo(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::tonWalletGaslessTransfersInfo(self::TonWalletGaslessTransfersInfo::from_json_object(o)?))
     }
@@ -431050,6 +442021,9 @@ impl Object {
     }
     fn __json_new_tonWalletOwnershipProofChallenge(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::tonWalletOwnershipProofChallenge(self::TonWalletOwnershipProofChallenge::from_json_object(o)?))
+    }
+    fn __json_new_tonWalletSecretPhrase(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::tonWalletSecretPhrase(self::TonWalletSecretPhrase::from_json_object(o)?))
     }
     fn __json_new_tonWalletState(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::tonWalletState(self::TonWalletState::from_json_object(o)?))
@@ -431071,6 +442045,9 @@ impl Object {
     }
     fn __json_new_tonWalletTransactionTypeNftTransfer(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::tonWalletTransactionTypeNftTransfer(self::tonWalletTransactionTypeNftTransfer::from_json_object(o)?))
+    }
+    fn __json_new_tonWalletTransactionTypeTelegramGiftTransfer(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::tonWalletTransactionTypeTelegramGiftTransfer(self::tonWalletTransactionTypeTelegramGiftTransfer::from_json_object(o)?))
     }
     fn __json_new_tonWalletTransactionTypeKeyChange(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::tonWalletTransactionTypeKeyChange(self::tonWalletTransactionTypeKeyChange::from_json_object(o)?))
@@ -431543,6 +442520,15 @@ impl Object {
     fn __json_new_updateConnectionState(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::updateConnectionState(self::updateConnectionState::from_json_object(o)?))
     }
+    fn __json_new_updateWebProxyCarrierOpened(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::updateWebProxyCarrierOpened(self::updateWebProxyCarrierOpened::from_json_object(o)?))
+    }
+    fn __json_new_updateWebProxyCarrierData(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::updateWebProxyCarrierData(self::updateWebProxyCarrierData::from_json_object(o)?))
+    }
+    fn __json_new_updateWebProxyCarrierClosed(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::updateWebProxyCarrierClosed(self::updateWebProxyCarrierClosed::from_json_object(o)?))
+    }
     fn __json_new_updateFreezeState(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::updateFreezeState(self::updateFreezeState::from_json_object(o)?))
     }
@@ -431609,6 +442595,9 @@ impl Object {
     fn __json_new_updateSpeechRecognitionTrial(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::updateSpeechRecognitionTrial(self::updateSpeechRecognitionTrial::from_json_object(o)?))
     }
+    fn __json_new_updateSpeechRecognitionInFile(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::updateSpeechRecognitionInFile(self::updateSpeechRecognitionInFile::from_json_object(o)?))
+    }
     fn __json_new_updateGroupCallMessageLevels(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::updateGroupCallMessageLevels(self::updateGroupCallMessageLevels::from_json_object(o)?))
     }
@@ -431668,6 +442657,15 @@ impl Object {
     }
     fn __json_new_updateNewBusinessCallbackQuery(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::updateNewBusinessCallbackQuery(self::updateNewBusinessCallbackQuery::from_json_object(o)?))
+    }
+    fn __json_new_updateNewWidgetQuery(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::updateNewWidgetQuery(self::updateNewWidgetQuery::from_json_object(o)?))
+    }
+    fn __json_new_updateNewInlineWidgetQuery(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::updateNewInlineWidgetQuery(self::updateNewInlineWidgetQuery::from_json_object(o)?))
+    }
+    fn __json_new_updateNewWidgetCopyQuery(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::updateNewWidgetCopyQuery(self::updateNewWidgetCopyQuery::from_json_object(o)?))
     }
     fn __json_new_updateNewShippingQuery(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::updateNewShippingQuery(self::updateNewShippingQuery::from_json_object(o)?))
@@ -431753,8 +442751,14 @@ impl Object {
     fn __json_new_upgradedGiftBackdropCount(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::upgradedGiftBackdropCount(self::UpgradedGiftBackdropCount::from_json_object(o)?))
     }
+    fn __json_new_upgradedGiftCollectionNames(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::upgradedGiftCollectionNames(self::UpgradedGiftCollectionNames::from_json_object(o)?))
+    }
     fn __json_new_upgradedGiftColors(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::upgradedGiftColors(self::UpgradedGiftColors::from_json_object(o)?))
+    }
+    fn __json_new_upgradedGiftDepositInfo(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::upgradedGiftDepositInfo(self::UpgradedGiftDepositInfo::from_json_object(o)?))
     }
     fn __json_new_upgradedGiftModel(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::upgradedGiftModel(self::UpgradedGiftModel::from_json_object(o)?))
@@ -432008,8 +443012,50 @@ impl Object {
     fn __json_new_webPageInstantView(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::webPageInstantView(self::WebPageInstantView::from_json_object(o)?))
     }
+    fn __json_new_webProxyCarrier(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::webProxyCarrier(self::WebProxyCarrier::from_json_object(o)?))
+    }
+    fn __json_new_webProxyCarrierErrorUnsupported(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::webProxyCarrierErrorUnsupported(self::webProxyCarrierErrorUnsupported::from_json_object(o)?))
+    }
+    fn __json_new_webProxyCarrierErrorPaused(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::webProxyCarrierErrorPaused(self::webProxyCarrierErrorPaused::from_json_object(o)?))
+    }
+    fn __json_new_webProxyCarrierErrorLoadFailed(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::webProxyCarrierErrorLoadFailed(self::webProxyCarrierErrorLoadFailed::from_json_object(o)?))
+    }
+    fn __json_new_webProxyCarrierErrorTerminated(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::webProxyCarrierErrorTerminated(self::webProxyCarrierErrorTerminated::from_json_object(o)?))
+    }
+    fn __json_new_webProxyCarrierErrorRefused(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::webProxyCarrierErrorRefused(self::webProxyCarrierErrorRefused::from_json_object(o)?))
+    }
+    fn __json_new_webProxyCarrierMessageText(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::webProxyCarrierMessageText(self::webProxyCarrierMessageText::from_json_object(o)?))
+    }
+    fn __json_new_webProxyCarrierMessageBinary(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::webProxyCarrierMessageBinary(self::webProxyCarrierMessageBinary::from_json_object(o)?))
+    }
     fn __json_new_welcomeMessage(o: &tl_json::Object) -> Result<Self, String> {
         Result::Ok(Self::welcomeMessage(self::WelcomeMessage::from_json_object(o)?))
+    }
+    fn __json_new_widgetPublicData(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::widgetPublicData(self::WidgetPublicData::from_json_object(o)?))
+    }
+    fn __json_new_widgetQueryAnswer(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::widgetQueryAnswer(self::WidgetQueryAnswer::from_json_object(o)?))
+    }
+    fn __json_new_widgetQueryTypeData(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::widgetQueryTypeData(self::widgetQueryTypeData::from_json_object(o)?))
+    }
+    fn __json_new_widgetQueryTypeSignData(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::widgetQueryTypeSignData(self::widgetQueryTypeSignData::from_json_object(o)?))
+    }
+    fn __json_new_widgetQueryTypeSentTransaction(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::widgetQueryTypeSentTransaction(self::widgetQueryTypeSentTransaction::from_json_object(o)?))
+    }
+    fn __json_new_widgetQueryWallet(o: &tl_json::Object) -> Result<Self, String> {
+        Result::Ok(Self::widgetQueryWallet(self::WidgetQueryWallet::from_json_object(o)?))
     }
     pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {
         let o = match v {
@@ -432051,6 +443097,7 @@ impl Object {
                 "animation" => Self::__json_new_animation(o),
                 "animations" => Self::__json_new_animations(o),
                 "archiveChatListSettings" => Self::__json_new_archiveChatListSettings(o),
+                "areaPosition" => Self::__json_new_areaPosition(o),
                 "attachmentMenuBot" => Self::__json_new_attachmentMenuBot(o),
                 "attachmentMenuBotColor" => Self::__json_new_attachmentMenuBotColor(o),
                 "attributeCraftPersistenceProbability" => Self::__json_new_attributeCraftPersistenceProbability(o),
@@ -432419,11 +443466,15 @@ impl Object {
                 "collectibleItemInfo" => Self::__json_new_collectibleItemInfo(o),
                 "collectibleItemTypeUsername" => Self::__json_new_collectibleItemTypeUsername(o),
                 "collectibleItemTypePhoneNumber" => Self::__json_new_collectibleItemTypePhoneNumber(o),
+                "communities" => Self::__json_new_communities(o),
                 "community" => Self::__json_new_community(o),
+                "communityAddChatRequest" => Self::__json_new_communityAddChatRequest(o),
+                "communityAddChatRequests" => Self::__json_new_communityAddChatRequests(o),
                 "communityAdministratorRights" => Self::__json_new_communityAdministratorRights(o),
                 "communityChat" => Self::__json_new_communityChat(o),
                 "communityFullInfo" => Self::__json_new_communityFullInfo(o),
                 "communityId" => Self::__json_new_communityId(o),
+                "communityMemberChats" => Self::__json_new_communityMemberChats(o),
                 "communityMemberStatusCreator" => Self::__json_new_communityMemberStatusCreator(o),
                 "communityMemberStatusAdministrator" => Self::__json_new_communityMemberStatusAdministrator(o),
                 "communityMemberStatusMember" => Self::__json_new_communityMemberStatusMember(o),
@@ -432515,6 +443566,8 @@ impl Object {
                 "emojiStatusTypeCustomEmoji" => Self::__json_new_emojiStatusTypeCustomEmoji(o),
                 "emojiStatusTypeUpgradedGift" => Self::__json_new_emojiStatusTypeUpgradedGift(o),
                 "emojiStatuses" => Self::__json_new_emojiStatuses(o),
+                "emojiTypeRegular" => Self::__json_new_emojiTypeRegular(o),
+                "emojiTypeCustomEmoji" => Self::__json_new_emojiTypeCustomEmoji(o),
                 "emojis" => Self::__json_new_emojis(o),
                 "encryptedCredentials" => Self::__json_new_encryptedCredentials(o),
                 "encryptedPassportElement" => Self::__json_new_encryptedPassportElement(o),
@@ -432737,6 +443790,8 @@ impl Object {
                 "inputMessageStakeDice" => Self::__json_new_inputMessageStakeDice(o),
                 "inputMessageStory" => Self::__json_new_inputMessageStory(o),
                 "inputMessageChecklist" => Self::__json_new_inputMessageChecklist(o),
+                "inputMessageWidget" => Self::__json_new_inputMessageWidget(o),
+                "inputMessageSharedWidget" => Self::__json_new_inputMessageSharedWidget(o),
                 "inputMessageForwarded" => Self::__json_new_inputMessageForwarded(o),
                 "inputMessageReplyToMessage" => Self::__json_new_inputMessageReplyToMessage(o),
                 "inputMessageReplyToExternalMessage" => Self::__json_new_inputMessageReplyToExternalMessage(o),
@@ -432807,12 +443862,13 @@ impl Object {
                 "inputPollOption" => Self::__json_new_inputPollOption(o),
                 "inputPollTypeRegular" => Self::__json_new_inputPollTypeRegular(o),
                 "inputPollTypeQuiz" => Self::__json_new_inputPollTypeQuiz(o),
+                "inputProfileShareThemeEmoji" => Self::__json_new_inputProfileShareThemeEmoji(o),
+                "inputProfileShareThemeUpgradedGift" => Self::__json_new_inputProfileShareThemeUpgradedGift(o),
                 "inputRichMessage" => Self::__json_new_inputRichMessage(o),
                 "inputRichMessageMedia" => Self::__json_new_inputRichMessageMedia(o),
                 "inputSticker" => Self::__json_new_inputSticker(o),
                 "inputStoryArea" => Self::__json_new_inputStoryArea(o),
                 "inputStoryAreaTypeLocation" => Self::__json_new_inputStoryAreaTypeLocation(o),
-                "inputStoryAreaTypeFoundVenue" => Self::__json_new_inputStoryAreaTypeFoundVenue(o),
                 "inputStoryAreaTypePreviousVenue" => Self::__json_new_inputStoryAreaTypePreviousVenue(o),
                 "inputStoryAreaTypeSuggestedReaction" => Self::__json_new_inputStoryAreaTypeSuggestedReaction(o),
                 "inputStoryAreaTypeMessage" => Self::__json_new_inputStoryAreaTypeMessage(o),
@@ -432825,6 +443881,7 @@ impl Object {
                 "inputSuggestedPostInfo" => Self::__json_new_inputSuggestedPostInfo(o),
                 "inputTextQuote" => Self::__json_new_inputTextQuote(o),
                 "inputThumbnail" => Self::__json_new_inputThumbnail(o),
+                "inputTonWalletCardSticker" => Self::__json_new_inputTonWalletCardSticker(o),
                 "inputVideo" => Self::__json_new_inputVideo(o),
                 "inputVideoNote" => Self::__json_new_inputVideoNote(o),
                 "inputVoiceNote" => Self::__json_new_inputVoiceNote(o),
@@ -433012,6 +444069,7 @@ impl Object {
                 "messagePoll" => Self::__json_new_messagePoll(o),
                 "messageStakeDice" => Self::__json_new_messageStakeDice(o),
                 "messageStory" => Self::__json_new_messageStory(o),
+                "messageWidget" => Self::__json_new_messageWidget(o),
                 "messageChecklist" => Self::__json_new_messageChecklist(o),
                 "messageInvoice" => Self::__json_new_messageInvoice(o),
                 "messageCall" => Self::__json_new_messageCall(o),
@@ -433077,6 +444135,7 @@ impl Object {
                 "messagePaidMessagesRefunded" => Self::__json_new_messagePaidMessagesRefunded(o),
                 "messagePaidMessagePriceChanged" => Self::__json_new_messagePaidMessagePriceChanged(o),
                 "messageDirectMessagePriceChanged" => Self::__json_new_messageDirectMessagePriceChanged(o),
+                "messageUnpaidMessagesAllowedByLink" => Self::__json_new_messageUnpaidMessagesAllowedByLink(o),
                 "messageChecklistTasksDone" => Self::__json_new_messageChecklistTasksDone(o),
                 "messageChecklistTasksAdded" => Self::__json_new_messageChecklistTasksAdded(o),
                 "messageSuggestedPostApprovalFailed" => Self::__json_new_messageSuggestedPostApprovalFailed(o),
@@ -433420,6 +444479,10 @@ impl Object {
                 "profileAccentColor" => Self::__json_new_profileAccentColor(o),
                 "profileAccentColors" => Self::__json_new_profileAccentColors(o),
                 "profilePhoto" => Self::__json_new_profilePhoto(o),
+                "profileShareThemeEmoji" => Self::__json_new_profileShareThemeEmoji(o),
+                "profileShareThemeUpgradedGift" => Self::__json_new_profileShareThemeUpgradedGift(o),
+                "profileShareThemeBackdrop" => Self::__json_new_profileShareThemeBackdrop(o),
+                "profileShareThemeBackdrops" => Self::__json_new_profileShareThemeBackdrops(o),
                 "profileTabPosts" => Self::__json_new_profileTabPosts(o),
                 "profileTabGifts" => Self::__json_new_profileTabGifts(o),
                 "profileTabMedia" => Self::__json_new_profileTabMedia(o),
@@ -433432,6 +444495,7 @@ impl Object {
                 "proxyTypeSocks5" => Self::__json_new_proxyTypeSocks5(o),
                 "proxyTypeHttp" => Self::__json_new_proxyTypeHttp(o),
                 "proxyTypeMtproto" => Self::__json_new_proxyTypeMtproto(o),
+                "proxyTypeWeb" => Self::__json_new_proxyTypeWeb(o),
                 "publicChatTypeHasUsername" => Self::__json_new_publicChatTypeHasUsername(o),
                 "publicChatTypeIsLocationBased" => Self::__json_new_publicChatTypeIsLocationBased(o),
                 "publicForwardMessage" => Self::__json_new_publicForwardMessage(o),
@@ -433665,6 +444729,7 @@ impl Object {
                 "sharedChat" => Self::__json_new_sharedChat(o),
                 "sharedUser" => Self::__json_new_sharedUser(o),
                 "shippingOption" => Self::__json_new_shippingOption(o),
+                "speechRecognitionLanguages" => Self::__json_new_speechRecognitionLanguages(o),
                 "speechRecognitionResultPending" => Self::__json_new_speechRecognitionResultPending(o),
                 "speechRecognitionResultText" => Self::__json_new_speechRecognitionResultText(o),
                 "speechRecognitionResultError" => Self::__json_new_speechRecognitionResultError(o),
@@ -433772,7 +444837,6 @@ impl Object {
                 "storyAlbum" => Self::__json_new_storyAlbum(o),
                 "storyAlbums" => Self::__json_new_storyAlbums(o),
                 "storyArea" => Self::__json_new_storyArea(o),
-                "storyAreaPosition" => Self::__json_new_storyAreaPosition(o),
                 "storyAreaTypeLocation" => Self::__json_new_storyAreaTypeLocation(o),
                 "storyAreaTypeVenue" => Self::__json_new_storyAreaTypeVenue(o),
                 "storyAreaTypeSuggestedReaction" => Self::__json_new_storyAreaTypeSuggestedReaction(o),
@@ -433901,6 +444965,8 @@ impl Object {
                 "textParseModeMarkdown" => Self::__json_new_textParseModeMarkdown(o),
                 "textParseModeHTML" => Self::__json_new_textParseModeHTML(o),
                 "textQuote" => Self::__json_new_textQuote(o),
+                "textRange" => Self::__json_new_textRange(o),
+                "textRanges" => Self::__json_new_textRanges(o),
                 "themeParameters" => Self::__json_new_themeParameters(o),
                 "themeSettings" => Self::__json_new_themeSettings(o),
                 "thumbnail" => Self::__json_new_thumbnail(o),
@@ -433917,6 +444983,7 @@ impl Object {
                 "tonCenterApiRequestTypePost" => Self::__json_new_tonCenterApiRequestTypePost(o),
                 "tonCenterStreamingApiUrl" => Self::__json_new_tonCenterStreamingApiUrl(o),
                 "tonConnectChallenge" => Self::__json_new_tonConnectChallenge(o),
+                "tonConnectConnectData" => Self::__json_new_tonConnectConnectData(o),
                 "tonConnectConnectItemAddress" => Self::__json_new_tonConnectConnectItemAddress(o),
                 "tonConnectConnectItemProof" => Self::__json_new_tonConnectConnectItemProof(o),
                 "tonConnectConnectRequest" => Self::__json_new_tonConnectConnectRequest(o),
@@ -433950,9 +445017,12 @@ impl Object {
                 "tonTransactionTypeStakeDicePayout" => Self::__json_new_tonTransactionTypeStakeDicePayout(o),
                 "tonTransactionTypeUnsupported" => Self::__json_new_tonTransactionTypeUnsupported(o),
                 "tonTransactions" => Self::__json_new_tonTransactions(o),
+                "tonWalletCard" => Self::__json_new_tonWalletCard(o),
+                "tonWalletCardSticker" => Self::__json_new_tonWalletCardSticker(o),
                 "tonWalletGaslessTransfersInfo" => Self::__json_new_tonWalletGaslessTransfersInfo(o),
                 "tonWalletOwnershipProof" => Self::__json_new_tonWalletOwnershipProof(o),
                 "tonWalletOwnershipProofChallenge" => Self::__json_new_tonWalletOwnershipProofChallenge(o),
+                "tonWalletSecretPhrase" => Self::__json_new_tonWalletSecretPhrase(o),
                 "tonWalletState" => Self::__json_new_tonWalletState(o),
                 "tonWalletTransaction" => Self::__json_new_tonWalletTransaction(o),
                 "tonWalletTransactionStateSucceeded" => Self::__json_new_tonWalletTransactionStateSucceeded(o),
@@ -433960,6 +445030,7 @@ impl Object {
                 "tonWalletTransactionTypeOnRampDeposit" => Self::__json_new_tonWalletTransactionTypeOnRampDeposit(o),
                 "tonWalletTransactionTypeTransfer" => Self::__json_new_tonWalletTransactionTypeTransfer(o),
                 "tonWalletTransactionTypeNftTransfer" => Self::__json_new_tonWalletTransactionTypeNftTransfer(o),
+                "tonWalletTransactionTypeTelegramGiftTransfer" => Self::__json_new_tonWalletTransactionTypeTelegramGiftTransfer(o),
                 "tonWalletTransactionTypeKeyChange" => Self::__json_new_tonWalletTransactionTypeKeyChange(o),
                 "tonWalletTransactions" => Self::__json_new_tonWalletTransactions(o),
                 "tonWalletTransferReceiverUser" => Self::__json_new_tonWalletTransferReceiverUser(o),
@@ -434117,6 +445188,9 @@ impl Object {
                 "updateWebBrowserSettings" => Self::__json_new_updateWebBrowserSettings(o),
                 "updateLanguagePackStrings" => Self::__json_new_updateLanguagePackStrings(o),
                 "updateConnectionState" => Self::__json_new_updateConnectionState(o),
+                "updateWebProxyCarrierOpened" => Self::__json_new_updateWebProxyCarrierOpened(o),
+                "updateWebProxyCarrierData" => Self::__json_new_updateWebProxyCarrierData(o),
+                "updateWebProxyCarrierClosed" => Self::__json_new_updateWebProxyCarrierClosed(o),
                 "updateFreezeState" => Self::__json_new_updateFreezeState(o),
                 "updateAgeVerificationParameters" => Self::__json_new_updateAgeVerificationParameters(o),
                 "updateTermsOfService" => Self::__json_new_updateTermsOfService(o),
@@ -434139,6 +445213,7 @@ impl Object {
                 "updateStarRevenueStatus" => Self::__json_new_updateStarRevenueStatus(o),
                 "updateGramRevenueStatus" => Self::__json_new_updateGramRevenueStatus(o),
                 "updateSpeechRecognitionTrial" => Self::__json_new_updateSpeechRecognitionTrial(o),
+                "updateSpeechRecognitionInFile" => Self::__json_new_updateSpeechRecognitionInFile(o),
                 "updateGroupCallMessageLevels" => Self::__json_new_updateGroupCallMessageLevels(o),
                 "updateDiceEmojis" => Self::__json_new_updateDiceEmojis(o),
                 "updateStakeDiceState" => Self::__json_new_updateStakeDiceState(o),
@@ -434159,6 +445234,9 @@ impl Object {
                 "updateNewCallbackQuery" => Self::__json_new_updateNewCallbackQuery(o),
                 "updateNewInlineCallbackQuery" => Self::__json_new_updateNewInlineCallbackQuery(o),
                 "updateNewBusinessCallbackQuery" => Self::__json_new_updateNewBusinessCallbackQuery(o),
+                "updateNewWidgetQuery" => Self::__json_new_updateNewWidgetQuery(o),
+                "updateNewInlineWidgetQuery" => Self::__json_new_updateNewInlineWidgetQuery(o),
+                "updateNewWidgetCopyQuery" => Self::__json_new_updateNewWidgetCopyQuery(o),
                 "updateNewShippingQuery" => Self::__json_new_updateNewShippingQuery(o),
                 "updateNewPreCheckoutQuery" => Self::__json_new_updateNewPreCheckoutQuery(o),
                 "updateNewCustomEvent" => Self::__json_new_updateNewCustomEvent(o),
@@ -434187,7 +445265,9 @@ impl Object {
                 "upgradedGiftBackdrop" => Self::__json_new_upgradedGiftBackdrop(o),
                 "upgradedGiftBackdropColors" => Self::__json_new_upgradedGiftBackdropColors(o),
                 "upgradedGiftBackdropCount" => Self::__json_new_upgradedGiftBackdropCount(o),
+                "upgradedGiftCollectionNames" => Self::__json_new_upgradedGiftCollectionNames(o),
                 "upgradedGiftColors" => Self::__json_new_upgradedGiftColors(o),
+                "upgradedGiftDepositInfo" => Self::__json_new_upgradedGiftDepositInfo(o),
                 "upgradedGiftModel" => Self::__json_new_upgradedGiftModel(o),
                 "upgradedGiftModelCount" => Self::__json_new_upgradedGiftModelCount(o),
                 "upgradedGiftOriginUpgrade" => Self::__json_new_upgradedGiftOriginUpgrade(o),
@@ -434272,7 +445352,21 @@ impl Object {
                 "webBrowserTypeInApp" => Self::__json_new_webBrowserTypeInApp(o),
                 "webDomainException" => Self::__json_new_webDomainException(o),
                 "webPageInstantView" => Self::__json_new_webPageInstantView(o),
+                "webProxyCarrier" => Self::__json_new_webProxyCarrier(o),
+                "webProxyCarrierErrorUnsupported" => Self::__json_new_webProxyCarrierErrorUnsupported(o),
+                "webProxyCarrierErrorPaused" => Self::__json_new_webProxyCarrierErrorPaused(o),
+                "webProxyCarrierErrorLoadFailed" => Self::__json_new_webProxyCarrierErrorLoadFailed(o),
+                "webProxyCarrierErrorTerminated" => Self::__json_new_webProxyCarrierErrorTerminated(o),
+                "webProxyCarrierErrorRefused" => Self::__json_new_webProxyCarrierErrorRefused(o),
+                "webProxyCarrierMessageText" => Self::__json_new_webProxyCarrierMessageText(o),
+                "webProxyCarrierMessageBinary" => Self::__json_new_webProxyCarrierMessageBinary(o),
                 "welcomeMessage" => Self::__json_new_welcomeMessage(o),
+                "widgetPublicData" => Self::__json_new_widgetPublicData(o),
+                "widgetQueryAnswer" => Self::__json_new_widgetQueryAnswer(o),
+                "widgetQueryTypeData" => Self::__json_new_widgetQueryTypeData(o),
+                "widgetQueryTypeSignData" => Self::__json_new_widgetQueryTypeSignData(o),
+                "widgetQueryTypeSentTransaction" => Self::__json_new_widgetQueryTypeSentTransaction(o),
+                "widgetQueryWallet" => Self::__json_new_widgetQueryWallet(o),
                 _ => Result::Err(format!("Unknown class \"{s}\"")),
             },
             tl_json::Json::Number(n) => match tl_json::to_integer_i32(n) {
@@ -434305,6 +445399,7 @@ impl Object {
                 self::Animation::ID => Self::__json_new_animation(o),
                 self::Animations::ID => Self::__json_new_animations(o),
                 self::ArchiveChatListSettings::ID => Self::__json_new_archiveChatListSettings(o),
+                self::AreaPosition::ID => Self::__json_new_areaPosition(o),
                 self::AttachmentMenuBot::ID => Self::__json_new_attachmentMenuBot(o),
                 self::AttachmentMenuBotColor::ID => Self::__json_new_attachmentMenuBotColor(o),
                 self::AttributeCraftPersistenceProbability::ID => Self::__json_new_attributeCraftPersistenceProbability(o),
@@ -434673,11 +445768,15 @@ impl Object {
                 self::CollectibleItemInfo::ID => Self::__json_new_collectibleItemInfo(o),
                 self::collectibleItemTypeUsername::ID => Self::__json_new_collectibleItemTypeUsername(o),
                 self::collectibleItemTypePhoneNumber::ID => Self::__json_new_collectibleItemTypePhoneNumber(o),
+                self::Communities::ID => Self::__json_new_communities(o),
                 self::Community::ID => Self::__json_new_community(o),
+                self::CommunityAddChatRequest::ID => Self::__json_new_communityAddChatRequest(o),
+                self::CommunityAddChatRequests::ID => Self::__json_new_communityAddChatRequests(o),
                 self::CommunityAdministratorRights::ID => Self::__json_new_communityAdministratorRights(o),
                 self::CommunityChat::ID => Self::__json_new_communityChat(o),
                 self::CommunityFullInfo::ID => Self::__json_new_communityFullInfo(o),
                 self::CommunityId::ID => Self::__json_new_communityId(o),
+                self::CommunityMemberChats::ID => Self::__json_new_communityMemberChats(o),
                 self::communityMemberStatusCreator::ID => Self::__json_new_communityMemberStatusCreator(o),
                 self::communityMemberStatusAdministrator::ID => Self::__json_new_communityMemberStatusAdministrator(o),
                 self::communityMemberStatusMember::ID => Self::__json_new_communityMemberStatusMember(o),
@@ -434769,6 +445868,8 @@ impl Object {
                 self::emojiStatusTypeCustomEmoji::ID => Self::__json_new_emojiStatusTypeCustomEmoji(o),
                 self::emojiStatusTypeUpgradedGift::ID => Self::__json_new_emojiStatusTypeUpgradedGift(o),
                 self::EmojiStatuses::ID => Self::__json_new_emojiStatuses(o),
+                self::emojiTypeRegular::ID => Self::__json_new_emojiTypeRegular(o),
+                self::emojiTypeCustomEmoji::ID => Self::__json_new_emojiTypeCustomEmoji(o),
                 self::Emojis::ID => Self::__json_new_emojis(o),
                 self::EncryptedCredentials::ID => Self::__json_new_encryptedCredentials(o),
                 self::EncryptedPassportElement::ID => Self::__json_new_encryptedPassportElement(o),
@@ -434991,6 +446092,8 @@ impl Object {
                 self::inputMessageStakeDice::ID => Self::__json_new_inputMessageStakeDice(o),
                 self::inputMessageStory::ID => Self::__json_new_inputMessageStory(o),
                 self::inputMessageChecklist::ID => Self::__json_new_inputMessageChecklist(o),
+                self::inputMessageWidget::ID => Self::__json_new_inputMessageWidget(o),
+                self::inputMessageSharedWidget::ID => Self::__json_new_inputMessageSharedWidget(o),
                 self::inputMessageForwarded::ID => Self::__json_new_inputMessageForwarded(o),
                 self::inputMessageReplyToMessage::ID => Self::__json_new_inputMessageReplyToMessage(o),
                 self::inputMessageReplyToExternalMessage::ID => Self::__json_new_inputMessageReplyToExternalMessage(o),
@@ -435061,12 +446164,13 @@ impl Object {
                 self::InputPollOption::ID => Self::__json_new_inputPollOption(o),
                 self::inputPollTypeRegular::ID => Self::__json_new_inputPollTypeRegular(o),
                 self::inputPollTypeQuiz::ID => Self::__json_new_inputPollTypeQuiz(o),
+                self::inputProfileShareThemeEmoji::ID => Self::__json_new_inputProfileShareThemeEmoji(o),
+                self::inputProfileShareThemeUpgradedGift::ID => Self::__json_new_inputProfileShareThemeUpgradedGift(o),
                 self::InputRichMessage::ID => Self::__json_new_inputRichMessage(o),
                 self::InputRichMessageMedia::ID => Self::__json_new_inputRichMessageMedia(o),
                 self::InputSticker::ID => Self::__json_new_inputSticker(o),
                 self::InputStoryArea::ID => Self::__json_new_inputStoryArea(o),
                 self::inputStoryAreaTypeLocation::ID => Self::__json_new_inputStoryAreaTypeLocation(o),
-                self::inputStoryAreaTypeFoundVenue::ID => Self::__json_new_inputStoryAreaTypeFoundVenue(o),
                 self::inputStoryAreaTypePreviousVenue::ID => Self::__json_new_inputStoryAreaTypePreviousVenue(o),
                 self::inputStoryAreaTypeSuggestedReaction::ID => Self::__json_new_inputStoryAreaTypeSuggestedReaction(o),
                 self::inputStoryAreaTypeMessage::ID => Self::__json_new_inputStoryAreaTypeMessage(o),
@@ -435079,6 +446183,7 @@ impl Object {
                 self::InputSuggestedPostInfo::ID => Self::__json_new_inputSuggestedPostInfo(o),
                 self::InputTextQuote::ID => Self::__json_new_inputTextQuote(o),
                 self::InputThumbnail::ID => Self::__json_new_inputThumbnail(o),
+                self::InputTonWalletCardSticker::ID => Self::__json_new_inputTonWalletCardSticker(o),
                 self::InputVideo::ID => Self::__json_new_inputVideo(o),
                 self::InputVideoNote::ID => Self::__json_new_inputVideoNote(o),
                 self::InputVoiceNote::ID => Self::__json_new_inputVoiceNote(o),
@@ -435266,6 +446371,7 @@ impl Object {
                 self::messagePoll::ID => Self::__json_new_messagePoll(o),
                 self::messageStakeDice::ID => Self::__json_new_messageStakeDice(o),
                 self::messageStory::ID => Self::__json_new_messageStory(o),
+                self::messageWidget::ID => Self::__json_new_messageWidget(o),
                 self::messageChecklist::ID => Self::__json_new_messageChecklist(o),
                 self::messageInvoice::ID => Self::__json_new_messageInvoice(o),
                 self::messageCall::ID => Self::__json_new_messageCall(o),
@@ -435331,6 +446437,7 @@ impl Object {
                 self::messagePaidMessagesRefunded::ID => Self::__json_new_messagePaidMessagesRefunded(o),
                 self::messagePaidMessagePriceChanged::ID => Self::__json_new_messagePaidMessagePriceChanged(o),
                 self::messageDirectMessagePriceChanged::ID => Self::__json_new_messageDirectMessagePriceChanged(o),
+                self::messageUnpaidMessagesAllowedByLink::ID => Self::__json_new_messageUnpaidMessagesAllowedByLink(o),
                 self::messageChecklistTasksDone::ID => Self::__json_new_messageChecklistTasksDone(o),
                 self::messageChecklistTasksAdded::ID => Self::__json_new_messageChecklistTasksAdded(o),
                 self::messageSuggestedPostApprovalFailed::ID => Self::__json_new_messageSuggestedPostApprovalFailed(o),
@@ -435674,6 +446781,10 @@ impl Object {
                 self::ProfileAccentColor::ID => Self::__json_new_profileAccentColor(o),
                 self::ProfileAccentColors::ID => Self::__json_new_profileAccentColors(o),
                 self::ProfilePhoto::ID => Self::__json_new_profilePhoto(o),
+                self::profileShareThemeEmoji::ID => Self::__json_new_profileShareThemeEmoji(o),
+                self::profileShareThemeUpgradedGift::ID => Self::__json_new_profileShareThemeUpgradedGift(o),
+                self::ProfileShareThemeBackdrop::ID => Self::__json_new_profileShareThemeBackdrop(o),
+                self::ProfileShareThemeBackdrops::ID => Self::__json_new_profileShareThemeBackdrops(o),
                 self::profileTabPosts::ID => Self::__json_new_profileTabPosts(o),
                 self::profileTabGifts::ID => Self::__json_new_profileTabGifts(o),
                 self::profileTabMedia::ID => Self::__json_new_profileTabMedia(o),
@@ -435686,6 +446797,7 @@ impl Object {
                 self::proxyTypeSocks5::ID => Self::__json_new_proxyTypeSocks5(o),
                 self::proxyTypeHttp::ID => Self::__json_new_proxyTypeHttp(o),
                 self::proxyTypeMtproto::ID => Self::__json_new_proxyTypeMtproto(o),
+                self::proxyTypeWeb::ID => Self::__json_new_proxyTypeWeb(o),
                 self::publicChatTypeHasUsername::ID => Self::__json_new_publicChatTypeHasUsername(o),
                 self::publicChatTypeIsLocationBased::ID => Self::__json_new_publicChatTypeIsLocationBased(o),
                 self::publicForwardMessage::ID => Self::__json_new_publicForwardMessage(o),
@@ -435919,6 +447031,7 @@ impl Object {
                 self::SharedChat::ID => Self::__json_new_sharedChat(o),
                 self::SharedUser::ID => Self::__json_new_sharedUser(o),
                 self::ShippingOption::ID => Self::__json_new_shippingOption(o),
+                self::SpeechRecognitionLanguages::ID => Self::__json_new_speechRecognitionLanguages(o),
                 self::speechRecognitionResultPending::ID => Self::__json_new_speechRecognitionResultPending(o),
                 self::speechRecognitionResultText::ID => Self::__json_new_speechRecognitionResultText(o),
                 self::speechRecognitionResultError::ID => Self::__json_new_speechRecognitionResultError(o),
@@ -436026,7 +447139,6 @@ impl Object {
                 self::StoryAlbum::ID => Self::__json_new_storyAlbum(o),
                 self::StoryAlbums::ID => Self::__json_new_storyAlbums(o),
                 self::StoryArea::ID => Self::__json_new_storyArea(o),
-                self::StoryAreaPosition::ID => Self::__json_new_storyAreaPosition(o),
                 self::storyAreaTypeLocation::ID => Self::__json_new_storyAreaTypeLocation(o),
                 self::storyAreaTypeVenue::ID => Self::__json_new_storyAreaTypeVenue(o),
                 self::storyAreaTypeSuggestedReaction::ID => Self::__json_new_storyAreaTypeSuggestedReaction(o),
@@ -436155,6 +447267,8 @@ impl Object {
                 self::textParseModeMarkdown::ID => Self::__json_new_textParseModeMarkdown(o),
                 self::textParseModeHTML::ID => Self::__json_new_textParseModeHTML(o),
                 self::TextQuote::ID => Self::__json_new_textQuote(o),
+                self::TextRange::ID => Self::__json_new_textRange(o),
+                self::TextRanges::ID => Self::__json_new_textRanges(o),
                 self::ThemeParameters::ID => Self::__json_new_themeParameters(o),
                 self::ThemeSettings::ID => Self::__json_new_themeSettings(o),
                 self::Thumbnail::ID => Self::__json_new_thumbnail(o),
@@ -436171,6 +447285,7 @@ impl Object {
                 self::tonCenterApiRequestTypePost::ID => Self::__json_new_tonCenterApiRequestTypePost(o),
                 self::TonCenterStreamingApiUrl::ID => Self::__json_new_tonCenterStreamingApiUrl(o),
                 self::TonConnectChallenge::ID => Self::__json_new_tonConnectChallenge(o),
+                self::TonConnectConnectData::ID => Self::__json_new_tonConnectConnectData(o),
                 self::tonConnectConnectItemAddress::ID => Self::__json_new_tonConnectConnectItemAddress(o),
                 self::tonConnectConnectItemProof::ID => Self::__json_new_tonConnectConnectItemProof(o),
                 self::TonConnectConnectRequest::ID => Self::__json_new_tonConnectConnectRequest(o),
@@ -436204,9 +447319,12 @@ impl Object {
                 self::tonTransactionTypeStakeDicePayout::ID => Self::__json_new_tonTransactionTypeStakeDicePayout(o),
                 self::tonTransactionTypeUnsupported::ID => Self::__json_new_tonTransactionTypeUnsupported(o),
                 self::TonTransactions::ID => Self::__json_new_tonTransactions(o),
+                self::TonWalletCard::ID => Self::__json_new_tonWalletCard(o),
+                self::TonWalletCardSticker::ID => Self::__json_new_tonWalletCardSticker(o),
                 self::TonWalletGaslessTransfersInfo::ID => Self::__json_new_tonWalletGaslessTransfersInfo(o),
                 self::TonWalletOwnershipProof::ID => Self::__json_new_tonWalletOwnershipProof(o),
                 self::TonWalletOwnershipProofChallenge::ID => Self::__json_new_tonWalletOwnershipProofChallenge(o),
+                self::TonWalletSecretPhrase::ID => Self::__json_new_tonWalletSecretPhrase(o),
                 self::TonWalletState::ID => Self::__json_new_tonWalletState(o),
                 self::TonWalletTransaction::ID => Self::__json_new_tonWalletTransaction(o),
                 self::tonWalletTransactionStateSucceeded::ID => Self::__json_new_tonWalletTransactionStateSucceeded(o),
@@ -436214,6 +447332,7 @@ impl Object {
                 self::tonWalletTransactionTypeOnRampDeposit::ID => Self::__json_new_tonWalletTransactionTypeOnRampDeposit(o),
                 self::tonWalletTransactionTypeTransfer::ID => Self::__json_new_tonWalletTransactionTypeTransfer(o),
                 self::tonWalletTransactionTypeNftTransfer::ID => Self::__json_new_tonWalletTransactionTypeNftTransfer(o),
+                self::tonWalletTransactionTypeTelegramGiftTransfer::ID => Self::__json_new_tonWalletTransactionTypeTelegramGiftTransfer(o),
                 self::tonWalletTransactionTypeKeyChange::ID => Self::__json_new_tonWalletTransactionTypeKeyChange(o),
                 self::TonWalletTransactions::ID => Self::__json_new_tonWalletTransactions(o),
                 self::tonWalletTransferReceiverUser::ID => Self::__json_new_tonWalletTransferReceiverUser(o),
@@ -436371,6 +447490,9 @@ impl Object {
                 self::updateWebBrowserSettings::ID => Self::__json_new_updateWebBrowserSettings(o),
                 self::updateLanguagePackStrings::ID => Self::__json_new_updateLanguagePackStrings(o),
                 self::updateConnectionState::ID => Self::__json_new_updateConnectionState(o),
+                self::updateWebProxyCarrierOpened::ID => Self::__json_new_updateWebProxyCarrierOpened(o),
+                self::updateWebProxyCarrierData::ID => Self::__json_new_updateWebProxyCarrierData(o),
+                self::updateWebProxyCarrierClosed::ID => Self::__json_new_updateWebProxyCarrierClosed(o),
                 self::updateFreezeState::ID => Self::__json_new_updateFreezeState(o),
                 self::updateAgeVerificationParameters::ID => Self::__json_new_updateAgeVerificationParameters(o),
                 self::updateTermsOfService::ID => Self::__json_new_updateTermsOfService(o),
@@ -436393,6 +447515,7 @@ impl Object {
                 self::updateStarRevenueStatus::ID => Self::__json_new_updateStarRevenueStatus(o),
                 self::updateGramRevenueStatus::ID => Self::__json_new_updateGramRevenueStatus(o),
                 self::updateSpeechRecognitionTrial::ID => Self::__json_new_updateSpeechRecognitionTrial(o),
+                self::updateSpeechRecognitionInFile::ID => Self::__json_new_updateSpeechRecognitionInFile(o),
                 self::updateGroupCallMessageLevels::ID => Self::__json_new_updateGroupCallMessageLevels(o),
                 self::updateDiceEmojis::ID => Self::__json_new_updateDiceEmojis(o),
                 self::updateStakeDiceState::ID => Self::__json_new_updateStakeDiceState(o),
@@ -436413,6 +447536,9 @@ impl Object {
                 self::updateNewCallbackQuery::ID => Self::__json_new_updateNewCallbackQuery(o),
                 self::updateNewInlineCallbackQuery::ID => Self::__json_new_updateNewInlineCallbackQuery(o),
                 self::updateNewBusinessCallbackQuery::ID => Self::__json_new_updateNewBusinessCallbackQuery(o),
+                self::updateNewWidgetQuery::ID => Self::__json_new_updateNewWidgetQuery(o),
+                self::updateNewInlineWidgetQuery::ID => Self::__json_new_updateNewInlineWidgetQuery(o),
+                self::updateNewWidgetCopyQuery::ID => Self::__json_new_updateNewWidgetCopyQuery(o),
                 self::updateNewShippingQuery::ID => Self::__json_new_updateNewShippingQuery(o),
                 self::updateNewPreCheckoutQuery::ID => Self::__json_new_updateNewPreCheckoutQuery(o),
                 self::updateNewCustomEvent::ID => Self::__json_new_updateNewCustomEvent(o),
@@ -436441,7 +447567,9 @@ impl Object {
                 self::UpgradedGiftBackdrop::ID => Self::__json_new_upgradedGiftBackdrop(o),
                 self::UpgradedGiftBackdropColors::ID => Self::__json_new_upgradedGiftBackdropColors(o),
                 self::UpgradedGiftBackdropCount::ID => Self::__json_new_upgradedGiftBackdropCount(o),
+                self::UpgradedGiftCollectionNames::ID => Self::__json_new_upgradedGiftCollectionNames(o),
                 self::UpgradedGiftColors::ID => Self::__json_new_upgradedGiftColors(o),
+                self::UpgradedGiftDepositInfo::ID => Self::__json_new_upgradedGiftDepositInfo(o),
                 self::UpgradedGiftModel::ID => Self::__json_new_upgradedGiftModel(o),
                 self::UpgradedGiftModelCount::ID => Self::__json_new_upgradedGiftModelCount(o),
                 self::upgradedGiftOriginUpgrade::ID => Self::__json_new_upgradedGiftOriginUpgrade(o),
@@ -436526,7 +447654,21 @@ impl Object {
                 self::webBrowserTypeInApp::ID => Self::__json_new_webBrowserTypeInApp(o),
                 self::WebDomainException::ID => Self::__json_new_webDomainException(o),
                 self::WebPageInstantView::ID => Self::__json_new_webPageInstantView(o),
+                self::WebProxyCarrier::ID => Self::__json_new_webProxyCarrier(o),
+                self::webProxyCarrierErrorUnsupported::ID => Self::__json_new_webProxyCarrierErrorUnsupported(o),
+                self::webProxyCarrierErrorPaused::ID => Self::__json_new_webProxyCarrierErrorPaused(o),
+                self::webProxyCarrierErrorLoadFailed::ID => Self::__json_new_webProxyCarrierErrorLoadFailed(o),
+                self::webProxyCarrierErrorTerminated::ID => Self::__json_new_webProxyCarrierErrorTerminated(o),
+                self::webProxyCarrierErrorRefused::ID => Self::__json_new_webProxyCarrierErrorRefused(o),
+                self::webProxyCarrierMessageText::ID => Self::__json_new_webProxyCarrierMessageText(o),
+                self::webProxyCarrierMessageBinary::ID => Self::__json_new_webProxyCarrierMessageBinary(o),
                 self::WelcomeMessage::ID => Self::__json_new_welcomeMessage(o),
+                self::WidgetPublicData::ID => Self::__json_new_widgetPublicData(o),
+                self::WidgetQueryAnswer::ID => Self::__json_new_widgetQueryAnswer(o),
+                self::widgetQueryTypeData::ID => Self::__json_new_widgetQueryTypeData(o),
+                self::widgetQueryTypeSignData::ID => Self::__json_new_widgetQueryTypeSignData(o),
+                self::widgetQueryTypeSentTransaction::ID => Self::__json_new_widgetQueryTypeSentTransaction(o),
+                self::WidgetQueryWallet::ID => Self::__json_new_widgetQueryWallet(o),
                 id => Result::Err(format!("Unknown constructor 0x{:08x}", id as u32)),
             },
             other => Result::Err(format!("Expected String or Integer, but receive {}", other.type_name())),
@@ -436572,6 +447714,7 @@ impl Object {
             Self::animation(v) => v.store_debug(s, field_name),
             Self::animations(v) => v.store_debug(s, field_name),
             Self::archiveChatListSettings(v) => v.store_debug(s, field_name),
+            Self::areaPosition(v) => v.store_debug(s, field_name),
             Self::attachmentMenuBot(v) => v.store_debug(s, field_name),
             Self::attachmentMenuBotColor(v) => v.store_debug(s, field_name),
             Self::attributeCraftPersistenceProbability(v) => v.store_debug(s, field_name),
@@ -436940,11 +448083,15 @@ impl Object {
             Self::collectibleItemInfo(v) => v.store_debug(s, field_name),
             Self::collectibleItemTypeUsername(v) => v.store_debug(s, field_name),
             Self::collectibleItemTypePhoneNumber(v) => v.store_debug(s, field_name),
+            Self::communities(v) => v.store_debug(s, field_name),
             Self::community(v) => v.store_debug(s, field_name),
+            Self::communityAddChatRequest(v) => v.store_debug(s, field_name),
+            Self::communityAddChatRequests(v) => v.store_debug(s, field_name),
             Self::communityAdministratorRights(v) => v.store_debug(s, field_name),
             Self::communityChat(v) => v.store_debug(s, field_name),
             Self::communityFullInfo(v) => v.store_debug(s, field_name),
             Self::communityId(v) => v.store_debug(s, field_name),
+            Self::communityMemberChats(v) => v.store_debug(s, field_name),
             Self::communityMemberStatusCreator(v) => v.store_debug(s, field_name),
             Self::communityMemberStatusAdministrator(v) => v.store_debug(s, field_name),
             Self::communityMemberStatusMember(v) => v.store_debug(s, field_name),
@@ -437036,6 +448183,8 @@ impl Object {
             Self::emojiStatusTypeCustomEmoji(v) => v.store_debug(s, field_name),
             Self::emojiStatusTypeUpgradedGift(v) => v.store_debug(s, field_name),
             Self::emojiStatuses(v) => v.store_debug(s, field_name),
+            Self::emojiTypeRegular(v) => v.store_debug(s, field_name),
+            Self::emojiTypeCustomEmoji(v) => v.store_debug(s, field_name),
             Self::emojis(v) => v.store_debug(s, field_name),
             Self::encryptedCredentials(v) => v.store_debug(s, field_name),
             Self::encryptedPassportElement(v) => v.store_debug(s, field_name),
@@ -437258,6 +448407,8 @@ impl Object {
             Self::inputMessageStakeDice(v) => v.store_debug(s, field_name),
             Self::inputMessageStory(v) => v.store_debug(s, field_name),
             Self::inputMessageChecklist(v) => v.store_debug(s, field_name),
+            Self::inputMessageWidget(v) => v.store_debug(s, field_name),
+            Self::inputMessageSharedWidget(v) => v.store_debug(s, field_name),
             Self::inputMessageForwarded(v) => v.store_debug(s, field_name),
             Self::inputMessageReplyToMessage(v) => v.store_debug(s, field_name),
             Self::inputMessageReplyToExternalMessage(v) => v.store_debug(s, field_name),
@@ -437328,12 +448479,13 @@ impl Object {
             Self::inputPollOption(v) => v.store_debug(s, field_name),
             Self::inputPollTypeRegular(v) => v.store_debug(s, field_name),
             Self::inputPollTypeQuiz(v) => v.store_debug(s, field_name),
+            Self::inputProfileShareThemeEmoji(v) => v.store_debug(s, field_name),
+            Self::inputProfileShareThemeUpgradedGift(v) => v.store_debug(s, field_name),
             Self::inputRichMessage(v) => v.store_debug(s, field_name),
             Self::inputRichMessageMedia(v) => v.store_debug(s, field_name),
             Self::inputSticker(v) => v.store_debug(s, field_name),
             Self::inputStoryArea(v) => v.store_debug(s, field_name),
             Self::inputStoryAreaTypeLocation(v) => v.store_debug(s, field_name),
-            Self::inputStoryAreaTypeFoundVenue(v) => v.store_debug(s, field_name),
             Self::inputStoryAreaTypePreviousVenue(v) => v.store_debug(s, field_name),
             Self::inputStoryAreaTypeSuggestedReaction(v) => v.store_debug(s, field_name),
             Self::inputStoryAreaTypeMessage(v) => v.store_debug(s, field_name),
@@ -437346,6 +448498,7 @@ impl Object {
             Self::inputSuggestedPostInfo(v) => v.store_debug(s, field_name),
             Self::inputTextQuote(v) => v.store_debug(s, field_name),
             Self::inputThumbnail(v) => v.store_debug(s, field_name),
+            Self::inputTonWalletCardSticker(v) => v.store_debug(s, field_name),
             Self::inputVideo(v) => v.store_debug(s, field_name),
             Self::inputVideoNote(v) => v.store_debug(s, field_name),
             Self::inputVoiceNote(v) => v.store_debug(s, field_name),
@@ -437533,6 +448686,7 @@ impl Object {
             Self::messagePoll(v) => v.store_debug(s, field_name),
             Self::messageStakeDice(v) => v.store_debug(s, field_name),
             Self::messageStory(v) => v.store_debug(s, field_name),
+            Self::messageWidget(v) => v.store_debug(s, field_name),
             Self::messageChecklist(v) => v.store_debug(s, field_name),
             Self::messageInvoice(v) => v.store_debug(s, field_name),
             Self::messageCall(v) => v.store_debug(s, field_name),
@@ -437598,6 +448752,7 @@ impl Object {
             Self::messagePaidMessagesRefunded(v) => v.store_debug(s, field_name),
             Self::messagePaidMessagePriceChanged(v) => v.store_debug(s, field_name),
             Self::messageDirectMessagePriceChanged(v) => v.store_debug(s, field_name),
+            Self::messageUnpaidMessagesAllowedByLink(v) => v.store_debug(s, field_name),
             Self::messageChecklistTasksDone(v) => v.store_debug(s, field_name),
             Self::messageChecklistTasksAdded(v) => v.store_debug(s, field_name),
             Self::messageSuggestedPostApprovalFailed(v) => v.store_debug(s, field_name),
@@ -437941,6 +449096,10 @@ impl Object {
             Self::profileAccentColor(v) => v.store_debug(s, field_name),
             Self::profileAccentColors(v) => v.store_debug(s, field_name),
             Self::profilePhoto(v) => v.store_debug(s, field_name),
+            Self::profileShareThemeEmoji(v) => v.store_debug(s, field_name),
+            Self::profileShareThemeUpgradedGift(v) => v.store_debug(s, field_name),
+            Self::profileShareThemeBackdrop(v) => v.store_debug(s, field_name),
+            Self::profileShareThemeBackdrops(v) => v.store_debug(s, field_name),
             Self::profileTabPosts(v) => v.store_debug(s, field_name),
             Self::profileTabGifts(v) => v.store_debug(s, field_name),
             Self::profileTabMedia(v) => v.store_debug(s, field_name),
@@ -437953,6 +449112,7 @@ impl Object {
             Self::proxyTypeSocks5(v) => v.store_debug(s, field_name),
             Self::proxyTypeHttp(v) => v.store_debug(s, field_name),
             Self::proxyTypeMtproto(v) => v.store_debug(s, field_name),
+            Self::proxyTypeWeb(v) => v.store_debug(s, field_name),
             Self::publicChatTypeHasUsername(v) => v.store_debug(s, field_name),
             Self::publicChatTypeIsLocationBased(v) => v.store_debug(s, field_name),
             Self::publicForwardMessage(v) => v.store_debug(s, field_name),
@@ -438186,6 +449346,7 @@ impl Object {
             Self::sharedChat(v) => v.store_debug(s, field_name),
             Self::sharedUser(v) => v.store_debug(s, field_name),
             Self::shippingOption(v) => v.store_debug(s, field_name),
+            Self::speechRecognitionLanguages(v) => v.store_debug(s, field_name),
             Self::speechRecognitionResultPending(v) => v.store_debug(s, field_name),
             Self::speechRecognitionResultText(v) => v.store_debug(s, field_name),
             Self::speechRecognitionResultError(v) => v.store_debug(s, field_name),
@@ -438293,7 +449454,6 @@ impl Object {
             Self::storyAlbum(v) => v.store_debug(s, field_name),
             Self::storyAlbums(v) => v.store_debug(s, field_name),
             Self::storyArea(v) => v.store_debug(s, field_name),
-            Self::storyAreaPosition(v) => v.store_debug(s, field_name),
             Self::storyAreaTypeLocation(v) => v.store_debug(s, field_name),
             Self::storyAreaTypeVenue(v) => v.store_debug(s, field_name),
             Self::storyAreaTypeSuggestedReaction(v) => v.store_debug(s, field_name),
@@ -438422,6 +449582,8 @@ impl Object {
             Self::textParseModeMarkdown(v) => v.store_debug(s, field_name),
             Self::textParseModeHTML(v) => v.store_debug(s, field_name),
             Self::textQuote(v) => v.store_debug(s, field_name),
+            Self::textRange(v) => v.store_debug(s, field_name),
+            Self::textRanges(v) => v.store_debug(s, field_name),
             Self::themeParameters(v) => v.store_debug(s, field_name),
             Self::themeSettings(v) => v.store_debug(s, field_name),
             Self::thumbnail(v) => v.store_debug(s, field_name),
@@ -438438,6 +449600,7 @@ impl Object {
             Self::tonCenterApiRequestTypePost(v) => v.store_debug(s, field_name),
             Self::tonCenterStreamingApiUrl(v) => v.store_debug(s, field_name),
             Self::tonConnectChallenge(v) => v.store_debug(s, field_name),
+            Self::tonConnectConnectData(v) => v.store_debug(s, field_name),
             Self::tonConnectConnectItemAddress(v) => v.store_debug(s, field_name),
             Self::tonConnectConnectItemProof(v) => v.store_debug(s, field_name),
             Self::tonConnectConnectRequest(v) => v.store_debug(s, field_name),
@@ -438471,9 +449634,12 @@ impl Object {
             Self::tonTransactionTypeStakeDicePayout(v) => v.store_debug(s, field_name),
             Self::tonTransactionTypeUnsupported(v) => v.store_debug(s, field_name),
             Self::tonTransactions(v) => v.store_debug(s, field_name),
+            Self::tonWalletCard(v) => v.store_debug(s, field_name),
+            Self::tonWalletCardSticker(v) => v.store_debug(s, field_name),
             Self::tonWalletGaslessTransfersInfo(v) => v.store_debug(s, field_name),
             Self::tonWalletOwnershipProof(v) => v.store_debug(s, field_name),
             Self::tonWalletOwnershipProofChallenge(v) => v.store_debug(s, field_name),
+            Self::tonWalletSecretPhrase(v) => v.store_debug(s, field_name),
             Self::tonWalletState(v) => v.store_debug(s, field_name),
             Self::tonWalletTransaction(v) => v.store_debug(s, field_name),
             Self::tonWalletTransactionStateSucceeded(v) => v.store_debug(s, field_name),
@@ -438481,6 +449647,7 @@ impl Object {
             Self::tonWalletTransactionTypeOnRampDeposit(v) => v.store_debug(s, field_name),
             Self::tonWalletTransactionTypeTransfer(v) => v.store_debug(s, field_name),
             Self::tonWalletTransactionTypeNftTransfer(v) => v.store_debug(s, field_name),
+            Self::tonWalletTransactionTypeTelegramGiftTransfer(v) => v.store_debug(s, field_name),
             Self::tonWalletTransactionTypeKeyChange(v) => v.store_debug(s, field_name),
             Self::tonWalletTransactions(v) => v.store_debug(s, field_name),
             Self::tonWalletTransferReceiverUser(v) => v.store_debug(s, field_name),
@@ -438638,6 +449805,9 @@ impl Object {
             Self::updateWebBrowserSettings(v) => v.store_debug(s, field_name),
             Self::updateLanguagePackStrings(v) => v.store_debug(s, field_name),
             Self::updateConnectionState(v) => v.store_debug(s, field_name),
+            Self::updateWebProxyCarrierOpened(v) => v.store_debug(s, field_name),
+            Self::updateWebProxyCarrierData(v) => v.store_debug(s, field_name),
+            Self::updateWebProxyCarrierClosed(v) => v.store_debug(s, field_name),
             Self::updateFreezeState(v) => v.store_debug(s, field_name),
             Self::updateAgeVerificationParameters(v) => v.store_debug(s, field_name),
             Self::updateTermsOfService(v) => v.store_debug(s, field_name),
@@ -438660,6 +449830,7 @@ impl Object {
             Self::updateStarRevenueStatus(v) => v.store_debug(s, field_name),
             Self::updateGramRevenueStatus(v) => v.store_debug(s, field_name),
             Self::updateSpeechRecognitionTrial(v) => v.store_debug(s, field_name),
+            Self::updateSpeechRecognitionInFile(v) => v.store_debug(s, field_name),
             Self::updateGroupCallMessageLevels(v) => v.store_debug(s, field_name),
             Self::updateDiceEmojis(v) => v.store_debug(s, field_name),
             Self::updateStakeDiceState(v) => v.store_debug(s, field_name),
@@ -438680,6 +449851,9 @@ impl Object {
             Self::updateNewCallbackQuery(v) => v.store_debug(s, field_name),
             Self::updateNewInlineCallbackQuery(v) => v.store_debug(s, field_name),
             Self::updateNewBusinessCallbackQuery(v) => v.store_debug(s, field_name),
+            Self::updateNewWidgetQuery(v) => v.store_debug(s, field_name),
+            Self::updateNewInlineWidgetQuery(v) => v.store_debug(s, field_name),
+            Self::updateNewWidgetCopyQuery(v) => v.store_debug(s, field_name),
             Self::updateNewShippingQuery(v) => v.store_debug(s, field_name),
             Self::updateNewPreCheckoutQuery(v) => v.store_debug(s, field_name),
             Self::updateNewCustomEvent(v) => v.store_debug(s, field_name),
@@ -438708,7 +449882,9 @@ impl Object {
             Self::upgradedGiftBackdrop(v) => v.store_debug(s, field_name),
             Self::upgradedGiftBackdropColors(v) => v.store_debug(s, field_name),
             Self::upgradedGiftBackdropCount(v) => v.store_debug(s, field_name),
+            Self::upgradedGiftCollectionNames(v) => v.store_debug(s, field_name),
             Self::upgradedGiftColors(v) => v.store_debug(s, field_name),
+            Self::upgradedGiftDepositInfo(v) => v.store_debug(s, field_name),
             Self::upgradedGiftModel(v) => v.store_debug(s, field_name),
             Self::upgradedGiftModelCount(v) => v.store_debug(s, field_name),
             Self::upgradedGiftOriginUpgrade(v) => v.store_debug(s, field_name),
@@ -438793,7 +449969,21 @@ impl Object {
             Self::webBrowserTypeInApp(v) => v.store_debug(s, field_name),
             Self::webDomainException(v) => v.store_debug(s, field_name),
             Self::webPageInstantView(v) => v.store_debug(s, field_name),
+            Self::webProxyCarrier(v) => v.store_debug(s, field_name),
+            Self::webProxyCarrierErrorUnsupported(v) => v.store_debug(s, field_name),
+            Self::webProxyCarrierErrorPaused(v) => v.store_debug(s, field_name),
+            Self::webProxyCarrierErrorLoadFailed(v) => v.store_debug(s, field_name),
+            Self::webProxyCarrierErrorTerminated(v) => v.store_debug(s, field_name),
+            Self::webProxyCarrierErrorRefused(v) => v.store_debug(s, field_name),
+            Self::webProxyCarrierMessageText(v) => v.store_debug(s, field_name),
+            Self::webProxyCarrierMessageBinary(v) => v.store_debug(s, field_name),
             Self::welcomeMessage(v) => v.store_debug(s, field_name),
+            Self::widgetPublicData(v) => v.store_debug(s, field_name),
+            Self::widgetQueryAnswer(v) => v.store_debug(s, field_name),
+            Self::widgetQueryTypeData(v) => v.store_debug(s, field_name),
+            Self::widgetQueryTypeSignData(v) => v.store_debug(s, field_name),
+            Self::widgetQueryTypeSentTransaction(v) => v.store_debug(s, field_name),
+            Self::widgetQueryWallet(v) => v.store_debug(s, field_name),
         }
     }
 }
@@ -438940,6 +450130,9 @@ impl Update {
             Object::updateWebBrowserSettings(v) => Result::Ok(Update::updateWebBrowserSettings(v)),
             Object::updateLanguagePackStrings(v) => Result::Ok(Update::updateLanguagePackStrings(v)),
             Object::updateConnectionState(v) => Result::Ok(Update::updateConnectionState(v)),
+            Object::updateWebProxyCarrierOpened(v) => Result::Ok(Update::updateWebProxyCarrierOpened(v)),
+            Object::updateWebProxyCarrierData(v) => Result::Ok(Update::updateWebProxyCarrierData(v)),
+            Object::updateWebProxyCarrierClosed(v) => Result::Ok(Update::updateWebProxyCarrierClosed(v)),
             Object::updateFreezeState(v) => Result::Ok(Update::updateFreezeState(v)),
             Object::updateAgeVerificationParameters(v) => Result::Ok(Update::updateAgeVerificationParameters(v)),
             Object::updateTermsOfService(v) => Result::Ok(Update::updateTermsOfService(v)),
@@ -438962,6 +450155,7 @@ impl Update {
             Object::updateStarRevenueStatus(v) => Result::Ok(Update::updateStarRevenueStatus(v)),
             Object::updateGramRevenueStatus(v) => Result::Ok(Update::updateGramRevenueStatus(v)),
             Object::updateSpeechRecognitionTrial(v) => Result::Ok(Update::updateSpeechRecognitionTrial(v)),
+            Object::updateSpeechRecognitionInFile(v) => Result::Ok(Update::updateSpeechRecognitionInFile(v)),
             Object::updateGroupCallMessageLevels(v) => Result::Ok(Update::updateGroupCallMessageLevels(v)),
             Object::updateDiceEmojis(v) => Result::Ok(Update::updateDiceEmojis(v)),
             Object::updateStakeDiceState(v) => Result::Ok(Update::updateStakeDiceState(v)),
@@ -438982,6 +450176,9 @@ impl Update {
             Object::updateNewCallbackQuery(v) => Result::Ok(Update::updateNewCallbackQuery(v)),
             Object::updateNewInlineCallbackQuery(v) => Result::Ok(Update::updateNewInlineCallbackQuery(v)),
             Object::updateNewBusinessCallbackQuery(v) => Result::Ok(Update::updateNewBusinessCallbackQuery(v)),
+            Object::updateNewWidgetQuery(v) => Result::Ok(Update::updateNewWidgetQuery(v)),
+            Object::updateNewInlineWidgetQuery(v) => Result::Ok(Update::updateNewInlineWidgetQuery(v)),
+            Object::updateNewWidgetCopyQuery(v) => Result::Ok(Update::updateNewWidgetCopyQuery(v)),
             Object::updateNewShippingQuery(v) => Result::Ok(Update::updateNewShippingQuery(v)),
             Object::updateNewPreCheckoutQuery(v) => Result::Ok(Update::updateNewPreCheckoutQuery(v)),
             Object::updateNewCustomEvent(v) => Result::Ok(Update::updateNewCustomEvent(v)),
@@ -439001,9 +450198,9 @@ impl Update {
     }
 }
 
-pub const SCHEME_TYPES: usize = 792;
-pub const SCHEME_CTORS: usize = 2260;
-pub const SCHEME_FUNCTIONS: usize = 1065;
+pub const SCHEME_TYPES: usize = 818;
+pub const SCHEME_CTORS: usize = 2308;
+pub const SCHEME_FUNCTIONS: usize = 1099;
 pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "acceptCall",
     "acceptOauthRequest",
@@ -439017,6 +450214,7 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "addChatToList",
     "addChatWelcomeMessage",
     "addChecklistTasks",
+    "addCommunityChat",
     "addContact",
     "addCustomServerLanguagePack",
     "addFavoriteSticker",
@@ -439055,7 +450253,9 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "answerShippingQuery",
     "answerTonConnectRequest",
     "answerWebAppQuery",
+    "answerWidgetQuery",
     "applyPremiumGiftCode",
+    "applyUnpaidMessagesToken",
     "approveSuggestedPost",
     "assignStoreTransaction",
     "banChatMember",
@@ -439189,6 +450389,7 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "deleteEphemeralMessage",
     "deleteFile",
     "deleteForumTopic",
+    "deleteGift",
     "deleteGiftCollection",
     "deleteGroupCallMessages",
     "deleteGroupCallMessagesBySender",
@@ -439222,6 +450423,7 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "disconnectTonConnectSession",
     "disconnectWebsite",
     "dismissWebToken",
+    "displayUpgradedGift",
     "downloadFile",
     "dropGiftOriginalDetails",
     "editBotMediaPreview",
@@ -439247,6 +450449,7 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "editInlineMessageMedia",
     "editInlineMessageReplyMarkup",
     "editInlineMessageText",
+    "editInlineMessageWidgetData",
     "editMessageCaption",
     "editMessageChecklist",
     "editMessageLiveLocation",
@@ -439254,13 +450457,16 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "editMessageReplyMarkup",
     "editMessageSchedulingState",
     "editMessageText",
+    "editMessageWidgetData",
     "editProxy",
     "editQuickReplyMessage",
     "editStarSubscription",
     "editStory",
     "editStoryCover",
+    "editStoryMusic",
     "editTextCompositionStyle",
     "editUserStarSubscription",
+    "editWidgetData",
     "enableProxy",
     "enableTonWalletBackup",
     "encryptGroupCallData",
@@ -439268,6 +450474,8 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "endGroupCallRecording",
     "endGroupCallScreenSharing",
     "finishFileGeneration",
+    "fixRecognizedRichMessageWithAi",
+    "fixRecognizedTextWithAi",
     "fixRichMessageWithAi",
     "fixTextWithAi",
     "forwardMessages",
@@ -439361,7 +450569,9 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "getCloseFriends",
     "getCollectibleItemInfo",
     "getCommands",
+    "getCommunityAddChatRequests",
     "getCommunityFullInfo",
+    "getCommunityMemberChats",
     "getConnectedAffiliateProgram",
     "getConnectedAffiliatePrograms",
     "getConnectedWebsites",
@@ -439431,6 +450641,7 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "getInstalledStickerSets",
     "getInternalLink",
     "getInternalLinkType",
+    "getJoinedCommunities",
     "getJsonString",
     "getJsonValue",
     "getKeywordEmojis",
@@ -439513,6 +450724,7 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "getPremiumStickers",
     "getPreparedInlineMessage",
     "getPreparedKeyboardButton",
+    "getProfileShareThemeBackdrops",
     "getProxies",
     "getPublicPostSearchLimits",
     "getPushReceiverId",
@@ -439540,6 +450752,7 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "getSearchSponsoredChats",
     "getSearchedForTags",
     "getSecretChat",
+    "getSpeechRecognitionLanguages",
     "getStakeDiceState",
     "getStarAdAccountUrl",
     "getStarGiftPaymentOptions",
@@ -439567,6 +450780,7 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "getStoryStatistics",
     "getSuggestedFileName",
     "getSuggestedStickerSetName",
+    "getSuitableCommunityChats",
     "getSuitableDiscussionChats",
     "getSuitablePersonalChats",
     "getSupergroup",
@@ -439576,6 +450790,7 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "getSupportUser",
     "getTemporaryPasswordState",
     "getTextCompositionStyleExample",
+    "getTextEmojiRanges",
     "getTextEntities",
     "getThemeParametersJsonString",
     "getThemedChatEmojiStatuses",
@@ -439587,6 +450802,7 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "getTonConnectSessionPendingRequests",
     "getTonConnectSessions",
     "getTonTransactions",
+    "getTonWalletCardBackgroundGiftCollectionNames",
     "getTonWalletNfts",
     "getTonWalletOwnershipProofChallenge",
     "getTonWalletSecretPhrase",
@@ -439596,6 +450812,7 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "getTopChats",
     "getTrendingStickerSets",
     "getUpgradedGift",
+    "getUpgradedGiftDepositInfo",
     "getUpgradedGiftEmojiStatuses",
     "getUpgradedGiftValueInfo",
     "getUpgradedGiftVariants",
@@ -439618,6 +450835,8 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "getWebAppPlaceholder",
     "getWebAppUrl",
     "getWebPageInstantView",
+    "getWidgetPublicData",
+    "getWidgetQueryAnswer",
     "giftPremiumWithStars",
     "hideContactCloseBirthdays",
     "hideSuggestedAction",
@@ -439669,8 +450888,11 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "processChatHasProtectedContentDisableRequest",
     "processChatJoinRequest",
     "processChatJoinRequests",
+    "processCommunityAddChatRequest",
+    "processCommunityAddChatRequests",
     "processGiftPurchaseOffer",
     "processPushNotification",
+    "processWebProxyCarrierMessage",
     "rateSpeechRecognition",
     "readAllChatMentions",
     "readAllChatPollVotes",
@@ -439684,6 +450906,7 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "readFilePart",
     "readdQuickReplyShortcutMessages",
     "recognizeSpeech",
+    "recognizeSpeechInFile",
     "recoverAuthenticationPassword",
     "recoverPassword",
     "refundStarPayment",
@@ -439693,6 +450916,7 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "removeAllWebBrowserSettingsExceptions",
     "removeBusinessConnectedBotFromChat",
     "removeChatActionBar",
+    "removeCommunityChat",
     "removeContacts",
     "removeFavoriteSticker",
     "removeFileFromDownloads",
@@ -439746,6 +450970,7 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "reportSupergroupAntiSpamFalsePositive",
     "reportSupergroupSpam",
     "reportVideoMessageAdvertisement",
+    "reportWebProxyCarrierError",
     "requestAuthenticationPasswordRecovery",
     "requestPasswordRecovery",
     "requestQrCodeAuthentication",
@@ -439892,6 +451117,7 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "setCloseFriends",
     "setCommands",
     "setCommunityName",
+    "setCommunityNotificationSettings",
     "setCommunityPermissions",
     "setCommunityPhoto",
     "setCustomEmojiStickerSetThumbnail",
@@ -439945,6 +451171,7 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "setProfileAccentColor",
     "setProfileAudioPosition",
     "setProfilePhoto",
+    "setProfileShareTheme",
     "setQuickReplyShortcutName",
     "setReactionNotificationSettings",
     "setReadDatePrivacySettings",
@@ -439967,6 +451194,7 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "setSupergroupUsername",
     "setTdlibParameters",
     "setTonConnectSessionWalletClientId",
+    "setTonWalletCardStickers",
     "setUpgradedGiftColors",
     "setUserEmojiStatus",
     "setUserNote",
@@ -440018,6 +451246,8 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "toggleChatIsPinned",
     "toggleChatIsTranslatable",
     "toggleChatViewAsTopics",
+    "toggleCommunityAreChatsCollapsed",
+    "toggleCommunityMemberIsBanned",
     "toggleDirectMessagesChatTopicCanSendUnpaidMessages",
     "toggleDownloadIsPaused",
     "toggleForumTopicIsClosed",
@@ -440069,10 +451299,11 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "viewSponsoredChat",
     "viewTrendingStickerSets",
     "viewVideoMessageAdvertisement",
+    "withdrawUpgradedGift",
     "writeGeneratedFilePart",
 ];
-pub const GENERATED_STRUCTS: usize = 3316;
-pub const GENERATED_ENUMS: usize = 219;
+pub const GENERATED_STRUCTS: usize = 3398;
+pub const GENERATED_ENUMS: usize = 225;
 #[cfg(test)]
 #[allow(non_snake_case, dead_code)]
 pub mod samples {
@@ -440191,6 +451422,10 @@ pub mod samples {
 
     pub fn t_ArchiveChatListSettings(depth: u32) -> ArchiveChatListSettings {
         s_ArchiveChatListSettings(depth)
+    }
+
+    pub fn t_AreaPosition(depth: u32) -> AreaPosition {
+        s_AreaPosition(depth)
     }
 
     pub fn t_AttachmentMenuBot(depth: u32) -> AttachmentMenuBot {
@@ -440841,8 +452076,20 @@ pub mod samples {
         CollectibleItemType::collectibleItemTypeUsername(s_collectibleItemTypeUsername(depth))
     }
 
+    pub fn t_Communities(depth: u32) -> Communities {
+        s_Communities(depth)
+    }
+
     pub fn t_Community(depth: u32) -> Community {
         s_Community(depth)
+    }
+
+    pub fn t_CommunityAddChatRequest(depth: u32) -> CommunityAddChatRequest {
+        s_CommunityAddChatRequest(depth)
+    }
+
+    pub fn t_CommunityAddChatRequests(depth: u32) -> CommunityAddChatRequests {
+        s_CommunityAddChatRequests(depth)
     }
 
     pub fn t_CommunityAdministratorRights(depth: u32) -> CommunityAdministratorRights {
@@ -440859,6 +452106,10 @@ pub mod samples {
 
     pub fn t_CommunityId(depth: u32) -> CommunityId {
         s_CommunityId(depth)
+    }
+
+    pub fn t_CommunityMemberChats(depth: u32) -> CommunityMemberChats {
+        s_CommunityMemberChats(depth)
     }
 
     pub fn t_CommunityMemberStatus(depth: u32) -> CommunityMemberStatus {
@@ -441063,6 +452314,10 @@ pub mod samples {
 
     pub fn t_EmojiStatuses(depth: u32) -> EmojiStatuses {
         s_EmojiStatuses(depth)
+    }
+
+    pub fn t_EmojiType(depth: u32) -> EmojiType {
+        EmojiType::emojiTypeRegular(s_emojiTypeRegular(depth))
     }
 
     pub fn t_Emojis(depth: u32) -> Emojis {
@@ -441577,6 +452832,10 @@ pub mod samples {
         InputPollType::inputPollTypeRegular(s_inputPollTypeRegular(depth))
     }
 
+    pub fn t_InputProfileShareTheme(depth: u32) -> InputProfileShareTheme {
+        InputProfileShareTheme::inputProfileShareThemeEmoji(s_inputProfileShareThemeEmoji(depth))
+    }
+
     pub fn t_InputRichMessage(depth: u32) -> InputRichMessage {
         if depth == 0 {
             s_InputRichMessage(0)
@@ -441623,6 +452882,10 @@ pub mod samples {
 
     pub fn t_InputThumbnail(depth: u32) -> InputThumbnail {
         s_InputThumbnail(depth)
+    }
+
+    pub fn t_InputTonWalletCardSticker(depth: u32) -> InputTonWalletCardSticker {
+        s_InputTonWalletCardSticker(depth)
     }
 
     pub fn t_InputVideo(depth: u32) -> InputVideo {
@@ -442297,6 +453560,18 @@ pub mod samples {
         s_ProfilePhoto(depth)
     }
 
+    pub fn t_ProfileShareTheme(depth: u32) -> ProfileShareTheme {
+        ProfileShareTheme::profileShareThemeEmoji(s_profileShareThemeEmoji(depth))
+    }
+
+    pub fn t_ProfileShareThemeBackdrop(depth: u32) -> ProfileShareThemeBackdrop {
+        s_ProfileShareThemeBackdrop(depth)
+    }
+
+    pub fn t_ProfileShareThemeBackdrops(depth: u32) -> ProfileShareThemeBackdrops {
+        s_ProfileShareThemeBackdrops(depth)
+    }
+
     pub fn t_ProfileTab(depth: u32) -> ProfileTab {
         ProfileTab::profileTabPosts(s_profileTabPosts(depth))
     }
@@ -442541,6 +453816,10 @@ pub mod samples {
         s_ShippingOption(depth)
     }
 
+    pub fn t_SpeechRecognitionLanguages(depth: u32) -> SpeechRecognitionLanguages {
+        s_SpeechRecognitionLanguages(depth)
+    }
+
     pub fn t_SpeechRecognitionResult(depth: u32) -> SpeechRecognitionResult {
         SpeechRecognitionResult::speechRecognitionResultPending(s_speechRecognitionResultPending(depth))
     }
@@ -442715,10 +453994,6 @@ pub mod samples {
 
     pub fn t_StoryArea(depth: u32) -> StoryArea {
         s_StoryArea(depth)
-    }
-
-    pub fn t_StoryAreaPosition(depth: u32) -> StoryAreaPosition {
-        s_StoryAreaPosition(depth)
     }
 
     pub fn t_StoryAreaType(depth: u32) -> StoryAreaType {
@@ -442909,6 +454184,14 @@ pub mod samples {
         s_TextQuote(depth)
     }
 
+    pub fn t_TextRange(depth: u32) -> TextRange {
+        s_TextRange(depth)
+    }
+
+    pub fn t_TextRanges(depth: u32) -> TextRanges {
+        s_TextRanges(depth)
+    }
+
     pub fn t_ThemeParameters(depth: u32) -> ThemeParameters {
         s_ThemeParameters(depth)
     }
@@ -442943,6 +454226,10 @@ pub mod samples {
 
     pub fn t_TonConnectChallenge(depth: u32) -> TonConnectChallenge {
         s_TonConnectChallenge(depth)
+    }
+
+    pub fn t_TonConnectConnectData(depth: u32) -> TonConnectConnectData {
+        s_TonConnectConnectData(depth)
     }
 
     pub fn t_TonConnectConnectItem(depth: u32) -> TonConnectConnectItem {
@@ -443009,6 +454296,14 @@ pub mod samples {
         s_TonTransactions(depth)
     }
 
+    pub fn t_TonWalletCard(depth: u32) -> TonWalletCard {
+        s_TonWalletCard(depth)
+    }
+
+    pub fn t_TonWalletCardSticker(depth: u32) -> TonWalletCardSticker {
+        s_TonWalletCardSticker(depth)
+    }
+
     pub fn t_TonWalletGaslessTransfersInfo(depth: u32) -> TonWalletGaslessTransfersInfo {
         s_TonWalletGaslessTransfersInfo(depth)
     }
@@ -443019,6 +454314,10 @@ pub mod samples {
 
     pub fn t_TonWalletOwnershipProofChallenge(depth: u32) -> TonWalletOwnershipProofChallenge {
         s_TonWalletOwnershipProofChallenge(depth)
+    }
+
+    pub fn t_TonWalletSecretPhrase(depth: u32) -> TonWalletSecretPhrase {
+        s_TonWalletSecretPhrase(depth)
     }
 
     pub fn t_TonWalletState(depth: u32) -> TonWalletState {
@@ -443105,8 +454404,16 @@ pub mod samples {
         s_UpgradedGiftBackdropCount(depth)
     }
 
+    pub fn t_UpgradedGiftCollectionNames(depth: u32) -> UpgradedGiftCollectionNames {
+        s_UpgradedGiftCollectionNames(depth)
+    }
+
     pub fn t_UpgradedGiftColors(depth: u32) -> UpgradedGiftColors {
         s_UpgradedGiftColors(depth)
+    }
+
+    pub fn t_UpgradedGiftDepositInfo(depth: u32) -> UpgradedGiftDepositInfo {
+        s_UpgradedGiftDepositInfo(depth)
     }
 
     pub fn t_UpgradedGiftModel(depth: u32) -> UpgradedGiftModel {
@@ -443281,8 +454588,36 @@ pub mod samples {
         s_WebPageInstantView(depth)
     }
 
+    pub fn t_WebProxyCarrier(depth: u32) -> WebProxyCarrier {
+        s_WebProxyCarrier(depth)
+    }
+
+    pub fn t_WebProxyCarrierError(depth: u32) -> WebProxyCarrierError {
+        WebProxyCarrierError::webProxyCarrierErrorUnsupported(s_webProxyCarrierErrorUnsupported(depth))
+    }
+
+    pub fn t_WebProxyCarrierMessage(depth: u32) -> WebProxyCarrierMessage {
+        WebProxyCarrierMessage::webProxyCarrierMessageText(s_webProxyCarrierMessageText(depth))
+    }
+
     pub fn t_WelcomeMessage(depth: u32) -> WelcomeMessage {
         s_WelcomeMessage(depth)
+    }
+
+    pub fn t_WidgetPublicData(depth: u32) -> WidgetPublicData {
+        s_WidgetPublicData(depth)
+    }
+
+    pub fn t_WidgetQueryAnswer(depth: u32) -> WidgetQueryAnswer {
+        s_WidgetQueryAnswer(depth)
+    }
+
+    pub fn t_WidgetQueryType(depth: u32) -> WidgetQueryType {
+        WidgetQueryType::widgetQueryTypeData(s_widgetQueryTypeData(depth))
+    }
+
+    pub fn t_WidgetQueryWallet(depth: u32) -> WidgetQueryWallet {
+        s_WidgetQueryWallet(depth)
     }
 
     pub fn t_Function(depth: u32) -> Function {
@@ -443538,6 +454873,18 @@ pub mod samples {
             archive_and_mute_new_chats_from_unknown_users: true,
             keep_unmuted_chats_archived: true,
             keep_chats_from_folders_archived: true,
+        }
+    }
+
+    pub fn s_AreaPosition(depth: u32) -> AreaPosition {
+        let _ = depth;
+        AreaPosition {
+            x_percentage: 1.5f64,
+            y_percentage: 1.5f64,
+            width_percentage: 1.5f64,
+            height_percentage: 1.5f64,
+            rotation_angle: 1.5f64,
+            corner_radius_percentage: 1.5f64,
         }
     }
 
@@ -446525,6 +457872,13 @@ pub mod samples {
         }
     }
 
+    pub fn s_Communities(depth: u32) -> Communities {
+        let _ = depth;
+        Communities {
+            community_ids: if depth == 0 { Vec::new() } else { vec![0x1234_5678_9abc_def0i64] },
+        }
+    }
+
     pub fn s_Community(depth: u32) -> Community {
         let _ = depth;
         Community {
@@ -446535,6 +457889,26 @@ pub mod samples {
             date: 0x1234_5678i32,
             status: Some(t_CommunityMemberStatus((depth).saturating_sub(1))),
             permissions: Some(t_CommunityPermissions((depth).saturating_sub(1))),
+            are_chats_collapsed: true,
+        }
+    }
+
+    pub fn s_CommunityAddChatRequest(depth: u32) -> CommunityAddChatRequest {
+        let _ = depth;
+        CommunityAddChatRequest {
+            chat_id: 0x1234_5678_9abc_def0i64,
+            is_hidden: true,
+            sender_user_id: 0x1234_5678_9abc_def0i64,
+            date: 0x1234_5678i32,
+        }
+    }
+
+    pub fn s_CommunityAddChatRequests(depth: u32) -> CommunityAddChatRequests {
+        let _ = depth;
+        CommunityAddChatRequests {
+            total_count: 0x1234_5678i32,
+            requests: if depth == 0 { Vec::new() } else { vec![t_CommunityAddChatRequest((depth - 1).saturating_sub(1))] },
+            next_offset: "tl-sample".to_owned(),
         }
     }
 
@@ -446566,6 +457940,7 @@ pub mod samples {
             administrator_count: 0x1234_5678i32,
             banned_count: 0x1234_5678i32,
             add_chat_request_count: 0x1234_5678i32,
+            notification_settings: Some(t_ChatNotificationSettings((depth).saturating_sub(1))),
         }
     }
 
@@ -446573,6 +457948,14 @@ pub mod samples {
         let _ = depth;
         CommunityId {
             id: 0x1234_5678_9abc_def0i64,
+        }
+    }
+
+    pub fn s_CommunityMemberChats(depth: u32) -> CommunityMemberChats {
+        let _ = depth;
+        CommunityMemberChats {
+            owned_chat_ids: if depth == 0 { Vec::new() } else { vec![0x1234_5678_9abc_def0i64] },
+            joined_chat_ids: if depth == 0 { Vec::new() } else { vec![0x1234_5678_9abc_def0i64] },
         }
     }
 
@@ -447267,6 +458650,20 @@ pub mod samples {
         let _ = depth;
         EmojiStatuses {
             emoji_statuses: if depth == 0 { Vec::new() } else { vec![t_EmojiStatus((depth - 1).saturating_sub(1))] },
+        }
+    }
+
+    pub fn s_emojiTypeRegular(depth: u32) -> emojiTypeRegular {
+        let _ = depth;
+        emojiTypeRegular {
+            emoji: "tl-sample".to_owned(),
+        }
+    }
+
+    pub fn s_emojiTypeCustomEmoji(depth: u32) -> emojiTypeCustomEmoji {
+        let _ = depth;
+        emojiTypeCustomEmoji {
+            custom_emoji_id: 0x1234_5678_9abc_def0i64,
         }
     }
 
@@ -449190,6 +460587,31 @@ pub mod samples {
         }
     }
 
+    pub fn s_inputMessageWidget(depth: u32) -> inputMessageWidget {
+        let _ = depth;
+        inputMessageWidget {
+            width: 0x1234_5678i32,
+            height: 0x1234_5678i32,
+            html: "tl-sample".to_owned(),
+            public_data: "tl-sample".to_owned(),
+            chat_data: "tl-sample".to_owned(),
+            caption: Some(t_FormattedText((depth).saturating_sub(1))),
+            show_caption_above_media: true,
+            allow_queries: true,
+            is_shared: true,
+        }
+    }
+
+    pub fn s_inputMessageSharedWidget(depth: u32) -> inputMessageSharedWidget {
+        let _ = depth;
+        inputMessageSharedWidget {
+            widget_id: 0x1234_5678_9abc_def0i64,
+            chat_data: "tl-sample".to_owned(),
+            caption: Some(t_FormattedText((depth).saturating_sub(1))),
+            show_caption_above_media: true,
+        }
+    }
+
     pub fn s_inputMessageForwarded(depth: u32) -> inputMessageForwarded {
         let _ = depth;
         inputMessageForwarded {
@@ -449742,6 +461164,22 @@ pub mod samples {
         }
     }
 
+    pub fn s_inputProfileShareThemeEmoji(depth: u32) -> inputProfileShareThemeEmoji {
+        let _ = depth;
+        inputProfileShareThemeEmoji {
+            emojis: if depth == 0 { Vec::new() } else { vec![t_EmojiType((depth - 1).saturating_sub(1))] },
+            use_default_background: true,
+            background_backdrop_id: 0x1234_5678i32,
+        }
+    }
+
+    pub fn s_inputProfileShareThemeUpgradedGift(depth: u32) -> inputProfileShareThemeUpgradedGift {
+        let _ = depth;
+        inputProfileShareThemeUpgradedGift {
+            received_gift_id: "tl-sample".to_owned(),
+        }
+    }
+
     pub fn s_InputRichMessage(depth: u32) -> InputRichMessage {
         let _ = depth;
         InputRichMessage {
@@ -449772,7 +461210,7 @@ pub mod samples {
     pub fn s_InputStoryArea(depth: u32) -> InputStoryArea {
         let _ = depth;
         InputStoryArea {
-            position: Some(t_StoryAreaPosition((depth).saturating_sub(1))),
+            position: Some(t_AreaPosition((depth).saturating_sub(1))),
             r#type: Some(t_InputStoryAreaType((depth).saturating_sub(1))),
         }
     }
@@ -449782,14 +461220,6 @@ pub mod samples {
         inputStoryAreaTypeLocation {
             location: Some(t_Location((depth).saturating_sub(1))),
             address: Some(t_LocationAddress((depth).saturating_sub(1))),
-        }
-    }
-
-    pub fn s_inputStoryAreaTypeFoundVenue(depth: u32) -> inputStoryAreaTypeFoundVenue {
-        let _ = depth;
-        inputStoryAreaTypeFoundVenue {
-            query_id: 0x1234_5678_9abc_def0i64,
-            result_id: "tl-sample".to_owned(),
         }
     }
 
@@ -449879,6 +461309,7 @@ pub mod samples {
         let _ = depth;
         InputTextQuote {
             text: Some(t_FormattedText((depth).saturating_sub(1))),
+            rich_texts: if depth == 0 { Vec::new() } else { vec![Box::new(t_RichText((depth - 1).saturating_sub(1)))] },
             position: 0x1234_5678i32,
         }
     }
@@ -449889,6 +461320,14 @@ pub mod samples {
             thumbnail: Some(t_InputFile((depth).saturating_sub(1))),
             width: 0x1234_5678i32,
             height: 0x1234_5678i32,
+        }
+    }
+
+    pub fn s_InputTonWalletCardSticker(depth: u32) -> InputTonWalletCardSticker {
+        let _ = depth;
+        InputTonWalletCardSticker {
+            position: Some(t_AreaPosition((depth).saturating_sub(1))),
+            nft_address: "tl-sample".to_owned(),
         }
     }
 
@@ -450209,6 +461648,7 @@ pub mod samples {
             chat_username: "tl-sample".to_owned(),
             draft_text: "tl-sample".to_owned(),
             open_profile: true,
+            unpaid_messages_token: "tl-sample".to_owned(),
         }
     }
 
@@ -450334,6 +461774,7 @@ pub mod samples {
             phone_number: "tl-sample".to_owned(),
             draft_text: "tl-sample".to_owned(),
             open_profile: true,
+            unpaid_messages_token: "tl-sample".to_owned(),
         }
     }
 
@@ -450341,6 +461782,7 @@ pub mod samples {
         let _ = depth;
         internalLinkTypeUserToken {
             token: "tl-sample".to_owned(),
+            unpaid_messages_token: "tl-sample".to_owned(),
         }
     }
 
@@ -451412,6 +462854,23 @@ pub mod samples {
         }
     }
 
+    pub fn s_messageWidget(depth: u32) -> messageWidget {
+        let _ = depth;
+        messageWidget {
+            width: 0x1234_5678i32,
+            height: 0x1234_5678i32,
+            html: "tl-sample".to_owned(),
+            public_data: "tl-sample".to_owned(),
+            chat_data: "tl-sample".to_owned(),
+            widget_id: 0x1234_5678_9abc_def0i64,
+            caption: Some(t_FormattedText((depth).saturating_sub(1))),
+            show_caption_above_media: true,
+            is_copy: true,
+            can_send_queries: true,
+            can_send_background_queries: true,
+        }
+    }
+
     pub fn s_messageChecklist(depth: u32) -> messageChecklist {
         let _ = depth;
         messageChecklist {
@@ -451937,6 +463396,7 @@ pub mod samples {
             is_saved: true,
             is_prepaid_upgrade: true,
             can_be_upgraded: true,
+            can_be_deleted: true,
             was_converted: true,
             was_upgraded: true,
             was_refunded: true,
@@ -452018,6 +463478,11 @@ pub mod samples {
             is_enabled: true,
             paid_message_star_count: 0x1234_5678_9abc_def0i64,
         }
+    }
+
+    pub fn s_messageUnpaidMessagesAllowedByLink(depth: u32) -> messageUnpaidMessagesAllowedByLink {
+        let _ = depth;
+        messageUnpaidMessagesAllowedByLink
     }
 
     pub fn s_messageChecklistTasksDone(depth: u32) -> messageChecklistTasksDone {
@@ -452846,6 +464311,10 @@ pub mod samples {
             bot_user_id: 0x1234_5678_9abc_def0i64,
             request_write_access: true,
             request_phone_number_access: true,
+            request_ton_wallet_access: true,
+            dapp_client_id: "tl-sample".to_owned(),
+            ton_connect_manifest_url: "tl-sample".to_owned(),
+            ton_proof_payload: "tl-sample".to_owned(),
             browser: "tl-sample".to_owned(),
             platform: "tl-sample".to_owned(),
             ip_address: "tl-sample".to_owned(),
@@ -454595,6 +466064,38 @@ pub mod samples {
         }
     }
 
+    pub fn s_profileShareThemeEmoji(depth: u32) -> profileShareThemeEmoji {
+        let _ = depth;
+        profileShareThemeEmoji {
+            emojis: if depth == 0 { Vec::new() } else { vec![t_EmojiType((depth - 1).saturating_sub(1))] },
+            use_default_background: true,
+            background_backdrop_id: 0x1234_5678i32,
+        }
+    }
+
+    pub fn s_profileShareThemeUpgradedGift(depth: u32) -> profileShareThemeUpgradedGift {
+        let _ = depth;
+        profileShareThemeUpgradedGift {
+            gift: Some(t_UpgradedGift((depth).saturating_sub(1))),
+        }
+    }
+
+    pub fn s_ProfileShareThemeBackdrop(depth: u32) -> ProfileShareThemeBackdrop {
+        let _ = depth;
+        ProfileShareThemeBackdrop {
+            id: 0x1234_5678i32,
+            name: "tl-sample".to_owned(),
+            colors: Some(t_UpgradedGiftBackdropColors((depth).saturating_sub(1))),
+        }
+    }
+
+    pub fn s_ProfileShareThemeBackdrops(depth: u32) -> ProfileShareThemeBackdrops {
+        let _ = depth;
+        ProfileShareThemeBackdrops {
+            backdrops: if depth == 0 { Vec::new() } else { vec![t_ProfileShareThemeBackdrop((depth - 1).saturating_sub(1))] },
+        }
+    }
+
     pub fn s_profileTabPosts(depth: u32) -> profileTabPosts {
         let _ = depth;
         profileTabPosts
@@ -454664,6 +466165,14 @@ pub mod samples {
     pub fn s_proxyTypeMtproto(depth: u32) -> proxyTypeMtproto {
         let _ = depth;
         proxyTypeMtproto {
+            secret: "tl-sample".to_owned(),
+        }
+    }
+
+    pub fn s_proxyTypeWeb(depth: u32) -> proxyTypeWeb {
+        let _ = depth;
+        proxyTypeWeb {
+            path: "tl-sample".to_owned(),
             secret: "tl-sample".to_owned(),
         }
     }
@@ -455187,6 +466696,7 @@ pub mod samples {
             is_pinned: true,
             can_be_upgraded: true,
             can_be_transferred: true,
+            can_be_deleted: true,
             was_refunded: true,
             date: 0x1234_5678i32,
             gift: Some(t_SentGift((depth).saturating_sub(1))),
@@ -456298,6 +467808,13 @@ pub mod samples {
         }
     }
 
+    pub fn s_SpeechRecognitionLanguages(depth: u32) -> SpeechRecognitionLanguages {
+        let _ = depth;
+        SpeechRecognitionLanguages {
+            language_codes: if depth == 0 { Vec::new() } else { vec!["tl-sample".to_owned()] },
+        }
+    }
+
     pub fn s_speechRecognitionResultPending(depth: u32) -> speechRecognitionResultPending {
         let _ = depth;
         speechRecognitionResultPending {
@@ -457203,6 +468720,7 @@ pub mod samples {
             content: Some(t_StoryContent((depth).saturating_sub(1))),
             areas: if depth == 0 { Vec::new() } else { vec![t_StoryArea((depth - 1).saturating_sub(1))] },
             caption: Some(t_FormattedText((depth).saturating_sub(1))),
+            music: Some(t_Audio((depth).saturating_sub(1))),
             album_ids: if depth == 0 { Vec::new() } else { vec![0x1234_5678i32] },
         }
     }
@@ -457227,20 +468745,8 @@ pub mod samples {
     pub fn s_StoryArea(depth: u32) -> StoryArea {
         let _ = depth;
         StoryArea {
-            position: Some(t_StoryAreaPosition((depth).saturating_sub(1))),
+            position: Some(t_AreaPosition((depth).saturating_sub(1))),
             r#type: Some(t_StoryAreaType((depth).saturating_sub(1))),
-        }
-    }
-
-    pub fn s_StoryAreaPosition(depth: u32) -> StoryAreaPosition {
-        let _ = depth;
-        StoryAreaPosition {
-            x_percentage: 1.5f64,
-            y_percentage: 1.5f64,
-            width_percentage: 1.5f64,
-            height_percentage: 1.5f64,
-            rotation_angle: 1.5f64,
-            corner_radius_percentage: 1.5f64,
         }
     }
 
@@ -457679,6 +469185,7 @@ pub mod samples {
             verification_status: Some(t_VerificationStatus((depth).saturating_sub(1))),
             has_direct_messages_group: true,
             has_forum_tabs: true,
+            has_forum_sidebar: true,
             restriction_info: Some(t_RestrictionInfo((depth).saturating_sub(1))),
             paid_message_star_count: 0x1234_5678_9abc_def0i64,
             active_story_state: Some(t_ActiveStoryState((depth).saturating_sub(1))),
@@ -457728,6 +469235,7 @@ pub mod samples {
             bot_commands: if depth == 0 { Vec::new() } else { vec![t_BotCommands((depth - 1).saturating_sub(1))] },
             bot_verification: Some(t_BotVerification((depth).saturating_sub(1))),
             main_profile_tab: Some(t_ProfileTab((depth).saturating_sub(1))),
+            share_theme: Some(t_ProfileShareTheme((depth).saturating_sub(1))),
             upgraded_from_basic_group_id: 0x1234_5678_9abc_def0i64,
             upgraded_from_max_message_id: 0x1234_5678_9abc_def0i64,
         }
@@ -458189,8 +469697,24 @@ pub mod samples {
         let _ = depth;
         TextQuote {
             text: Some(t_FormattedText((depth).saturating_sub(1))),
+            rich_texts: if depth == 0 { Vec::new() } else { vec![Box::new(t_RichText((depth - 1).saturating_sub(1)))] },
             position: 0x1234_5678i32,
             is_manual: true,
+        }
+    }
+
+    pub fn s_TextRange(depth: u32) -> TextRange {
+        let _ = depth;
+        TextRange {
+            offset: 0x1234_5678i32,
+            length: 0x1234_5678i32,
+        }
+    }
+
+    pub fn s_TextRanges(depth: u32) -> TextRanges {
+        let _ = depth;
+        TextRanges {
+            ranges: if depth == 0 { Vec::new() } else { vec![t_TextRange((depth - 1).saturating_sub(1))] },
         }
     }
 
@@ -458316,6 +469840,16 @@ pub mod samples {
         TonConnectChallenge {
             challenge: b"tl\x00\x01".to_vec(),
             event_id: 0x1234_5678_9abc_def0i64,
+        }
+    }
+
+    pub fn s_TonConnectConnectData(depth: u32) -> TonConnectConnectData {
+        let _ = depth;
+        TonConnectConnectData {
+            session_id: 0x1234_5678_9abc_def0i64,
+            challenge_answer: b"tl\x00\x01".to_vec(),
+            body: b"tl\x00\x01".to_vec(),
+            proof: Some(t_TonWalletOwnershipProof((depth).saturating_sub(1))),
         }
     }
 
@@ -458464,6 +469998,7 @@ pub mod samples {
             sticker: Some(t_Sticker((depth).saturating_sub(1))),
             attributes: if depth == 0 { Vec::new() } else { vec![t_TonNftAttribute((depth - 1).saturating_sub(1))] },
             extra: Some(Box::new(t_JsonValue((depth).saturating_sub(1)))),
+            gift: Some(t_UpgradedGift((depth).saturating_sub(1))),
         }
     }
 
@@ -458566,6 +470101,24 @@ pub mod samples {
         }
     }
 
+    pub fn s_TonWalletCard(depth: u32) -> TonWalletCard {
+        let _ = depth;
+        TonWalletCard {
+            address: "tl-sample".to_owned(),
+            gram_amount: 0x1234_5678_9abc_def0i64,
+            stickers: if depth == 0 { Vec::new() } else { vec![t_TonWalletCardSticker((depth - 1).saturating_sub(1))] },
+            background_nft_address: "tl-sample".to_owned(),
+        }
+    }
+
+    pub fn s_TonWalletCardSticker(depth: u32) -> TonWalletCardSticker {
+        let _ = depth;
+        TonWalletCardSticker {
+            position: Some(t_AreaPosition((depth).saturating_sub(1))),
+            nft: Some(t_TonNft((depth).saturating_sub(1))),
+        }
+    }
+
     pub fn s_TonWalletGaslessTransfersInfo(depth: u32) -> TonWalletGaslessTransfersInfo {
         let _ = depth;
         TonWalletGaslessTransfersInfo {
@@ -458589,6 +470142,13 @@ pub mod samples {
         TonWalletOwnershipProofChallenge {
             payload: "tl-sample".to_owned(),
             domain: "tl-sample".to_owned(),
+        }
+    }
+
+    pub fn s_TonWalletSecretPhrase(depth: u32) -> TonWalletSecretPhrase {
+        let _ = depth;
+        TonWalletSecretPhrase {
+            secret_phrase: "tl-sample".to_owned(),
         }
     }
 
@@ -458656,6 +470216,15 @@ pub mod samples {
             is_outgoing: true,
             comment: "tl-sample".to_owned(),
             is_comment_encrypted: true,
+        }
+    }
+
+    pub fn s_tonWalletTransactionTypeTelegramGiftTransfer(depth: u32) -> tonWalletTransactionTypeTelegramGiftTransfer {
+        let _ = depth;
+        tonWalletTransactionTypeTelegramGiftTransfer {
+            nft: Some(t_TonNft((depth).saturating_sub(1))),
+            is_outgoing: true,
+            is_saved: true,
         }
     }
 
@@ -459914,6 +471483,28 @@ pub mod samples {
         }
     }
 
+    pub fn s_updateWebProxyCarrierOpened(depth: u32) -> updateWebProxyCarrierOpened {
+        let _ = depth;
+        updateWebProxyCarrierOpened {
+            carrier: Some(t_WebProxyCarrier((depth).saturating_sub(1))),
+        }
+    }
+
+    pub fn s_updateWebProxyCarrierData(depth: u32) -> updateWebProxyCarrierData {
+        let _ = depth;
+        updateWebProxyCarrierData {
+            carrier_id: 0x1234_5678i32,
+            data: b"tl\x00\x01".to_vec(),
+        }
+    }
+
+    pub fn s_updateWebProxyCarrierClosed(depth: u32) -> updateWebProxyCarrierClosed {
+        let _ = depth;
+        updateWebProxyCarrierClosed {
+            carrier_id: 0x1234_5678i32,
+        }
+    }
+
     pub fn s_updateFreezeState(depth: u32) -> updateFreezeState {
         let _ = depth;
         updateFreezeState {
@@ -460077,6 +471668,14 @@ pub mod samples {
             weekly_count: 0x1234_5678i32,
             left_count: 0x1234_5678i32,
             next_reset_date: 0x1234_5678i32,
+        }
+    }
+
+    pub fn s_updateSpeechRecognitionInFile(depth: u32) -> updateSpeechRecognitionInFile {
+        let _ = depth;
+        updateSpeechRecognitionInFile {
+            recognition_id: 0x1234_5678_9abc_def0i64,
+            partial_text: "tl-sample".to_owned(),
         }
     }
 
@@ -460251,6 +471850,49 @@ pub mod samples {
             message: Some(t_BusinessMessage((depth).saturating_sub(1))),
             chat_instance: 0x1234_5678_9abc_def0i64,
             payload: Some(t_CallbackQueryPayload((depth).saturating_sub(1))),
+        }
+    }
+
+    pub fn s_updateNewWidgetQuery(depth: u32) -> updateNewWidgetQuery {
+        let _ = depth;
+        updateNewWidgetQuery {
+            id: 0x1234_5678_9abc_def0i64,
+            sender_user_id: 0x1234_5678_9abc_def0i64,
+            chat_id: 0x1234_5678_9abc_def0i64,
+            message_id: 0x1234_5678_9abc_def0i64,
+            chat_instance: 0x1234_5678_9abc_def0i64,
+            chat_type: "tl-sample".to_owned(),
+            query_type: Some(t_WidgetQueryType((depth).saturating_sub(1))),
+            data: b"tl\x00\x01".to_vec(),
+            widget_id: 0x1234_5678_9abc_def0i64,
+            wallet_card: Some(t_TonWalletCard((depth).saturating_sub(1))),
+        }
+    }
+
+    pub fn s_updateNewInlineWidgetQuery(depth: u32) -> updateNewInlineWidgetQuery {
+        let _ = depth;
+        updateNewInlineWidgetQuery {
+            id: 0x1234_5678_9abc_def0i64,
+            sender_user_id: 0x1234_5678_9abc_def0i64,
+            inline_message_id: "tl-sample".to_owned(),
+            chat_instance: 0x1234_5678_9abc_def0i64,
+            chat_type: "tl-sample".to_owned(),
+            query_type: Some(t_WidgetQueryType((depth).saturating_sub(1))),
+            data: b"tl\x00\x01".to_vec(),
+            widget_id: 0x1234_5678_9abc_def0i64,
+            wallet_card: Some(t_TonWalletCard((depth).saturating_sub(1))),
+        }
+    }
+
+    pub fn s_updateNewWidgetCopyQuery(depth: u32) -> updateNewWidgetCopyQuery {
+        let _ = depth;
+        updateNewWidgetCopyQuery {
+            id: 0x1234_5678_9abc_def0i64,
+            sender_user_id: 0x1234_5678_9abc_def0i64,
+            query_type: Some(t_WidgetQueryType((depth).saturating_sub(1))),
+            data: b"tl\x00\x01".to_vec(),
+            widget_id: 0x1234_5678_9abc_def0i64,
+            wallet_card: Some(t_TonWalletCard((depth).saturating_sub(1))),
         }
     }
 
@@ -460435,6 +472077,7 @@ pub mod samples {
             owner_address: "tl-sample".to_owned(),
             owner_name: "tl-sample".to_owned(),
             gift_address: "tl-sample".to_owned(),
+            can_be_ton_wallet_card_background: true,
             model: Some(t_UpgradedGiftModel((depth).saturating_sub(1))),
             symbol: Some(t_UpgradedGiftSymbol((depth).saturating_sub(1))),
             backdrop: Some(t_UpgradedGiftBackdrop((depth).saturating_sub(1))),
@@ -460525,6 +472168,13 @@ pub mod samples {
         }
     }
 
+    pub fn s_UpgradedGiftCollectionNames(depth: u32) -> UpgradedGiftCollectionNames {
+        let _ = depth;
+        UpgradedGiftCollectionNames {
+            names: if depth == 0 { Vec::new() } else { vec!["tl-sample".to_owned()] },
+        }
+    }
+
     pub fn s_UpgradedGiftColors(depth: u32) -> UpgradedGiftColors {
         let _ = depth;
         UpgradedGiftColors {
@@ -460535,6 +472185,15 @@ pub mod samples {
             light_theme_colors: if depth == 0 { Vec::new() } else { vec![0x1234_5678i32] },
             dark_theme_accent_color: 0x1234_5678i32,
             dark_theme_colors: if depth == 0 { Vec::new() } else { vec![0x1234_5678i32] },
+        }
+    }
+
+    pub fn s_UpgradedGiftDepositInfo(depth: u32) -> UpgradedGiftDepositInfo {
+        let _ = depth;
+        UpgradedGiftDepositInfo {
+            nft_address: "tl-sample".to_owned(),
+            payload: b"tl\x00\x01".to_vec(),
+            gram_amount: 0x1234_5678_9abc_def0i64,
         }
     }
 
@@ -460721,6 +472380,8 @@ pub mod samples {
             pending_rating: Some(t_UserRating((depth).saturating_sub(1))),
             pending_rating_date: 0x1234_5678i32,
             note: Some(t_FormattedText((depth).saturating_sub(1))),
+            ton_wallet_card: Some(t_TonWalletCard((depth).saturating_sub(1))),
+            share_theme: Some(t_ProfileShareTheme((depth).saturating_sub(1))),
             business_info: Some(t_BusinessInfo((depth).saturating_sub(1))),
             bot_info: Some(t_BotInfo((depth).saturating_sub(1))),
         }
@@ -460731,6 +472392,7 @@ pub mod samples {
         UserLink {
             url: "tl-sample".to_owned(),
             expires_in: 0x1234_5678i32,
+            can_get_permanent_link: true,
         }
     }
 
@@ -460968,6 +472630,7 @@ pub mod samples {
             can_read_all_group_messages: true,
             has_main_web_app: true,
             has_topics: true,
+            has_topic_sidebar: true,
             allows_users_to_create_topics: true,
             can_manage_bots: true,
             is_inline: true,
@@ -461234,11 +472897,113 @@ pub mod samples {
         }
     }
 
+    pub fn s_WebProxyCarrier(depth: u32) -> WebProxyCarrier {
+        let _ = depth;
+        WebProxyCarrier {
+            id: 0x1234_5678i32,
+            proxy_id: 0x1234_5678i32,
+            url: "tl-sample".to_owned(),
+            origin: "tl-sample".to_owned(),
+            path_prefix: "tl-sample".to_owned(),
+            bridge_object_name: "tl-sample".to_owned(),
+            is_temporary: true,
+        }
+    }
+
+    pub fn s_webProxyCarrierErrorUnsupported(depth: u32) -> webProxyCarrierErrorUnsupported {
+        let _ = depth;
+        webProxyCarrierErrorUnsupported
+    }
+
+    pub fn s_webProxyCarrierErrorPaused(depth: u32) -> webProxyCarrierErrorPaused {
+        let _ = depth;
+        webProxyCarrierErrorPaused
+    }
+
+    pub fn s_webProxyCarrierErrorLoadFailed(depth: u32) -> webProxyCarrierErrorLoadFailed {
+        let _ = depth;
+        webProxyCarrierErrorLoadFailed {
+            message: "tl-sample".to_owned(),
+        }
+    }
+
+    pub fn s_webProxyCarrierErrorTerminated(depth: u32) -> webProxyCarrierErrorTerminated {
+        let _ = depth;
+        webProxyCarrierErrorTerminated
+    }
+
+    pub fn s_webProxyCarrierErrorRefused(depth: u32) -> webProxyCarrierErrorRefused {
+        let _ = depth;
+        webProxyCarrierErrorRefused
+    }
+
+    pub fn s_webProxyCarrierMessageText(depth: u32) -> webProxyCarrierMessageText {
+        let _ = depth;
+        webProxyCarrierMessageText {
+            text: "tl-sample".to_owned(),
+        }
+    }
+
+    pub fn s_webProxyCarrierMessageBinary(depth: u32) -> webProxyCarrierMessageBinary {
+        let _ = depth;
+        webProxyCarrierMessageBinary {
+            data: b"tl\x00\x01".to_vec(),
+        }
+    }
+
     pub fn s_WelcomeMessage(depth: u32) -> WelcomeMessage {
         let _ = depth;
         WelcomeMessage {
             id: 0x1234_5678i32,
             content: Some(t_MessageContent((depth).saturating_sub(1))),
+        }
+    }
+
+    pub fn s_WidgetPublicData(depth: u32) -> WidgetPublicData {
+        let _ = depth;
+        WidgetPublicData {
+            data: "tl-sample".to_owned(),
+            poll_period: 0x1234_5678i32,
+        }
+    }
+
+    pub fn s_WidgetQueryAnswer(depth: u32) -> WidgetQueryAnswer {
+        let _ = depth;
+        WidgetQueryAnswer {
+            data: "tl-sample".to_owned(),
+        }
+    }
+
+    pub fn s_widgetQueryTypeData(depth: u32) -> widgetQueryTypeData {
+        let _ = depth;
+        widgetQueryTypeData {
+            with_wallet: true,
+        }
+    }
+
+    pub fn s_widgetQueryTypeSignData(depth: u32) -> widgetQueryTypeSignData {
+        let _ = depth;
+        widgetQueryTypeSignData {
+            wallet: Some(t_WidgetQueryWallet((depth).saturating_sub(1))),
+            sign_data: "tl-sample".to_owned(),
+        }
+    }
+
+    pub fn s_widgetQueryTypeSentTransaction(depth: u32) -> widgetQueryTypeSentTransaction {
+        let _ = depth;
+        widgetQueryTypeSentTransaction {
+            wallet: Some(t_WidgetQueryWallet((depth).saturating_sub(1))),
+            msg_hash: "tl-sample".to_owned(),
+        }
+    }
+
+    pub fn s_WidgetQueryWallet(depth: u32) -> WidgetQueryWallet {
+        let _ = depth;
+        WidgetQueryWallet {
+            address: "tl-sample".to_owned(),
+            gram_amount: 0x1234_5678_9abc_def0i64,
+            public_key: b"tl\x00\x01".to_vec(),
+            state_init: b"tl\x00\x01".to_vec(),
         }
     }
 
@@ -461257,6 +473022,7 @@ pub mod samples {
             match_code: "tl-sample".to_owned(),
             allow_write_access: true,
             allow_phone_number_access: true,
+            ton_connect_connect_data: Some(t_TonConnectConnectData((depth).saturating_sub(1))),
         }
     }
 
@@ -461336,6 +473102,15 @@ pub mod samples {
             chat_id: 0x1234_5678_9abc_def0i64,
             message_id: 0x1234_5678_9abc_def0i64,
             tasks: if depth == 0 { Vec::new() } else { vec![t_InputChecklistTask((depth - 1).saturating_sub(1))] },
+        }
+    }
+
+    pub fn s_addCommunityChat(depth: u32) -> addCommunityChat {
+        let _ = depth;
+        addCommunityChat {
+            community_id: 0x1234_5678_9abc_def0i64,
+            chat_id: 0x1234_5678_9abc_def0i64,
+            is_hidden: true,
         }
     }
 
@@ -461667,10 +473442,26 @@ pub mod samples {
         }
     }
 
+    pub fn s_answerWidgetQuery(depth: u32) -> answerWidgetQuery {
+        let _ = depth;
+        answerWidgetQuery {
+            widget_query_id: 0x1234_5678_9abc_def0i64,
+            data: "tl-sample".to_owned(),
+        }
+    }
+
     pub fn s_applyPremiumGiftCode(depth: u32) -> applyPremiumGiftCode {
         let _ = depth;
         applyPremiumGiftCode {
             code: "tl-sample".to_owned(),
+        }
+    }
+
+    pub fn s_applyUnpaidMessagesToken(depth: u32) -> applyUnpaidMessagesToken {
+        let _ = depth;
+        applyUnpaidMessagesToken {
+            user_id: 0x1234_5678_9abc_def0i64,
+            token: "tl-sample".to_owned(),
         }
     }
 
@@ -462722,6 +474513,14 @@ pub mod samples {
         }
     }
 
+    pub fn s_deleteGift(depth: u32) -> deleteGift {
+        let _ = depth;
+        deleteGift {
+            business_connection_id: "tl-sample".to_owned(),
+            received_gift_id: "tl-sample".to_owned(),
+        }
+    }
+
     pub fn s_deleteGiftCollection(depth: u32) -> deleteGiftCollection {
         let _ = depth;
         deleteGiftCollection {
@@ -462965,6 +474764,14 @@ pub mod samples {
         let _ = depth;
         dismissWebToken {
             token: "tl-sample".to_owned(),
+        }
+    }
+
+    pub fn s_displayUpgradedGift(depth: u32) -> displayUpgradedGift {
+        let _ = depth;
+        displayUpgradedGift {
+            owner_id: Some(t_MessageSender((depth).saturating_sub(1))),
+            name: "tl-sample".to_owned(),
         }
     }
 
@@ -463217,6 +475024,17 @@ pub mod samples {
         }
     }
 
+    pub fn s_editInlineMessageWidgetData(depth: u32) -> editInlineMessageWidgetData {
+        let _ = depth;
+        editInlineMessageWidgetData {
+            inline_message_id: "tl-sample".to_owned(),
+            edit_public_data: true,
+            public_data: "tl-sample".to_owned(),
+            edit_chat_data: true,
+            chat_data: "tl-sample".to_owned(),
+        }
+    }
+
     pub fn s_editMessageCaption(depth: u32) -> editMessageCaption {
         let _ = depth;
         editMessageCaption {
@@ -463286,6 +475104,18 @@ pub mod samples {
         }
     }
 
+    pub fn s_editMessageWidgetData(depth: u32) -> editMessageWidgetData {
+        let _ = depth;
+        editMessageWidgetData {
+            chat_id: 0x1234_5678_9abc_def0i64,
+            message_id: 0x1234_5678_9abc_def0i64,
+            edit_public_data: true,
+            public_data: "tl-sample".to_owned(),
+            edit_chat_data: true,
+            chat_data: "tl-sample".to_owned(),
+        }
+    }
+
     pub fn s_editProxy(depth: u32) -> editProxy {
         let _ = depth;
         editProxy {
@@ -463333,6 +475163,15 @@ pub mod samples {
         }
     }
 
+    pub fn s_editStoryMusic(depth: u32) -> editStoryMusic {
+        let _ = depth;
+        editStoryMusic {
+            story_poster_chat_id: 0x1234_5678_9abc_def0i64,
+            story_id: 0x1234_5678i32,
+            music: Some(t_InputAudio((depth).saturating_sub(1))),
+        }
+    }
+
     pub fn s_editTextCompositionStyle(depth: u32) -> editTextCompositionStyle {
         let _ = depth;
         editTextCompositionStyle {
@@ -463350,6 +475189,15 @@ pub mod samples {
             user_id: 0x1234_5678_9abc_def0i64,
             telegram_payment_charge_id: "tl-sample".to_owned(),
             is_canceled: true,
+        }
+    }
+
+    pub fn s_editWidgetData(depth: u32) -> editWidgetData {
+        let _ = depth;
+        editWidgetData {
+            widget_id: 0x1234_5678_9abc_def0i64,
+            public_data: "tl-sample".to_owned(),
+            cache_time: 0x1234_5678i32,
         }
     }
 
@@ -463404,6 +475252,20 @@ pub mod samples {
         finishFileGeneration {
             generation_id: 0x1234_5678_9abc_def0i64,
             error: Some(t_Error((depth).saturating_sub(1))),
+        }
+    }
+
+    pub fn s_fixRecognizedRichMessageWithAi(depth: u32) -> fixRecognizedRichMessageWithAi {
+        let _ = depth;
+        fixRecognizedRichMessageWithAi {
+            message: Some(Box::new(t_InputRichMessage((depth).saturating_sub(1)))),
+        }
+    }
+
+    pub fn s_fixRecognizedTextWithAi(depth: u32) -> fixRecognizedTextWithAi {
+        let _ = depth;
+        fixRecognizedTextWithAi {
+            text: Some(t_FormattedText((depth).saturating_sub(1))),
         }
     }
 
@@ -464111,10 +475973,27 @@ pub mod samples {
         }
     }
 
+    pub fn s_getCommunityAddChatRequests(depth: u32) -> getCommunityAddChatRequests {
+        let _ = depth;
+        getCommunityAddChatRequests {
+            community_id: 0x1234_5678_9abc_def0i64,
+            offset: "tl-sample".to_owned(),
+            limit: 0x1234_5678i32,
+        }
+    }
+
     pub fn s_getCommunityFullInfo(depth: u32) -> getCommunityFullInfo {
         let _ = depth;
         getCommunityFullInfo {
             community_id: 0x1234_5678_9abc_def0i64,
+        }
+    }
+
+    pub fn s_getCommunityMemberChats(depth: u32) -> getCommunityMemberChats {
+        let _ = depth;
+        getCommunityMemberChats {
+            community_id: 0x1234_5678_9abc_def0i64,
+            member_id: Some(t_MessageSender((depth).saturating_sub(1))),
         }
     }
 
@@ -464605,6 +476484,11 @@ pub mod samples {
         getInternalLinkType {
             link: "tl-sample".to_owned(),
         }
+    }
+
+    pub fn s_getJoinedCommunities(depth: u32) -> getJoinedCommunities {
+        let _ = depth;
+        getJoinedCommunities
     }
 
     pub fn s_getJsonString(depth: u32) -> getJsonString {
@@ -465240,6 +477124,11 @@ pub mod samples {
         }
     }
 
+    pub fn s_getProfileShareThemeBackdrops(depth: u32) -> getProfileShareThemeBackdrops {
+        let _ = depth;
+        getProfileShareThemeBackdrops
+    }
+
     pub fn s_getProxies(depth: u32) -> getProxies {
         let _ = depth;
         getProxies
@@ -465428,6 +477317,13 @@ pub mod samples {
         let _ = depth;
         getSecretChat {
             secret_chat_id: 0x1234_5678i32,
+        }
+    }
+
+    pub fn s_getSpeechRecognitionLanguages(depth: u32) -> getSpeechRecognitionLanguages {
+        let _ = depth;
+        getSpeechRecognitionLanguages {
+            chat_id: 0x1234_5678_9abc_def0i64,
         }
     }
 
@@ -465644,6 +477540,11 @@ pub mod samples {
         }
     }
 
+    pub fn s_getSuitableCommunityChats(depth: u32) -> getSuitableCommunityChats {
+        let _ = depth;
+        getSuitableCommunityChats
+    }
+
     pub fn s_getSuitableDiscussionChats(depth: u32) -> getSuitableDiscussionChats {
         let _ = depth;
         getSuitableDiscussionChats
@@ -465698,6 +477599,13 @@ pub mod samples {
         getTextCompositionStyleExample {
             name: "tl-sample".to_owned(),
             example_number: 0x1234_5678i32,
+        }
+    }
+
+    pub fn s_getTextEmojiRanges(depth: u32) -> getTextEmojiRanges {
+        let _ = depth;
+        getTextEmojiRanges {
+            text: "tl-sample".to_owned(),
         }
     }
 
@@ -465770,6 +477678,11 @@ pub mod samples {
         }
     }
 
+    pub fn s_getTonWalletCardBackgroundGiftCollectionNames(depth: u32) -> getTonWalletCardBackgroundGiftCollectionNames {
+        let _ = depth;
+        getTonWalletCardBackgroundGiftCollectionNames
+    }
+
     pub fn s_getTonWalletNfts(depth: u32) -> getTonWalletNfts {
         let _ = depth;
         getTonWalletNfts {
@@ -465837,6 +477750,15 @@ pub mod samples {
         }
     }
 
+    pub fn s_getUpgradedGiftDepositInfo(depth: u32) -> getUpgradedGiftDepositInfo {
+        let _ = depth;
+        getUpgradedGiftDepositInfo {
+            owner_id: Some(t_MessageSender((depth).saturating_sub(1))),
+            name: "tl-sample".to_owned(),
+            hide_sender: true,
+        }
+    }
+
     pub fn s_getUpgradedGiftEmojiStatuses(depth: u32) -> getUpgradedGiftEmojiStatuses {
         let _ = depth;
         getUpgradedGiftEmojiStatuses
@@ -465862,7 +477784,6 @@ pub mod samples {
         let _ = depth;
         getUpgradedGiftWithdrawalUrl {
             received_gift_id: "tl-sample".to_owned(),
-            password: "tl-sample".to_owned(),
         }
     }
 
@@ -465895,7 +477816,11 @@ pub mod samples {
 
     pub fn s_getUserLink(depth: u32) -> getUserLink {
         let _ = depth;
-        getUserLink
+        getUserLink {
+            remove_messages_fee: true,
+            return_permanent_link: true,
+            revoke_previous_links: true,
+        }
     }
 
     pub fn s_getUserPrivacySettingRules(depth: u32) -> getUserPrivacySettingRules {
@@ -466000,6 +477925,24 @@ pub mod samples {
         getWebPageInstantView {
             url: "tl-sample".to_owned(),
             only_local: true,
+        }
+    }
+
+    pub fn s_getWidgetPublicData(depth: u32) -> getWidgetPublicData {
+        let _ = depth;
+        getWidgetPublicData {
+            chat_id: 0x1234_5678_9abc_def0i64,
+            message_id: 0x1234_5678_9abc_def0i64,
+        }
+    }
+
+    pub fn s_getWidgetQueryAnswer(depth: u32) -> getWidgetQueryAnswer {
+        let _ = depth;
+        getWidgetQueryAnswer {
+            chat_id: 0x1234_5678_9abc_def0i64,
+            message_id: 0x1234_5678_9abc_def0i64,
+            query_type: Some(t_WidgetQueryType((depth).saturating_sub(1))),
+            data: b"tl\x00\x01".to_vec(),
         }
     }
 
@@ -466362,6 +478305,7 @@ pub mod samples {
             content: Some(t_InputStoryContent((depth).saturating_sub(1))),
             areas: Some(t_InputStoryAreas((depth).saturating_sub(1))),
             caption: Some(t_FormattedText((depth).saturating_sub(1))),
+            music: Some(t_InputAudio((depth).saturating_sub(1))),
             privacy_settings: Some(t_StoryPrivacySettings((depth).saturating_sub(1))),
             album_ids: if depth == 0 { Vec::new() } else { vec![0x1234_5678i32] },
             active_period: 0x1234_5678i32,
@@ -466415,6 +478359,23 @@ pub mod samples {
         }
     }
 
+    pub fn s_processCommunityAddChatRequest(depth: u32) -> processCommunityAddChatRequest {
+        let _ = depth;
+        processCommunityAddChatRequest {
+            community_id: 0x1234_5678_9abc_def0i64,
+            chat_id: 0x1234_5678_9abc_def0i64,
+            approve: true,
+        }
+    }
+
+    pub fn s_processCommunityAddChatRequests(depth: u32) -> processCommunityAddChatRequests {
+        let _ = depth;
+        processCommunityAddChatRequests {
+            community_id: 0x1234_5678_9abc_def0i64,
+            approve: true,
+        }
+    }
+
     pub fn s_processGiftPurchaseOffer(depth: u32) -> processGiftPurchaseOffer {
         let _ = depth;
         processGiftPurchaseOffer {
@@ -466427,6 +478388,14 @@ pub mod samples {
         let _ = depth;
         processPushNotification {
             payload: "tl-sample".to_owned(),
+        }
+    }
+
+    pub fn s_processWebProxyCarrierMessage(depth: u32) -> processWebProxyCarrierMessage {
+        let _ = depth;
+        processWebProxyCarrierMessage {
+            carrier_id: 0x1234_5678i32,
+            message: Some(t_WebProxyCarrierMessage((depth).saturating_sub(1))),
         }
     }
 
@@ -466533,6 +478502,14 @@ pub mod samples {
         }
     }
 
+    pub fn s_recognizeSpeechInFile(depth: u32) -> recognizeSpeechInFile {
+        let _ = depth;
+        recognizeSpeechInFile {
+            audio_file: Some(t_InputFile((depth).saturating_sub(1))),
+            recognition_id: 0x1234_5678_9abc_def0i64,
+        }
+    }
+
     pub fn s_recoverAuthenticationPassword(depth: u32) -> recoverAuthenticationPassword {
         let _ = depth;
         recoverAuthenticationPassword {
@@ -466600,6 +478577,14 @@ pub mod samples {
     pub fn s_removeChatActionBar(depth: u32) -> removeChatActionBar {
         let _ = depth;
         removeChatActionBar {
+            chat_id: 0x1234_5678_9abc_def0i64,
+        }
+    }
+
+    pub fn s_removeCommunityChat(depth: u32) -> removeCommunityChat {
+        let _ = depth;
+        removeCommunityChat {
+            community_id: 0x1234_5678_9abc_def0i64,
             chat_id: 0x1234_5678_9abc_def0i64,
         }
     }
@@ -467023,6 +479008,14 @@ pub mod samples {
         reportVideoMessageAdvertisement {
             advertisement_unique_id: 0x1234_5678_9abc_def0i64,
             option_id: b"tl\x00\x01".to_vec(),
+        }
+    }
+
+    pub fn s_reportWebProxyCarrierError(depth: u32) -> reportWebProxyCarrierError {
+        let _ = depth;
+        reportWebProxyCarrierError {
+            carrier_id: 0x1234_5678i32,
+            error: Some(t_WebProxyCarrierError((depth).saturating_sub(1))),
         }
     }
 
@@ -468290,6 +480283,14 @@ pub mod samples {
         }
     }
 
+    pub fn s_setCommunityNotificationSettings(depth: u32) -> setCommunityNotificationSettings {
+        let _ = depth;
+        setCommunityNotificationSettings {
+            community_id: 0x1234_5678_9abc_def0i64,
+            notification_settings: Some(t_ChatNotificationSettings((depth).saturating_sub(1))),
+        }
+    }
+
     pub fn s_setCommunityPermissions(depth: u32) -> setCommunityPermissions {
         let _ = depth;
         setCommunityPermissions {
@@ -468721,6 +480722,14 @@ pub mod samples {
         }
     }
 
+    pub fn s_setProfileShareTheme(depth: u32) -> setProfileShareTheme {
+        let _ = depth;
+        setProfileShareTheme {
+            chat_id: 0x1234_5678_9abc_def0i64,
+            theme: Some(t_InputProfileShareTheme((depth).saturating_sub(1))),
+        }
+    }
+
     pub fn s_setQuickReplyShortcutName(depth: u32) -> setQuickReplyShortcutName {
         let _ = depth;
         setQuickReplyShortcutName {
@@ -468909,6 +480918,14 @@ pub mod samples {
         setTonConnectSessionWalletClientId {
             session_id: 0x1234_5678_9abc_def0i64,
             wallet_client_id: "tl-sample".to_owned(),
+        }
+    }
+
+    pub fn s_setTonWalletCardStickers(depth: u32) -> setTonWalletCardStickers {
+        let _ = depth;
+        setTonWalletCardStickers {
+            stickers: if depth == 0 { Vec::new() } else { vec![t_InputTonWalletCardSticker((depth - 1).saturating_sub(1))] },
+            background_nft_address: "tl-sample".to_owned(),
         }
     }
 
@@ -469310,6 +481327,23 @@ pub mod samples {
         }
     }
 
+    pub fn s_toggleCommunityAreChatsCollapsed(depth: u32) -> toggleCommunityAreChatsCollapsed {
+        let _ = depth;
+        toggleCommunityAreChatsCollapsed {
+            community_id: 0x1234_5678_9abc_def0i64,
+            are_chats_collapsed: true,
+        }
+    }
+
+    pub fn s_toggleCommunityMemberIsBanned(depth: u32) -> toggleCommunityMemberIsBanned {
+        let _ = depth;
+        toggleCommunityMemberIsBanned {
+            community_id: 0x1234_5678_9abc_def0i64,
+            member_id: Some(t_MessageSender((depth).saturating_sub(1))),
+            is_banned: true,
+        }
+    }
+
     pub fn s_toggleDirectMessagesChatTopicCanSendUnpaidMessages(depth: u32) -> toggleDirectMessagesChatTopicCanSendUnpaidMessages {
         let _ = depth;
         toggleDirectMessagesChatTopicCanSendUnpaidMessages {
@@ -469505,6 +481539,7 @@ pub mod samples {
             supergroup_id: 0x1234_5678_9abc_def0i64,
             is_forum: true,
             has_forum_tabs: true,
+            has_forum_sidebar: true,
         }
     }
 
@@ -469734,6 +481769,14 @@ pub mod samples {
         let _ = depth;
         viewVideoMessageAdvertisement {
             advertisement_unique_id: 0x1234_5678_9abc_def0i64,
+        }
+    }
+
+    pub fn s_withdrawUpgradedGift(depth: u32) -> withdrawUpgradedGift {
+        let _ = depth;
+        withdrawUpgradedGift {
+            received_gift_id: "tl-sample".to_owned(),
+            keep_on_profile: true,
         }
     }
 
@@ -470288,6 +482331,26 @@ fn __rt_ArchiveChatListSettings() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = ArchiveChatListSettings::from_json(&j).expect("ArchiveChatListSettings json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_AreaPosition() {
+    samples::__stack(move || {
+        let v = samples::s_AreaPosition(3);
+        let mut out = Vec::new();
+        v.store_boxed(&mut out);
+        let w = AreaPosition::parse(&out).expect("AreaPosition parse");
+        assert_eq!(v, w);
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = AreaPosition::parse_bare(&out).expect("AreaPosition bare parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = AreaPosition::from_json(&j).expect("AreaPosition json parse");
         assert_eq!(v, w);
     });
 }
@@ -476663,6 +488726,26 @@ fn __rt_collectibleItemTypePhoneNumber() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_Communities() {
+    samples::__stack(move || {
+        let v = samples::s_Communities(3);
+        let mut out = Vec::new();
+        v.store_boxed(&mut out);
+        let w = Communities::parse(&out).expect("Communities parse");
+        assert_eq!(v, w);
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Communities::parse_bare(&out).expect("Communities bare parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Communities::from_json(&j).expect("Communities json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_Community() {
     samples::__stack(move || {
         let v = samples::s_Community(3);
@@ -476676,6 +488759,46 @@ fn __rt_Community() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = Community::from_json(&j).expect("Community json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_CommunityAddChatRequest() {
+    samples::__stack(move || {
+        let v = samples::s_CommunityAddChatRequest(3);
+        let mut out = Vec::new();
+        v.store_boxed(&mut out);
+        let w = CommunityAddChatRequest::parse(&out).expect("CommunityAddChatRequest parse");
+        assert_eq!(v, w);
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = CommunityAddChatRequest::parse_bare(&out).expect("CommunityAddChatRequest bare parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = CommunityAddChatRequest::from_json(&j).expect("CommunityAddChatRequest json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_CommunityAddChatRequests() {
+    samples::__stack(move || {
+        let v = samples::s_CommunityAddChatRequests(3);
+        let mut out = Vec::new();
+        v.store_boxed(&mut out);
+        let w = CommunityAddChatRequests::parse(&out).expect("CommunityAddChatRequests parse");
+        assert_eq!(v, w);
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = CommunityAddChatRequests::parse_bare(&out).expect("CommunityAddChatRequests bare parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = CommunityAddChatRequests::from_json(&j).expect("CommunityAddChatRequests json parse");
         assert_eq!(v, w);
     });
 }
@@ -476756,6 +488879,26 @@ fn __rt_CommunityId() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = CommunityId::from_json(&j).expect("CommunityId json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_CommunityMemberChats() {
+    samples::__stack(move || {
+        let v = samples::s_CommunityMemberChats(3);
+        let mut out = Vec::new();
+        v.store_boxed(&mut out);
+        let w = CommunityMemberChats::parse(&out).expect("CommunityMemberChats parse");
+        assert_eq!(v, w);
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = CommunityMemberChats::parse_bare(&out).expect("CommunityMemberChats bare parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = CommunityMemberChats::from_json(&j).expect("CommunityMemberChats json parse");
         assert_eq!(v, w);
     });
 }
@@ -478360,6 +490503,38 @@ fn __rt_EmojiStatuses() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = EmojiStatuses::from_json(&j).expect("EmojiStatuses json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_emojiTypeRegular() {
+    samples::__stack(move || {
+        let v = EmojiType::emojiTypeRegular(samples::s_emojiTypeRegular(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = EmojiType::parse(&out).expect("emojiTypeRegular parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = EmojiType::from_json(&j).expect("emojiTypeRegular json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_emojiTypeCustomEmoji() {
+    samples::__stack(move || {
+        let v = EmojiType::emojiTypeCustomEmoji(samples::s_emojiTypeCustomEmoji(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = EmojiType::parse(&out).expect("emojiTypeCustomEmoji parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = EmojiType::from_json(&j).expect("emojiTypeCustomEmoji json parse");
         assert_eq!(v, w);
     });
 }
@@ -482263,6 +494438,38 @@ fn __rt_inputMessageChecklist() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_inputMessageWidget() {
+    samples::__stack(move || {
+        let v = InputMessageContent::inputMessageWidget(samples::s_inputMessageWidget(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = InputMessageContent::parse(&out).expect("inputMessageWidget parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = InputMessageContent::from_json(&j).expect("inputMessageWidget json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_inputMessageSharedWidget() {
+    samples::__stack(move || {
+        let v = InputMessageContent::inputMessageSharedWidget(samples::s_inputMessageSharedWidget(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = InputMessageContent::parse(&out).expect("inputMessageSharedWidget parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = InputMessageContent::from_json(&j).expect("inputMessageSharedWidget json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_inputMessageForwarded() {
     samples::__stack(move || {
         let v = InputMessageContent::inputMessageForwarded(samples::s_inputMessageForwarded(3));
@@ -483407,6 +495614,38 @@ fn __rt_inputPollTypeQuiz() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_inputProfileShareThemeEmoji() {
+    samples::__stack(move || {
+        let v = InputProfileShareTheme::inputProfileShareThemeEmoji(samples::s_inputProfileShareThemeEmoji(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = InputProfileShareTheme::parse(&out).expect("inputProfileShareThemeEmoji parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = InputProfileShareTheme::from_json(&j).expect("inputProfileShareThemeEmoji json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_inputProfileShareThemeUpgradedGift() {
+    samples::__stack(move || {
+        let v = InputProfileShareTheme::inputProfileShareThemeUpgradedGift(samples::s_inputProfileShareThemeUpgradedGift(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = InputProfileShareTheme::parse(&out).expect("inputProfileShareThemeUpgradedGift parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = InputProfileShareTheme::from_json(&j).expect("inputProfileShareThemeUpgradedGift json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_InputRichMessage() {
     samples::__stack(move || {
         let v = samples::s_InputRichMessage(3);
@@ -483496,22 +495735,6 @@ fn __rt_inputStoryAreaTypeLocation() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = InputStoryAreaType::from_json(&j).expect("inputStoryAreaTypeLocation json parse");
-        assert_eq!(v, w);
-    });
-}
-
-#[cfg(test)]
-#[test]
-#[allow(non_snake_case)]
-fn __rt_inputStoryAreaTypeFoundVenue() {
-    samples::__stack(move || {
-        let v = InputStoryAreaType::inputStoryAreaTypeFoundVenue(samples::s_inputStoryAreaTypeFoundVenue(3));
-        let mut out = Vec::new();
-        v.store(&mut out);
-        let w = InputStoryAreaType::parse(&out).expect("inputStoryAreaTypeFoundVenue parse");
-        assert_eq!(v, w);
-        let j = v.to_json();
-        let w = InputStoryAreaType::from_json(&j).expect("inputStoryAreaTypeFoundVenue json parse");
         assert_eq!(v, w);
     });
 }
@@ -483720,6 +495943,26 @@ fn __rt_InputThumbnail() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = InputThumbnail::from_json(&j).expect("InputThumbnail json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_InputTonWalletCardSticker() {
+    samples::__stack(move || {
+        let v = samples::s_InputTonWalletCardSticker(3);
+        let mut out = Vec::new();
+        v.store_boxed(&mut out);
+        let w = InputTonWalletCardSticker::parse(&out).expect("InputTonWalletCardSticker parse");
+        assert_eq!(v, w);
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = InputTonWalletCardSticker::parse_bare(&out).expect("InputTonWalletCardSticker bare parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = InputTonWalletCardSticker::from_json(&j).expect("InputTonWalletCardSticker json parse");
         assert_eq!(v, w);
     });
 }
@@ -486823,6 +499066,22 @@ fn __rt_messageStory() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_messageWidget() {
+    samples::__stack(move || {
+        let v = MessageContent::messageWidget(samples::s_messageWidget(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = MessageContent::parse(&out).expect("messageWidget parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = MessageContent::from_json(&j).expect("messageWidget json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_messageChecklist() {
     samples::__stack(move || {
         let v = MessageContent::messageChecklist(samples::s_messageChecklist(3));
@@ -487856,6 +500115,22 @@ fn __rt_messageDirectMessagePriceChanged() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = MessageContent::from_json(&j).expect("messageDirectMessagePriceChanged json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_messageUnpaidMessagesAllowedByLink() {
+    samples::__stack(move || {
+        let v = MessageContent::messageUnpaidMessagesAllowedByLink(samples::s_messageUnpaidMessagesAllowedByLink(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = MessageContent::parse(&out).expect("messageUnpaidMessagesAllowedByLink parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = MessageContent::from_json(&j).expect("messageUnpaidMessagesAllowedByLink json parse");
         assert_eq!(v, w);
     });
 }
@@ -493703,6 +505978,78 @@ fn __rt_ProfilePhoto() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_profileShareThemeEmoji() {
+    samples::__stack(move || {
+        let v = ProfileShareTheme::profileShareThemeEmoji(samples::s_profileShareThemeEmoji(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = ProfileShareTheme::parse(&out).expect("profileShareThemeEmoji parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = ProfileShareTheme::from_json(&j).expect("profileShareThemeEmoji json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_profileShareThemeUpgradedGift() {
+    samples::__stack(move || {
+        let v = ProfileShareTheme::profileShareThemeUpgradedGift(samples::s_profileShareThemeUpgradedGift(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = ProfileShareTheme::parse(&out).expect("profileShareThemeUpgradedGift parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = ProfileShareTheme::from_json(&j).expect("profileShareThemeUpgradedGift json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_ProfileShareThemeBackdrop() {
+    samples::__stack(move || {
+        let v = samples::s_ProfileShareThemeBackdrop(3);
+        let mut out = Vec::new();
+        v.store_boxed(&mut out);
+        let w = ProfileShareThemeBackdrop::parse(&out).expect("ProfileShareThemeBackdrop parse");
+        assert_eq!(v, w);
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = ProfileShareThemeBackdrop::parse_bare(&out).expect("ProfileShareThemeBackdrop bare parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = ProfileShareThemeBackdrop::from_json(&j).expect("ProfileShareThemeBackdrop json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_ProfileShareThemeBackdrops() {
+    samples::__stack(move || {
+        let v = samples::s_ProfileShareThemeBackdrops(3);
+        let mut out = Vec::new();
+        v.store_boxed(&mut out);
+        let w = ProfileShareThemeBackdrops::parse(&out).expect("ProfileShareThemeBackdrops parse");
+        assert_eq!(v, w);
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = ProfileShareThemeBackdrops::parse_bare(&out).expect("ProfileShareThemeBackdrops bare parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = ProfileShareThemeBackdrops::from_json(&j).expect("ProfileShareThemeBackdrops json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_profileTabPosts() {
     samples::__stack(move || {
         let v = ProfileTab::profileTabPosts(samples::s_profileTabPosts(3));
@@ -493892,6 +506239,22 @@ fn __rt_proxyTypeMtproto() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = ProxyType::from_json(&j).expect("proxyTypeMtproto json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_proxyTypeWeb() {
+    samples::__stack(move || {
+        let v = ProxyType::proxyTypeWeb(samples::s_proxyTypeWeb(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = ProxyType::parse(&out).expect("proxyTypeWeb parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = ProxyType::from_json(&j).expect("proxyTypeWeb json parse");
         assert_eq!(v, w);
     });
 }
@@ -497751,6 +510114,26 @@ fn __rt_ShippingOption() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_SpeechRecognitionLanguages() {
+    samples::__stack(move || {
+        let v = samples::s_SpeechRecognitionLanguages(3);
+        let mut out = Vec::new();
+        v.store_boxed(&mut out);
+        let w = SpeechRecognitionLanguages::parse(&out).expect("SpeechRecognitionLanguages parse");
+        assert_eq!(v, w);
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = SpeechRecognitionLanguages::parse_bare(&out).expect("SpeechRecognitionLanguages bare parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = SpeechRecognitionLanguages::from_json(&j).expect("SpeechRecognitionLanguages json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_speechRecognitionResultPending() {
     samples::__stack(move || {
         let v = SpeechRecognitionResult::speechRecognitionResultPending(samples::s_speechRecognitionResultPending(3));
@@ -499592,26 +511975,6 @@ fn __rt_StoryArea() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = StoryArea::from_json(&j).expect("StoryArea json parse");
-        assert_eq!(v, w);
-    });
-}
-
-#[cfg(test)]
-#[test]
-#[allow(non_snake_case)]
-fn __rt_StoryAreaPosition() {
-    samples::__stack(move || {
-        let v = samples::s_StoryAreaPosition(3);
-        let mut out = Vec::new();
-        v.store_boxed(&mut out);
-        let w = StoryAreaPosition::parse(&out).expect("StoryAreaPosition parse");
-        assert_eq!(v, w);
-        let mut out = Vec::new();
-        v.store(&mut out);
-        let w = StoryAreaPosition::parse_bare(&out).expect("StoryAreaPosition bare parse");
-        assert_eq!(v, w);
-        let j = v.to_json();
-        let w = StoryAreaPosition::from_json(&j).expect("StoryAreaPosition json parse");
         assert_eq!(v, w);
     });
 }
@@ -501783,6 +514146,46 @@ fn __rt_TextQuote() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_TextRange() {
+    samples::__stack(move || {
+        let v = samples::s_TextRange(3);
+        let mut out = Vec::new();
+        v.store_boxed(&mut out);
+        let w = TextRange::parse(&out).expect("TextRange parse");
+        assert_eq!(v, w);
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = TextRange::parse_bare(&out).expect("TextRange bare parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = TextRange::from_json(&j).expect("TextRange json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_TextRanges() {
+    samples::__stack(move || {
+        let v = samples::s_TextRanges(3);
+        let mut out = Vec::new();
+        v.store_boxed(&mut out);
+        let w = TextRanges::parse(&out).expect("TextRanges parse");
+        assert_eq!(v, w);
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = TextRanges::parse_bare(&out).expect("TextRanges bare parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = TextRanges::from_json(&j).expect("TextRanges json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_ThemeParameters() {
     samples::__stack(move || {
         let v = samples::s_ThemeParameters(3);
@@ -502060,6 +514463,26 @@ fn __rt_TonConnectChallenge() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = TonConnectChallenge::from_json(&j).expect("TonConnectChallenge json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_TonConnectConnectData() {
+    samples::__stack(move || {
+        let v = samples::s_TonConnectConnectData(3);
+        let mut out = Vec::new();
+        v.store_boxed(&mut out);
+        let w = TonConnectConnectData::parse(&out).expect("TonConnectConnectData parse");
+        assert_eq!(v, w);
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = TonConnectConnectData::parse_bare(&out).expect("TonConnectConnectData bare parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = TonConnectConnectData::from_json(&j).expect("TonConnectConnectData json parse");
         assert_eq!(v, w);
     });
 }
@@ -502639,6 +515062,46 @@ fn __rt_TonTransactions() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_TonWalletCard() {
+    samples::__stack(move || {
+        let v = samples::s_TonWalletCard(3);
+        let mut out = Vec::new();
+        v.store_boxed(&mut out);
+        let w = TonWalletCard::parse(&out).expect("TonWalletCard parse");
+        assert_eq!(v, w);
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = TonWalletCard::parse_bare(&out).expect("TonWalletCard bare parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = TonWalletCard::from_json(&j).expect("TonWalletCard json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_TonWalletCardSticker() {
+    samples::__stack(move || {
+        let v = samples::s_TonWalletCardSticker(3);
+        let mut out = Vec::new();
+        v.store_boxed(&mut out);
+        let w = TonWalletCardSticker::parse(&out).expect("TonWalletCardSticker parse");
+        assert_eq!(v, w);
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = TonWalletCardSticker::parse_bare(&out).expect("TonWalletCardSticker bare parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = TonWalletCardSticker::from_json(&j).expect("TonWalletCardSticker json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_TonWalletGaslessTransfersInfo() {
     samples::__stack(move || {
         let v = samples::s_TonWalletGaslessTransfersInfo(3);
@@ -502692,6 +515155,26 @@ fn __rt_TonWalletOwnershipProofChallenge() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = TonWalletOwnershipProofChallenge::from_json(&j).expect("TonWalletOwnershipProofChallenge json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_TonWalletSecretPhrase() {
+    samples::__stack(move || {
+        let v = samples::s_TonWalletSecretPhrase(3);
+        let mut out = Vec::new();
+        v.store_boxed(&mut out);
+        let w = TonWalletSecretPhrase::parse(&out).expect("TonWalletSecretPhrase parse");
+        assert_eq!(v, w);
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = TonWalletSecretPhrase::parse_bare(&out).expect("TonWalletSecretPhrase bare parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = TonWalletSecretPhrase::from_json(&j).expect("TonWalletSecretPhrase json parse");
         assert_eq!(v, w);
     });
 }
@@ -502812,6 +515295,22 @@ fn __rt_tonWalletTransactionTypeNftTransfer() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = TonWalletTransactionType::from_json(&j).expect("tonWalletTransactionTypeNftTransfer json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_tonWalletTransactionTypeTelegramGiftTransfer() {
+    samples::__stack(move || {
+        let v = TonWalletTransactionType::tonWalletTransactionTypeTelegramGiftTransfer(samples::s_tonWalletTransactionTypeTelegramGiftTransfer(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = TonWalletTransactionType::parse(&out).expect("tonWalletTransactionTypeTelegramGiftTransfer parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = TonWalletTransactionType::from_json(&j).expect("tonWalletTransactionTypeTelegramGiftTransfer json parse");
         assert_eq!(v, w);
     });
 }
@@ -505351,6 +517850,54 @@ fn __rt_updateConnectionState() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_updateWebProxyCarrierOpened() {
+    samples::__stack(move || {
+        let v = Update::updateWebProxyCarrierOpened(samples::s_updateWebProxyCarrierOpened(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Update::parse(&out).expect("updateWebProxyCarrierOpened parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Update::from_json(&j).expect("updateWebProxyCarrierOpened json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_updateWebProxyCarrierData() {
+    samples::__stack(move || {
+        let v = Update::updateWebProxyCarrierData(samples::s_updateWebProxyCarrierData(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Update::parse(&out).expect("updateWebProxyCarrierData parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Update::from_json(&j).expect("updateWebProxyCarrierData json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_updateWebProxyCarrierClosed() {
+    samples::__stack(move || {
+        let v = Update::updateWebProxyCarrierClosed(samples::s_updateWebProxyCarrierClosed(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Update::parse(&out).expect("updateWebProxyCarrierClosed parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Update::from_json(&j).expect("updateWebProxyCarrierClosed json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_updateFreezeState() {
     samples::__stack(move || {
         let v = Update::updateFreezeState(samples::s_updateFreezeState(3));
@@ -505703,6 +518250,22 @@ fn __rt_updateSpeechRecognitionTrial() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_updateSpeechRecognitionInFile() {
+    samples::__stack(move || {
+        let v = Update::updateSpeechRecognitionInFile(samples::s_updateSpeechRecognitionInFile(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Update::parse(&out).expect("updateSpeechRecognitionInFile parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Update::from_json(&j).expect("updateSpeechRecognitionInFile json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_updateGroupCallMessageLevels() {
     samples::__stack(move || {
         let v = Update::updateGroupCallMessageLevels(samples::s_updateGroupCallMessageLevels(3));
@@ -506016,6 +518579,54 @@ fn __rt_updateNewBusinessCallbackQuery() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = Update::from_json(&j).expect("updateNewBusinessCallbackQuery json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_updateNewWidgetQuery() {
+    samples::__stack(move || {
+        let v = Update::updateNewWidgetQuery(samples::s_updateNewWidgetQuery(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Update::parse(&out).expect("updateNewWidgetQuery parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Update::from_json(&j).expect("updateNewWidgetQuery json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_updateNewInlineWidgetQuery() {
+    samples::__stack(move || {
+        let v = Update::updateNewInlineWidgetQuery(samples::s_updateNewInlineWidgetQuery(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Update::parse(&out).expect("updateNewInlineWidgetQuery parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Update::from_json(&j).expect("updateNewInlineWidgetQuery json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_updateNewWidgetCopyQuery() {
+    samples::__stack(move || {
+        let v = Update::updateNewWidgetCopyQuery(samples::s_updateNewWidgetCopyQuery(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Update::parse(&out).expect("updateNewWidgetCopyQuery parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Update::from_json(&j).expect("updateNewWidgetCopyQuery json parse");
         assert_eq!(v, w);
     });
 }
@@ -506495,6 +519106,26 @@ fn __rt_UpgradedGiftBackdropCount() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_UpgradedGiftCollectionNames() {
+    samples::__stack(move || {
+        let v = samples::s_UpgradedGiftCollectionNames(3);
+        let mut out = Vec::new();
+        v.store_boxed(&mut out);
+        let w = UpgradedGiftCollectionNames::parse(&out).expect("UpgradedGiftCollectionNames parse");
+        assert_eq!(v, w);
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = UpgradedGiftCollectionNames::parse_bare(&out).expect("UpgradedGiftCollectionNames bare parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = UpgradedGiftCollectionNames::from_json(&j).expect("UpgradedGiftCollectionNames json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_UpgradedGiftColors() {
     samples::__stack(move || {
         let v = samples::s_UpgradedGiftColors(3);
@@ -506508,6 +519139,26 @@ fn __rt_UpgradedGiftColors() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = UpgradedGiftColors::from_json(&j).expect("UpgradedGiftColors json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_UpgradedGiftDepositInfo() {
+    samples::__stack(move || {
+        let v = samples::s_UpgradedGiftDepositInfo(3);
+        let mut out = Vec::new();
+        v.store_boxed(&mut out);
+        let w = UpgradedGiftDepositInfo::parse(&out).expect("UpgradedGiftDepositInfo parse");
+        assert_eq!(v, w);
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = UpgradedGiftDepositInfo::parse_bare(&out).expect("UpgradedGiftDepositInfo bare parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = UpgradedGiftDepositInfo::from_json(&j).expect("UpgradedGiftDepositInfo json parse");
         assert_eq!(v, w);
     });
 }
@@ -507999,6 +520650,138 @@ fn __rt_WebPageInstantView() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_WebProxyCarrier() {
+    samples::__stack(move || {
+        let v = samples::s_WebProxyCarrier(3);
+        let mut out = Vec::new();
+        v.store_boxed(&mut out);
+        let w = WebProxyCarrier::parse(&out).expect("WebProxyCarrier parse");
+        assert_eq!(v, w);
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = WebProxyCarrier::parse_bare(&out).expect("WebProxyCarrier bare parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = WebProxyCarrier::from_json(&j).expect("WebProxyCarrier json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_webProxyCarrierErrorUnsupported() {
+    samples::__stack(move || {
+        let v = WebProxyCarrierError::webProxyCarrierErrorUnsupported(samples::s_webProxyCarrierErrorUnsupported(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = WebProxyCarrierError::parse(&out).expect("webProxyCarrierErrorUnsupported parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = WebProxyCarrierError::from_json(&j).expect("webProxyCarrierErrorUnsupported json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_webProxyCarrierErrorPaused() {
+    samples::__stack(move || {
+        let v = WebProxyCarrierError::webProxyCarrierErrorPaused(samples::s_webProxyCarrierErrorPaused(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = WebProxyCarrierError::parse(&out).expect("webProxyCarrierErrorPaused parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = WebProxyCarrierError::from_json(&j).expect("webProxyCarrierErrorPaused json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_webProxyCarrierErrorLoadFailed() {
+    samples::__stack(move || {
+        let v = WebProxyCarrierError::webProxyCarrierErrorLoadFailed(samples::s_webProxyCarrierErrorLoadFailed(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = WebProxyCarrierError::parse(&out).expect("webProxyCarrierErrorLoadFailed parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = WebProxyCarrierError::from_json(&j).expect("webProxyCarrierErrorLoadFailed json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_webProxyCarrierErrorTerminated() {
+    samples::__stack(move || {
+        let v = WebProxyCarrierError::webProxyCarrierErrorTerminated(samples::s_webProxyCarrierErrorTerminated(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = WebProxyCarrierError::parse(&out).expect("webProxyCarrierErrorTerminated parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = WebProxyCarrierError::from_json(&j).expect("webProxyCarrierErrorTerminated json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_webProxyCarrierErrorRefused() {
+    samples::__stack(move || {
+        let v = WebProxyCarrierError::webProxyCarrierErrorRefused(samples::s_webProxyCarrierErrorRefused(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = WebProxyCarrierError::parse(&out).expect("webProxyCarrierErrorRefused parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = WebProxyCarrierError::from_json(&j).expect("webProxyCarrierErrorRefused json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_webProxyCarrierMessageText() {
+    samples::__stack(move || {
+        let v = WebProxyCarrierMessage::webProxyCarrierMessageText(samples::s_webProxyCarrierMessageText(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = WebProxyCarrierMessage::parse(&out).expect("webProxyCarrierMessageText parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = WebProxyCarrierMessage::from_json(&j).expect("webProxyCarrierMessageText json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_webProxyCarrierMessageBinary() {
+    samples::__stack(move || {
+        let v = WebProxyCarrierMessage::webProxyCarrierMessageBinary(samples::s_webProxyCarrierMessageBinary(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = WebProxyCarrierMessage::parse(&out).expect("webProxyCarrierMessageBinary parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = WebProxyCarrierMessage::from_json(&j).expect("webProxyCarrierMessageBinary json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_WelcomeMessage() {
     samples::__stack(move || {
         let v = samples::s_WelcomeMessage(3);
@@ -508012,6 +520795,114 @@ fn __rt_WelcomeMessage() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = WelcomeMessage::from_json(&j).expect("WelcomeMessage json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_WidgetPublicData() {
+    samples::__stack(move || {
+        let v = samples::s_WidgetPublicData(3);
+        let mut out = Vec::new();
+        v.store_boxed(&mut out);
+        let w = WidgetPublicData::parse(&out).expect("WidgetPublicData parse");
+        assert_eq!(v, w);
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = WidgetPublicData::parse_bare(&out).expect("WidgetPublicData bare parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = WidgetPublicData::from_json(&j).expect("WidgetPublicData json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_WidgetQueryAnswer() {
+    samples::__stack(move || {
+        let v = samples::s_WidgetQueryAnswer(3);
+        let mut out = Vec::new();
+        v.store_boxed(&mut out);
+        let w = WidgetQueryAnswer::parse(&out).expect("WidgetQueryAnswer parse");
+        assert_eq!(v, w);
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = WidgetQueryAnswer::parse_bare(&out).expect("WidgetQueryAnswer bare parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = WidgetQueryAnswer::from_json(&j).expect("WidgetQueryAnswer json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_widgetQueryTypeData() {
+    samples::__stack(move || {
+        let v = WidgetQueryType::widgetQueryTypeData(samples::s_widgetQueryTypeData(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = WidgetQueryType::parse(&out).expect("widgetQueryTypeData parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = WidgetQueryType::from_json(&j).expect("widgetQueryTypeData json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_widgetQueryTypeSignData() {
+    samples::__stack(move || {
+        let v = WidgetQueryType::widgetQueryTypeSignData(samples::s_widgetQueryTypeSignData(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = WidgetQueryType::parse(&out).expect("widgetQueryTypeSignData parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = WidgetQueryType::from_json(&j).expect("widgetQueryTypeSignData json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_widgetQueryTypeSentTransaction() {
+    samples::__stack(move || {
+        let v = WidgetQueryType::widgetQueryTypeSentTransaction(samples::s_widgetQueryTypeSentTransaction(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = WidgetQueryType::parse(&out).expect("widgetQueryTypeSentTransaction parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = WidgetQueryType::from_json(&j).expect("widgetQueryTypeSentTransaction json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_WidgetQueryWallet() {
+    samples::__stack(move || {
+        let v = samples::s_WidgetQueryWallet(3);
+        let mut out = Vec::new();
+        v.store_boxed(&mut out);
+        let w = WidgetQueryWallet::parse(&out).expect("WidgetQueryWallet parse");
+        assert_eq!(v, w);
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = WidgetQueryWallet::parse_bare(&out).expect("WidgetQueryWallet bare parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = WidgetQueryWallet::from_json(&j).expect("WidgetQueryWallet json parse");
         assert_eq!(v, w);
     });
 }
@@ -508204,6 +521095,22 @@ fn __rt_addChecklistTasks() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = Function::from_json(&j).expect("addChecklistTasks json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_addCommunityChat() {
+    samples::__stack(move || {
+        let v = Function::addCommunityChat(samples::s_addCommunityChat(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("addCommunityChat parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("addCommunityChat json parse");
         assert_eq!(v, w);
     });
 }
@@ -508819,6 +521726,22 @@ fn __rt_answerWebAppQuery() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_answerWidgetQuery() {
+    samples::__stack(move || {
+        let v = Function::answerWidgetQuery(samples::s_answerWidgetQuery(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("answerWidgetQuery parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("answerWidgetQuery json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_applyPremiumGiftCode() {
     samples::__stack(move || {
         let v = Function::applyPremiumGiftCode(samples::s_applyPremiumGiftCode(3));
@@ -508828,6 +521751,22 @@ fn __rt_applyPremiumGiftCode() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = Function::from_json(&j).expect("applyPremiumGiftCode json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_applyUnpaidMessagesToken() {
+    samples::__stack(move || {
+        let v = Function::applyUnpaidMessagesToken(samples::s_applyUnpaidMessagesToken(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("applyUnpaidMessagesToken parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("applyUnpaidMessagesToken json parse");
         assert_eq!(v, w);
     });
 }
@@ -510963,6 +523902,22 @@ fn __rt_deleteForumTopic() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_deleteGift() {
+    samples::__stack(move || {
+        let v = Function::deleteGift(samples::s_deleteGift(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("deleteGift parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("deleteGift json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_deleteGiftCollection() {
     samples::__stack(move || {
         let v = Function::deleteGiftCollection(samples::s_deleteGiftCollection(3));
@@ -511491,6 +524446,22 @@ fn __rt_dismissWebToken() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_displayUpgradedGift() {
+    samples::__stack(move || {
+        let v = Function::displayUpgradedGift(samples::s_displayUpgradedGift(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("displayUpgradedGift parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("displayUpgradedGift json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_downloadFile() {
     samples::__stack(move || {
         let v = Function::downloadFile(samples::s_downloadFile(3));
@@ -511891,6 +524862,22 @@ fn __rt_editInlineMessageText() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_editInlineMessageWidgetData() {
+    samples::__stack(move || {
+        let v = Function::editInlineMessageWidgetData(samples::s_editInlineMessageWidgetData(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("editInlineMessageWidgetData parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("editInlineMessageWidgetData json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_editMessageCaption() {
     samples::__stack(move || {
         let v = Function::editMessageCaption(samples::s_editMessageCaption(3));
@@ -512003,6 +524990,22 @@ fn __rt_editMessageText() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_editMessageWidgetData() {
+    samples::__stack(move || {
+        let v = Function::editMessageWidgetData(samples::s_editMessageWidgetData(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("editMessageWidgetData parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("editMessageWidgetData json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_editProxy() {
     samples::__stack(move || {
         let v = Function::editProxy(samples::s_editProxy(3));
@@ -512083,6 +525086,22 @@ fn __rt_editStoryCover() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_editStoryMusic() {
+    samples::__stack(move || {
+        let v = Function::editStoryMusic(samples::s_editStoryMusic(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("editStoryMusic parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("editStoryMusic json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_editTextCompositionStyle() {
     samples::__stack(move || {
         let v = Function::editTextCompositionStyle(samples::s_editTextCompositionStyle(3));
@@ -512108,6 +525127,22 @@ fn __rt_editUserStarSubscription() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = Function::from_json(&j).expect("editUserStarSubscription json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_editWidgetData() {
+    samples::__stack(move || {
+        let v = Function::editWidgetData(samples::s_editWidgetData(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("editWidgetData parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("editWidgetData json parse");
         assert_eq!(v, w);
     });
 }
@@ -512220,6 +525255,38 @@ fn __rt_finishFileGeneration() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = Function::from_json(&j).expect("finishFileGeneration json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_fixRecognizedRichMessageWithAi() {
+    samples::__stack(move || {
+        let v = Function::fixRecognizedRichMessageWithAi(samples::s_fixRecognizedRichMessageWithAi(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("fixRecognizedRichMessageWithAi parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("fixRecognizedRichMessageWithAi json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_fixRecognizedTextWithAi() {
+    samples::__stack(move || {
+        let v = Function::fixRecognizedTextWithAi(samples::s_fixRecognizedTextWithAi(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("fixRecognizedTextWithAi parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("fixRecognizedTextWithAi json parse");
         assert_eq!(v, w);
     });
 }
@@ -513715,6 +526782,22 @@ fn __rt_getCommands() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_getCommunityAddChatRequests() {
+    samples::__stack(move || {
+        let v = Function::getCommunityAddChatRequests(samples::s_getCommunityAddChatRequests(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("getCommunityAddChatRequests parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("getCommunityAddChatRequests json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_getCommunityFullInfo() {
     samples::__stack(move || {
         let v = Function::getCommunityFullInfo(samples::s_getCommunityFullInfo(3));
@@ -513724,6 +526807,22 @@ fn __rt_getCommunityFullInfo() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = Function::from_json(&j).expect("getCommunityFullInfo json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_getCommunityMemberChats() {
+    samples::__stack(move || {
+        let v = Function::getCommunityMemberChats(samples::s_getCommunityMemberChats(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("getCommunityMemberChats parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("getCommunityMemberChats json parse");
         assert_eq!(v, w);
     });
 }
@@ -514828,6 +527927,22 @@ fn __rt_getInternalLinkType() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = Function::from_json(&j).expect("getInternalLinkType json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_getJoinedCommunities() {
+    samples::__stack(move || {
+        let v = Function::getJoinedCommunities(samples::s_getJoinedCommunities(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("getJoinedCommunities parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("getJoinedCommunities json parse");
         assert_eq!(v, w);
     });
 }
@@ -516147,6 +529262,22 @@ fn __rt_getPreparedKeyboardButton() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_getProfileShareThemeBackdrops() {
+    samples::__stack(move || {
+        let v = Function::getProfileShareThemeBackdrops(samples::s_getProfileShareThemeBackdrops(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("getProfileShareThemeBackdrops parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("getProfileShareThemeBackdrops json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_getProxies() {
     samples::__stack(move || {
         let v = Function::getProxies(samples::s_getProxies(3));
@@ -516572,6 +529703,22 @@ fn __rt_getSecretChat() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = Function::from_json(&j).expect("getSecretChat json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_getSpeechRecognitionLanguages() {
+    samples::__stack(move || {
+        let v = Function::getSpeechRecognitionLanguages(samples::s_getSpeechRecognitionLanguages(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("getSpeechRecognitionLanguages parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("getSpeechRecognitionLanguages json parse");
         assert_eq!(v, w);
     });
 }
@@ -517011,6 +530158,22 @@ fn __rt_getSuggestedStickerSetName() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_getSuitableCommunityChats() {
+    samples::__stack(move || {
+        let v = Function::getSuitableCommunityChats(samples::s_getSuitableCommunityChats(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("getSuitableCommunityChats parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("getSuitableCommunityChats json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_getSuitableDiscussionChats() {
     samples::__stack(move || {
         let v = Function::getSuitableDiscussionChats(samples::s_getSuitableDiscussionChats(3));
@@ -517148,6 +530311,22 @@ fn __rt_getTextCompositionStyleExample() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = Function::from_json(&j).expect("getTextCompositionStyleExample json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_getTextEmojiRanges() {
+    samples::__stack(move || {
+        let v = Function::getTextEmojiRanges(samples::s_getTextEmojiRanges(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("getTextEmojiRanges parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("getTextEmojiRanges json parse");
         assert_eq!(v, w);
     });
 }
@@ -517331,6 +530510,22 @@ fn __rt_getTonTransactions() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_getTonWalletCardBackgroundGiftCollectionNames() {
+    samples::__stack(move || {
+        let v = Function::getTonWalletCardBackgroundGiftCollectionNames(samples::s_getTonWalletCardBackgroundGiftCollectionNames(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("getTonWalletCardBackgroundGiftCollectionNames parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("getTonWalletCardBackgroundGiftCollectionNames json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_getTonWalletNfts() {
     samples::__stack(move || {
         let v = Function::getTonWalletNfts(samples::s_getTonWalletNfts(3));
@@ -517468,6 +530663,22 @@ fn __rt_getUpgradedGift() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = Function::from_json(&j).expect("getUpgradedGift json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_getUpgradedGiftDepositInfo() {
+    samples::__stack(move || {
+        let v = Function::getUpgradedGiftDepositInfo(samples::s_getUpgradedGiftDepositInfo(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("getUpgradedGiftDepositInfo parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("getUpgradedGiftDepositInfo json parse");
         assert_eq!(v, w);
     });
 }
@@ -517820,6 +531031,38 @@ fn __rt_getWebPageInstantView() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = Function::from_json(&j).expect("getWebPageInstantView json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_getWidgetPublicData() {
+    samples::__stack(move || {
+        let v = Function::getWidgetPublicData(samples::s_getWidgetPublicData(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("getWidgetPublicData parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("getWidgetPublicData json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_getWidgetQueryAnswer() {
+    samples::__stack(move || {
+        let v = Function::getWidgetQueryAnswer(samples::s_getWidgetQueryAnswer(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("getWidgetQueryAnswer parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("getWidgetQueryAnswer json parse");
         assert_eq!(v, w);
     });
 }
@@ -518643,6 +531886,38 @@ fn __rt_processChatJoinRequests() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_processCommunityAddChatRequest() {
+    samples::__stack(move || {
+        let v = Function::processCommunityAddChatRequest(samples::s_processCommunityAddChatRequest(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("processCommunityAddChatRequest parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("processCommunityAddChatRequest json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_processCommunityAddChatRequests() {
+    samples::__stack(move || {
+        let v = Function::processCommunityAddChatRequests(samples::s_processCommunityAddChatRequests(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("processCommunityAddChatRequests parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("processCommunityAddChatRequests json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_processGiftPurchaseOffer() {
     samples::__stack(move || {
         let v = Function::processGiftPurchaseOffer(samples::s_processGiftPurchaseOffer(3));
@@ -518668,6 +531943,22 @@ fn __rt_processPushNotification() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = Function::from_json(&j).expect("processPushNotification json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_processWebProxyCarrierMessage() {
+    samples::__stack(move || {
+        let v = Function::processWebProxyCarrierMessage(samples::s_processWebProxyCarrierMessage(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("processWebProxyCarrierMessage parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("processWebProxyCarrierMessage json parse");
         assert_eq!(v, w);
     });
 }
@@ -518883,6 +532174,22 @@ fn __rt_recognizeSpeech() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_recognizeSpeechInFile() {
+    samples::__stack(move || {
+        let v = Function::recognizeSpeechInFile(samples::s_recognizeSpeechInFile(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("recognizeSpeechInFile parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("recognizeSpeechInFile json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_recoverAuthenticationPassword() {
     samples::__stack(move || {
         let v = Function::recoverAuthenticationPassword(samples::s_recoverAuthenticationPassword(3));
@@ -519020,6 +532327,22 @@ fn __rt_removeChatActionBar() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = Function::from_json(&j).expect("removeChatActionBar json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_removeCommunityChat() {
+    samples::__stack(move || {
+        let v = Function::removeCommunityChat(samples::s_removeCommunityChat(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("removeCommunityChat parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("removeCommunityChat json parse");
         assert_eq!(v, w);
     });
 }
@@ -519868,6 +533191,22 @@ fn __rt_reportVideoMessageAdvertisement() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = Function::from_json(&j).expect("reportVideoMessageAdvertisement json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_reportWebProxyCarrierError() {
+    samples::__stack(move || {
+        let v = Function::reportWebProxyCarrierError(samples::s_reportWebProxyCarrierError(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("reportWebProxyCarrierError parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("reportWebProxyCarrierError json parse");
         assert_eq!(v, w);
     });
 }
@@ -522211,6 +535550,22 @@ fn __rt_setCommunityName() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_setCommunityNotificationSettings() {
+    samples::__stack(move || {
+        let v = Function::setCommunityNotificationSettings(samples::s_setCommunityNotificationSettings(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("setCommunityNotificationSettings parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("setCommunityNotificationSettings json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_setCommunityPermissions() {
     samples::__stack(move || {
         let v = Function::setCommunityPermissions(samples::s_setCommunityPermissions(3));
@@ -523059,6 +536414,22 @@ fn __rt_setProfilePhoto() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_setProfileShareTheme() {
+    samples::__stack(move || {
+        let v = Function::setProfileShareTheme(samples::s_setProfileShareTheme(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("setProfileShareTheme parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("setProfileShareTheme json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_setQuickReplyShortcutName() {
     samples::__stack(move || {
         let v = Function::setQuickReplyShortcutName(samples::s_setQuickReplyShortcutName(3));
@@ -523404,6 +536775,22 @@ fn __rt_setTonConnectSessionWalletClientId() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = Function::from_json(&j).expect("setTonConnectSessionWalletClientId json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_setTonWalletCardStickers() {
+    samples::__stack(move || {
+        let v = Function::setTonWalletCardStickers(samples::s_setTonWalletCardStickers(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("setTonWalletCardStickers parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("setTonWalletCardStickers json parse");
         assert_eq!(v, w);
     });
 }
@@ -524227,6 +537614,38 @@ fn __rt_toggleChatViewAsTopics() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_toggleCommunityAreChatsCollapsed() {
+    samples::__stack(move || {
+        let v = Function::toggleCommunityAreChatsCollapsed(samples::s_toggleCommunityAreChatsCollapsed(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("toggleCommunityAreChatsCollapsed parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("toggleCommunityAreChatsCollapsed json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_toggleCommunityMemberIsBanned() {
+    samples::__stack(move || {
+        let v = Function::toggleCommunityMemberIsBanned(samples::s_toggleCommunityMemberIsBanned(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("toggleCommunityMemberIsBanned parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("toggleCommunityMemberIsBanned json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_toggleDirectMessagesChatTopicCanSendUnpaidMessages() {
     samples::__stack(move || {
         let v = Function::toggleDirectMessagesChatTopicCanSendUnpaidMessages(samples::s_toggleDirectMessagesChatTopicCanSendUnpaidMessages(3));
@@ -525036,6 +538455,22 @@ fn __rt_viewVideoMessageAdvertisement() {
         assert_eq!(v, w);
         let j = v.to_json();
         let w = Function::from_json(&j).expect("viewVideoMessageAdvertisement json parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_withdrawUpgradedGift() {
+    samples::__stack(move || {
+        let v = Function::withdrawUpgradedGift(samples::s_withdrawUpgradedGift(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("withdrawUpgradedGift parse");
+        assert_eq!(v, w);
+        let j = v.to_json();
+        let w = Function::from_json(&j).expect("withdrawUpgradedGift json parse");
         assert_eq!(v, w);
     });
 }

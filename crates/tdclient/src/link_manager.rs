@@ -1534,6 +1534,15 @@ impl InternalLink {
                         td_api::ProxyType::proxyTypeHttp(_) => {
                             unreachable!("proxyTypeHttp cannot appear in a parsed proxy link")
                         }
+                        // 1.8.70 proxyTypeWeb — the parsed link form
+                        // round-trips like the socks/mtproto forms
+                        // (LinkManager.cpp:1229-1232).
+                        td_api::ProxyType::proxyTypeWeb(type_web) => {
+                            td_api::ProxyType::proxyTypeWeb(td_api::proxyTypeWeb {
+                                path: type_web.path.clone(),
+                                secret: type_web.secret.clone(),
+                            })
+                        }
                     };
                     td_api::Proxy {
                         server: server.clone(),
@@ -1554,6 +1563,10 @@ impl InternalLink {
                     chat_username: dialog_username.clone(),
                     draft_text: draft_text.clone(),
                     open_profile: *open_profile,
+                    // The `?free=` URL-query token (LinkManager.cpp
+                    // get_url_query_unpaid_messages_token) rides the
+                    // unpaid-links family follow-up.
+                    unpaid_messages_token: String::new(),
                 },
             ),
             InternalLink::QrCodeAuthentication => {
@@ -1730,12 +1743,20 @@ impl InternalLink {
                     phone_number: phone_number.clone(),
                     draft_text: draft_text.clone(),
                     open_profile: *open_profile,
+                    // The `?free=` URL-query token (LinkManager.cpp
+                    // get_url_query_unpaid_messages_token) rides the
+                    // unpaid-links family follow-up.
+                    unpaid_messages_token: String::new(),
                 },
             ),
             InternalLink::UserToken { token } => {
                 td_api::InternalLinkType::internalLinkTypeUserToken(
                     td_api::internalLinkTypeUserToken {
                         token: token.clone(),
+                        // The `?free=` URL-query token (LinkManager.cpp
+                        // get_url_query_unpaid_messages_token) rides the
+                        // unpaid-links family follow-up.
+                        unpaid_messages_token: String::new(),
                     },
                 )
             }
@@ -6331,6 +6352,14 @@ impl NetProxy {
                     proxy.port,
                     secret,
                 ))
+            }
+            // 1.8.70 web proxies (Proxy::web — port 443, the path in
+            // the server parameter, net/Proxy.cpp:183-193) need the
+            // NetProxy web transport — the web-proxy family follow-up
+            // (#114); the interim arm refuses like an unbuildable proxy.
+            td_api::ProxyType::proxyTypeWeb(_) => {
+                let _ = proxy_type;
+                Err(Status::error(400, "Web proxies are not supported yet"))
             }
         }
     }

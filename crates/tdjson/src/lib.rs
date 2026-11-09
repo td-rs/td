@@ -297,7 +297,7 @@ mod tests {
         let response = unsafe { cstr(response) };
         assert_eq!(
             response,
-            r#"{"@type":"optionValueString","value":"1.8.68"}"#
+            r#"{"@type":"optionValueString","value":"1.8.70"}"#
         );
     }
 
@@ -321,7 +321,7 @@ mod tests {
             }
             assert_eq!(
                 response.expect("the getOption answer"),
-                r#"{"@type":"optionValueString","value":"1.8.68"}"#
+                r#"{"@type":"optionValueString","value":"1.8.70"}"#
             );
             td_json_client_destroy(client);
         }
@@ -359,7 +359,7 @@ mod tests {
             assert_eq!(
                 response.expect("the getOption answer"),
                 format!(
-                    r#"{{"@type":"optionValueString","value":"1.8.68","@client_id":{client_id}}}"#
+                    r#"{{"@type":"optionValueString","value":"1.8.70","@client_id":{client_id}}}"#
                 )
             );
         }

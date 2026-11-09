@@ -374,6 +374,8 @@ pub fn get_ton_wallet_transaction_object(
     let mut peer_user_id = 0i64;
     let mut peer_domain = String::new();
     let mut peer_provider_name = String::new();
+    let mut is_telegram_gift = false;
+    let mut is_saved = false;
     match peer {
         Some(telegram_api::WalletTransactionPeer::walletTransactionPeerUser(peer)) => {
             peer_user_id = peer.user_id;
@@ -393,6 +395,12 @@ pub fn get_ton_wallet_transaction_object(
             peer_domain = peer.domain;
             peer_provider_name = peer.provider_name;
         }
+        // cpp:2343-2344 — the channel peer fields stay unread.
+        Some(telegram_api::WalletTransactionPeer::walletTransactionPeerChannel(_)) => {}
+        Some(telegram_api::WalletTransactionPeer::walletTransactionPeerTelegramGift(peer)) => {
+            is_telegram_gift = true;
+            is_saved = peer.own_profile;
+        }
         Some(telegram_api::WalletTransactionPeer::walletTransactionPeerUnsupported(_)) | None => {}
     }
     let mut amount = amount;
@@ -411,35 +419,51 @@ pub fn get_ton_wallet_transaction_object(
         )
     };
     let transaction_type = if let Some(nft) = nft {
-        td_api::TonWalletTransactionType::tonWalletTransactionTypeNftTransfer(
-            td_api::tonWalletTransactionTypeNftTransfer {
-                nft: Some(get_ton_nft_object(&nft)),
-                is_outgoing: !incoming,
-                comment: comment.clone(),
-                is_comment_encrypted: comment_encrypted,
-            },
-        )
-    } else if !peer_provider_name.is_empty() {
-        td_api::TonWalletTransactionType::tonWalletTransactionTypeOnRampDeposit(
-            td_api::tonWalletTransactionTypeOnRampDeposit {
-                amount,
-                provider_name: peer_provider_name,
-            },
-        )
-    } else if key_change {
-        peer_user_id = my_user_id;
-        td_api::TonWalletTransactionType::tonWalletTransactionTypeKeyChange(
-            td_api::tonWalletTransactionTypeKeyChange,
-        )
+        let nft_object = get_ton_nft_object(&nft);
+        if is_telegram_gift {
+            td_api::TonWalletTransactionType::tonWalletTransactionTypeTelegramGiftTransfer(
+                td_api::tonWalletTransactionTypeTelegramGiftTransfer {
+                    nft: Some(nft_object),
+                    is_outgoing: !incoming,
+                    is_saved,
+                },
+            )
+        } else {
+            td_api::TonWalletTransactionType::tonWalletTransactionTypeNftTransfer(
+                td_api::tonWalletTransactionTypeNftTransfer {
+                    nft: Some(nft_object),
+                    is_outgoing: !incoming,
+                    comment: comment.clone(),
+                    is_comment_encrypted: comment_encrypted,
+                },
+            )
+        }
     } else {
-        td_api::TonWalletTransactionType::tonWalletTransactionTypeTransfer(
-            td_api::tonWalletTransactionTypeTransfer {
-                amount,
-                is_gasless: gasless,
-                comment,
-                is_comment_encrypted: comment_encrypted,
-            },
-        )
+        if is_telegram_gift {
+            tdutils::log_error!("Receive Telegram gift transaction {id} without NFT");
+        }
+        if !peer_provider_name.is_empty() {
+            td_api::TonWalletTransactionType::tonWalletTransactionTypeOnRampDeposit(
+                td_api::tonWalletTransactionTypeOnRampDeposit {
+                    amount,
+                    provider_name: peer_provider_name,
+                },
+            )
+        } else if key_change {
+            peer_user_id = my_user_id;
+            td_api::TonWalletTransactionType::tonWalletTransactionTypeKeyChange(
+                td_api::tonWalletTransactionTypeKeyChange,
+            )
+        } else {
+            td_api::TonWalletTransactionType::tonWalletTransactionTypeTransfer(
+                td_api::tonWalletTransactionTypeTransfer {
+                    amount,
+                    is_gasless: gasless,
+                    comment,
+                    is_comment_encrypted: comment_encrypted,
+                },
+            )
+        }
     };
     td_api::TonWalletTransaction {
         id,
@@ -487,6 +511,10 @@ pub(crate) fn get_ton_nft_object(item: &telegram_api::wallet_NftItem) -> td_api:
             tdutils::status::Result::Ok(value) => Some(Box::new(value)),
             tdutils::status::Result::Err(_) => None,
         },
+        // The wire gift (TonNft.cpp:69-76 StarGift parse → upgradedGift)
+        // needs the StarGiftEnv conversion plane — the TON-wallet-cards
+        // family follow-up.
+        gift: None,
     }
 }
 

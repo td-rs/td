@@ -1785,7 +1785,7 @@ impl SessionConnectionCallback for FullConfigCallback {
 }
 
 /// `MTPROTO_LAYER` (Version.h:13) — the layer the pinned scheme carries.
-pub(crate) const MTPROTO_LAYER: i32 = 230;
+pub(crate) const MTPROTO_LAYER: i32 = 233;
 
 /// The `GetConfigActor::set_timeout_in(10)` budget (ConfigManager.cpp:466)
 /// — the whole mini-session, handshake included, fails with

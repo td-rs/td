@@ -347,11 +347,11 @@ mod tests {
         let client = ClientJson::new();
         assert_eq!(
             client.execute(r#"{"@type":"getOption","name":"version"}"#),
-            r#"{"@type":"optionValueString","value":"1.8.68"}"#
+            r#"{"@type":"optionValueString","value":"1.8.70"}"#
         );
         assert_eq!(
             client.execute(r#"{"@type":"getOption","name":"version","@extra":[1]}"#),
-            r#"{"@type":"optionValueString","value":"1.8.68","@extra":[1]}"#
+            r#"{"@type":"optionValueString","value":"1.8.70","@extra":[1]}"#
         );
     }
 
@@ -374,7 +374,7 @@ mod tests {
         }
         assert_eq!(
             response.as_deref(),
-            Some(r#"{"@type":"optionValueString","value":"1.8.68","@extra":{"n":2}}"#)
+            Some(r#"{"@type":"optionValueString","value":"1.8.70","@extra":{"n":2}}"#)
         );
     }
 
@@ -396,7 +396,7 @@ mod tests {
         assert_eq!(
             response,
             Some(format!(
-                r#"{{"@type":"optionValueString","value":"1.8.68","@client_id":{client_id}}}"#
+                r#"{{"@type":"optionValueString","value":"1.8.70","@client_id":{client_id}}}"#
             ))
         );
     }
@@ -405,7 +405,7 @@ mod tests {
     fn execute_is_process_wide() {
         assert_eq!(
             execute(r#"{"@type":"getOption","name":"version"}"#),
-            r#"{"@type":"optionValueString","value":"1.8.68"}"#
+            r#"{"@type":"optionValueString","value":"1.8.70"}"#
         );
     }
 }

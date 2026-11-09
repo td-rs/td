@@ -323,6 +323,16 @@ impl PasswordManager {
         Ok(())
     }
 
+    /// `PasswordManager::get_temp_password_state_sync` (cpp:285-286)
+    /// — the raw saved temporary password while still valid.
+    pub fn get_temp_password(&self) -> Option<String> {
+        if self.temp_password.is_some() && self.temp_password_valid_until > tdutils::time::now() {
+            self.temp_password.clone()
+        } else {
+            None
+        }
+    }
+
     /// `PasswordManager::get_temp_password_state` (cpp:272-274).
     pub fn get_temporary_password_state(&self) -> td_api::TemporaryPasswordState {
         let now = tdutils::time::now();

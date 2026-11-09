@@ -591,6 +591,7 @@ pub struct User {
     pub can_be_edited_bot: bool,
     pub has_main_app: bool,
     pub has_bot_forum_view: bool,
+    pub has_bot_forum_sidebar: bool,
     pub can_bot_create_topics: bool,
     pub can_manage_bots: bool,
     pub is_inline_bot: bool,
@@ -695,6 +696,7 @@ impl Default for User {
             can_be_edited_bot: false,
             has_main_app: false,
             has_bot_forum_view: false,
+            has_bot_forum_sidebar: false,
             can_bot_create_topics: false,
             can_manage_bots: false,
             is_inline_bot: false,
@@ -934,6 +936,10 @@ impl User {
                     self.is_noforwards_inited,
                     self.noforwards_my_enabled,
                     self.noforwards_peer_enabled,
+                    // 1.8.70: appended last (UserManager.cpp STORE_FLAG
+                    // order) — the shared binlog layout stays
+                    // byte-compatible.
+                    self.has_bot_forum_sidebar,
                 ],
             );
         }
@@ -1107,10 +1113,12 @@ impl User {
             is_noforwards_inited,
             noforwards_my_enabled,
             noforwards_peer_enabled,
+            // 1.8.70: appended last (UserManager.cpp PARSE_FLAG order).
+            has_bot_forum_sidebar,
         ] = if has_flags2 {
             parser.parse_flags()?
         } else {
-            [false; 27]
+            [false; 28]
         };
         if legacy_has_stories {
             return Err("legacy user stories need the story subsystem");
@@ -1121,6 +1129,7 @@ impl User {
         u.is_business_bot = is_business_bot;
         u.has_main_app = has_main_app;
         u.has_bot_forum_view = has_bot_forum_view;
+        u.has_bot_forum_sidebar = has_bot_forum_sidebar;
         u.has_live_story = has_live_story;
         u.can_bot_create_topics = can_bot_create_topics;
         u.can_manage_bots = can_manage_bots;
@@ -3812,6 +3821,14 @@ impl UserManager {
         let mut can_be_added_to_attach_menu = user.bot_attach_menu;
         let mut has_main_app = user.bot_has_main_app;
         let mut has_bot_forum_view = user.bot_forum_view;
+        // cpp:3247-3250 — the sidebar is gated by the forum view (with
+        // the error band for the ungated wire form).
+        let mut has_bot_forum_sidebar = has_bot_forum_view && user.bot_forum_sidebar;
+        if user.bot_forum_sidebar && !has_bot_forum_view {
+            tdutils::log_error!(
+                "Receive forum sidebar without forum view for {user_id:?} from {source}"
+            );
+        }
         let mut can_bot_create_topics = has_bot_forum_view && !user.bot_forum_can_manage_topics;
         let mut can_manage_bots = user.bot_can_manage_bots;
         let attach_menu_enabled = user.attach_menu_enabled;
@@ -3883,6 +3900,7 @@ impl UserManager {
             can_be_edited_bot = false;
             has_main_app = false;
             has_bot_forum_view = false;
+            has_bot_forum_sidebar = false;
             can_bot_create_topics = false;
             can_manage_bots = false;
             is_inline_bot = false;
@@ -3912,6 +3930,7 @@ impl UserManager {
                 || need_location_bot != u.need_location_bot
                 || can_be_added_to_attach_menu != u.can_be_added_to_attach_menu
                 || has_main_app != u.has_main_app
+                || has_bot_forum_sidebar != u.has_bot_forum_sidebar
                 || can_bot_create_topics != u.can_bot_create_topics
                 || can_manage_bots != u.can_manage_bots
                 || is_guestchat_bot != u.is_guestchat_bot
@@ -3933,6 +3952,7 @@ impl UserManager {
                 u.need_location_bot = need_location_bot;
                 u.can_be_added_to_attach_menu = can_be_added_to_attach_menu;
                 u.has_main_app = has_main_app;
+                u.has_bot_forum_sidebar = has_bot_forum_sidebar;
                 u.can_bot_create_topics = can_bot_create_topics;
                 u.can_manage_bots = can_manage_bots;
                 u.is_guestchat_bot = is_guestchat_bot;
@@ -6696,6 +6716,7 @@ impl UserManager {
                 can_read_all_group_messages: u.can_read_all_group_messages,
                 has_main_web_app: u.has_main_app,
                 has_topics: u.has_bot_forum_view,
+                has_topic_sidebar: u.has_bot_forum_sidebar,
                 allows_users_to_create_topics: u.has_bot_forum_view && !u.can_bot_create_topics,
                 can_manage_bots: u.can_manage_bots,
                 is_inline: u.is_inline_bot,
@@ -6920,6 +6941,11 @@ impl UserManager {
                 text: String::new(),
                 entities: Vec::new(),
             }),
+            // The TON wallet card / profile share theme plane (userFull
+            // wallet_card / share_theme, UserManager.cpp:9049-9052)
+            // rides the profile-themes family follow-up.
+            ton_wallet_card: None,
+            share_theme: None,
             business_info: Some(td_api::BusinessInfo::default()),
             bot_info: Some(td_api::BotInfo::default()),
         }

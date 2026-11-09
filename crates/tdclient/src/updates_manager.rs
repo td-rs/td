@@ -152,6 +152,7 @@ fn update_id_and_name(update: &telegram_api::Update) -> (i32, &'static str) {
             (updateBotCallbackQuery::ID, "updateBotCallbackQuery")
         }
         Update::updateEditMessage(_t) => (updateEditMessage::ID, "updateEditMessage"),
+        Update::updateEditForumTopic(_t) => (updateEditForumTopic::ID, "updateEditForumTopic"),
         Update::updateInlineBotCallbackQuery(_t) => (
             updateInlineBotCallbackQuery::ID,
             "updateInlineBotCallbackQuery",
@@ -279,6 +280,9 @@ fn update_id_and_name(update: &telegram_api::Update) -> (i32, &'static str) {
         Update::updateTranscribedAudio(_t) => {
             (updateTranscribedAudio::ID, "updateTranscribedAudio")
         }
+        Update::updateTranscribedAudioFile(_t) => {
+            (updateTranscribedAudioFile::ID, "updateTranscribedAudioFile")
+        }
         Update::updateReadFeaturedEmojiStickers(_t) => (
             updateReadFeaturedEmojiStickers::ID,
             "updateReadFeaturedEmojiStickers",
@@ -308,6 +312,16 @@ fn update_id_and_name(update: &telegram_api::Update) -> (i32, &'static str) {
             (updateSentStoryReaction::ID, "updateSentStoryReaction")
         }
         Update::updateBotChatBoost(_t) => (updateBotChatBoost::ID, "updateBotChatBoost"),
+        Update::updateBotWidgetQuery(_t) => (updateBotWidgetQuery::ID, "updateBotWidgetQuery"),
+        Update::updateInlineBotWidgetQuery(_t) => {
+            (updateInlineBotWidgetQuery::ID, "updateInlineBotWidgetQuery")
+        }
+        Update::updateBotWidgetCopyQuery(_t) => {
+            (updateBotWidgetCopyQuery::ID, "updateBotWidgetCopyQuery")
+        }
+        Update::updateMessageWidgetData(_t) => {
+            (updateMessageWidgetData::ID, "updateMessageWidgetData")
+        }
         Update::updateChannelViewForumAsMessages(_t) => (
             updateChannelViewForumAsMessages::ID,
             "updateChannelViewForumAsMessages",
@@ -4748,6 +4762,73 @@ impl<S: UpdatesSink> UpdatesManager<S> {
                     promise,
                 );
             }
+            // 1.8.70 widget updates (cpp:5233-5255) — the widget_manager
+            // seam; the promise settles like the C++ direct routing.
+            PendingUpdate::Wire(telegram_api::Update::updateBotWidgetQuery(_)) => {
+                self.drop_unsupported(
+                    telegram_api::updateBotWidgetQuery::ID,
+                    "updateBotWidgetQuery",
+                    5233,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateInlineBotWidgetQuery(_)) => {
+                self.drop_unsupported(
+                    telegram_api::updateInlineBotWidgetQuery::ID,
+                    "updateInlineBotWidgetQuery",
+                    5240,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateBotWidgetCopyQuery(_)) => {
+                self.drop_unsupported(
+                    telegram_api::updateBotWidgetCopyQuery::ID,
+                    "updateBotWidgetCopyQuery",
+                    5248,
+                    promise,
+                );
+            }
+            // 1.8.70 `updateMessageWidgetData` (cpp:4046-4051) — the
+            // pts-affected widget-data update.
+            PendingUpdate::Wire(telegram_api::Update::updateMessageWidgetData(update)) => {
+                let new_pts = update.pts;
+                let pts_count = update.pts_count;
+                let now = env.now();
+                self.add_pending_pts_update(
+                    env,
+                    PendingUpdate::Wire(telegram_api::Update::updateMessageWidgetData(update)),
+                    new_pts,
+                    pts_count,
+                    now,
+                    promise,
+                    "updateMessageWidgetData",
+                );
+            }
+            // 1.8.70 `updateEditForumTopic` (cpp:4028-4037) — the
+            // forum_topic_manager seam.
+            PendingUpdate::Wire(telegram_api::Update::updateEditForumTopic(_)) => {
+                self.drop_unsupported(
+                    telegram_api::updateEditForumTopic::ID,
+                    "updateEditForumTopic",
+                    4028,
+                    promise,
+                );
+            }
+            // 1.8.70 `updateTranscribedAudioFile` (cpp:5030-5034) — the
+            // TranscriptionManager wrap back into updateTranscribedAudio
+            // (TranscriptionManager.cpp:653-659).
+            PendingUpdate::Wire(telegram_api::Update::updateTranscribedAudioFile(update)) => {
+                let audio_update = telegram_api::updateTranscribedAudio {
+                    flags: i32::from(update.pending),
+                    pending: update.pending,
+                    peer: None,
+                    msg_id: 0,
+                    transcription_id: update.transcription_id,
+                    text: update.text,
+                };
+                self.sink.on_update_transcribed_audio(audio_update);
+                promise.set_value(());
+            }
             PendingUpdate::Wire(telegram_api::Update::updateBotMessageReaction(update)) => {
                 let qts = update.qts;
                 self.add_pending_qts_update(
@@ -5963,7 +6044,9 @@ impl<S: UpdatesSink> UpdatesManager<S> {
             | MA::messageActionPollDeleteAnswer(_)
             | MA::messageActionManagedBotCreated(_)
             | MA::messageActionGramTransfer(_)
-            | MA::messageActionWalletTonConnectRequest(_) => true,
+            | MA::messageActionWalletTonConnectRequest(_)
+            // 1.8.70 (cpp:1008) — the no-op accept band.
+            | MA::messageActionNoPaidMessagesTokenUsed(_) => true,
             MA::messageActionChatCreate(action) => action
                 .users
                 .iter()
@@ -6526,7 +6609,10 @@ pub fn is_additional_service_message(message: &telegram_api::Message) -> bool {
     match message {
         telegram_api::Message::messageService(message) => matches!(
             message.action,
+            // cpp:1516-1517 — 1.8.70 adds the no-paid-messages-token
+            // marker.
             Some(telegram_api::MessageAction::messageActionSetMessagesTTL(_))
+                | Some(telegram_api::MessageAction::messageActionNoPaidMessagesTokenUsed(_))
         ),
         _ => false,
     }
@@ -7084,6 +7170,14 @@ fn check_pts_update(update: &PendingUpdate) -> bool {
             }
             (u.pts, u.pts_count)
         }
+        // 1.8.70 (cpp:4253-4256) — the widget-data update is a peer-gated
+        // pts update.
+        PendingUpdate::Wire(telegram_api::Update::updateMessageWidgetData(u)) => {
+            if !check_pts_update_peer(u.peer.as_ref().unwrap_or(&telegram_api::Peer::default())) {
+                return false;
+            }
+            (u.pts, u.pts_count)
+        }
         PendingUpdate::Wire(telegram_api::Update::updateReadMessagesContents(u)) => {
             (u.pts, u.pts_count)
         }
@@ -7116,6 +7210,8 @@ fn is_pts_update(update: &PendingUpdate) -> bool {
             | PendingUpdate::Wire(telegram_api::Update::updateWebPage(_))
             | PendingUpdate::Wire(telegram_api::Update::updatePinnedMessages(_))
             | PendingUpdate::Wire(telegram_api::Update::updateFolderPeers(_))
+            // 1.8.70 (cpp:4273).
+            | PendingUpdate::Wire(telegram_api::Update::updateMessageWidgetData(_))
     )
 }
 
@@ -7131,6 +7227,8 @@ fn get_update_pts(update: &PendingUpdate) -> i32 {
         PendingUpdate::Wire(telegram_api::Update::updateWebPage(u)) => u.pts,
         PendingUpdate::Wire(telegram_api::Update::updatePinnedMessages(u)) => u.pts,
         PendingUpdate::Wire(telegram_api::Update::updateFolderPeers(u)) => u.pts,
+        // 1.8.70 (cpp:4300-4301).
+        PendingUpdate::Wire(telegram_api::Update::updateMessageWidgetData(u)) => u.pts,
         _ => 0,
     }
 }

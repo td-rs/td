@@ -216,15 +216,16 @@ mod tests {
     #[test]
     fn generated_model_counts_match_the_scheme() {
         // Fixed by the S07 differential dump against td's own tl-parser:
-        // 792 types / 2260 ctors / 1065 functions (the c15d3f5a pin —
-        // layer 230, tdlib 1.8.68). Every non-builtin ctor (2260 - 9)
-        // and every function get a struct; multi-ctor types (219)
-        // additionally get an enum, plus the Function umbrella.
-        assert_eq!(td_api::SCHEME_TYPES, 792);
-        assert_eq!(td_api::SCHEME_CTORS, 2260);
-        assert_eq!(td_api::SCHEME_FUNCTIONS, 1065);
-        assert_eq!(td_api::GENERATED_STRUCTS, 3316);
-        assert_eq!(td_api::GENERATED_ENUMS, 219);
+        // 818 types / 2308 ctors / 1099 functions (the 23383aef pin —
+        // layer 233, tdlib 1.8.70; previous c15d3f5a: 792/2260/1065).
+        // Every non-builtin ctor (2308 - 9) and every function get a
+        // struct; multi-ctor types (224) additionally get an enum, plus
+        // the Function umbrella.
+        assert_eq!(td_api::SCHEME_TYPES, 818);
+        assert_eq!(td_api::SCHEME_CTORS, 2308);
+        assert_eq!(td_api::SCHEME_FUNCTIONS, 1099);
+        assert_eq!(td_api::GENERATED_STRUCTS, 3398);
+        assert_eq!(td_api::GENERATED_ENUMS, 225);
     }
 
     #[test]

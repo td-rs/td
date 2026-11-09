@@ -2631,6 +2631,9 @@ impl crate::messages_manager::SendMessageContext for Td {
                 monoforum_peer_id: None,
                 todo_item_id: 0,
                 poll_option: Vec::new(),
+                // The rich-quote wire plane (flags.8) rides the quotes
+                // family follow-up (#117).
+                quote_rich: Vec::new(),
             })
         });
         // the `get_input_suggested_post` build stays the suggested-post
@@ -3181,6 +3184,10 @@ pub(crate) enum AccountNetKind {
     /// `ExportContactTokenQuery` (cpp:545) — the token arm of
     /// `get_user_link` (the expires clamp).
     ExportContactToken,
+    /// `ExportNoPaidMessagesTokenQuery` (cpp:1357-1368) — the
+    /// `remove_messages_fee` arm of `get_user_link`; the token answer
+    /// re-enters through `create_user_link`.
+    ExportNoPaidMessagesToken,
     /// `ImportContactTokenQuery` (cpp:574) — the `on_get_user` intake
     /// answers with the stored user object.
     ImportContactToken,
@@ -10067,6 +10074,7 @@ impl Td {
         run: impl FnOnce(&mut StarGiftTdEnv<'_>, &mut crate::star_gift_manager::StarGiftManager) -> R,
     ) -> R {
         let my_dialog_id = crate::dialog_manager::get_my_dialog_id(self);
+        let temp_password = self.password_manager.get_temp_password();
         let crate::td::Td {
             global,
             option_manager,
@@ -10085,6 +10093,7 @@ impl Td {
             user_manager,
             chat_manager,
             my_dialog_id,
+            temp_password,
             updates: notification_updates,
         };
         run(&mut env, star_gift_manager)
@@ -25395,8 +25404,52 @@ impl Td {
                     "auth_cancelWebTokenAuthorization",
                 );
             }
+            // `ExportNoPaidMessagesTokenQuery` (cpp:1357-1368) — the
+            // token answer re-enters through `create_user_link` (the
+            // returned url stays unused, cpp:1361-1363).
+            AccountNetKind::ExportNoPaidMessagesToken => {
+                let promise = self
+                    .account_manager
+                    .take_promise(|m| &mut m.pending_no_paid_token_link);
+                if query.is_error() {
+                    if let Some(mut promise) = promise {
+                        promise.set_error(query.error().clone());
+                    }
+                    return;
+                }
+                match telegram_api::ExportedNoPaidMessagesToken::parse(query.ok()) {
+                    Ok(ptr) => {
+                        if let Some(promise) = promise {
+                            let net = self.account_net();
+                            let mut env = AccountEnv {
+                                global: &mut self.global,
+                                options: self.option_manager.as_mut(),
+                                user_manager: &mut self.user_manager,
+                                chat_manager: &mut self.chat_manager,
+                                device_token_manager: &mut self.device_token_manager,
+                                auth_is_bot: self.auth_manager.is_bot(),
+                                updates: &mut self.account_updates,
+                                net,
+                            };
+                            self.account_manager.create_user_link(
+                                &mut env,
+                                ptr.token,
+                                ptr.expires,
+                                promise,
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(mut promise) = promise {
+                            promise.set_error(parse_error("contacts_exportNoPaidMessagesToken"));
+                        }
+                    }
+                }
+            }
             // `ExportContactTokenQuery` (cpp:545-572) — the expires
-            // clamp keeps the link alive for at least a second.
+            // clamp keeps the link alive for at least a second; the
+            // token link answers `can_get_permanent_link = false`
+            // (cpp:625).
             AccountNetKind::ExportContactToken => {
                 let promise = self
                     .account_manager
@@ -25414,6 +25467,7 @@ impl Td {
                             promise.set_value(td_api::UserLink {
                                 url: ptr.url,
                                 expires_in,
+                                can_get_permanent_link: false,
                             });
                         }
                     }
@@ -27851,6 +27905,21 @@ impl Td {
                     tdutils::log_error!("Receive an invalid urlAuthResultRequest user_id_hint");
                     user_id_hint = UserId::default();
                 }
+                // The computed TON Connect pair (cpp:1973-1977) — both
+                // only with the wallet request flag.
+                let ton_connect_manifest_url = if request.request_wallet {
+                    format!("https://{}/tonconnect-manifest.json", request.domain)
+                } else {
+                    String::new()
+                };
+                let ton_proof_payload = if request.request_wallet {
+                    format!(
+                        "tc-login:{bot_user_id}:{}:{}",
+                        request.tc_client_id, request.tc_session_id
+                    )
+                } else {
+                    String::new()
+                };
                 promise.set_value(td_api::OauthLinkInfo {
                     user_id: user_id_hint.get(),
                     url,
@@ -27860,6 +27929,10 @@ impl Td {
                     bot_user_id,
                     request_write_access: request.request_write_access,
                     request_phone_number_access: request.request_phone_number,
+                    request_ton_wallet_access: request.request_wallet,
+                    dapp_client_id: request.tc_client_id,
+                    ton_connect_manifest_url,
+                    ton_proof_payload,
                     browser: request.browser,
                     platform: request.platform,
                     ip_address: request.ip,
@@ -39573,6 +39646,33 @@ impl AccountManagerEnv for AccountEnv<'_> {
         }
     }
 
+    /// `ExportNoPaidMessagesTokenQuery::send` (cpp:1365-1368) — the
+    /// flags pair `revoke` (bit 0) and `temporary` (bit 1).
+    fn send_export_no_paid_messages_token_query(&mut self, revoke: bool, temporary: bool) {
+        let mut flags = 0i32;
+        if revoke {
+            flags |= 1;
+        }
+        if temporary {
+            flags |= 2;
+        }
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                AccountNetKind::ExportNoPaidMessagesToken,
+                telegram_api::Function::contacts_exportNoPaidMessagesToken(
+                    telegram_api::contacts_exportNoPaidMessagesToken {
+                        flags,
+                        revoke,
+                        temporary,
+                    },
+                ),
+            ),
+            None => tdutils::log_info!(
+                "Send contacts.exportNoPaidMessagesToken(revoke = {revoke}, temporary = {temporary}) — [net-inert]"
+            ),
+        }
+    }
+
     /// `ImportContactTokenQuery::send` (cpp:584-587).
     fn send_import_contact_token_query(&mut self, token: &str) {
         match self.net.clone() {
@@ -44612,6 +44712,9 @@ pub(crate) struct StarGiftTdEnv<'a> {
     /// `dialog_manager_->get_my_dialog_id()` (the M.6.15a free-function
     /// answer, snapshotted at construction).
     pub(crate) my_dialog_id: crate::dialog_id::DialogId,
+    /// `PasswordManager::get_temp_password_state_sync` snapshotted at
+    /// construction (the withdrawal-url gate).
+    pub(crate) temp_password: Option<String>,
     pub(crate) updates: &'a mut Vec<td_api::Update>,
 }
 
@@ -44626,6 +44729,10 @@ impl crate::star_gift_manager::StarGiftEnv for StarGiftTdEnv<'_> {
 
     fn unix_time(&self) -> i32 {
         self.global.unix_time()
+    }
+
+    fn get_temp_password(&self) -> Option<String> {
+        self.temp_password.clone()
     }
 
     fn get_option_integer(&mut self, name: &str) -> i64 {
@@ -44840,6 +44947,12 @@ impl crate::star_gift_manager::StarGiftEnv for StarGiftTdEnv<'_> {
 
     fn can_channel_post_messages(&mut self, _channel_id: crate::chat_manager::ChannelId) -> bool {
         false
+    }
+
+    fn is_channel_creator(&mut self, channel_id: crate::chat_manager::ChannelId) -> bool {
+        self.chat_manager
+            .get_channel(channel_id)
+            .is_some_and(|c| c.status.is_creator())
     }
 
     fn on_update_channel_gift_count(
@@ -53201,6 +53314,9 @@ pub(crate) fn send_multi_media_query(
             monoforum_peer_id: None,
             todo_item_id: 0,
             poll_option: Vec::new(),
+            // The rich-quote wire plane (flags.8) rides the quotes
+            // family follow-up (#117).
+            quote_rich: Vec::new(),
         })
     });
     td.pending_multi_media_random_ids.push_back(random_ids);
@@ -54964,7 +55080,7 @@ mod tests {
                 }),
             );
             assert!(responses_of(callback, 7).iter().any(
-                |object| matches!(object, Object::optionValueString(v) if v.value == "1.8.68")
+                |object| matches!(object, Object::optionValueString(v) if v.value == "1.8.70")
             ));
         });
     }
@@ -59904,12 +60020,13 @@ mod tests {
     fn account_queries_ride_the_dispatcher_impl() {
         let (mut td, rec) = netted_td("netfix-account");
 
-        // 1. getUserLink — the empty first username parks at the
+        // 1. getUserLink — the plain form (remove_messages_fee =
+        //    false) with the empty first username parks at the
         //    contacts_exportContactToken query; the answer clamps the
         //    expiry against the td clock.
         let (promise, slot) = record_account_user_link();
         with_account_manager(&mut td, |manager, env| {
-            manager.get_user_link(env, promise);
+            manager.get_user_link(env, false, false, false, promise);
         });
         let sent = std::mem::take(&mut *rec.sent.lock());
         assert_eq!(sent.len(), 1);
@@ -80709,6 +80826,8 @@ mod tests {
                 supergroup_id: 704,
                 is_forum: true,
                 has_forum_tabs: true,
+                // 1.8.70: the sidebar leg stays unset in the fixture.
+                has_forum_sidebar: false,
             }),
         );
         let sent = take_sent(
@@ -80741,6 +80860,8 @@ mod tests {
                 supergroup_id: 705,
                 is_forum: true,
                 has_forum_tabs: true,
+                // 1.8.70: the sidebar leg stays unset in the fixture.
+                has_forum_sidebar: false,
             }),
         );
         assert!(matches!(
@@ -82162,6 +82283,8 @@ mod tests {
                 content: None,
                 areas: None,
                 caption: None,
+                // 1.8.70: no story music in the fixtures.
+                music: None,
                 privacy_settings: None,
                 album_ids: Vec::new(),
                 active_period: 6 * 3600,
@@ -82245,6 +82368,8 @@ mod tests {
                 content: None,
                 areas: None,
                 caption: None,
+                // 1.8.70: no story music in the fixtures.
+                music: None,
                 privacy_settings: None,
                 album_ids: Vec::new(),
                 active_period: 86400,
@@ -82315,6 +82440,8 @@ mod tests {
                     text: "caption".to_owned(),
                     entities: Vec::new(),
                 }),
+                // 1.8.70: no story music in the fixtures.
+                music: None,
                 privacy_settings: Some(td_api::StoryPrivacySettings::storyPrivacySettingsEveryone(
                     td_api::storyPrivacySettingsEveryone {
                         except_user_ids: Vec::new(),
@@ -82386,6 +82513,8 @@ mod tests {
                 )),
                 areas: None,
                 caption: None,
+                // 1.8.70: no story music in the fixtures.
+                music: None,
                 privacy_settings: Some(td_api::StoryPrivacySettings::storyPrivacySettingsEveryone(
                     td_api::storyPrivacySettingsEveryone {
                         except_user_ids: Vec::new(),
@@ -90424,6 +90553,10 @@ kQIDAQAB\n\
                 request_write_access: true,
                 request_phone_number: false,
                 match_codes_first: false,
+                // 1.8.70 wire fields — no TON Connect in the fixtures.
+                request_wallet: false,
+                tc_session_id: 0,
+                tc_client_id: String::new(),
                 is_app: false,
                 bot: Some(telegram_api::User::user(telegram_api::user {
                     flags: 1,
@@ -90568,6 +90701,10 @@ kQIDAQAB\n\
                 request_write_access: false,
                 request_phone_number: false,
                 match_codes_first: false,
+                // 1.8.70 wire fields — no TON Connect in the fixtures.
+                request_wallet: false,
+                tc_session_id: 0,
+                tc_client_id: String::new(),
                 is_app: false,
                 bot: None,
                 domain: "auth.com".to_owned(),
@@ -90615,6 +90752,10 @@ kQIDAQAB\n\
                 request_write_access: true,
                 request_phone_number: true,
                 match_codes_first: true,
+                // 1.8.70 wire fields — no TON Connect in the fixtures.
+                request_wallet: false,
+                tc_session_id: 0,
+                tc_client_id: String::new(),
                 is_app: true,
                 bot: Some(telegram_api::User::user(telegram_api::user {
                     flags: 1,
@@ -93370,19 +93511,19 @@ kQIDAQAB\n\
             (500, "Receive invalid server response")
         );
 
-        // 6. getUpgradedGiftWithdrawalUrl — the empty-password band; the
-        //    srp hop parks on the password plane ([blocked: M.25])
+        // 6. getUpgradedGiftWithdrawalUrl — 1.8.70 dropped the request
+        //    password; with no saved temporary password the gate answers
+        //    the 400 band synchronously
         td.request(
             11,
             Function::getUpgradedGiftWithdrawalUrl(td_api::getUpgradedGiftWithdrawalUrl {
                 received_gift_id: "123".to_owned(),
-                password: String::new(),
             }),
         );
         let error = error_of(&callback, 11);
         assert_eq!(
             (error.code, error.message.as_str()),
-            (400, "PASSWORD_HASH_INVALID")
+            (400, "Temporary password required to withdraw the gift")
         );
 
         // the updatesTooLong re-entry re-arms the difference engine (its

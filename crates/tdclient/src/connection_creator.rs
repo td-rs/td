@@ -727,6 +727,14 @@ impl Proxy {
                     secret,
                 })
             }
+            // 1.8.70 web proxies (Proxy::web — port 443, the path in
+            // the server parameter, net/Proxy.cpp:183-193) need the
+            // web transport in the connection machinery — the
+            // web-proxy family follow-up (#114); the interim arm
+            // refuses like an unbuildable proxy.
+            td_api::ProxyType::proxyTypeWeb(_) => {
+                Err("Web proxies are not supported yet".to_string())
+            }
         }
     }
 

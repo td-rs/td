@@ -12158,6 +12158,24 @@ pub fn create_input_message_content(
     let is_bot = td.is_bot();
     let is_secret = dialog_id.get_type() == DialogType::SecretChat;
     match input_message_content {
+        // 1.8.70 widgets (MessageContent.cpp:5475-5519) — the bot gate
+        // and the shared-widget id gate port now; the MessageWidget
+        // content kind rides the widgets family follow-up.
+        td_api::InputMessageContent::inputMessageWidget(_) => {
+            if !is_bot {
+                return Err(Status::error(400, "Only bots can send widget messages"));
+            }
+            return Err(Status::error(500, "Widgets are not supported yet"));
+        }
+        td_api::InputMessageContent::inputMessageSharedWidget(input_widget) => {
+            if !is_bot {
+                return Err(Status::error(400, "Only bots can send widget messages"));
+            }
+            if input_widget.widget_id == 0 {
+                return Err(Status::error(400, "Invalid widget identifier specified"));
+            }
+            return Err(Status::error(500, "Widgets are not supported yet"));
+        }
         td_api::InputMessageContent::inputMessageText(_) => {
             let input_message_text =
                 process_input_message_text(td, dialog_id, input_message_content, is_bot, false)?;
@@ -18619,6 +18637,13 @@ pub fn get_action_message_content(
                 ttl: action.period,
                 from_user_id,
             })
+        }
+        // 1.8.70 (MessageContent.cpp:11858-11859) — the C++ answers the
+        // new MessageUnpaidMessagesAllowedByLink content; its content
+        // kind rides the unpaid-messages family follow-up, so the interim
+        // arm answers the C++ `break` tail (the empty-text fallback).
+        telegram_api::MessageAction::messageActionNoPaidMessagesTokenUsed(_) => {
+            fallback_action_message_content()
         }
         telegram_api::MessageAction::messageActionGroupCallScheduled(action) => {
             if action.schedule_date <= 0 {

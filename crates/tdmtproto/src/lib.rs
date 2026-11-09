@@ -86,15 +86,16 @@ mod tests {
     #[test]
     fn generated_counts_match_the_c_oracle() {
         // Fixed by the S07 differential dump against td's own tl-parser,
-        // re-run at the c15d3f5a re-pin (6e2b9aa, layer 230 / tdlib 1.8.68):
-        // 660 types / 1715 ctors / 856 functions. Structs = non-builtin
-        // ctors + functions; enums = multi-ctor types + the umbrella.
-        // Refresh on every scheme re-pin (RELEASE.md §1-2).
-        assert_eq!(telegram_api::SCHEME_TYPES, 660);
-        assert_eq!(telegram_api::SCHEME_CTORS, 1715);
-        assert_eq!(telegram_api::SCHEME_FUNCTIONS, 856);
-        assert_eq!(telegram_api::GENERATED_STRUCTS, 2562);
-        assert_eq!(telegram_api::GENERATED_ENUMS, 247);
+        // re-run at the c15d3f5a re-pin (6e2b9aa, layer 230 / tdlib
+        // 1.8.68), refreshed at the 23383aef re-pin (layer 233 / tdlib
+        // 1.8.70): 673 types / 1750 ctors / 873 functions. Structs =
+        // non-builtin ctors + functions; enums = multi-ctor types + the
+        // umbrella. Refresh on every scheme re-pin (RELEASE.md §1-2).
+        assert_eq!(telegram_api::SCHEME_TYPES, 673);
+        assert_eq!(telegram_api::SCHEME_CTORS, 1750);
+        assert_eq!(telegram_api::SCHEME_FUNCTIONS, 873);
+        assert_eq!(telegram_api::GENERATED_STRUCTS, 2614);
+        assert_eq!(telegram_api::GENERATED_ENUMS, 251);
 
         // S13: the secret-chat and MTProto service schemes.
         assert_eq!(secret_api::SCHEME_TYPES, 20);

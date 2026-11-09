@@ -5245,6 +5245,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 ChannelId::new(request.supergroup_id),
                 request.is_forum,
                 request.has_forum_tabs,
+                request.has_forum_sidebar,
                 promise,
             );
         }
@@ -6717,7 +6718,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             );
             td.suggested_action_manager = manager;
         }
-        Function::getUserLink(_) => {
+        Function::getUserLink(request) => {
             if !check_is_user(td, id) {
                 return;
             }
@@ -6735,7 +6736,13 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 updates: &mut td.account_updates,
                 net,
             };
-            td.account_manager.get_user_link(&mut env, promise);
+            td.account_manager.get_user_link(
+                &mut env,
+                request.remove_messages_fee,
+                request.return_permanent_link,
+                request.revoke_previous_links,
+                promise,
+            );
         }
         Function::getActiveSessions(_) => {
             if !check_is_user(td, id) {
@@ -8522,6 +8529,7 @@ macro_rules! star_gift_env {
             user_manager: &mut $td.user_manager,
             chat_manager: &mut $td.chat_manager,
             my_dialog_id,
+            temp_password: $td.password_manager.get_temp_password(),
             updates: &mut $td.notification_updates,
         }
     }};
@@ -9080,21 +9088,19 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
                 .get_upgraded_gift_value_info(&mut env, &name, promise);
         }
 
-        // getUpgradedGiftWithdrawalUrl (Requests.cpp:8658-8662)
+        // getUpgradedGiftWithdrawalUrl (Requests.cpp:8658-8662) — the
+        // request password is gone; the saved temporary password gates
+        // the wire query (StarGiftManager.cpp:3307-3316).
         Function::getUpgradedGiftWithdrawalUrl(request) => {
             if !check_is_user(td, id) {
                 return;
             }
-            let Some(password) = clean_or_utf8_error(td, id, &request.password) else {
-                return;
-            };
             let promise = td
                 .deferred_promise::<String, _>(id, |url| Object::httpUrl(td_api::HttpUrl { url }));
             let mut env = star_gift_env!(td);
             td.star_gift_manager.get_star_gift_withdrawal_url(
                 &mut env,
                 StarGiftId::from_string(&request.received_gift_id),
-                &password,
                 promise,
             );
         }
@@ -19902,12 +19908,14 @@ mod request_census_tests {
             1039,
             "dispatched count"
         );
-        // the c15d3f5a sync: the TonWalletManager plane landed over the
-        // tde2e keychain subset — the TON wallet / TonConnect / On-ramp
-        // surface (38 arms incl. getTonWalletNfts and dismissWebToken)
-        // went dispatched with the community write family before it; the
-        // census closes: 1001 + 38 = 1039 dispatched / 0 interim, sync
-        // unmoved 26.
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 0, "interim count");
+        // the 23383aef sync base (1.8.70): the 34 new scheme functions
+        // (widgets ×9, communities ×8, TON wallet cards, speech
+        // recognition, profile share themes, text fixes, web-proxy
+        // carrier …) enter as interim arms — the catch-all
+        // NOT_IMPLEMENTED_YET placeholder — pending their family
+        // follow-ups; the 7 changed functions keep their dispatched
+        // arms with updated signatures. Census: 1,099 functions,
+        // dispatched unmoved 1,039 / 0 + 34 = 34 interim, sync 26.
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 34, "interim count");
     }
 }

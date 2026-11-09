@@ -57,12 +57,12 @@ pub enum SetOptionAction {
     SetContentSettings { value: bool },
 }
 
-/// The API version, hardcoded like `OptionManager.cpp` ("1.8.68" — pinned
+/// The API version, hardcoded like `OptionManager.cpp` ("1.8.70" — pinned
 /// to the reference C++ version for JSON parity).
-pub const API_VERSION: &str = "1.8.68";
+pub const API_VERSION: &str = "1.8.70";
 
 /// `OptionManager::get_synchronous_options`: `{"version", "commit_hash"}`.
-pub const VERSION: &str = "1.8.68";
+pub const VERSION: &str = "1.8.70";
 
 pub fn get_synchronous_options() -> &'static [&'static str] {
     &["version", "commit_hash"]

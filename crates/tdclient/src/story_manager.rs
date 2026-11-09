@@ -177,7 +177,10 @@ pub fn get_media_areas(
         .into_iter()
         .map(|area| MediaArea {
             area: td_api::StoryArea {
-                position: area.position.map(|position| td_api::StoryAreaPosition {
+                // 1.8.70: the shared `areaPosition` replaces
+                // storyAreaPosition (same fields, both story areas and
+                // TON wallet card stickers use it now).
+                position: area.position.map(|position| td_api::AreaPosition {
                     x_percentage: position.x_percentage,
                     y_percentage: position.y_percentage,
                     width_percentage: position.width_percentage,
@@ -194,14 +197,13 @@ pub fn get_media_areas(
                             },
                         ))
                     }
-                    Some(td_api::InputStoryAreaType::inputStoryAreaTypeFoundVenue(area)) => {
-                        // the found/previous venue inputs resolve the Venue
-                        // through the venue search — [blocked: the venue
-                        // track]; the interim area drops the venue payload
-                        let _ = (area.query_id, area.result_id);
-                        None
-                    }
                     Some(td_api::InputStoryAreaType::inputStoryAreaTypePreviousVenue(area)) => {
+                        // the previous-venue input resolves the Venue
+                        // against the old areas (MediaArea.cpp:159-172) —
+                        // [blocked: the venue track]; the interim area
+                        // drops the venue payload. 1.8.70 removed
+                        // inputStoryAreaTypeFoundVenue (the search-side
+                        // twin) — only the previous-venue form remains.
                         let _ = (area.venue_provider, area.venue_id);
                         None
                     }
@@ -3285,6 +3287,10 @@ impl StoryManager {
             } else {
                 None
             },
+            // The story music (StoryManager.cpp:4474-4483 — the wire
+            // music document → audio object) rides the story-music
+            // follow-up.
+            music: None,
             album_ids: StoryAlbumId::get_story_album_ids_object(&story.album_ids),
         })
     }

@@ -5088,6 +5088,183 @@ impl botInlineMessageRichMessage {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct botInlineMessageWidget {
+    pub flags: i32,
+    pub invert_media: bool,
+    pub width: i32,
+    pub height: i32,
+    pub payload: Vec<u8>,
+    pub public_data: String,
+    pub public_data_hash: i64,
+    pub chat_data: String,
+    pub reply_markup: Option<ReplyMarkup>,
+    pub widget_id: i64,
+    pub message: String,
+    pub entities: Vec<MessageEntity>,
+}
+
+impl botInlineMessageWidget {
+    pub const ID: i32 = -1163823052;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.flags | ((self.invert_media as i32) << 5));
+        tl::__i32(out, self.width);
+        tl::__i32(out, self.height);
+        tl::__string(out, &self.payload);
+        if (self.flags | ((self.invert_media as i32) << 5)) & 1 != 0 {
+            tl::__string(out, &self.public_data);
+        }
+        if (self.flags | ((self.invert_media as i32) << 5)) & 1 != 0 {
+            tl::__i64(out, self.public_data_hash);
+        }
+        if (self.flags | ((self.invert_media as i32) << 5)) & 1 << 1 != 0 {
+            tl::__string(out, &self.chat_data);
+        }
+        if (self.flags | ((self.invert_media as i32) << 5)) & 1 << 2 != 0 {
+            let __d0 = Default::default();
+            let __m0 = self.reply_markup.as_ref().unwrap_or(&__d0);
+            __m0.store(out);
+        }
+        if (self.flags | ((self.invert_media as i32) << 5)) & 1 << 3 != 0 {
+            tl::__i64(out, self.widget_id);
+        }
+        tl::__string(out, &self.message);
+        if (self.flags | ((self.invert_media as i32) << 5)) & 1 << 4 != 0 {
+            tl::__i32(out, tl::VECTOR_ID);
+            tl::__i32(out, self.entities.len() as i32);
+            for __v1 in &self.entities {
+                (*__v1).store(out);
+            }
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let flags: i32 = r.i32()?;
+        if flags < 0 {
+            return Result::Err("Variable of type # can't be negative");
+        }
+        let invert_media: bool = (flags & 1 << 5) != 0;
+        let width: i32 = r.i32()?;
+        let height: i32 = r.i32()?;
+        let payload: Vec<u8> = r.bytes()?;
+        let public_data: String = if (flags & 1) != 0 {
+            r.string()?
+        } else {
+            Default::default()
+        };
+        let public_data_hash: i64 = if (flags & 1) != 0 {
+            r.i64()?
+        } else {
+            Default::default()
+        };
+        let chat_data: String = if (flags & 1 << 1) != 0 {
+            r.string()?
+        } else {
+            Default::default()
+        };
+        let reply_markup: Option<ReplyMarkup> = if (flags & 1 << 2) != 0 {
+            Some(ReplyMarkup::read(r)?)
+        } else {
+            Default::default()
+        };
+        let widget_id: i64 = if (flags & 1 << 3) != 0 {
+            r.i64()?
+        } else {
+            Default::default()
+        };
+        let message: String = r.string()?;
+        let entities: Vec<MessageEntity> = if (flags & 1 << 4) != 0 {
+            let __v0: Vec<MessageEntity> = {
+                if r.i32()? != tl::VECTOR_ID {
+                    return Result::Err("Wrong constructor");
+                }
+                let count: u32 = r.i32()? as u32;
+                if count as usize > r.remaining() {
+                    return Result::Err("Wrong vector length");
+                }
+                let mut res = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    res.push(MessageEntity::read(r)?);
+                }
+                res
+            };
+            __v0
+        } else {
+            Default::default()
+        };
+        Result::Ok(Self { flags, invert_media, width, height, payload, public_data, public_data_hash, chat_data, reply_markup, widget_id, message, entities })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "botInlineMessageWidget");
+        s.store_field_int("flags", self.flags as i64);
+        if self.flags & 1 << 5 != 0 { s.store_field_bool("invert_media", true); }
+        s.store_field_int("width", self.width as i64);
+        s.store_field_int("height", self.height as i64);
+        s.store_bytes_field("payload", &self.payload);
+        if self.flags & 1 != 0 {
+            s.store_field_str("public_data", &self.public_data);
+        }
+        if self.flags & 1 != 0 {
+            s.store_field_int("public_data_hash", self.public_data_hash);
+        }
+        if self.flags & 1 << 1 != 0 {
+            s.store_field_str("chat_data", &self.chat_data);
+        }
+        if self.flags & 1 << 2 != 0 {
+            match &self.reply_markup {
+                Some(__m0) => __m0.store_debug(s, "reply_markup"),
+                None => s.store_null("reply_markup"),
+            }
+        }
+        if self.flags & 1 << 3 != 0 {
+            s.store_field_int("widget_id", self.widget_id);
+        }
+        s.store_field_str("message", &self.message);
+        if self.flags & 1 << 4 != 0 {
+            s.store_vector_begin("entities", self.entities.len());
+            for __v1 in &self.entities {
+                __v1.store_debug(s, "");
+            }
+            s.store_class_end();
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum BotInlineMessage {
     botInlineMessageMediaAuto(botInlineMessageMediaAuto),
@@ -5098,6 +5275,7 @@ pub enum BotInlineMessage {
     botInlineMessageMediaInvoice(botInlineMessageMediaInvoice),
     botInlineMessageMediaWebPage(botInlineMessageMediaWebPage),
     botInlineMessageRichMessage(botInlineMessageRichMessage),
+    botInlineMessageWidget(botInlineMessageWidget),
 }
 
 impl BotInlineMessage {
@@ -5111,6 +5289,7 @@ impl BotInlineMessage {
             Self::botInlineMessageMediaInvoice(v) => v.store_boxed(out),
             Self::botInlineMessageMediaWebPage(v) => v.store_boxed(out),
             Self::botInlineMessageRichMessage(v) => v.store_boxed(out),
+            Self::botInlineMessageWidget(v) => v.store_boxed(out),
         }
     }
 
@@ -5129,6 +5308,7 @@ impl BotInlineMessage {
             self::botInlineMessageMediaInvoice::ID => Result::Ok(Self::botInlineMessageMediaInvoice(self::botInlineMessageMediaInvoice::read_bare(r)?)),
             self::botInlineMessageMediaWebPage::ID => Result::Ok(Self::botInlineMessageMediaWebPage(self::botInlineMessageMediaWebPage::read_bare(r)?)),
             self::botInlineMessageRichMessage::ID => Result::Ok(Self::botInlineMessageRichMessage(self::botInlineMessageRichMessage::read_bare(r)?)),
+            self::botInlineMessageWidget::ID => Result::Ok(Self::botInlineMessageWidget(self::botInlineMessageWidget::read_bare(r)?)),
             _ => Result::Err("Unknown constructor"),
         }
     }
@@ -5143,6 +5323,7 @@ impl BotInlineMessage {
             Self::botInlineMessageMediaInvoice(v) => v.store_debug(s, field_name),
             Self::botInlineMessageMediaWebPage(v) => v.store_debug(s, field_name),
             Self::botInlineMessageRichMessage(v) => v.store_debug(s, field_name),
+            Self::botInlineMessageWidget(v) => v.store_debug(s, field_name),
         }
     }
 
@@ -13332,6 +13513,8 @@ pub struct channel {
     pub broadcast_messages_allowed: bool,
     pub monoforum: bool,
     pub forum_tabs: bool,
+    pub in_news: bool,
+    pub forum_sidebar: bool,
     pub id: i64,
     pub access_hash: i64,
     pub title: String,
@@ -13354,10 +13537,11 @@ pub struct channel {
     pub send_paid_messages_stars: i64,
     pub linked_monoforum_id: i64,
     pub linked_community_id: i64,
+    pub pinned_msg_id: i32,
 }
 
 impl channel {
-    pub const ID: i32 = -727763770;
+    pub const ID: i32 = 2060538432;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -13366,7 +13550,7 @@ impl channel {
 
     pub fn store(&self, out: &mut Vec<u8>) {
         tl::__i32(out, self.flags | (self.creator as i32) | ((self.left as i32) << 2) | ((self.broadcast as i32) << 5) | ((self.verified as i32) << 7) | ((self.megagroup as i32) << 8) | ((self.restricted as i32) << 9) | ((self.signatures as i32) << 11) | ((self.min as i32) << 12) | ((self.scam as i32) << 19) | ((self.has_link as i32) << 20) | ((self.has_geo as i32) << 21) | ((self.slowmode_enabled as i32) << 22) | ((self.call_active as i32) << 23) | ((self.call_not_empty as i32) << 24) | ((self.fake as i32) << 25) | ((self.gigagroup as i32) << 26) | ((self.noforwards as i32) << 27) | ((self.join_to_send as i32) << 28) | ((self.join_request as i32) << 29) | ((self.forum as i32) << 30));
-        tl::__i32(out, self.flags2 | ((self.stories_hidden as i32) << 1) | ((self.stories_hidden_min as i32) << 2) | ((self.stories_unavailable as i32) << 3) | ((self.signature_profiles as i32) << 12) | ((self.autotranslation as i32) << 15) | ((self.broadcast_messages_allowed as i32) << 16) | ((self.monoforum as i32) << 17) | ((self.forum_tabs as i32) << 19));
+        tl::__i32(out, self.flags2 | ((self.stories_hidden as i32) << 1) | ((self.stories_hidden_min as i32) << 2) | ((self.stories_unavailable as i32) << 3) | ((self.signature_profiles as i32) << 12) | ((self.autotranslation as i32) << 15) | ((self.broadcast_messages_allowed as i32) << 16) | ((self.monoforum as i32) << 17) | ((self.forum_tabs as i32) << 19) | ((self.in_news as i32) << 21) | ((self.forum_sidebar as i32) << 23));
         tl::__i64(out, self.id);
         if (self.flags | (self.creator as i32) | ((self.left as i32) << 2) | ((self.broadcast as i32) << 5) | ((self.verified as i32) << 7) | ((self.megagroup as i32) << 8) | ((self.restricted as i32) << 9) | ((self.signatures as i32) << 11) | ((self.min as i32) << 12) | ((self.scam as i32) << 19) | ((self.has_link as i32) << 20) | ((self.has_geo as i32) << 21) | ((self.slowmode_enabled as i32) << 22) | ((self.call_active as i32) << 23) | ((self.call_not_empty as i32) << 24) | ((self.fake as i32) << 25) | ((self.gigagroup as i32) << 26) | ((self.noforwards as i32) << 27) | ((self.join_to_send as i32) << 28) | ((self.join_request as i32) << 29) | ((self.forum as i32) << 30)) & 1 << 13 != 0 {
             tl::__i64(out, self.access_hash);
@@ -13404,50 +13588,53 @@ impl channel {
         if (self.flags | (self.creator as i32) | ((self.left as i32) << 2) | ((self.broadcast as i32) << 5) | ((self.verified as i32) << 7) | ((self.megagroup as i32) << 8) | ((self.restricted as i32) << 9) | ((self.signatures as i32) << 11) | ((self.min as i32) << 12) | ((self.scam as i32) << 19) | ((self.has_link as i32) << 20) | ((self.has_geo as i32) << 21) | ((self.slowmode_enabled as i32) << 22) | ((self.call_active as i32) << 23) | ((self.call_not_empty as i32) << 24) | ((self.fake as i32) << 25) | ((self.gigagroup as i32) << 26) | ((self.noforwards as i32) << 27) | ((self.join_to_send as i32) << 28) | ((self.join_request as i32) << 29) | ((self.forum as i32) << 30)) & 1 << 17 != 0 {
             tl::__i32(out, self.participants_count);
         }
-        if (self.flags2 | ((self.stories_hidden as i32) << 1) | ((self.stories_hidden_min as i32) << 2) | ((self.stories_unavailable as i32) << 3) | ((self.signature_profiles as i32) << 12) | ((self.autotranslation as i32) << 15) | ((self.broadcast_messages_allowed as i32) << 16) | ((self.monoforum as i32) << 17) | ((self.forum_tabs as i32) << 19)) & 1 != 0 {
+        if (self.flags2 | ((self.stories_hidden as i32) << 1) | ((self.stories_hidden_min as i32) << 2) | ((self.stories_unavailable as i32) << 3) | ((self.signature_profiles as i32) << 12) | ((self.autotranslation as i32) << 15) | ((self.broadcast_messages_allowed as i32) << 16) | ((self.monoforum as i32) << 17) | ((self.forum_tabs as i32) << 19) | ((self.in_news as i32) << 21) | ((self.forum_sidebar as i32) << 23)) & 1 != 0 {
             tl::__i32(out, tl::VECTOR_ID);
             tl::__i32(out, self.usernames.len() as i32);
             for __v5 in &self.usernames {
                 (*__v5).store_boxed(out);
             }
         }
-        if (self.flags2 | ((self.stories_hidden as i32) << 1) | ((self.stories_hidden_min as i32) << 2) | ((self.stories_unavailable as i32) << 3) | ((self.signature_profiles as i32) << 12) | ((self.autotranslation as i32) << 15) | ((self.broadcast_messages_allowed as i32) << 16) | ((self.monoforum as i32) << 17) | ((self.forum_tabs as i32) << 19)) & 1 << 4 != 0 {
+        if (self.flags2 | ((self.stories_hidden as i32) << 1) | ((self.stories_hidden_min as i32) << 2) | ((self.stories_unavailable as i32) << 3) | ((self.signature_profiles as i32) << 12) | ((self.autotranslation as i32) << 15) | ((self.broadcast_messages_allowed as i32) << 16) | ((self.monoforum as i32) << 17) | ((self.forum_tabs as i32) << 19) | ((self.in_news as i32) << 21) | ((self.forum_sidebar as i32) << 23)) & 1 << 4 != 0 {
             let __d6 = Default::default();
             let __m6 = self.stories_max_id.as_ref().unwrap_or(&__d6);
             __m6.store_boxed(out);
         }
-        if (self.flags2 | ((self.stories_hidden as i32) << 1) | ((self.stories_hidden_min as i32) << 2) | ((self.stories_unavailable as i32) << 3) | ((self.signature_profiles as i32) << 12) | ((self.autotranslation as i32) << 15) | ((self.broadcast_messages_allowed as i32) << 16) | ((self.monoforum as i32) << 17) | ((self.forum_tabs as i32) << 19)) & 1 << 7 != 0 {
+        if (self.flags2 | ((self.stories_hidden as i32) << 1) | ((self.stories_hidden_min as i32) << 2) | ((self.stories_unavailable as i32) << 3) | ((self.signature_profiles as i32) << 12) | ((self.autotranslation as i32) << 15) | ((self.broadcast_messages_allowed as i32) << 16) | ((self.monoforum as i32) << 17) | ((self.forum_tabs as i32) << 19) | ((self.in_news as i32) << 21) | ((self.forum_sidebar as i32) << 23)) & 1 << 7 != 0 {
             let __d7 = Default::default();
             let __m7 = self.color.as_ref().unwrap_or(&__d7);
             __m7.store(out);
         }
-        if (self.flags2 | ((self.stories_hidden as i32) << 1) | ((self.stories_hidden_min as i32) << 2) | ((self.stories_unavailable as i32) << 3) | ((self.signature_profiles as i32) << 12) | ((self.autotranslation as i32) << 15) | ((self.broadcast_messages_allowed as i32) << 16) | ((self.monoforum as i32) << 17) | ((self.forum_tabs as i32) << 19)) & 1 << 8 != 0 {
+        if (self.flags2 | ((self.stories_hidden as i32) << 1) | ((self.stories_hidden_min as i32) << 2) | ((self.stories_unavailable as i32) << 3) | ((self.signature_profiles as i32) << 12) | ((self.autotranslation as i32) << 15) | ((self.broadcast_messages_allowed as i32) << 16) | ((self.monoforum as i32) << 17) | ((self.forum_tabs as i32) << 19) | ((self.in_news as i32) << 21) | ((self.forum_sidebar as i32) << 23)) & 1 << 8 != 0 {
             let __d8 = Default::default();
             let __m8 = self.profile_color.as_ref().unwrap_or(&__d8);
             __m8.store(out);
         }
-        if (self.flags2 | ((self.stories_hidden as i32) << 1) | ((self.stories_hidden_min as i32) << 2) | ((self.stories_unavailable as i32) << 3) | ((self.signature_profiles as i32) << 12) | ((self.autotranslation as i32) << 15) | ((self.broadcast_messages_allowed as i32) << 16) | ((self.monoforum as i32) << 17) | ((self.forum_tabs as i32) << 19)) & 1 << 9 != 0 {
+        if (self.flags2 | ((self.stories_hidden as i32) << 1) | ((self.stories_hidden_min as i32) << 2) | ((self.stories_unavailable as i32) << 3) | ((self.signature_profiles as i32) << 12) | ((self.autotranslation as i32) << 15) | ((self.broadcast_messages_allowed as i32) << 16) | ((self.monoforum as i32) << 17) | ((self.forum_tabs as i32) << 19) | ((self.in_news as i32) << 21) | ((self.forum_sidebar as i32) << 23)) & 1 << 9 != 0 {
             let __d9 = Default::default();
             let __m9 = self.emoji_status.as_ref().unwrap_or(&__d9);
             __m9.store(out);
         }
-        if (self.flags2 | ((self.stories_hidden as i32) << 1) | ((self.stories_hidden_min as i32) << 2) | ((self.stories_unavailable as i32) << 3) | ((self.signature_profiles as i32) << 12) | ((self.autotranslation as i32) << 15) | ((self.broadcast_messages_allowed as i32) << 16) | ((self.monoforum as i32) << 17) | ((self.forum_tabs as i32) << 19)) & 1 << 10 != 0 {
+        if (self.flags2 | ((self.stories_hidden as i32) << 1) | ((self.stories_hidden_min as i32) << 2) | ((self.stories_unavailable as i32) << 3) | ((self.signature_profiles as i32) << 12) | ((self.autotranslation as i32) << 15) | ((self.broadcast_messages_allowed as i32) << 16) | ((self.monoforum as i32) << 17) | ((self.forum_tabs as i32) << 19) | ((self.in_news as i32) << 21) | ((self.forum_sidebar as i32) << 23)) & 1 << 10 != 0 {
             tl::__i32(out, self.level);
         }
-        if (self.flags2 | ((self.stories_hidden as i32) << 1) | ((self.stories_hidden_min as i32) << 2) | ((self.stories_unavailable as i32) << 3) | ((self.signature_profiles as i32) << 12) | ((self.autotranslation as i32) << 15) | ((self.broadcast_messages_allowed as i32) << 16) | ((self.monoforum as i32) << 17) | ((self.forum_tabs as i32) << 19)) & 1 << 11 != 0 {
+        if (self.flags2 | ((self.stories_hidden as i32) << 1) | ((self.stories_hidden_min as i32) << 2) | ((self.stories_unavailable as i32) << 3) | ((self.signature_profiles as i32) << 12) | ((self.autotranslation as i32) << 15) | ((self.broadcast_messages_allowed as i32) << 16) | ((self.monoforum as i32) << 17) | ((self.forum_tabs as i32) << 19) | ((self.in_news as i32) << 21) | ((self.forum_sidebar as i32) << 23)) & 1 << 11 != 0 {
             tl::__i32(out, self.subscription_until_date);
         }
-        if (self.flags2 | ((self.stories_hidden as i32) << 1) | ((self.stories_hidden_min as i32) << 2) | ((self.stories_unavailable as i32) << 3) | ((self.signature_profiles as i32) << 12) | ((self.autotranslation as i32) << 15) | ((self.broadcast_messages_allowed as i32) << 16) | ((self.monoforum as i32) << 17) | ((self.forum_tabs as i32) << 19)) & 1 << 13 != 0 {
+        if (self.flags2 | ((self.stories_hidden as i32) << 1) | ((self.stories_hidden_min as i32) << 2) | ((self.stories_unavailable as i32) << 3) | ((self.signature_profiles as i32) << 12) | ((self.autotranslation as i32) << 15) | ((self.broadcast_messages_allowed as i32) << 16) | ((self.monoforum as i32) << 17) | ((self.forum_tabs as i32) << 19) | ((self.in_news as i32) << 21) | ((self.forum_sidebar as i32) << 23)) & 1 << 13 != 0 {
             tl::__i64(out, self.bot_verification_icon);
         }
-        if (self.flags2 | ((self.stories_hidden as i32) << 1) | ((self.stories_hidden_min as i32) << 2) | ((self.stories_unavailable as i32) << 3) | ((self.signature_profiles as i32) << 12) | ((self.autotranslation as i32) << 15) | ((self.broadcast_messages_allowed as i32) << 16) | ((self.monoforum as i32) << 17) | ((self.forum_tabs as i32) << 19)) & 1 << 14 != 0 {
+        if (self.flags2 | ((self.stories_hidden as i32) << 1) | ((self.stories_hidden_min as i32) << 2) | ((self.stories_unavailable as i32) << 3) | ((self.signature_profiles as i32) << 12) | ((self.autotranslation as i32) << 15) | ((self.broadcast_messages_allowed as i32) << 16) | ((self.monoforum as i32) << 17) | ((self.forum_tabs as i32) << 19) | ((self.in_news as i32) << 21) | ((self.forum_sidebar as i32) << 23)) & 1 << 14 != 0 {
             tl::__i64(out, self.send_paid_messages_stars);
         }
-        if (self.flags2 | ((self.stories_hidden as i32) << 1) | ((self.stories_hidden_min as i32) << 2) | ((self.stories_unavailable as i32) << 3) | ((self.signature_profiles as i32) << 12) | ((self.autotranslation as i32) << 15) | ((self.broadcast_messages_allowed as i32) << 16) | ((self.monoforum as i32) << 17) | ((self.forum_tabs as i32) << 19)) & 1 << 18 != 0 {
+        if (self.flags2 | ((self.stories_hidden as i32) << 1) | ((self.stories_hidden_min as i32) << 2) | ((self.stories_unavailable as i32) << 3) | ((self.signature_profiles as i32) << 12) | ((self.autotranslation as i32) << 15) | ((self.broadcast_messages_allowed as i32) << 16) | ((self.monoforum as i32) << 17) | ((self.forum_tabs as i32) << 19) | ((self.in_news as i32) << 21) | ((self.forum_sidebar as i32) << 23)) & 1 << 18 != 0 {
             tl::__i64(out, self.linked_monoforum_id);
         }
-        if (self.flags2 | ((self.stories_hidden as i32) << 1) | ((self.stories_hidden_min as i32) << 2) | ((self.stories_unavailable as i32) << 3) | ((self.signature_profiles as i32) << 12) | ((self.autotranslation as i32) << 15) | ((self.broadcast_messages_allowed as i32) << 16) | ((self.monoforum as i32) << 17) | ((self.forum_tabs as i32) << 19)) & 1 << 20 != 0 {
+        if (self.flags2 | ((self.stories_hidden as i32) << 1) | ((self.stories_hidden_min as i32) << 2) | ((self.stories_unavailable as i32) << 3) | ((self.signature_profiles as i32) << 12) | ((self.autotranslation as i32) << 15) | ((self.broadcast_messages_allowed as i32) << 16) | ((self.monoforum as i32) << 17) | ((self.forum_tabs as i32) << 19) | ((self.in_news as i32) << 21) | ((self.forum_sidebar as i32) << 23)) & 1 << 20 != 0 {
             tl::__i64(out, self.linked_community_id);
+        }
+        if (self.flags2 | ((self.stories_hidden as i32) << 1) | ((self.stories_hidden_min as i32) << 2) | ((self.stories_unavailable as i32) << 3) | ((self.signature_profiles as i32) << 12) | ((self.autotranslation as i32) << 15) | ((self.broadcast_messages_allowed as i32) << 16) | ((self.monoforum as i32) << 17) | ((self.forum_tabs as i32) << 19) | ((self.in_news as i32) << 21) | ((self.forum_sidebar as i32) << 23)) & 1 << 22 != 0 {
+            tl::__i32(out, self.pinned_msg_id);
         }
     }
 
@@ -13505,6 +13692,8 @@ impl channel {
         let broadcast_messages_allowed: bool = (flags2 & 1 << 16) != 0;
         let monoforum: bool = (flags2 & 1 << 17) != 0;
         let forum_tabs: bool = (flags2 & 1 << 19) != 0;
+        let in_news: bool = (flags2 & 1 << 21) != 0;
+        let forum_sidebar: bool = (flags2 & 1 << 23) != 0;
         let id: i64 = r.i64()?;
         let access_hash: i64 = if (flags & 1 << 13) != 0 {
             r.i64()?
@@ -13627,7 +13816,12 @@ impl channel {
         } else {
             Default::default()
         };
-        Result::Ok(Self { flags, creator, left, broadcast, verified, megagroup, restricted, signatures, min, scam, has_link, has_geo, slowmode_enabled, call_active, call_not_empty, fake, gigagroup, noforwards, join_to_send, join_request, forum, flags2, stories_hidden, stories_hidden_min, stories_unavailable, signature_profiles, autotranslation, broadcast_messages_allowed, monoforum, forum_tabs, id, access_hash, title, username, photo, date, restriction_reason, admin_rights, banned_rights, default_banned_rights, participants_count, usernames, stories_max_id, color, profile_color, emoji_status, level, subscription_until_date, bot_verification_icon, send_paid_messages_stars, linked_monoforum_id, linked_community_id })
+        let pinned_msg_id: i32 = if (flags2 & 1 << 22) != 0 {
+            r.i32()?
+        } else {
+            Default::default()
+        };
+        Result::Ok(Self { flags, creator, left, broadcast, verified, megagroup, restricted, signatures, min, scam, has_link, has_geo, slowmode_enabled, call_active, call_not_empty, fake, gigagroup, noforwards, join_to_send, join_request, forum, flags2, stories_hidden, stories_hidden_min, stories_unavailable, signature_profiles, autotranslation, broadcast_messages_allowed, monoforum, forum_tabs, in_news, forum_sidebar, id, access_hash, title, username, photo, date, restriction_reason, admin_rights, banned_rights, default_banned_rights, participants_count, usernames, stories_max_id, color, profile_color, emoji_status, level, subscription_until_date, bot_verification_icon, send_paid_messages_stars, linked_monoforum_id, linked_community_id, pinned_msg_id })
     }
 
     /// td's generated `Class::store(TlStorerToString&, const char*)`
@@ -13664,6 +13858,8 @@ impl channel {
         if self.flags2 & 1 << 16 != 0 { s.store_field_bool("broadcast_messages_allowed", true); }
         if self.flags2 & 1 << 17 != 0 { s.store_field_bool("monoforum", true); }
         if self.flags2 & 1 << 19 != 0 { s.store_field_bool("forum_tabs", true); }
+        if self.flags2 & 1 << 21 != 0 { s.store_field_bool("in_news", true); }
+        if self.flags2 & 1 << 23 != 0 { s.store_field_bool("forum_sidebar", true); }
         s.store_field_int("id", self.id);
         if self.flags & 1 << 13 != 0 {
             s.store_field_int("access_hash", self.access_hash);
@@ -13753,6 +13949,9 @@ impl channel {
         }
         if self.flags2 & 1 << 20 != 0 {
             s.store_field_int("linked_community_id", self.linked_community_id);
+        }
+        if self.flags2 & 1 << 22 != 0 {
+            s.store_field_int("pinned_msg_id", self.pinned_msg_id as i64);
         }
         s.store_class_end();
     }
@@ -14857,10 +15056,11 @@ pub struct channelFull {
     pub send_paid_messages_stars: i64,
     pub main_tab: Option<ProfileTab>,
     pub guard_bot_id: i64,
+    pub share_theme: Option<ShareTheme>,
 }
 
 impl channelFull {
-    pub const ID: i32 = -1605464774;
+    pub const ID: i32 = -993731264;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -15029,6 +15229,11 @@ impl channelFull {
         }
         if (self.flags2 | (self.can_delete_channel as i32) | ((self.antispam as i32) << 1) | ((self.participants_hidden as i32) << 2) | ((self.translations_disabled as i32) << 3) | ((self.stories_pinned_available as i32) << 5) | ((self.view_forum_as_messages as i32) << 6) | ((self.restricted_sponsored as i32) << 11) | ((self.can_view_revenue as i32) << 12) | ((self.paid_media_allowed as i32) << 14) | ((self.can_view_stars_revenue as i32) << 15) | ((self.paid_reactions_available as i32) << 16) | ((self.stargifts_available as i32) << 19) | ((self.paid_messages_available as i32) << 20) | ((self.has_welcome_messages as i32) << 24)) & 1 << 23 != 0 {
             tl::__i64(out, self.guard_bot_id);
+        }
+        if (self.flags2 | (self.can_delete_channel as i32) | ((self.antispam as i32) << 1) | ((self.participants_hidden as i32) << 2) | ((self.translations_disabled as i32) << 3) | ((self.stories_pinned_available as i32) << 5) | ((self.view_forum_as_messages as i32) << 6) | ((self.restricted_sponsored as i32) << 11) | ((self.can_view_revenue as i32) << 12) | ((self.paid_media_allowed as i32) << 14) | ((self.can_view_stars_revenue as i32) << 15) | ((self.paid_reactions_available as i32) << 16) | ((self.stargifts_available as i32) << 19) | ((self.paid_messages_available as i32) << 20) | ((self.has_welcome_messages as i32) << 24)) & 1 << 25 != 0 {
+            let __d17 = Default::default();
+            let __m17 = self.share_theme.as_ref().unwrap_or(&__d17);
+            __m17.store(out);
         }
     }
 
@@ -15316,7 +15521,12 @@ impl channelFull {
         } else {
             Default::default()
         };
-        Result::Ok(Self { flags, can_view_participants, can_set_username, can_set_stickers, hidden_prehistory, can_set_location, has_scheduled, can_view_stats, blocked, flags2, can_delete_channel, antispam, participants_hidden, translations_disabled, stories_pinned_available, view_forum_as_messages, restricted_sponsored, can_view_revenue, paid_media_allowed, can_view_stars_revenue, paid_reactions_available, stargifts_available, paid_messages_available, has_welcome_messages, id, about, participants_count, admins_count, kicked_count, banned_count, online_count, read_inbox_max_id, read_outbox_max_id, unread_count, chat_photo, notify_settings, exported_invite, bot_info, migrated_from_chat_id, migrated_from_max_id, pinned_msg_id, stickerset, available_min_id, folder_id, linked_chat_id, location, slowmode_seconds, slowmode_next_send_date, stats_dc, pts, call, ttl_period, pending_suggestions, groupcall_default_join_as, theme_emoticon, requests_pending, recent_requesters, default_send_as, available_reactions, reactions_limit, stories, wallpaper, boosts_applied, boosts_unrestrict, emojiset, bot_verification, stargifts_count, send_paid_messages_stars, main_tab, guard_bot_id })
+        let share_theme: Option<ShareTheme> = if (flags2 & 1 << 25) != 0 {
+            Some(ShareTheme::read(r)?)
+        } else {
+            Default::default()
+        };
+        Result::Ok(Self { flags, can_view_participants, can_set_username, can_set_stickers, hidden_prehistory, can_set_location, has_scheduled, can_view_stats, blocked, flags2, can_delete_channel, antispam, participants_hidden, translations_disabled, stories_pinned_available, view_forum_as_messages, restricted_sponsored, can_view_revenue, paid_media_allowed, can_view_stars_revenue, paid_reactions_available, stargifts_available, paid_messages_available, has_welcome_messages, id, about, participants_count, admins_count, kicked_count, banned_count, online_count, read_inbox_max_id, read_outbox_max_id, unread_count, chat_photo, notify_settings, exported_invite, bot_info, migrated_from_chat_id, migrated_from_max_id, pinned_msg_id, stickerset, available_min_id, folder_id, linked_chat_id, location, slowmode_seconds, slowmode_next_send_date, stats_dc, pts, call, ttl_period, pending_suggestions, groupcall_default_join_as, theme_emoticon, requests_pending, recent_requesters, default_send_as, available_reactions, reactions_limit, stories, wallpaper, boosts_applied, boosts_unrestrict, emojiset, bot_verification, stargifts_count, send_paid_messages_stars, main_tab, guard_bot_id, share_theme })
     }
 
     /// td's generated `Class::store(TlStorerToString&, const char*)`
@@ -15520,6 +15730,12 @@ impl channelFull {
         }
         if self.flags2 & 1 << 23 != 0 {
             s.store_field_int("guard_bot_id", self.guard_bot_id);
+        }
+        if self.flags2 & 1 << 25 != 0 {
+            match &self.share_theme {
+                Some(__m17) => __m17.store_debug(s, "share_theme"),
+                None => s.store_null("share_theme"),
+            }
         }
         s.store_class_end();
     }
@@ -17691,6 +17907,7 @@ pub struct Config {
     pub revoke_pm_inbox: bool,
     pub blocked_mode: bool,
     pub force_try_ipv6: bool,
+    pub fpnv_allowed: bool,
     pub date: i32,
     pub expires: i32,
     pub test_mode: bool,
@@ -17744,7 +17961,7 @@ impl Config {
     }
 
     pub fn store(&self, out: &mut Vec<u8>) {
-        tl::__i32(out, self.flags | ((self.default_p2p_contacts as i32) << 3) | ((self.preload_featured_stickers as i32) << 4) | ((self.revoke_pm_inbox as i32) << 6) | ((self.blocked_mode as i32) << 8) | ((self.force_try_ipv6 as i32) << 14));
+        tl::__i32(out, self.flags | ((self.default_p2p_contacts as i32) << 3) | ((self.preload_featured_stickers as i32) << 4) | ((self.revoke_pm_inbox as i32) << 6) | ((self.blocked_mode as i32) << 8) | ((self.force_try_ipv6 as i32) << 14) | ((self.fpnv_allowed as i32) << 17));
         tl::__i32(out, self.date);
         tl::__i32(out, self.expires);
         tl::__bool(out, self.test_mode);
@@ -17772,7 +17989,7 @@ impl Config {
         tl::__i32(out, self.rating_e_decay);
         tl::__i32(out, self.stickers_recent_limit);
         tl::__i32(out, self.channels_read_media_period);
-        if (self.flags | ((self.default_p2p_contacts as i32) << 3) | ((self.preload_featured_stickers as i32) << 4) | ((self.revoke_pm_inbox as i32) << 6) | ((self.blocked_mode as i32) << 8) | ((self.force_try_ipv6 as i32) << 14)) & 1 != 0 {
+        if (self.flags | ((self.default_p2p_contacts as i32) << 3) | ((self.preload_featured_stickers as i32) << 4) | ((self.revoke_pm_inbox as i32) << 6) | ((self.blocked_mode as i32) << 8) | ((self.force_try_ipv6 as i32) << 14) | ((self.fpnv_allowed as i32) << 17)) & 1 != 0 {
             tl::__i32(out, self.tmp_sessions);
         }
         tl::__i32(out, self.call_receive_timeout_ms);
@@ -17780,39 +17997,39 @@ impl Config {
         tl::__i32(out, self.call_connect_timeout_ms);
         tl::__i32(out, self.call_packet_timeout_ms);
         tl::__string(out, &self.me_url_prefix);
-        if (self.flags | ((self.default_p2p_contacts as i32) << 3) | ((self.preload_featured_stickers as i32) << 4) | ((self.revoke_pm_inbox as i32) << 6) | ((self.blocked_mode as i32) << 8) | ((self.force_try_ipv6 as i32) << 14)) & 1 << 7 != 0 {
+        if (self.flags | ((self.default_p2p_contacts as i32) << 3) | ((self.preload_featured_stickers as i32) << 4) | ((self.revoke_pm_inbox as i32) << 6) | ((self.blocked_mode as i32) << 8) | ((self.force_try_ipv6 as i32) << 14) | ((self.fpnv_allowed as i32) << 17)) & 1 << 7 != 0 {
             tl::__string(out, &self.autoupdate_url_prefix);
         }
-        if (self.flags | ((self.default_p2p_contacts as i32) << 3) | ((self.preload_featured_stickers as i32) << 4) | ((self.revoke_pm_inbox as i32) << 6) | ((self.blocked_mode as i32) << 8) | ((self.force_try_ipv6 as i32) << 14)) & 1 << 9 != 0 {
+        if (self.flags | ((self.default_p2p_contacts as i32) << 3) | ((self.preload_featured_stickers as i32) << 4) | ((self.revoke_pm_inbox as i32) << 6) | ((self.blocked_mode as i32) << 8) | ((self.force_try_ipv6 as i32) << 14) | ((self.fpnv_allowed as i32) << 17)) & 1 << 9 != 0 {
             tl::__string(out, &self.gif_search_username);
         }
-        if (self.flags | ((self.default_p2p_contacts as i32) << 3) | ((self.preload_featured_stickers as i32) << 4) | ((self.revoke_pm_inbox as i32) << 6) | ((self.blocked_mode as i32) << 8) | ((self.force_try_ipv6 as i32) << 14)) & 1 << 10 != 0 {
+        if (self.flags | ((self.default_p2p_contacts as i32) << 3) | ((self.preload_featured_stickers as i32) << 4) | ((self.revoke_pm_inbox as i32) << 6) | ((self.blocked_mode as i32) << 8) | ((self.force_try_ipv6 as i32) << 14) | ((self.fpnv_allowed as i32) << 17)) & 1 << 10 != 0 {
             tl::__string(out, &self.venue_search_username);
         }
-        if (self.flags | ((self.default_p2p_contacts as i32) << 3) | ((self.preload_featured_stickers as i32) << 4) | ((self.revoke_pm_inbox as i32) << 6) | ((self.blocked_mode as i32) << 8) | ((self.force_try_ipv6 as i32) << 14)) & 1 << 11 != 0 {
+        if (self.flags | ((self.default_p2p_contacts as i32) << 3) | ((self.preload_featured_stickers as i32) << 4) | ((self.revoke_pm_inbox as i32) << 6) | ((self.blocked_mode as i32) << 8) | ((self.force_try_ipv6 as i32) << 14) | ((self.fpnv_allowed as i32) << 17)) & 1 << 11 != 0 {
             tl::__string(out, &self.img_search_username);
         }
-        if (self.flags | ((self.default_p2p_contacts as i32) << 3) | ((self.preload_featured_stickers as i32) << 4) | ((self.revoke_pm_inbox as i32) << 6) | ((self.blocked_mode as i32) << 8) | ((self.force_try_ipv6 as i32) << 14)) & 1 << 12 != 0 {
+        if (self.flags | ((self.default_p2p_contacts as i32) << 3) | ((self.preload_featured_stickers as i32) << 4) | ((self.revoke_pm_inbox as i32) << 6) | ((self.blocked_mode as i32) << 8) | ((self.force_try_ipv6 as i32) << 14) | ((self.fpnv_allowed as i32) << 17)) & 1 << 12 != 0 {
             tl::__string(out, &self.static_maps_provider);
         }
         tl::__i32(out, self.caption_length_max);
         tl::__i32(out, self.message_length_max);
         tl::__i32(out, self.webfile_dc_id);
-        if (self.flags | ((self.default_p2p_contacts as i32) << 3) | ((self.preload_featured_stickers as i32) << 4) | ((self.revoke_pm_inbox as i32) << 6) | ((self.blocked_mode as i32) << 8) | ((self.force_try_ipv6 as i32) << 14)) & 1 << 2 != 0 {
+        if (self.flags | ((self.default_p2p_contacts as i32) << 3) | ((self.preload_featured_stickers as i32) << 4) | ((self.revoke_pm_inbox as i32) << 6) | ((self.blocked_mode as i32) << 8) | ((self.force_try_ipv6 as i32) << 14) | ((self.fpnv_allowed as i32) << 17)) & 1 << 2 != 0 {
             tl::__string(out, &self.suggested_lang_code);
         }
-        if (self.flags | ((self.default_p2p_contacts as i32) << 3) | ((self.preload_featured_stickers as i32) << 4) | ((self.revoke_pm_inbox as i32) << 6) | ((self.blocked_mode as i32) << 8) | ((self.force_try_ipv6 as i32) << 14)) & 1 << 2 != 0 {
+        if (self.flags | ((self.default_p2p_contacts as i32) << 3) | ((self.preload_featured_stickers as i32) << 4) | ((self.revoke_pm_inbox as i32) << 6) | ((self.blocked_mode as i32) << 8) | ((self.force_try_ipv6 as i32) << 14) | ((self.fpnv_allowed as i32) << 17)) & 1 << 2 != 0 {
             tl::__i32(out, self.lang_pack_version);
         }
-        if (self.flags | ((self.default_p2p_contacts as i32) << 3) | ((self.preload_featured_stickers as i32) << 4) | ((self.revoke_pm_inbox as i32) << 6) | ((self.blocked_mode as i32) << 8) | ((self.force_try_ipv6 as i32) << 14)) & 1 << 2 != 0 {
+        if (self.flags | ((self.default_p2p_contacts as i32) << 3) | ((self.preload_featured_stickers as i32) << 4) | ((self.revoke_pm_inbox as i32) << 6) | ((self.blocked_mode as i32) << 8) | ((self.force_try_ipv6 as i32) << 14) | ((self.fpnv_allowed as i32) << 17)) & 1 << 2 != 0 {
             tl::__i32(out, self.base_lang_pack_version);
         }
-        if (self.flags | ((self.default_p2p_contacts as i32) << 3) | ((self.preload_featured_stickers as i32) << 4) | ((self.revoke_pm_inbox as i32) << 6) | ((self.blocked_mode as i32) << 8) | ((self.force_try_ipv6 as i32) << 14)) & 1 << 15 != 0 {
+        if (self.flags | ((self.default_p2p_contacts as i32) << 3) | ((self.preload_featured_stickers as i32) << 4) | ((self.revoke_pm_inbox as i32) << 6) | ((self.blocked_mode as i32) << 8) | ((self.force_try_ipv6 as i32) << 14) | ((self.fpnv_allowed as i32) << 17)) & 1 << 15 != 0 {
             let __d1 = Default::default();
             let __m1 = self.reactions_default.as_ref().unwrap_or(&__d1);
             __m1.store(out);
         }
-        if (self.flags | ((self.default_p2p_contacts as i32) << 3) | ((self.preload_featured_stickers as i32) << 4) | ((self.revoke_pm_inbox as i32) << 6) | ((self.blocked_mode as i32) << 8) | ((self.force_try_ipv6 as i32) << 14)) & 1 << 16 != 0 {
+        if (self.flags | ((self.default_p2p_contacts as i32) << 3) | ((self.preload_featured_stickers as i32) << 4) | ((self.revoke_pm_inbox as i32) << 6) | ((self.blocked_mode as i32) << 8) | ((self.force_try_ipv6 as i32) << 14) | ((self.fpnv_allowed as i32) << 17)) & 1 << 16 != 0 {
             tl::__string(out, &self.autologin_token);
         }
     }
@@ -17844,6 +18061,7 @@ impl Config {
         let revoke_pm_inbox: bool = (flags & 1 << 6) != 0;
         let blocked_mode: bool = (flags & 1 << 8) != 0;
         let force_try_ipv6: bool = (flags & 1 << 14) != 0;
+        let fpnv_allowed: bool = (flags & 1 << 17) != 0;
         let date: i32 = r.i32()?;
         let expires: i32 = r.i32()?;
         let test_mode: bool = r.bool()?;
@@ -17944,7 +18162,7 @@ impl Config {
         } else {
             Default::default()
         };
-        Result::Ok(Self { flags, default_p2p_contacts, preload_featured_stickers, revoke_pm_inbox, blocked_mode, force_try_ipv6, date, expires, test_mode, this_dc, dc_options, dc_txt_domain_name, chat_size_max, megagroup_size_max, forwarded_count_max, online_update_period_ms, offline_blur_timeout_ms, offline_idle_timeout_ms, online_cloud_timeout_ms, notify_cloud_delay_ms, notify_default_delay_ms, push_chat_period_ms, push_chat_limit, edit_time_limit, revoke_time_limit, revoke_pm_time_limit, rating_e_decay, stickers_recent_limit, channels_read_media_period, tmp_sessions, call_receive_timeout_ms, call_ring_timeout_ms, call_connect_timeout_ms, call_packet_timeout_ms, me_url_prefix, autoupdate_url_prefix, gif_search_username, venue_search_username, img_search_username, static_maps_provider, caption_length_max, message_length_max, webfile_dc_id, suggested_lang_code, lang_pack_version, base_lang_pack_version, reactions_default, autologin_token })
+        Result::Ok(Self { flags, default_p2p_contacts, preload_featured_stickers, revoke_pm_inbox, blocked_mode, force_try_ipv6, fpnv_allowed, date, expires, test_mode, this_dc, dc_options, dc_txt_domain_name, chat_size_max, megagroup_size_max, forwarded_count_max, online_update_period_ms, offline_blur_timeout_ms, offline_idle_timeout_ms, online_cloud_timeout_ms, notify_cloud_delay_ms, notify_default_delay_ms, push_chat_period_ms, push_chat_limit, edit_time_limit, revoke_time_limit, revoke_pm_time_limit, rating_e_decay, stickers_recent_limit, channels_read_media_period, tmp_sessions, call_receive_timeout_ms, call_ring_timeout_ms, call_connect_timeout_ms, call_packet_timeout_ms, me_url_prefix, autoupdate_url_prefix, gif_search_username, venue_search_username, img_search_username, static_maps_provider, caption_length_max, message_length_max, webfile_dc_id, suggested_lang_code, lang_pack_version, base_lang_pack_version, reactions_default, autologin_token })
     }
 
     /// td's generated `Class::store(TlStorerToString&, const char*)`
@@ -17957,6 +18175,7 @@ impl Config {
         if self.flags & 1 << 6 != 0 { s.store_field_bool("revoke_pm_inbox", true); }
         if self.flags & 1 << 8 != 0 { s.store_field_bool("blocked_mode", true); }
         if self.flags & 1 << 14 != 0 { s.store_field_bool("force_try_ipv6", true); }
+        if self.flags & 1 << 17 != 0 { s.store_field_bool("fpnv_allowed", true); }
         s.store_field_int("date", self.date as i64);
         s.store_field_int("expires", self.expires as i64);
         s.store_field_bool("test_mode", self.test_mode);
@@ -24512,6 +24731,85 @@ impl ExportedMessageLink {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+pub struct ExportedNoPaidMessagesToken {
+    pub flags: i32,
+    pub token: String,
+    pub url: String,
+    pub expires: i32,
+}
+
+impl ExportedNoPaidMessagesToken {
+    pub const ID: i32 = 1767755842;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.flags);
+        tl::__string(out, &self.token);
+        tl::__string(out, &self.url);
+        if (self.flags) & 1 != 0 {
+            tl::__i32(out, self.expires);
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let flags: i32 = r.i32()?;
+        if flags < 0 {
+            return Result::Err("Variable of type # can't be negative");
+        }
+        let token: String = r.string()?;
+        let url: String = r.string()?;
+        let expires: i32 = if (flags & 1) != 0 {
+            r.i32()?
+        } else {
+            Default::default()
+        };
+        Result::Ok(Self { flags, token, url, expires })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "exportedNoPaidMessagesToken");
+        s.store_field_int("flags", self.flags as i64);
+        s.store_field_str("token", &self.token);
+        s.store_field_str("url", &self.url);
+        if self.flags & 1 != 0 {
+            s.store_field_int("expires", self.expires as i64);
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ExportedStoryLink {
     pub link: String,
 }
@@ -29704,6 +30002,298 @@ impl inputBotInlineMessageRichMessage {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct inputBotInlineMessageWidget {
+    pub flags: i32,
+    pub allow_queries: bool,
+    pub shared_widget: bool,
+    pub invert_media: bool,
+    pub width: i32,
+    pub height: i32,
+    pub html: String,
+    pub public_data: String,
+    pub chat_data: String,
+    pub reply_markup: Option<ReplyMarkup>,
+    pub message: String,
+    pub entities: Vec<MessageEntity>,
+}
+
+impl inputBotInlineMessageWidget {
+    pub const ID: i32 = -174611472;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.flags | (self.allow_queries as i32) | ((self.shared_widget as i32) << 1) | ((self.invert_media as i32) << 6));
+        tl::__i32(out, self.width);
+        tl::__i32(out, self.height);
+        tl::__string(out, &self.html);
+        if (self.flags | (self.allow_queries as i32) | ((self.shared_widget as i32) << 1) | ((self.invert_media as i32) << 6)) & 1 << 2 != 0 {
+            tl::__string(out, &self.public_data);
+        }
+        if (self.flags | (self.allow_queries as i32) | ((self.shared_widget as i32) << 1) | ((self.invert_media as i32) << 6)) & 1 << 3 != 0 {
+            tl::__string(out, &self.chat_data);
+        }
+        if (self.flags | (self.allow_queries as i32) | ((self.shared_widget as i32) << 1) | ((self.invert_media as i32) << 6)) & 1 << 4 != 0 {
+            let __d0 = Default::default();
+            let __m0 = self.reply_markup.as_ref().unwrap_or(&__d0);
+            __m0.store(out);
+        }
+        tl::__string(out, &self.message);
+        if (self.flags | (self.allow_queries as i32) | ((self.shared_widget as i32) << 1) | ((self.invert_media as i32) << 6)) & 1 << 5 != 0 {
+            tl::__i32(out, tl::VECTOR_ID);
+            tl::__i32(out, self.entities.len() as i32);
+            for __v1 in &self.entities {
+                (*__v1).store(out);
+            }
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let flags: i32 = r.i32()?;
+        if flags < 0 {
+            return Result::Err("Variable of type # can't be negative");
+        }
+        let allow_queries: bool = (flags & 1) != 0;
+        let shared_widget: bool = (flags & 1 << 1) != 0;
+        let invert_media: bool = (flags & 1 << 6) != 0;
+        let width: i32 = r.i32()?;
+        let height: i32 = r.i32()?;
+        let html: String = r.string()?;
+        let public_data: String = if (flags & 1 << 2) != 0 {
+            r.string()?
+        } else {
+            Default::default()
+        };
+        let chat_data: String = if (flags & 1 << 3) != 0 {
+            r.string()?
+        } else {
+            Default::default()
+        };
+        let reply_markup: Option<ReplyMarkup> = if (flags & 1 << 4) != 0 {
+            Some(ReplyMarkup::read(r)?)
+        } else {
+            Default::default()
+        };
+        let message: String = r.string()?;
+        let entities: Vec<MessageEntity> = if (flags & 1 << 5) != 0 {
+            let __v0: Vec<MessageEntity> = {
+                if r.i32()? != tl::VECTOR_ID {
+                    return Result::Err("Wrong constructor");
+                }
+                let count: u32 = r.i32()? as u32;
+                if count as usize > r.remaining() {
+                    return Result::Err("Wrong vector length");
+                }
+                let mut res = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    res.push(MessageEntity::read(r)?);
+                }
+                res
+            };
+            __v0
+        } else {
+            Default::default()
+        };
+        Result::Ok(Self { flags, allow_queries, shared_widget, invert_media, width, height, html, public_data, chat_data, reply_markup, message, entities })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "inputBotInlineMessageWidget");
+        s.store_field_int("flags", self.flags as i64);
+        if self.flags & 1 != 0 { s.store_field_bool("allow_queries", true); }
+        if self.flags & 1 << 1 != 0 { s.store_field_bool("shared_widget", true); }
+        if self.flags & 1 << 6 != 0 { s.store_field_bool("invert_media", true); }
+        s.store_field_int("width", self.width as i64);
+        s.store_field_int("height", self.height as i64);
+        s.store_field_str("html", &self.html);
+        if self.flags & 1 << 2 != 0 {
+            s.store_field_str("public_data", &self.public_data);
+        }
+        if self.flags & 1 << 3 != 0 {
+            s.store_field_str("chat_data", &self.chat_data);
+        }
+        if self.flags & 1 << 4 != 0 {
+            match &self.reply_markup {
+                Some(__m0) => __m0.store_debug(s, "reply_markup"),
+                None => s.store_null("reply_markup"),
+            }
+        }
+        s.store_field_str("message", &self.message);
+        if self.flags & 1 << 5 != 0 {
+            s.store_vector_begin("entities", self.entities.len());
+            for __v1 in &self.entities {
+                __v1.store_debug(s, "");
+            }
+            s.store_class_end();
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct inputBotInlineMessageWidgetId {
+    pub flags: i32,
+    pub invert_media: bool,
+    pub widget_id: i64,
+    pub chat_data: String,
+    pub reply_markup: Option<ReplyMarkup>,
+    pub message: String,
+    pub entities: Vec<MessageEntity>,
+}
+
+impl inputBotInlineMessageWidgetId {
+    pub const ID: i32 = -24413909;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.flags | ((self.invert_media as i32) << 3));
+        tl::__i64(out, self.widget_id);
+        if (self.flags | ((self.invert_media as i32) << 3)) & 1 != 0 {
+            tl::__string(out, &self.chat_data);
+        }
+        if (self.flags | ((self.invert_media as i32) << 3)) & 1 << 1 != 0 {
+            let __d0 = Default::default();
+            let __m0 = self.reply_markup.as_ref().unwrap_or(&__d0);
+            __m0.store(out);
+        }
+        tl::__string(out, &self.message);
+        if (self.flags | ((self.invert_media as i32) << 3)) & 1 << 2 != 0 {
+            tl::__i32(out, tl::VECTOR_ID);
+            tl::__i32(out, self.entities.len() as i32);
+            for __v1 in &self.entities {
+                (*__v1).store(out);
+            }
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let flags: i32 = r.i32()?;
+        if flags < 0 {
+            return Result::Err("Variable of type # can't be negative");
+        }
+        let invert_media: bool = (flags & 1 << 3) != 0;
+        let widget_id: i64 = r.i64()?;
+        let chat_data: String = if (flags & 1) != 0 {
+            r.string()?
+        } else {
+            Default::default()
+        };
+        let reply_markup: Option<ReplyMarkup> = if (flags & 1 << 1) != 0 {
+            Some(ReplyMarkup::read(r)?)
+        } else {
+            Default::default()
+        };
+        let message: String = r.string()?;
+        let entities: Vec<MessageEntity> = if (flags & 1 << 2) != 0 {
+            let __v0: Vec<MessageEntity> = {
+                if r.i32()? != tl::VECTOR_ID {
+                    return Result::Err("Wrong constructor");
+                }
+                let count: u32 = r.i32()? as u32;
+                if count as usize > r.remaining() {
+                    return Result::Err("Wrong vector length");
+                }
+                let mut res = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    res.push(MessageEntity::read(r)?);
+                }
+                res
+            };
+            __v0
+        } else {
+            Default::default()
+        };
+        Result::Ok(Self { flags, invert_media, widget_id, chat_data, reply_markup, message, entities })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "inputBotInlineMessageWidgetId");
+        s.store_field_int("flags", self.flags as i64);
+        if self.flags & 1 << 3 != 0 { s.store_field_bool("invert_media", true); }
+        s.store_field_int("widget_id", self.widget_id);
+        if self.flags & 1 != 0 {
+            s.store_field_str("chat_data", &self.chat_data);
+        }
+        if self.flags & 1 << 1 != 0 {
+            match &self.reply_markup {
+                Some(__m0) => __m0.store_debug(s, "reply_markup"),
+                None => s.store_null("reply_markup"),
+            }
+        }
+        s.store_field_str("message", &self.message);
+        if self.flags & 1 << 2 != 0 {
+            s.store_vector_begin("entities", self.entities.len());
+            for __v1 in &self.entities {
+                __v1.store_debug(s, "");
+            }
+            s.store_class_end();
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum InputBotInlineMessage {
     inputBotInlineMessageMediaAuto(inputBotInlineMessageMediaAuto),
@@ -29715,6 +30305,8 @@ pub enum InputBotInlineMessage {
     inputBotInlineMessageMediaInvoice(inputBotInlineMessageMediaInvoice),
     inputBotInlineMessageMediaWebPage(inputBotInlineMessageMediaWebPage),
     inputBotInlineMessageRichMessage(inputBotInlineMessageRichMessage),
+    inputBotInlineMessageWidget(inputBotInlineMessageWidget),
+    inputBotInlineMessageWidgetId(inputBotInlineMessageWidgetId),
 }
 
 impl InputBotInlineMessage {
@@ -29729,6 +30321,8 @@ impl InputBotInlineMessage {
             Self::inputBotInlineMessageMediaInvoice(v) => v.store_boxed(out),
             Self::inputBotInlineMessageMediaWebPage(v) => v.store_boxed(out),
             Self::inputBotInlineMessageRichMessage(v) => v.store_boxed(out),
+            Self::inputBotInlineMessageWidget(v) => v.store_boxed(out),
+            Self::inputBotInlineMessageWidgetId(v) => v.store_boxed(out),
         }
     }
 
@@ -29748,6 +30342,8 @@ impl InputBotInlineMessage {
             self::inputBotInlineMessageMediaInvoice::ID => Result::Ok(Self::inputBotInlineMessageMediaInvoice(self::inputBotInlineMessageMediaInvoice::read_bare(r)?)),
             self::inputBotInlineMessageMediaWebPage::ID => Result::Ok(Self::inputBotInlineMessageMediaWebPage(self::inputBotInlineMessageMediaWebPage::read_bare(r)?)),
             self::inputBotInlineMessageRichMessage::ID => Result::Ok(Self::inputBotInlineMessageRichMessage(self::inputBotInlineMessageRichMessage::read_bare(r)?)),
+            self::inputBotInlineMessageWidget::ID => Result::Ok(Self::inputBotInlineMessageWidget(self::inputBotInlineMessageWidget::read_bare(r)?)),
+            self::inputBotInlineMessageWidgetId::ID => Result::Ok(Self::inputBotInlineMessageWidgetId(self::inputBotInlineMessageWidgetId::read_bare(r)?)),
             _ => Result::Err("Unknown constructor"),
         }
     }
@@ -29763,6 +30359,8 @@ impl InputBotInlineMessage {
             Self::inputBotInlineMessageMediaInvoice(v) => v.store_debug(s, field_name),
             Self::inputBotInlineMessageMediaWebPage(v) => v.store_debug(s, field_name),
             Self::inputBotInlineMessageRichMessage(v) => v.store_debug(s, field_name),
+            Self::inputBotInlineMessageWidget(v) => v.store_debug(s, field_name),
+            Self::inputBotInlineMessageWidgetId(v) => v.store_debug(s, field_name),
         }
     }
 
@@ -37989,6 +38587,182 @@ impl inputMediaStakeDice {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct inputMediaWidget {
+    pub flags: i32,
+    pub allow_queries: bool,
+    pub shared_widget: bool,
+    pub width: i32,
+    pub height: i32,
+    pub html: String,
+    pub public_data: String,
+    pub chat_data: String,
+}
+
+impl inputMediaWidget {
+    pub const ID: i32 = 1157021774;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.flags | (self.allow_queries as i32) | ((self.shared_widget as i32) << 1));
+        tl::__i32(out, self.width);
+        tl::__i32(out, self.height);
+        tl::__string(out, &self.html);
+        if (self.flags | (self.allow_queries as i32) | ((self.shared_widget as i32) << 1)) & 1 << 2 != 0 {
+            tl::__string(out, &self.public_data);
+        }
+        if (self.flags | (self.allow_queries as i32) | ((self.shared_widget as i32) << 1)) & 1 << 3 != 0 {
+            tl::__string(out, &self.chat_data);
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let flags: i32 = r.i32()?;
+        if flags < 0 {
+            return Result::Err("Variable of type # can't be negative");
+        }
+        let allow_queries: bool = (flags & 1) != 0;
+        let shared_widget: bool = (flags & 1 << 1) != 0;
+        let width: i32 = r.i32()?;
+        let height: i32 = r.i32()?;
+        let html: String = r.string()?;
+        let public_data: String = if (flags & 1 << 2) != 0 {
+            r.string()?
+        } else {
+            Default::default()
+        };
+        let chat_data: String = if (flags & 1 << 3) != 0 {
+            r.string()?
+        } else {
+            Default::default()
+        };
+        Result::Ok(Self { flags, allow_queries, shared_widget, width, height, html, public_data, chat_data })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "inputMediaWidget");
+        s.store_field_int("flags", self.flags as i64);
+        if self.flags & 1 != 0 { s.store_field_bool("allow_queries", true); }
+        if self.flags & 1 << 1 != 0 { s.store_field_bool("shared_widget", true); }
+        s.store_field_int("width", self.width as i64);
+        s.store_field_int("height", self.height as i64);
+        s.store_field_str("html", &self.html);
+        if self.flags & 1 << 2 != 0 {
+            s.store_field_str("public_data", &self.public_data);
+        }
+        if self.flags & 1 << 3 != 0 {
+            s.store_field_str("chat_data", &self.chat_data);
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct inputMediaWidgetId {
+    pub flags: i32,
+    pub widget_id: i64,
+    pub chat_data: String,
+}
+
+impl inputMediaWidgetId {
+    pub const ID: i32 = 2089114805;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.flags);
+        tl::__i64(out, self.widget_id);
+        if (self.flags) & 1 != 0 {
+            tl::__string(out, &self.chat_data);
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let flags: i32 = r.i32()?;
+        if flags < 0 {
+            return Result::Err("Variable of type # can't be negative");
+        }
+        let widget_id: i64 = r.i64()?;
+        let chat_data: String = if (flags & 1) != 0 {
+            r.string()?
+        } else {
+            Default::default()
+        };
+        Result::Ok(Self { flags, widget_id, chat_data })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "inputMediaWidgetId");
+        s.store_field_int("flags", self.flags as i64);
+        s.store_field_int("widget_id", self.widget_id);
+        if self.flags & 1 != 0 {
+            s.store_field_str("chat_data", &self.chat_data);
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum InputMedia {
     inputMediaEmpty(inputMediaEmpty),
@@ -38011,6 +38785,8 @@ pub enum InputMedia {
     inputMediaPaidMedia(inputMediaPaidMedia),
     inputMediaTodo(inputMediaTodo),
     inputMediaStakeDice(inputMediaStakeDice),
+    inputMediaWidget(inputMediaWidget),
+    inputMediaWidgetId(inputMediaWidgetId),
 }
 
 impl InputMedia {
@@ -38036,6 +38812,8 @@ impl InputMedia {
             Self::inputMediaPaidMedia(v) => v.store_boxed(out),
             Self::inputMediaTodo(v) => v.store_boxed(out),
             Self::inputMediaStakeDice(v) => v.store_boxed(out),
+            Self::inputMediaWidget(v) => v.store_boxed(out),
+            Self::inputMediaWidgetId(v) => v.store_boxed(out),
         }
     }
 
@@ -38066,6 +38844,8 @@ impl InputMedia {
             self::inputMediaPaidMedia::ID => Result::Ok(Self::inputMediaPaidMedia(self::inputMediaPaidMedia::read_bare(r)?)),
             self::inputMediaTodo::ID => Result::Ok(Self::inputMediaTodo(self::inputMediaTodo::read_bare(r)?)),
             self::inputMediaStakeDice::ID => Result::Ok(Self::inputMediaStakeDice(self::inputMediaStakeDice::read_bare(r)?)),
+            self::inputMediaWidget::ID => Result::Ok(Self::inputMediaWidget(self::inputMediaWidget::read_bare(r)?)),
+            self::inputMediaWidgetId::ID => Result::Ok(Self::inputMediaWidgetId(self::inputMediaWidgetId::read_bare(r)?)),
             _ => Result::Err("Unknown constructor"),
         }
     }
@@ -38092,6 +38872,8 @@ impl InputMedia {
             Self::inputMediaPaidMedia(v) => v.store_debug(s, field_name),
             Self::inputMediaTodo(v) => v.store_debug(s, field_name),
             Self::inputMediaStakeDice(v) => v.store_debug(s, field_name),
+            Self::inputMediaWidget(v) => v.store_debug(s, field_name),
+            Self::inputMediaWidgetId(v) => v.store_debug(s, field_name),
         }
     }
 
@@ -42150,10 +42932,11 @@ pub struct inputReplyToMessage {
     pub monoforum_peer_id: Option<Box<InputPeer>>,
     pub todo_item_id: i32,
     pub poll_option: Vec<u8>,
+    pub quote_rich: Vec<Box<RichText>>,
 }
 
 impl inputReplyToMessage {
-    pub const ID: i32 = 1003796418;
+    pub const ID: i32 = 1975627120;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -42194,6 +42977,13 @@ impl inputReplyToMessage {
         }
         if (self.flags) & 1 << 7 != 0 {
             tl::__string(out, &self.poll_option);
+        }
+        if (self.flags) & 1 << 8 != 0 {
+            tl::__i32(out, tl::VECTOR_ID);
+            tl::__i32(out, self.quote_rich.len() as i32);
+            for __v3 in &self.quote_rich {
+                (*__v3).store(out);
+            }
         }
     }
 
@@ -42274,7 +43064,26 @@ impl inputReplyToMessage {
         } else {
             Default::default()
         };
-        Result::Ok(Self { flags, reply_to_msg_id, top_msg_id, reply_to_peer_id, quote_text, quote_entities, quote_offset, monoforum_peer_id, todo_item_id, poll_option })
+        let quote_rich: Vec<Box<RichText>> = if (flags & 1 << 8) != 0 {
+            let __v1: Vec<Box<RichText>> = {
+                if r.i32()? != tl::VECTOR_ID {
+                    return Result::Err("Wrong constructor");
+                }
+                let count: u32 = r.i32()? as u32;
+                if count as usize > r.remaining() {
+                    return Result::Err("Wrong vector length");
+                }
+                let mut res = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    res.push(Box::new(RichText::read(r)?));
+                }
+                res
+            };
+            __v1
+        } else {
+            Default::default()
+        };
+        Result::Ok(Self { flags, reply_to_msg_id, top_msg_id, reply_to_peer_id, quote_text, quote_entities, quote_offset, monoforum_peer_id, todo_item_id, poll_option, quote_rich })
     }
 
     /// td's generated `Class::store(TlStorerToString&, const char*)`
@@ -42316,6 +43125,13 @@ impl inputReplyToMessage {
         }
         if self.flags & 1 << 7 != 0 {
             s.store_bytes_field("poll_option", &self.poll_option);
+        }
+        if self.flags & 1 << 8 != 0 {
+            s.store_vector_begin("quote_rich", self.quote_rich.len());
+            for __v3 in &self.quote_rich {
+                __v3.store_debug(s, "");
+            }
+            s.store_class_end();
         }
         s.store_class_end();
     }
@@ -46424,6 +47240,79 @@ impl InputThemeSettings {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+pub struct InputTonConnectOauthSession {
+    pub session_id: i64,
+    pub challenge_answer: Vec<u8>,
+    pub body: Vec<u8>,
+    pub proof: Option<WalletOwnershipProof>,
+}
+
+impl InputTonConnectOauthSession {
+    pub const ID: i32 = 1654613710;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i64(out, self.session_id);
+        tl::__string(out, &self.challenge_answer);
+        tl::__string(out, &self.body);
+        let __d0 = Default::default();
+        let __m0 = self.proof.as_ref().unwrap_or(&__d0);
+        __m0.store_boxed(out);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let session_id: i64 = r.i64()?;
+        let challenge_answer: Vec<u8> = r.bytes()?;
+        let body: Vec<u8> = r.bytes()?;
+        let proof: Option<WalletOwnershipProof> = Some(WalletOwnershipProof::read(r)?);
+        Result::Ok(Self { session_id, challenge_answer, body, proof })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "inputTonConnectOauthSession");
+        s.store_field_int("session_id", self.session_id);
+        s.store_bytes_field("challenge_answer", &self.challenge_answer);
+        s.store_bytes_field("body", &self.body);
+        match &self.proof {
+            Some(__m0) => __m0.store_debug(s, "proof"),
+            None => s.store_null("proof"),
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct inputUserEmpty;
 
 impl inputUserEmpty {
@@ -46937,6 +47826,71 @@ impl InputWallPaper {
 impl Default for InputWallPaper {
     fn default() -> Self {
         Self::inputWallPaper(Default::default())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct InputWalletCardSticker {
+    pub coordinates: Option<MediaAreaCoordinates>,
+    pub nft_address: String,
+}
+
+impl InputWalletCardSticker {
+    pub const ID: i32 = 1474250151;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let __d0 = Default::default();
+        let __m0 = self.coordinates.as_ref().unwrap_or(&__d0);
+        __m0.store_boxed(out);
+        tl::__string(out, &self.nft_address);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let coordinates: Option<MediaAreaCoordinates> = Some(MediaAreaCoordinates::read(r)?);
+        let nft_address: String = r.string()?;
+        Result::Ok(Self { coordinates, nft_address })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "inputWalletCardSticker");
+        match &self.coordinates {
+            Some(__m0) => __m0.store_debug(s, "coordinates"),
+            None => s.store_null("coordinates"),
+        }
+        s.store_field_str("nft_address", &self.nft_address);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
     }
 }
 
@@ -57134,6 +58088,59 @@ impl messageActionWalletTonConnectRequest {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct messageActionNoPaidMessagesTokenUsed;
+
+impl messageActionNoPaidMessagesTokenUsed {
+    pub const ID: i32 = -1043140154;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let _ = out;
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let _ = r;
+        Result::Ok(Self)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "messageActionNoPaidMessagesTokenUsed");
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum MessageAction {
     messageActionEmpty(messageActionEmpty),
@@ -57207,6 +58214,7 @@ pub enum MessageAction {
     messageActionChatJoinedViaCommunity(messageActionChatJoinedViaCommunity),
     messageActionGramTransfer(messageActionGramTransfer),
     messageActionWalletTonConnectRequest(messageActionWalletTonConnectRequest),
+    messageActionNoPaidMessagesTokenUsed(messageActionNoPaidMessagesTokenUsed),
 }
 
 impl MessageAction {
@@ -57283,6 +58291,7 @@ impl MessageAction {
             Self::messageActionChatJoinedViaCommunity(v) => v.store_boxed(out),
             Self::messageActionGramTransfer(v) => v.store_boxed(out),
             Self::messageActionWalletTonConnectRequest(v) => v.store_boxed(out),
+            Self::messageActionNoPaidMessagesTokenUsed(v) => v.store_boxed(out),
         }
     }
 
@@ -57364,6 +58373,7 @@ impl MessageAction {
             self::messageActionChatJoinedViaCommunity::ID => Result::Ok(Self::messageActionChatJoinedViaCommunity(self::messageActionChatJoinedViaCommunity::read_bare(r)?)),
             self::messageActionGramTransfer::ID => Result::Ok(Self::messageActionGramTransfer(self::messageActionGramTransfer::read_bare(r)?)),
             self::messageActionWalletTonConnectRequest::ID => Result::Ok(Self::messageActionWalletTonConnectRequest(self::messageActionWalletTonConnectRequest::read_bare(r)?)),
+            self::messageActionNoPaidMessagesTokenUsed::ID => Result::Ok(Self::messageActionNoPaidMessagesTokenUsed(self::messageActionNoPaidMessagesTokenUsed::read_bare(r)?)),
             _ => Result::Err("Unknown constructor"),
         }
     }
@@ -57441,6 +58451,7 @@ impl MessageAction {
             Self::messageActionChatJoinedViaCommunity(v) => v.store_debug(s, field_name),
             Self::messageActionGramTransfer(v) => v.store_debug(s, field_name),
             Self::messageActionWalletTonConnectRequest(v) => v.store_debug(s, field_name),
+            Self::messageActionNoPaidMessagesTokenUsed(v) => v.store_debug(s, field_name),
         }
     }
 
@@ -61476,6 +62487,134 @@ impl messageMediaVideoStream {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct messageMediaWidget {
+    pub flags: i32,
+    pub is_copy: bool,
+    pub can_query: bool,
+    pub background_query: bool,
+    pub width: i32,
+    pub height: i32,
+    pub payload: Vec<u8>,
+    pub public_data: String,
+    pub public_data_hash: i64,
+    pub chat_data: String,
+    pub widget_id: i64,
+}
+
+impl messageMediaWidget {
+    pub const ID: i32 = 574157332;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.flags | (self.is_copy as i32) | ((self.can_query as i32) << 1) | ((self.background_query as i32) << 2));
+        tl::__i32(out, self.width);
+        tl::__i32(out, self.height);
+        tl::__string(out, &self.payload);
+        if (self.flags | (self.is_copy as i32) | ((self.can_query as i32) << 1) | ((self.background_query as i32) << 2)) & 1 << 3 != 0 {
+            tl::__string(out, &self.public_data);
+        }
+        if (self.flags | (self.is_copy as i32) | ((self.can_query as i32) << 1) | ((self.background_query as i32) << 2)) & 1 << 3 != 0 {
+            tl::__i64(out, self.public_data_hash);
+        }
+        if (self.flags | (self.is_copy as i32) | ((self.can_query as i32) << 1) | ((self.background_query as i32) << 2)) & 1 << 4 != 0 {
+            tl::__string(out, &self.chat_data);
+        }
+        if (self.flags | (self.is_copy as i32) | ((self.can_query as i32) << 1) | ((self.background_query as i32) << 2)) & 1 << 5 != 0 {
+            tl::__i64(out, self.widget_id);
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let flags: i32 = r.i32()?;
+        if flags < 0 {
+            return Result::Err("Variable of type # can't be negative");
+        }
+        let is_copy: bool = (flags & 1) != 0;
+        let can_query: bool = (flags & 1 << 1) != 0;
+        let background_query: bool = (flags & 1 << 2) != 0;
+        let width: i32 = r.i32()?;
+        let height: i32 = r.i32()?;
+        let payload: Vec<u8> = r.bytes()?;
+        let public_data: String = if (flags & 1 << 3) != 0 {
+            r.string()?
+        } else {
+            Default::default()
+        };
+        let public_data_hash: i64 = if (flags & 1 << 3) != 0 {
+            r.i64()?
+        } else {
+            Default::default()
+        };
+        let chat_data: String = if (flags & 1 << 4) != 0 {
+            r.string()?
+        } else {
+            Default::default()
+        };
+        let widget_id: i64 = if (flags & 1 << 5) != 0 {
+            r.i64()?
+        } else {
+            Default::default()
+        };
+        Result::Ok(Self { flags, is_copy, can_query, background_query, width, height, payload, public_data, public_data_hash, chat_data, widget_id })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "messageMediaWidget");
+        s.store_field_int("flags", self.flags as i64);
+        if self.flags & 1 != 0 { s.store_field_bool("is_copy", true); }
+        if self.flags & 1 << 1 != 0 { s.store_field_bool("can_query", true); }
+        if self.flags & 1 << 2 != 0 { s.store_field_bool("background_query", true); }
+        s.store_field_int("width", self.width as i64);
+        s.store_field_int("height", self.height as i64);
+        s.store_bytes_field("payload", &self.payload);
+        if self.flags & 1 << 3 != 0 {
+            s.store_field_str("public_data", &self.public_data);
+        }
+        if self.flags & 1 << 3 != 0 {
+            s.store_field_int("public_data_hash", self.public_data_hash);
+        }
+        if self.flags & 1 << 4 != 0 {
+            s.store_field_str("chat_data", &self.chat_data);
+        }
+        if self.flags & 1 << 5 != 0 {
+            s.store_field_int("widget_id", self.widget_id);
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum MessageMedia {
     messageMediaEmpty(messageMediaEmpty),
@@ -61497,6 +62636,7 @@ pub enum MessageMedia {
     messageMediaPaidMedia(messageMediaPaidMedia),
     messageMediaToDo(messageMediaToDo),
     messageMediaVideoStream(messageMediaVideoStream),
+    messageMediaWidget(messageMediaWidget),
 }
 
 impl MessageMedia {
@@ -61521,6 +62661,7 @@ impl MessageMedia {
             Self::messageMediaPaidMedia(v) => v.store_boxed(out),
             Self::messageMediaToDo(v) => v.store_boxed(out),
             Self::messageMediaVideoStream(v) => v.store_boxed(out),
+            Self::messageMediaWidget(v) => v.store_boxed(out),
         }
     }
 
@@ -61550,6 +62691,7 @@ impl MessageMedia {
             self::messageMediaPaidMedia::ID => Result::Ok(Self::messageMediaPaidMedia(self::messageMediaPaidMedia::read_bare(r)?)),
             self::messageMediaToDo::ID => Result::Ok(Self::messageMediaToDo(self::messageMediaToDo::read_bare(r)?)),
             self::messageMediaVideoStream::ID => Result::Ok(Self::messageMediaVideoStream(self::messageMediaVideoStream::read_bare(r)?)),
+            self::messageMediaWidget::ID => Result::Ok(Self::messageMediaWidget(self::messageMediaWidget::read_bare(r)?)),
             _ => Result::Err("Unknown constructor"),
         }
     }
@@ -61575,6 +62717,7 @@ impl MessageMedia {
             Self::messageMediaPaidMedia(v) => v.store_debug(s, field_name),
             Self::messageMediaToDo(v) => v.store_debug(s, field_name),
             Self::messageMediaVideoStream(v) => v.store_debug(s, field_name),
+            Self::messageMediaWidget(v) => v.store_debug(s, field_name),
         }
     }
 
@@ -62429,10 +63572,11 @@ pub struct messageReplyHeader {
     pub quote_offset: i32,
     pub todo_item_id: i32,
     pub poll_option: Vec<u8>,
+    pub quote_rich: Vec<Box<RichText>>,
 }
 
 impl messageReplyHeader {
-    pub const ID: i32 = 462937446;
+    pub const ID: i32 = -575296651;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -62480,6 +63624,13 @@ impl messageReplyHeader {
         }
         if (self.flags | ((self.reply_to_scheduled as i32) << 2) | ((self.forum_topic as i32) << 3) | ((self.quote as i32) << 9) | ((self.reply_to_ephemeral as i32) << 13)) & 1 << 12 != 0 {
             tl::__string(out, &self.poll_option);
+        }
+        if (self.flags | ((self.reply_to_scheduled as i32) << 2) | ((self.forum_topic as i32) << 3) | ((self.quote as i32) << 9) | ((self.reply_to_ephemeral as i32) << 13)) & 1 << 14 != 0 {
+            tl::__i32(out, tl::VECTOR_ID);
+            tl::__i32(out, self.quote_rich.len() as i32);
+            for __v4 in &self.quote_rich {
+                (*__v4).store(out);
+            }
         }
     }
 
@@ -62573,7 +63724,26 @@ impl messageReplyHeader {
         } else {
             Default::default()
         };
-        Result::Ok(Self { flags, reply_to_scheduled, forum_topic, quote, reply_to_ephemeral, reply_to_msg_id, reply_to_peer_id, reply_from, reply_media, reply_to_top_id, quote_text, quote_entities, quote_offset, todo_item_id, poll_option })
+        let quote_rich: Vec<Box<RichText>> = if (flags & 1 << 14) != 0 {
+            let __v1: Vec<Box<RichText>> = {
+                if r.i32()? != tl::VECTOR_ID {
+                    return Result::Err("Wrong constructor");
+                }
+                let count: u32 = r.i32()? as u32;
+                if count as usize > r.remaining() {
+                    return Result::Err("Wrong vector length");
+                }
+                let mut res = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    res.push(Box::new(RichText::read(r)?));
+                }
+                res
+            };
+            __v1
+        } else {
+            Default::default()
+        };
+        Result::Ok(Self { flags, reply_to_scheduled, forum_topic, quote, reply_to_ephemeral, reply_to_msg_id, reply_to_peer_id, reply_from, reply_media, reply_to_top_id, quote_text, quote_entities, quote_offset, todo_item_id, poll_option, quote_rich })
     }
 
     /// td's generated `Class::store(TlStorerToString&, const char*)`
@@ -62627,6 +63797,13 @@ impl messageReplyHeader {
         }
         if self.flags & 1 << 12 != 0 {
             s.store_bytes_field("poll_option", &self.poll_option);
+        }
+        if self.flags & 1 << 14 != 0 {
+            s.store_vector_begin("quote_rich", self.quote_rich.len());
+            for __v4 in &self.quote_rich {
+                __v4.store_debug(s, "");
+            }
+            s.store_class_end();
         }
         s.store_class_end();
     }
@@ -89124,6 +90301,603 @@ impl Default for SendMessageAction {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+pub struct shareThemeDefault;
+
+impl shareThemeDefault {
+    pub const ID: i32 = -1783830449;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let _ = out;
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let _ = r;
+        Result::Ok(Self)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "shareThemeDefault");
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct shareThemeEmojiBackdrop {
+    pub flags: i32,
+    pub backdrop_id: i32,
+    pub emojis: Vec<Reaction>,
+}
+
+impl shareThemeEmojiBackdrop {
+    pub const ID: i32 = 1689466081;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.flags);
+        if (self.flags) & 1 != 0 {
+            tl::__i32(out, self.backdrop_id);
+        }
+        if (self.flags) & 1 << 1 != 0 {
+            tl::__i32(out, tl::VECTOR_ID);
+            tl::__i32(out, self.emojis.len() as i32);
+            for __v0 in &self.emojis {
+                (*__v0).store(out);
+            }
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let flags: i32 = r.i32()?;
+        if flags < 0 {
+            return Result::Err("Variable of type # can't be negative");
+        }
+        let backdrop_id: i32 = if (flags & 1) != 0 {
+            r.i32()?
+        } else {
+            Default::default()
+        };
+        let emojis: Vec<Reaction> = if (flags & 1 << 1) != 0 {
+            let __v0: Vec<Reaction> = {
+                if r.i32()? != tl::VECTOR_ID {
+                    return Result::Err("Wrong constructor");
+                }
+                let count: u32 = r.i32()? as u32;
+                if count as usize > r.remaining() {
+                    return Result::Err("Wrong vector length");
+                }
+                let mut res = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    res.push(Reaction::read(r)?);
+                }
+                res
+            };
+            __v0
+        } else {
+            Default::default()
+        };
+        Result::Ok(Self { flags, backdrop_id, emojis })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "shareThemeEmojiBackdrop");
+        s.store_field_int("flags", self.flags as i64);
+        if self.flags & 1 != 0 {
+            s.store_field_int("backdrop_id", self.backdrop_id as i64);
+        }
+        if self.flags & 1 << 1 != 0 {
+            s.store_vector_begin("emojis", self.emojis.len());
+            for __v0 in &self.emojis {
+                __v0.store_debug(s, "");
+            }
+            s.store_class_end();
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct shareThemeGift {
+    pub stargift: Option<StarGift>,
+}
+
+impl shareThemeGift {
+    pub const ID: i32 = -336796051;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let __d0 = Default::default();
+        let __m0 = self.stargift.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let stargift: Option<StarGift> = Some(StarGift::read(r)?);
+        Result::Ok(Self { stargift })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "shareThemeGift");
+        match &self.stargift {
+            Some(__m0) => __m0.store_debug(s, "stargift"),
+            None => s.store_null("stargift"),
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct inputShareThemeGift {
+    pub stargift: Option<InputSavedStarGift>,
+}
+
+impl inputShareThemeGift {
+    pub const ID: i32 = 1069099867;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let __d0 = Default::default();
+        let __m0 = self.stargift.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let stargift: Option<InputSavedStarGift> = Some(InputSavedStarGift::read(r)?);
+        Result::Ok(Self { stargift })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "inputShareThemeGift");
+        match &self.stargift {
+            Some(__m0) => __m0.store_debug(s, "stargift"),
+            None => s.store_null("stargift"),
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ShareTheme {
+    shareThemeDefault(shareThemeDefault),
+    shareThemeEmojiBackdrop(shareThemeEmojiBackdrop),
+    shareThemeGift(shareThemeGift),
+    inputShareThemeGift(inputShareThemeGift),
+}
+
+impl ShareTheme {
+    pub fn store(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::shareThemeDefault(v) => v.store_boxed(out),
+            Self::shareThemeEmojiBackdrop(v) => v.store_boxed(out),
+            Self::shareThemeGift(v) => v.store_boxed(out),
+            Self::inputShareThemeGift(v) => v.store_boxed(out),
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        match r.i32()? {
+            self::shareThemeDefault::ID => Result::Ok(Self::shareThemeDefault(self::shareThemeDefault::read_bare(r)?)),
+            self::shareThemeEmojiBackdrop::ID => Result::Ok(Self::shareThemeEmojiBackdrop(self::shareThemeEmojiBackdrop::read_bare(r)?)),
+            self::shareThemeGift::ID => Result::Ok(Self::shareThemeGift(self::shareThemeGift::read_bare(r)?)),
+            self::inputShareThemeGift::ID => Result::Ok(Self::inputShareThemeGift(self::inputShareThemeGift::read_bare(r)?)),
+            _ => Result::Err("Unknown constructor"),
+        }
+    }
+
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        match self {
+            Self::shareThemeDefault(v) => v.store_debug(s, field_name),
+            Self::shareThemeEmojiBackdrop(v) => v.store_debug(s, field_name),
+            Self::shareThemeGift(v) => v.store_debug(s, field_name),
+            Self::inputShareThemeGift(v) => v.store_debug(s, field_name),
+        }
+    }
+
+    /// td's `to_string(const BaseObject&)` for this type.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+impl Default for ShareTheme {
+    fn default() -> Self {
+        Self::shareThemeDefault(Default::default())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ShareThemeBackdropOption {
+    pub backdrop_id: i32,
+    pub name: String,
+    pub center_color: i32,
+    pub edge_color: i32,
+    pub pattern_color: i32,
+    pub text_color: i32,
+}
+
+impl ShareThemeBackdropOption {
+    pub const ID: i32 = 1170331218;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.backdrop_id);
+        tl::__string(out, &self.name);
+        tl::__i32(out, self.center_color);
+        tl::__i32(out, self.edge_color);
+        tl::__i32(out, self.pattern_color);
+        tl::__i32(out, self.text_color);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let backdrop_id: i32 = r.i32()?;
+        let name: String = r.string()?;
+        let center_color: i32 = r.i32()?;
+        let edge_color: i32 = r.i32()?;
+        let pattern_color: i32 = r.i32()?;
+        let text_color: i32 = r.i32()?;
+        Result::Ok(Self { backdrop_id, name, center_color, edge_color, pattern_color, text_color })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "shareThemeBackdropOption");
+        s.store_field_int("backdrop_id", self.backdrop_id as i64);
+        s.store_field_str("name", &self.name);
+        s.store_field_int("center_color", self.center_color as i64);
+        s.store_field_int("edge_color", self.edge_color as i64);
+        s.store_field_int("pattern_color", self.pattern_color as i64);
+        s.store_field_int("text_color", self.text_color as i64);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct shareThemeBackdropsNotModified;
+
+impl shareThemeBackdropsNotModified {
+    pub const ID: i32 = 2050977279;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let _ = out;
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let _ = r;
+        Result::Ok(Self)
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "shareThemeBackdropsNotModified");
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct shareThemeBackdrops {
+    pub hash: i32,
+    pub backdrops: Vec<ShareThemeBackdropOption>,
+}
+
+impl shareThemeBackdrops {
+    pub const ID: i32 = -1427448608;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.hash);
+        tl::__i32(out, tl::VECTOR_ID);
+        tl::__i32(out, self.backdrops.len() as i32);
+        for __v0 in &self.backdrops {
+            (*__v0).store_boxed(out);
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let hash: i32 = r.i32()?;
+        let __v0: Vec<ShareThemeBackdropOption> = {
+            if r.i32()? != tl::VECTOR_ID {
+                return Result::Err("Wrong constructor");
+            }
+            let count: u32 = r.i32()? as u32;
+            if count as usize > r.remaining() {
+                return Result::Err("Wrong vector length");
+            }
+            let mut res = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                res.push(ShareThemeBackdropOption::read(r)?);
+            }
+            res
+        };
+        let backdrops: Vec<ShareThemeBackdropOption> = __v0;
+        Result::Ok(Self { hash, backdrops })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "shareThemeBackdrops");
+        s.store_field_int("hash", self.hash as i64);
+        s.store_vector_begin("backdrops", self.backdrops.len());
+        for __v0 in &self.backdrops {
+            __v0.store_debug(s, "");
+        }
+        s.store_class_end();
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ShareThemeBackdrops {
+    shareThemeBackdropsNotModified(shareThemeBackdropsNotModified),
+    shareThemeBackdrops(shareThemeBackdrops),
+}
+
+impl ShareThemeBackdrops {
+    pub fn store(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::shareThemeBackdropsNotModified(v) => v.store_boxed(out),
+            Self::shareThemeBackdrops(v) => v.store_boxed(out),
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        match r.i32()? {
+            self::shareThemeBackdropsNotModified::ID => Result::Ok(Self::shareThemeBackdropsNotModified(self::shareThemeBackdropsNotModified::read_bare(r)?)),
+            self::shareThemeBackdrops::ID => Result::Ok(Self::shareThemeBackdrops(self::shareThemeBackdrops::read_bare(r)?)),
+            _ => Result::Err("Unknown constructor"),
+        }
+    }
+
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        match self {
+            Self::shareThemeBackdropsNotModified(v) => v.store_debug(s, field_name),
+            Self::shareThemeBackdrops(v) => v.store_debug(s, field_name),
+        }
+    }
+
+    /// td's `to_string(const BaseObject&)` for this type.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+impl Default for ShareThemeBackdrops {
+    fn default() -> Self {
+        Self::shareThemeBackdropsNotModified(Default::default())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ShippingOption {
     pub id: String,
     pub title: String,
@@ -112247,6 +114021,669 @@ impl updateWalletTonConnectPendingDisconnect {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct updateEditForumTopic {
+    pub flags: i32,
+    pub peer: Option<Peer>,
+    pub topic_id: i32,
+    pub title: String,
+    pub icon_emoji_id: i64,
+    pub closed: bool,
+    pub hidden: bool,
+}
+
+impl updateEditForumTopic {
+    pub const ID: i32 = 593913436;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.flags);
+        let __d0 = Default::default();
+        let __m0 = self.peer.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+        tl::__i32(out, self.topic_id);
+        if (self.flags) & 1 != 0 {
+            tl::__string(out, &self.title);
+        }
+        if (self.flags) & 1 << 1 != 0 {
+            tl::__i64(out, self.icon_emoji_id);
+        }
+        if (self.flags) & 1 << 2 != 0 {
+            tl::__bool(out, self.closed);
+        }
+        if (self.flags) & 1 << 3 != 0 {
+            tl::__bool(out, self.hidden);
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let flags: i32 = r.i32()?;
+        if flags < 0 {
+            return Result::Err("Variable of type # can't be negative");
+        }
+        let peer: Option<Peer> = Some(Peer::read(r)?);
+        let topic_id: i32 = r.i32()?;
+        let title: String = if (flags & 1) != 0 {
+            r.string()?
+        } else {
+            Default::default()
+        };
+        let icon_emoji_id: i64 = if (flags & 1 << 1) != 0 {
+            r.i64()?
+        } else {
+            Default::default()
+        };
+        let closed: bool = if (flags & 1 << 2) != 0 {
+            r.bool()?
+        } else {
+            Default::default()
+        };
+        let hidden: bool = if (flags & 1 << 3) != 0 {
+            r.bool()?
+        } else {
+            Default::default()
+        };
+        Result::Ok(Self { flags, peer, topic_id, title, icon_emoji_id, closed, hidden })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "updateEditForumTopic");
+        s.store_field_int("flags", self.flags as i64);
+        match &self.peer {
+            Some(__m0) => __m0.store_debug(s, "peer"),
+            None => s.store_null("peer"),
+        }
+        s.store_field_int("topic_id", self.topic_id as i64);
+        if self.flags & 1 != 0 {
+            s.store_field_str("title", &self.title);
+        }
+        if self.flags & 1 << 1 != 0 {
+            s.store_field_int("icon_emoji_id", self.icon_emoji_id);
+        }
+        if self.flags & 1 << 2 != 0 {
+            s.store_field_bool("closed", self.closed);
+        }
+        if self.flags & 1 << 3 != 0 {
+            s.store_field_bool("hidden", self.hidden);
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct updateBotWidgetQuery {
+    pub flags: i32,
+    pub query_id: i64,
+    pub query_type: Option<WidgetQueryType>,
+    pub user_id: i64,
+    pub peer: Option<Peer>,
+    pub msg_id: i32,
+    pub chat_instance: i64,
+    pub chat_type: String,
+    pub data: Vec<u8>,
+    pub widget_id: i64,
+    pub wallet_card: Option<wallet_Card>,
+}
+
+impl updateBotWidgetQuery {
+    pub const ID: i32 = -1284243864;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.flags);
+        tl::__i64(out, self.query_id);
+        let __d0 = Default::default();
+        let __m0 = self.query_type.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+        tl::__i64(out, self.user_id);
+        let __d1 = Default::default();
+        let __m1 = self.peer.as_ref().unwrap_or(&__d1);
+        __m1.store(out);
+        tl::__i32(out, self.msg_id);
+        tl::__i64(out, self.chat_instance);
+        tl::__string(out, &self.chat_type);
+        tl::__string(out, &self.data);
+        if (self.flags) & 1 != 0 {
+            tl::__i64(out, self.widget_id);
+        }
+        if (self.flags) & 1 << 1 != 0 {
+            let __d2 = Default::default();
+            let __m2 = self.wallet_card.as_ref().unwrap_or(&__d2);
+            __m2.store_boxed(out);
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let flags: i32 = r.i32()?;
+        if flags < 0 {
+            return Result::Err("Variable of type # can't be negative");
+        }
+        let query_id: i64 = r.i64()?;
+        let query_type: Option<WidgetQueryType> = Some(WidgetQueryType::read(r)?);
+        let user_id: i64 = r.i64()?;
+        let peer: Option<Peer> = Some(Peer::read(r)?);
+        let msg_id: i32 = r.i32()?;
+        let chat_instance: i64 = r.i64()?;
+        let chat_type: String = r.string()?;
+        let data: Vec<u8> = r.bytes()?;
+        let widget_id: i64 = if (flags & 1) != 0 {
+            r.i64()?
+        } else {
+            Default::default()
+        };
+        let wallet_card: Option<wallet_Card> = if (flags & 1 << 1) != 0 {
+            Some(wallet_Card::read(r)?)
+        } else {
+            Default::default()
+        };
+        Result::Ok(Self { flags, query_id, query_type, user_id, peer, msg_id, chat_instance, chat_type, data, widget_id, wallet_card })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "updateBotWidgetQuery");
+        s.store_field_int("flags", self.flags as i64);
+        s.store_field_int("query_id", self.query_id);
+        match &self.query_type {
+            Some(__m0) => __m0.store_debug(s, "query_type"),
+            None => s.store_null("query_type"),
+        }
+        s.store_field_int("user_id", self.user_id);
+        match &self.peer {
+            Some(__m1) => __m1.store_debug(s, "peer"),
+            None => s.store_null("peer"),
+        }
+        s.store_field_int("msg_id", self.msg_id as i64);
+        s.store_field_int("chat_instance", self.chat_instance);
+        s.store_field_str("chat_type", &self.chat_type);
+        s.store_bytes_field("data", &self.data);
+        if self.flags & 1 != 0 {
+            s.store_field_int("widget_id", self.widget_id);
+        }
+        if self.flags & 1 << 1 != 0 {
+            match &self.wallet_card {
+                Some(__m2) => __m2.store_debug(s, "wallet_card"),
+                None => s.store_null("wallet_card"),
+            }
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct updateInlineBotWidgetQuery {
+    pub flags: i32,
+    pub query_id: i64,
+    pub query_type: Option<WidgetQueryType>,
+    pub user_id: i64,
+    pub inline_message_id: Option<InputBotInlineMessageID>,
+    pub chat_instance: i64,
+    pub chat_type: String,
+    pub data: Vec<u8>,
+    pub widget_id: i64,
+    pub wallet_card: Option<wallet_Card>,
+}
+
+impl updateInlineBotWidgetQuery {
+    pub const ID: i32 = -1510965752;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.flags);
+        tl::__i64(out, self.query_id);
+        let __d0 = Default::default();
+        let __m0 = self.query_type.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+        tl::__i64(out, self.user_id);
+        let __d1 = Default::default();
+        let __m1 = self.inline_message_id.as_ref().unwrap_or(&__d1);
+        __m1.store(out);
+        tl::__i64(out, self.chat_instance);
+        tl::__string(out, &self.chat_type);
+        tl::__string(out, &self.data);
+        if (self.flags) & 1 != 0 {
+            tl::__i64(out, self.widget_id);
+        }
+        if (self.flags) & 1 << 1 != 0 {
+            let __d2 = Default::default();
+            let __m2 = self.wallet_card.as_ref().unwrap_or(&__d2);
+            __m2.store_boxed(out);
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let flags: i32 = r.i32()?;
+        if flags < 0 {
+            return Result::Err("Variable of type # can't be negative");
+        }
+        let query_id: i64 = r.i64()?;
+        let query_type: Option<WidgetQueryType> = Some(WidgetQueryType::read(r)?);
+        let user_id: i64 = r.i64()?;
+        let inline_message_id: Option<InputBotInlineMessageID> = Some(InputBotInlineMessageID::read(r)?);
+        let chat_instance: i64 = r.i64()?;
+        let chat_type: String = r.string()?;
+        let data: Vec<u8> = r.bytes()?;
+        let widget_id: i64 = if (flags & 1) != 0 {
+            r.i64()?
+        } else {
+            Default::default()
+        };
+        let wallet_card: Option<wallet_Card> = if (flags & 1 << 1) != 0 {
+            Some(wallet_Card::read(r)?)
+        } else {
+            Default::default()
+        };
+        Result::Ok(Self { flags, query_id, query_type, user_id, inline_message_id, chat_instance, chat_type, data, widget_id, wallet_card })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "updateInlineBotWidgetQuery");
+        s.store_field_int("flags", self.flags as i64);
+        s.store_field_int("query_id", self.query_id);
+        match &self.query_type {
+            Some(__m0) => __m0.store_debug(s, "query_type"),
+            None => s.store_null("query_type"),
+        }
+        s.store_field_int("user_id", self.user_id);
+        match &self.inline_message_id {
+            Some(__m1) => __m1.store_debug(s, "inline_message_id"),
+            None => s.store_null("inline_message_id"),
+        }
+        s.store_field_int("chat_instance", self.chat_instance);
+        s.store_field_str("chat_type", &self.chat_type);
+        s.store_bytes_field("data", &self.data);
+        if self.flags & 1 != 0 {
+            s.store_field_int("widget_id", self.widget_id);
+        }
+        if self.flags & 1 << 1 != 0 {
+            match &self.wallet_card {
+                Some(__m2) => __m2.store_debug(s, "wallet_card"),
+                None => s.store_null("wallet_card"),
+            }
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct updateBotWidgetCopyQuery {
+    pub flags: i32,
+    pub query_id: i64,
+    pub query_type: Option<WidgetQueryType>,
+    pub user_id: i64,
+    pub data: Vec<u8>,
+    pub widget_id: i64,
+    pub wallet_card: Option<wallet_Card>,
+}
+
+impl updateBotWidgetCopyQuery {
+    pub const ID: i32 = -91635977;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.flags);
+        tl::__i64(out, self.query_id);
+        let __d0 = Default::default();
+        let __m0 = self.query_type.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+        tl::__i64(out, self.user_id);
+        tl::__string(out, &self.data);
+        tl::__i64(out, self.widget_id);
+        if (self.flags) & 1 << 1 != 0 {
+            let __d1 = Default::default();
+            let __m1 = self.wallet_card.as_ref().unwrap_or(&__d1);
+            __m1.store_boxed(out);
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let flags: i32 = r.i32()?;
+        if flags < 0 {
+            return Result::Err("Variable of type # can't be negative");
+        }
+        let query_id: i64 = r.i64()?;
+        let query_type: Option<WidgetQueryType> = Some(WidgetQueryType::read(r)?);
+        let user_id: i64 = r.i64()?;
+        let data: Vec<u8> = r.bytes()?;
+        let widget_id: i64 = r.i64()?;
+        let wallet_card: Option<wallet_Card> = if (flags & 1 << 1) != 0 {
+            Some(wallet_Card::read(r)?)
+        } else {
+            Default::default()
+        };
+        Result::Ok(Self { flags, query_id, query_type, user_id, data, widget_id, wallet_card })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "updateBotWidgetCopyQuery");
+        s.store_field_int("flags", self.flags as i64);
+        s.store_field_int("query_id", self.query_id);
+        match &self.query_type {
+            Some(__m0) => __m0.store_debug(s, "query_type"),
+            None => s.store_null("query_type"),
+        }
+        s.store_field_int("user_id", self.user_id);
+        s.store_bytes_field("data", &self.data);
+        s.store_field_int("widget_id", self.widget_id);
+        if self.flags & 1 << 1 != 0 {
+            match &self.wallet_card {
+                Some(__m1) => __m1.store_debug(s, "wallet_card"),
+                None => s.store_null("wallet_card"),
+            }
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct updateMessageWidgetData {
+    pub flags: i32,
+    pub peer: Option<Peer>,
+    pub msg_id: i32,
+    pub public_data: String,
+    pub public_data_hash: i64,
+    pub chat_data: String,
+    pub pts: i32,
+    pub pts_count: i32,
+}
+
+impl updateMessageWidgetData {
+    pub const ID: i32 = -1146062627;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.flags);
+        let __d0 = Default::default();
+        let __m0 = self.peer.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+        tl::__i32(out, self.msg_id);
+        if (self.flags) & 1 != 0 {
+            tl::__string(out, &self.public_data);
+        }
+        if (self.flags) & 1 != 0 {
+            tl::__i64(out, self.public_data_hash);
+        }
+        if (self.flags) & 1 << 1 != 0 {
+            tl::__string(out, &self.chat_data);
+        }
+        tl::__i32(out, self.pts);
+        tl::__i32(out, self.pts_count);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let flags: i32 = r.i32()?;
+        if flags < 0 {
+            return Result::Err("Variable of type # can't be negative");
+        }
+        let peer: Option<Peer> = Some(Peer::read(r)?);
+        let msg_id: i32 = r.i32()?;
+        let public_data: String = if (flags & 1) != 0 {
+            r.string()?
+        } else {
+            Default::default()
+        };
+        let public_data_hash: i64 = if (flags & 1) != 0 {
+            r.i64()?
+        } else {
+            Default::default()
+        };
+        let chat_data: String = if (flags & 1 << 1) != 0 {
+            r.string()?
+        } else {
+            Default::default()
+        };
+        let pts: i32 = r.i32()?;
+        let pts_count: i32 = r.i32()?;
+        Result::Ok(Self { flags, peer, msg_id, public_data, public_data_hash, chat_data, pts, pts_count })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "updateMessageWidgetData");
+        s.store_field_int("flags", self.flags as i64);
+        match &self.peer {
+            Some(__m0) => __m0.store_debug(s, "peer"),
+            None => s.store_null("peer"),
+        }
+        s.store_field_int("msg_id", self.msg_id as i64);
+        if self.flags & 1 != 0 {
+            s.store_field_str("public_data", &self.public_data);
+        }
+        if self.flags & 1 != 0 {
+            s.store_field_int("public_data_hash", self.public_data_hash);
+        }
+        if self.flags & 1 << 1 != 0 {
+            s.store_field_str("chat_data", &self.chat_data);
+        }
+        s.store_field_int("pts", self.pts as i64);
+        s.store_field_int("pts_count", self.pts_count as i64);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct updateTranscribedAudioFile {
+    pub flags: i32,
+    pub pending: bool,
+    pub transcription_id: i64,
+    pub text: String,
+}
+
+impl updateTranscribedAudioFile {
+    pub const ID: i32 = 1934372475;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.flags | (self.pending as i32));
+        tl::__i64(out, self.transcription_id);
+        tl::__string(out, &self.text);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let flags: i32 = r.i32()?;
+        if flags < 0 {
+            return Result::Err("Variable of type # can't be negative");
+        }
+        let pending: bool = (flags & 1) != 0;
+        let transcription_id: i64 = r.i64()?;
+        let text: String = r.string()?;
+        Result::Ok(Self { flags, pending, transcription_id, text })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "updateTranscribedAudioFile");
+        s.store_field_int("flags", self.flags as i64);
+        if self.flags & 1 != 0 { s.store_field_bool("pending", true); }
+        s.store_field_int("transcription_id", self.transcription_id);
+        s.store_field_str("text", &self.text);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Update {
     updateNewMessage(updateNewMessage),
@@ -112419,6 +114856,12 @@ pub enum Update {
     updateWalletGaslessInfo(updateWalletGaslessInfo),
     updateWalletTonConnectSession(updateWalletTonConnectSession),
     updateWalletTonConnectPendingDisconnect(updateWalletTonConnectPendingDisconnect),
+    updateEditForumTopic(updateEditForumTopic),
+    updateBotWidgetQuery(updateBotWidgetQuery),
+    updateInlineBotWidgetQuery(updateInlineBotWidgetQuery),
+    updateBotWidgetCopyQuery(updateBotWidgetCopyQuery),
+    updateMessageWidgetData(updateMessageWidgetData),
+    updateTranscribedAudioFile(updateTranscribedAudioFile),
 }
 
 impl Update {
@@ -112594,6 +115037,12 @@ impl Update {
             Self::updateWalletGaslessInfo(v) => v.store_boxed(out),
             Self::updateWalletTonConnectSession(v) => v.store_boxed(out),
             Self::updateWalletTonConnectPendingDisconnect(v) => v.store_boxed(out),
+            Self::updateEditForumTopic(v) => v.store_boxed(out),
+            Self::updateBotWidgetQuery(v) => v.store_boxed(out),
+            Self::updateInlineBotWidgetQuery(v) => v.store_boxed(out),
+            Self::updateBotWidgetCopyQuery(v) => v.store_boxed(out),
+            Self::updateMessageWidgetData(v) => v.store_boxed(out),
+            Self::updateTranscribedAudioFile(v) => v.store_boxed(out),
         }
     }
 
@@ -112774,6 +115223,12 @@ impl Update {
             self::updateWalletGaslessInfo::ID => Result::Ok(Self::updateWalletGaslessInfo(self::updateWalletGaslessInfo::read_bare(r)?)),
             self::updateWalletTonConnectSession::ID => Result::Ok(Self::updateWalletTonConnectSession(self::updateWalletTonConnectSession::read_bare(r)?)),
             self::updateWalletTonConnectPendingDisconnect::ID => Result::Ok(Self::updateWalletTonConnectPendingDisconnect(self::updateWalletTonConnectPendingDisconnect::read_bare(r)?)),
+            self::updateEditForumTopic::ID => Result::Ok(Self::updateEditForumTopic(self::updateEditForumTopic::read_bare(r)?)),
+            self::updateBotWidgetQuery::ID => Result::Ok(Self::updateBotWidgetQuery(self::updateBotWidgetQuery::read_bare(r)?)),
+            self::updateInlineBotWidgetQuery::ID => Result::Ok(Self::updateInlineBotWidgetQuery(self::updateInlineBotWidgetQuery::read_bare(r)?)),
+            self::updateBotWidgetCopyQuery::ID => Result::Ok(Self::updateBotWidgetCopyQuery(self::updateBotWidgetCopyQuery::read_bare(r)?)),
+            self::updateMessageWidgetData::ID => Result::Ok(Self::updateMessageWidgetData(self::updateMessageWidgetData::read_bare(r)?)),
+            self::updateTranscribedAudioFile::ID => Result::Ok(Self::updateTranscribedAudioFile(self::updateTranscribedAudioFile::read_bare(r)?)),
             _ => Result::Err("Unknown constructor"),
         }
     }
@@ -112950,6 +115405,12 @@ impl Update {
             Self::updateWalletGaslessInfo(v) => v.store_debug(s, field_name),
             Self::updateWalletTonConnectSession(v) => v.store_debug(s, field_name),
             Self::updateWalletTonConnectPendingDisconnect(v) => v.store_debug(s, field_name),
+            Self::updateEditForumTopic(v) => v.store_debug(s, field_name),
+            Self::updateBotWidgetQuery(v) => v.store_debug(s, field_name),
+            Self::updateInlineBotWidgetQuery(v) => v.store_debug(s, field_name),
+            Self::updateBotWidgetCopyQuery(v) => v.store_debug(s, field_name),
+            Self::updateMessageWidgetData(v) => v.store_debug(s, field_name),
+            Self::updateTranscribedAudioFile(v) => v.store_debug(s, field_name),
         }
     }
 
@@ -113961,6 +116422,7 @@ pub struct urlAuthResultRequest {
     pub request_phone_number: bool,
     pub match_codes_first: bool,
     pub is_app: bool,
+    pub request_wallet: bool,
     pub bot: Option<User>,
     pub domain: String,
     pub browser: String,
@@ -113970,10 +116432,12 @@ pub struct urlAuthResultRequest {
     pub match_codes: Vec<String>,
     pub user_id_hint: i64,
     pub verified_app_name: String,
+    pub tc_session_id: i64,
+    pub tc_client_id: String,
 }
 
 impl urlAuthResultRequest {
-    pub const ID: i32 = 1020666860;
+    pub const ID: i32 = -1110810265;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -113981,35 +116445,41 @@ impl urlAuthResultRequest {
     }
 
     pub fn store(&self, out: &mut Vec<u8>) {
-        tl::__i32(out, self.flags | (self.request_write_access as i32) | ((self.request_phone_number as i32) << 1) | ((self.match_codes_first as i32) << 5) | ((self.is_app as i32) << 6));
+        tl::__i32(out, self.flags | (self.request_write_access as i32) | ((self.request_phone_number as i32) << 1) | ((self.match_codes_first as i32) << 5) | ((self.is_app as i32) << 6) | ((self.request_wallet as i32) << 8));
         let __d0 = Default::default();
         let __m0 = self.bot.as_ref().unwrap_or(&__d0);
         __m0.store(out);
         tl::__string(out, &self.domain);
-        if (self.flags | (self.request_write_access as i32) | ((self.request_phone_number as i32) << 1) | ((self.match_codes_first as i32) << 5) | ((self.is_app as i32) << 6)) & 1 << 2 != 0 {
+        if (self.flags | (self.request_write_access as i32) | ((self.request_phone_number as i32) << 1) | ((self.match_codes_first as i32) << 5) | ((self.is_app as i32) << 6) | ((self.request_wallet as i32) << 8)) & 1 << 2 != 0 {
             tl::__string(out, &self.browser);
         }
-        if (self.flags | (self.request_write_access as i32) | ((self.request_phone_number as i32) << 1) | ((self.match_codes_first as i32) << 5) | ((self.is_app as i32) << 6)) & 1 << 2 != 0 {
+        if (self.flags | (self.request_write_access as i32) | ((self.request_phone_number as i32) << 1) | ((self.match_codes_first as i32) << 5) | ((self.is_app as i32) << 6) | ((self.request_wallet as i32) << 8)) & 1 << 2 != 0 {
             tl::__string(out, &self.platform);
         }
-        if (self.flags | (self.request_write_access as i32) | ((self.request_phone_number as i32) << 1) | ((self.match_codes_first as i32) << 5) | ((self.is_app as i32) << 6)) & 1 << 2 != 0 {
+        if (self.flags | (self.request_write_access as i32) | ((self.request_phone_number as i32) << 1) | ((self.match_codes_first as i32) << 5) | ((self.is_app as i32) << 6) | ((self.request_wallet as i32) << 8)) & 1 << 2 != 0 {
             tl::__string(out, &self.ip);
         }
-        if (self.flags | (self.request_write_access as i32) | ((self.request_phone_number as i32) << 1) | ((self.match_codes_first as i32) << 5) | ((self.is_app as i32) << 6)) & 1 << 2 != 0 {
+        if (self.flags | (self.request_write_access as i32) | ((self.request_phone_number as i32) << 1) | ((self.match_codes_first as i32) << 5) | ((self.is_app as i32) << 6) | ((self.request_wallet as i32) << 8)) & 1 << 2 != 0 {
             tl::__string(out, &self.region);
         }
-        if (self.flags | (self.request_write_access as i32) | ((self.request_phone_number as i32) << 1) | ((self.match_codes_first as i32) << 5) | ((self.is_app as i32) << 6)) & 1 << 3 != 0 {
+        if (self.flags | (self.request_write_access as i32) | ((self.request_phone_number as i32) << 1) | ((self.match_codes_first as i32) << 5) | ((self.is_app as i32) << 6) | ((self.request_wallet as i32) << 8)) & 1 << 3 != 0 {
             tl::__i32(out, tl::VECTOR_ID);
             tl::__i32(out, self.match_codes.len() as i32);
             for __v1 in &self.match_codes {
                 tl::__string(out, &**__v1);
             }
         }
-        if (self.flags | (self.request_write_access as i32) | ((self.request_phone_number as i32) << 1) | ((self.match_codes_first as i32) << 5) | ((self.is_app as i32) << 6)) & 1 << 4 != 0 {
+        if (self.flags | (self.request_write_access as i32) | ((self.request_phone_number as i32) << 1) | ((self.match_codes_first as i32) << 5) | ((self.is_app as i32) << 6) | ((self.request_wallet as i32) << 8)) & 1 << 4 != 0 {
             tl::__i64(out, self.user_id_hint);
         }
-        if (self.flags | (self.request_write_access as i32) | ((self.request_phone_number as i32) << 1) | ((self.match_codes_first as i32) << 5) | ((self.is_app as i32) << 6)) & 1 << 7 != 0 {
+        if (self.flags | (self.request_write_access as i32) | ((self.request_phone_number as i32) << 1) | ((self.match_codes_first as i32) << 5) | ((self.is_app as i32) << 6) | ((self.request_wallet as i32) << 8)) & 1 << 7 != 0 {
             tl::__string(out, &self.verified_app_name);
+        }
+        if (self.flags | (self.request_write_access as i32) | ((self.request_phone_number as i32) << 1) | ((self.match_codes_first as i32) << 5) | ((self.is_app as i32) << 6) | ((self.request_wallet as i32) << 8)) & 1 << 9 != 0 {
+            tl::__i64(out, self.tc_session_id);
+        }
+        if (self.flags | (self.request_write_access as i32) | ((self.request_phone_number as i32) << 1) | ((self.match_codes_first as i32) << 5) | ((self.is_app as i32) << 6) | ((self.request_wallet as i32) << 8)) & 1 << 10 != 0 {
+            tl::__string(out, &self.tc_client_id);
         }
     }
 
@@ -114039,6 +116509,7 @@ impl urlAuthResultRequest {
         let request_phone_number: bool = (flags & 1 << 1) != 0;
         let match_codes_first: bool = (flags & 1 << 5) != 0;
         let is_app: bool = (flags & 1 << 6) != 0;
+        let request_wallet: bool = (flags & 1 << 8) != 0;
         let bot: Option<User> = Some(User::read(r)?);
         let domain: String = r.string()?;
         let browser: String = if (flags & 1 << 2) != 0 {
@@ -114090,7 +116561,17 @@ impl urlAuthResultRequest {
         } else {
             Default::default()
         };
-        Result::Ok(Self { flags, request_write_access, request_phone_number, match_codes_first, is_app, bot, domain, browser, platform, ip, region, match_codes, user_id_hint, verified_app_name })
+        let tc_session_id: i64 = if (flags & 1 << 9) != 0 {
+            r.i64()?
+        } else {
+            Default::default()
+        };
+        let tc_client_id: String = if (flags & 1 << 10) != 0 {
+            r.string()?
+        } else {
+            Default::default()
+        };
+        Result::Ok(Self { flags, request_write_access, request_phone_number, match_codes_first, is_app, request_wallet, bot, domain, browser, platform, ip, region, match_codes, user_id_hint, verified_app_name, tc_session_id, tc_client_id })
     }
 
     /// td's generated `Class::store(TlStorerToString&, const char*)`
@@ -114102,6 +116583,7 @@ impl urlAuthResultRequest {
         if self.flags & 1 << 1 != 0 { s.store_field_bool("request_phone_number", true); }
         if self.flags & 1 << 5 != 0 { s.store_field_bool("match_codes_first", true); }
         if self.flags & 1 << 6 != 0 { s.store_field_bool("is_app", true); }
+        if self.flags & 1 << 8 != 0 { s.store_field_bool("request_wallet", true); }
         match &self.bot {
             Some(__m0) => __m0.store_debug(s, "bot"),
             None => s.store_null("bot"),
@@ -114131,6 +116613,12 @@ impl urlAuthResultRequest {
         }
         if self.flags & 1 << 7 != 0 {
             s.store_field_str("verified_app_name", &self.verified_app_name);
+        }
+        if self.flags & 1 << 9 != 0 {
+            s.store_field_int("tc_session_id", self.tc_session_id);
+        }
+        if self.flags & 1 << 10 != 0 {
+            s.store_field_str("tc_client_id", &self.tc_client_id);
         }
         s.store_class_end();
     }
@@ -114411,6 +116899,7 @@ pub struct user {
     pub bot_can_manage_bots: bool,
     pub bot_guestchat: bool,
     pub bot_guard: bool,
+    pub bot_forum_sidebar: bool,
     pub id: i64,
     pub access_hash: i64,
     pub first_name: String,
@@ -114444,7 +116933,7 @@ impl user {
 
     pub fn store(&self, out: &mut Vec<u8>) {
         tl::__i32(out, self.flags | ((self.self_ as i32) << 10) | ((self.contact as i32) << 11) | ((self.mutual_contact as i32) << 12) | ((self.deleted as i32) << 13) | ((self.bot as i32) << 14) | ((self.bot_chat_history as i32) << 15) | ((self.bot_nochats as i32) << 16) | ((self.verified as i32) << 17) | ((self.restricted as i32) << 18) | ((self.min as i32) << 20) | ((self.bot_inline_geo as i32) << 21) | ((self.support as i32) << 23) | ((self.scam as i32) << 24) | ((self.apply_min_photo as i32) << 25) | ((self.fake as i32) << 26) | ((self.bot_attach_menu as i32) << 27) | ((self.premium as i32) << 28) | ((self.attach_menu_enabled as i32) << 29));
-        tl::__i32(out, self.flags2 | ((self.bot_can_edit as i32) << 1) | ((self.close_friend as i32) << 2) | ((self.stories_hidden as i32) << 3) | ((self.stories_unavailable as i32) << 4) | ((self.contact_require_premium as i32) << 10) | ((self.bot_business as i32) << 11) | ((self.bot_has_main_app as i32) << 13) | ((self.bot_forum_view as i32) << 16) | ((self.bot_forum_can_manage_topics as i32) << 17) | ((self.bot_can_manage_bots as i32) << 18) | ((self.bot_guestchat as i32) << 19) | ((self.bot_guard as i32) << 20));
+        tl::__i32(out, self.flags2 | ((self.bot_can_edit as i32) << 1) | ((self.close_friend as i32) << 2) | ((self.stories_hidden as i32) << 3) | ((self.stories_unavailable as i32) << 4) | ((self.contact_require_premium as i32) << 10) | ((self.bot_business as i32) << 11) | ((self.bot_has_main_app as i32) << 13) | ((self.bot_forum_view as i32) << 16) | ((self.bot_forum_can_manage_topics as i32) << 17) | ((self.bot_can_manage_bots as i32) << 18) | ((self.bot_guestchat as i32) << 19) | ((self.bot_guard as i32) << 20) | ((self.bot_forum_sidebar as i32) << 22));
         tl::__i64(out, self.id);
         if (self.flags | ((self.self_ as i32) << 10) | ((self.contact as i32) << 11) | ((self.mutual_contact as i32) << 12) | ((self.deleted as i32) << 13) | ((self.bot as i32) << 14) | ((self.bot_chat_history as i32) << 15) | ((self.bot_nochats as i32) << 16) | ((self.verified as i32) << 17) | ((self.restricted as i32) << 18) | ((self.min as i32) << 20) | ((self.bot_inline_geo as i32) << 21) | ((self.support as i32) << 23) | ((self.scam as i32) << 24) | ((self.apply_min_photo as i32) << 25) | ((self.fake as i32) << 26) | ((self.bot_attach_menu as i32) << 27) | ((self.premium as i32) << 28) | ((self.attach_menu_enabled as i32) << 29)) & 1 != 0 {
             tl::__i64(out, self.access_hash);
@@ -114492,38 +116981,38 @@ impl user {
             let __m3 = self.emoji_status.as_ref().unwrap_or(&__d3);
             __m3.store(out);
         }
-        if (self.flags2 | ((self.bot_can_edit as i32) << 1) | ((self.close_friend as i32) << 2) | ((self.stories_hidden as i32) << 3) | ((self.stories_unavailable as i32) << 4) | ((self.contact_require_premium as i32) << 10) | ((self.bot_business as i32) << 11) | ((self.bot_has_main_app as i32) << 13) | ((self.bot_forum_view as i32) << 16) | ((self.bot_forum_can_manage_topics as i32) << 17) | ((self.bot_can_manage_bots as i32) << 18) | ((self.bot_guestchat as i32) << 19) | ((self.bot_guard as i32) << 20)) & 1 != 0 {
+        if (self.flags2 | ((self.bot_can_edit as i32) << 1) | ((self.close_friend as i32) << 2) | ((self.stories_hidden as i32) << 3) | ((self.stories_unavailable as i32) << 4) | ((self.contact_require_premium as i32) << 10) | ((self.bot_business as i32) << 11) | ((self.bot_has_main_app as i32) << 13) | ((self.bot_forum_view as i32) << 16) | ((self.bot_forum_can_manage_topics as i32) << 17) | ((self.bot_can_manage_bots as i32) << 18) | ((self.bot_guestchat as i32) << 19) | ((self.bot_guard as i32) << 20) | ((self.bot_forum_sidebar as i32) << 22)) & 1 != 0 {
             tl::__i32(out, tl::VECTOR_ID);
             tl::__i32(out, self.usernames.len() as i32);
             for __v4 in &self.usernames {
                 (*__v4).store_boxed(out);
             }
         }
-        if (self.flags2 | ((self.bot_can_edit as i32) << 1) | ((self.close_friend as i32) << 2) | ((self.stories_hidden as i32) << 3) | ((self.stories_unavailable as i32) << 4) | ((self.contact_require_premium as i32) << 10) | ((self.bot_business as i32) << 11) | ((self.bot_has_main_app as i32) << 13) | ((self.bot_forum_view as i32) << 16) | ((self.bot_forum_can_manage_topics as i32) << 17) | ((self.bot_can_manage_bots as i32) << 18) | ((self.bot_guestchat as i32) << 19) | ((self.bot_guard as i32) << 20)) & 1 << 5 != 0 {
+        if (self.flags2 | ((self.bot_can_edit as i32) << 1) | ((self.close_friend as i32) << 2) | ((self.stories_hidden as i32) << 3) | ((self.stories_unavailable as i32) << 4) | ((self.contact_require_premium as i32) << 10) | ((self.bot_business as i32) << 11) | ((self.bot_has_main_app as i32) << 13) | ((self.bot_forum_view as i32) << 16) | ((self.bot_forum_can_manage_topics as i32) << 17) | ((self.bot_can_manage_bots as i32) << 18) | ((self.bot_guestchat as i32) << 19) | ((self.bot_guard as i32) << 20) | ((self.bot_forum_sidebar as i32) << 22)) & 1 << 5 != 0 {
             let __d5 = Default::default();
             let __m5 = self.stories_max_id.as_ref().unwrap_or(&__d5);
             __m5.store_boxed(out);
         }
-        if (self.flags2 | ((self.bot_can_edit as i32) << 1) | ((self.close_friend as i32) << 2) | ((self.stories_hidden as i32) << 3) | ((self.stories_unavailable as i32) << 4) | ((self.contact_require_premium as i32) << 10) | ((self.bot_business as i32) << 11) | ((self.bot_has_main_app as i32) << 13) | ((self.bot_forum_view as i32) << 16) | ((self.bot_forum_can_manage_topics as i32) << 17) | ((self.bot_can_manage_bots as i32) << 18) | ((self.bot_guestchat as i32) << 19) | ((self.bot_guard as i32) << 20)) & 1 << 8 != 0 {
+        if (self.flags2 | ((self.bot_can_edit as i32) << 1) | ((self.close_friend as i32) << 2) | ((self.stories_hidden as i32) << 3) | ((self.stories_unavailable as i32) << 4) | ((self.contact_require_premium as i32) << 10) | ((self.bot_business as i32) << 11) | ((self.bot_has_main_app as i32) << 13) | ((self.bot_forum_view as i32) << 16) | ((self.bot_forum_can_manage_topics as i32) << 17) | ((self.bot_can_manage_bots as i32) << 18) | ((self.bot_guestchat as i32) << 19) | ((self.bot_guard as i32) << 20) | ((self.bot_forum_sidebar as i32) << 22)) & 1 << 8 != 0 {
             let __d6 = Default::default();
             let __m6 = self.color.as_ref().unwrap_or(&__d6);
             __m6.store(out);
         }
-        if (self.flags2 | ((self.bot_can_edit as i32) << 1) | ((self.close_friend as i32) << 2) | ((self.stories_hidden as i32) << 3) | ((self.stories_unavailable as i32) << 4) | ((self.contact_require_premium as i32) << 10) | ((self.bot_business as i32) << 11) | ((self.bot_has_main_app as i32) << 13) | ((self.bot_forum_view as i32) << 16) | ((self.bot_forum_can_manage_topics as i32) << 17) | ((self.bot_can_manage_bots as i32) << 18) | ((self.bot_guestchat as i32) << 19) | ((self.bot_guard as i32) << 20)) & 1 << 9 != 0 {
+        if (self.flags2 | ((self.bot_can_edit as i32) << 1) | ((self.close_friend as i32) << 2) | ((self.stories_hidden as i32) << 3) | ((self.stories_unavailable as i32) << 4) | ((self.contact_require_premium as i32) << 10) | ((self.bot_business as i32) << 11) | ((self.bot_has_main_app as i32) << 13) | ((self.bot_forum_view as i32) << 16) | ((self.bot_forum_can_manage_topics as i32) << 17) | ((self.bot_can_manage_bots as i32) << 18) | ((self.bot_guestchat as i32) << 19) | ((self.bot_guard as i32) << 20) | ((self.bot_forum_sidebar as i32) << 22)) & 1 << 9 != 0 {
             let __d7 = Default::default();
             let __m7 = self.profile_color.as_ref().unwrap_or(&__d7);
             __m7.store(out);
         }
-        if (self.flags2 | ((self.bot_can_edit as i32) << 1) | ((self.close_friend as i32) << 2) | ((self.stories_hidden as i32) << 3) | ((self.stories_unavailable as i32) << 4) | ((self.contact_require_premium as i32) << 10) | ((self.bot_business as i32) << 11) | ((self.bot_has_main_app as i32) << 13) | ((self.bot_forum_view as i32) << 16) | ((self.bot_forum_can_manage_topics as i32) << 17) | ((self.bot_can_manage_bots as i32) << 18) | ((self.bot_guestchat as i32) << 19) | ((self.bot_guard as i32) << 20)) & 1 << 12 != 0 {
+        if (self.flags2 | ((self.bot_can_edit as i32) << 1) | ((self.close_friend as i32) << 2) | ((self.stories_hidden as i32) << 3) | ((self.stories_unavailable as i32) << 4) | ((self.contact_require_premium as i32) << 10) | ((self.bot_business as i32) << 11) | ((self.bot_has_main_app as i32) << 13) | ((self.bot_forum_view as i32) << 16) | ((self.bot_forum_can_manage_topics as i32) << 17) | ((self.bot_can_manage_bots as i32) << 18) | ((self.bot_guestchat as i32) << 19) | ((self.bot_guard as i32) << 20) | ((self.bot_forum_sidebar as i32) << 22)) & 1 << 12 != 0 {
             tl::__i32(out, self.bot_active_users);
         }
-        if (self.flags2 | ((self.bot_can_edit as i32) << 1) | ((self.close_friend as i32) << 2) | ((self.stories_hidden as i32) << 3) | ((self.stories_unavailable as i32) << 4) | ((self.contact_require_premium as i32) << 10) | ((self.bot_business as i32) << 11) | ((self.bot_has_main_app as i32) << 13) | ((self.bot_forum_view as i32) << 16) | ((self.bot_forum_can_manage_topics as i32) << 17) | ((self.bot_can_manage_bots as i32) << 18) | ((self.bot_guestchat as i32) << 19) | ((self.bot_guard as i32) << 20)) & 1 << 14 != 0 {
+        if (self.flags2 | ((self.bot_can_edit as i32) << 1) | ((self.close_friend as i32) << 2) | ((self.stories_hidden as i32) << 3) | ((self.stories_unavailable as i32) << 4) | ((self.contact_require_premium as i32) << 10) | ((self.bot_business as i32) << 11) | ((self.bot_has_main_app as i32) << 13) | ((self.bot_forum_view as i32) << 16) | ((self.bot_forum_can_manage_topics as i32) << 17) | ((self.bot_can_manage_bots as i32) << 18) | ((self.bot_guestchat as i32) << 19) | ((self.bot_guard as i32) << 20) | ((self.bot_forum_sidebar as i32) << 22)) & 1 << 14 != 0 {
             tl::__i64(out, self.bot_verification_icon);
         }
-        if (self.flags2 | ((self.bot_can_edit as i32) << 1) | ((self.close_friend as i32) << 2) | ((self.stories_hidden as i32) << 3) | ((self.stories_unavailable as i32) << 4) | ((self.contact_require_premium as i32) << 10) | ((self.bot_business as i32) << 11) | ((self.bot_has_main_app as i32) << 13) | ((self.bot_forum_view as i32) << 16) | ((self.bot_forum_can_manage_topics as i32) << 17) | ((self.bot_can_manage_bots as i32) << 18) | ((self.bot_guestchat as i32) << 19) | ((self.bot_guard as i32) << 20)) & 1 << 15 != 0 {
+        if (self.flags2 | ((self.bot_can_edit as i32) << 1) | ((self.close_friend as i32) << 2) | ((self.stories_hidden as i32) << 3) | ((self.stories_unavailable as i32) << 4) | ((self.contact_require_premium as i32) << 10) | ((self.bot_business as i32) << 11) | ((self.bot_has_main_app as i32) << 13) | ((self.bot_forum_view as i32) << 16) | ((self.bot_forum_can_manage_topics as i32) << 17) | ((self.bot_can_manage_bots as i32) << 18) | ((self.bot_guestchat as i32) << 19) | ((self.bot_guard as i32) << 20) | ((self.bot_forum_sidebar as i32) << 22)) & 1 << 15 != 0 {
             tl::__i64(out, self.send_paid_messages_stars);
         }
-        if (self.flags2 | ((self.bot_can_edit as i32) << 1) | ((self.close_friend as i32) << 2) | ((self.stories_hidden as i32) << 3) | ((self.stories_unavailable as i32) << 4) | ((self.contact_require_premium as i32) << 10) | ((self.bot_business as i32) << 11) | ((self.bot_has_main_app as i32) << 13) | ((self.bot_forum_view as i32) << 16) | ((self.bot_forum_can_manage_topics as i32) << 17) | ((self.bot_can_manage_bots as i32) << 18) | ((self.bot_guestchat as i32) << 19) | ((self.bot_guard as i32) << 20)) & 1 << 21 != 0 {
+        if (self.flags2 | ((self.bot_can_edit as i32) << 1) | ((self.close_friend as i32) << 2) | ((self.stories_hidden as i32) << 3) | ((self.stories_unavailable as i32) << 4) | ((self.contact_require_premium as i32) << 10) | ((self.bot_business as i32) << 11) | ((self.bot_has_main_app as i32) << 13) | ((self.bot_forum_view as i32) << 16) | ((self.bot_forum_can_manage_topics as i32) << 17) | ((self.bot_can_manage_bots as i32) << 18) | ((self.bot_guestchat as i32) << 19) | ((self.bot_guard as i32) << 20) | ((self.bot_forum_sidebar as i32) << 22)) & 1 << 21 != 0 {
             tl::__i64(out, self.linked_community_id);
         }
     }
@@ -114584,6 +117073,7 @@ impl user {
         let bot_can_manage_bots: bool = (flags2 & 1 << 18) != 0;
         let bot_guestchat: bool = (flags2 & 1 << 19) != 0;
         let bot_guard: bool = (flags2 & 1 << 20) != 0;
+        let bot_forum_sidebar: bool = (flags2 & 1 << 22) != 0;
         let id: i64 = r.i64()?;
         let access_hash: i64 = if (flags & 1) != 0 {
             r.i64()?
@@ -114713,7 +117203,7 @@ impl user {
         } else {
             Default::default()
         };
-        Result::Ok(Self { flags, self_, contact, mutual_contact, deleted, bot, bot_chat_history, bot_nochats, verified, restricted, min, bot_inline_geo, support, scam, apply_min_photo, fake, bot_attach_menu, premium, attach_menu_enabled, flags2, bot_can_edit, close_friend, stories_hidden, stories_unavailable, contact_require_premium, bot_business, bot_has_main_app, bot_forum_view, bot_forum_can_manage_topics, bot_can_manage_bots, bot_guestchat, bot_guard, id, access_hash, first_name, last_name, username, phone, photo, status, bot_info_version, restriction_reason, bot_inline_placeholder, lang_code, emoji_status, usernames, stories_max_id, color, profile_color, bot_active_users, bot_verification_icon, send_paid_messages_stars, linked_community_id })
+        Result::Ok(Self { flags, self_, contact, mutual_contact, deleted, bot, bot_chat_history, bot_nochats, verified, restricted, min, bot_inline_geo, support, scam, apply_min_photo, fake, bot_attach_menu, premium, attach_menu_enabled, flags2, bot_can_edit, close_friend, stories_hidden, stories_unavailable, contact_require_premium, bot_business, bot_has_main_app, bot_forum_view, bot_forum_can_manage_topics, bot_can_manage_bots, bot_guestchat, bot_guard, bot_forum_sidebar, id, access_hash, first_name, last_name, username, phone, photo, status, bot_info_version, restriction_reason, bot_inline_placeholder, lang_code, emoji_status, usernames, stories_max_id, color, profile_color, bot_active_users, bot_verification_icon, send_paid_messages_stars, linked_community_id })
     }
 
     /// td's generated `Class::store(TlStorerToString&, const char*)`
@@ -114752,6 +117242,7 @@ impl user {
         if self.flags2 & 1 << 18 != 0 { s.store_field_bool("bot_can_manage_bots", true); }
         if self.flags2 & 1 << 19 != 0 { s.store_field_bool("bot_guestchat", true); }
         if self.flags2 & 1 << 20 != 0 { s.store_field_bool("bot_guard", true); }
+        if self.flags2 & 1 << 22 != 0 { s.store_field_bool("bot_forum_sidebar", true); }
         s.store_field_int("id", self.id);
         if self.flags & 1 != 0 {
             s.store_field_int("access_hash", self.access_hash);
@@ -114962,10 +117453,12 @@ pub struct UserFull {
     pub saved_music: Option<Document>,
     pub note: Option<TextWithEntities>,
     pub bot_manager_id: i64,
+    pub wallet_card: Option<wallet_Card>,
+    pub share_theme: Option<ShareTheme>,
 }
 
 impl UserFull {
-    pub const ID: i32 = 114026053;
+    pub const ID: i32 = -1190384899;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -115130,6 +117623,16 @@ impl UserFull {
         }
         if (self.flags2 | ((self.sponsored_enabled as i32) << 7) | ((self.can_view_revenue as i32) << 9) | ((self.bot_can_manage_emoji_status as i32) << 10) | ((self.display_gifts_button as i32) << 16) | ((self.noforwards_my_enabled as i32) << 23) | ((self.noforwards_peer_enabled as i32) << 24) | ((self.unofficial_security_risk as i32) << 26)) & 1 << 25 != 0 {
             tl::__i64(out, self.bot_manager_id);
+        }
+        if (self.flags2 | ((self.sponsored_enabled as i32) << 7) | ((self.can_view_revenue as i32) << 9) | ((self.bot_can_manage_emoji_status as i32) << 10) | ((self.display_gifts_button as i32) << 16) | ((self.noforwards_my_enabled as i32) << 23) | ((self.noforwards_peer_enabled as i32) << 24) | ((self.unofficial_security_risk as i32) << 26)) & 1 << 19 != 0 {
+            let __d25 = Default::default();
+            let __m25 = self.wallet_card.as_ref().unwrap_or(&__d25);
+            __m25.store_boxed(out);
+        }
+        if (self.flags2 | ((self.sponsored_enabled as i32) << 7) | ((self.can_view_revenue as i32) << 9) | ((self.bot_can_manage_emoji_status as i32) << 10) | ((self.display_gifts_button as i32) << 16) | ((self.noforwards_my_enabled as i32) << 23) | ((self.noforwards_peer_enabled as i32) << 24) | ((self.unofficial_security_risk as i32) << 26)) & 1 << 27 != 0 {
+            let __d26 = Default::default();
+            let __m26 = self.share_theme.as_ref().unwrap_or(&__d26);
+            __m26.store(out);
         }
     }
 
@@ -115353,7 +117856,17 @@ impl UserFull {
         } else {
             Default::default()
         };
-        Result::Ok(Self { flags, blocked, phone_calls_available, phone_calls_private, can_pin_message, has_scheduled, video_calls_available, voice_messages_forbidden, translations_disabled, stories_pinned_available, blocked_my_stories_from, wallpaper_overridden, contact_require_premium, read_dates_private, flags2, sponsored_enabled, can_view_revenue, bot_can_manage_emoji_status, display_gifts_button, noforwards_my_enabled, noforwards_peer_enabled, unofficial_security_risk, id, about, settings, personal_photo, profile_photo, fallback_photo, notify_settings, bot_info, pinned_msg_id, common_chats_count, folder_id, ttl_period, theme, private_forward_name, bot_group_admin_rights, bot_broadcast_admin_rights, wallpaper, stories, business_work_hours, business_location, business_greeting_message, business_away_message, business_intro, birthday, personal_channel_id, personal_channel_message, stargifts_count, starref_program, bot_verification, send_paid_messages_stars, disallowed_gifts, stars_rating, stars_my_pending_rating, stars_my_pending_rating_date, main_tab, saved_music, note, bot_manager_id })
+        let wallet_card: Option<wallet_Card> = if (flags2 & 1 << 19) != 0 {
+            Some(wallet_Card::read(r)?)
+        } else {
+            Default::default()
+        };
+        let share_theme: Option<ShareTheme> = if (flags2 & 1 << 27) != 0 {
+            Some(ShareTheme::read(r)?)
+        } else {
+            Default::default()
+        };
+        Result::Ok(Self { flags, blocked, phone_calls_available, phone_calls_private, can_pin_message, has_scheduled, video_calls_available, voice_messages_forbidden, translations_disabled, stories_pinned_available, blocked_my_stories_from, wallpaper_overridden, contact_require_premium, read_dates_private, flags2, sponsored_enabled, can_view_revenue, bot_can_manage_emoji_status, display_gifts_button, noforwards_my_enabled, noforwards_peer_enabled, unofficial_security_risk, id, about, settings, personal_photo, profile_photo, fallback_photo, notify_settings, bot_info, pinned_msg_id, common_chats_count, folder_id, ttl_period, theme, private_forward_name, bot_group_admin_rights, bot_broadcast_admin_rights, wallpaper, stories, business_work_hours, business_location, business_greeting_message, business_away_message, business_intro, birthday, personal_channel_id, personal_channel_message, stargifts_count, starref_program, bot_verification, send_paid_messages_stars, disallowed_gifts, stars_rating, stars_my_pending_rating, stars_my_pending_rating_date, main_tab, saved_music, note, bot_manager_id, wallet_card, share_theme })
     }
 
     /// td's generated `Class::store(TlStorerToString&, const char*)`
@@ -115562,6 +118075,18 @@ impl UserFull {
         }
         if self.flags2 & 1 << 25 != 0 {
             s.store_field_int("bot_manager_id", self.bot_manager_id);
+        }
+        if self.flags2 & 1 << 19 != 0 {
+            match &self.wallet_card {
+                Some(__m25) => __m25.store_debug(s, "wallet_card"),
+                None => s.store_null("wallet_card"),
+            }
+        }
+        if self.flags2 & 1 << 27 != 0 {
+            match &self.share_theme {
+                Some(__m26) => __m26.store_debug(s, "share_theme"),
+                None => s.store_null("share_theme"),
+            }
         }
         s.store_class_end();
     }
@@ -116175,6 +118700,97 @@ impl UserStatus {
 impl Default for UserStatus {
     fn default() -> Self {
         Self::userStatusEmpty(Default::default())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct UserWallet {
+    pub flags: i32,
+    pub address: String,
+    pub balance: i64,
+    pub public_key: Vec<u8>,
+    pub state_init: Vec<u8>,
+}
+
+impl UserWallet {
+    pub const ID: i32 = 1162684215;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.flags);
+        tl::__string(out, &self.address);
+        tl::__i64(out, self.balance);
+        if (self.flags) & 1 != 0 {
+            tl::__string(out, &self.public_key);
+        }
+        if (self.flags) & 1 != 0 {
+            tl::__string(out, &self.state_init);
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let flags: i32 = r.i32()?;
+        if flags < 0 {
+            return Result::Err("Variable of type # can't be negative");
+        }
+        let address: String = r.string()?;
+        let balance: i64 = r.i64()?;
+        let public_key: Vec<u8> = if (flags & 1) != 0 {
+            r.bytes()?
+        } else {
+            Default::default()
+        };
+        let state_init: Vec<u8> = if (flags & 1) != 0 {
+            r.bytes()?
+        } else {
+            Default::default()
+        };
+        Result::Ok(Self { flags, address, balance, public_key, state_init })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "userWallet");
+        s.store_field_int("flags", self.flags as i64);
+        s.store_field_str("address", &self.address);
+        s.store_field_int("balance", self.balance);
+        if self.flags & 1 != 0 {
+            s.store_bytes_field("public_key", &self.public_key);
+        }
+        if self.flags & 1 != 0 {
+            s.store_bytes_field("state_init", &self.state_init);
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
     }
 }
 
@@ -117636,12 +120252,155 @@ impl walletTransactionPeerUnsupported {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct walletTransactionPeerChannel {
+    pub flags: i32,
+    pub channel_id: i64,
+    pub address: String,
+    pub domain: String,
+}
+
+impl walletTransactionPeerChannel {
+    pub const ID: i32 = 1424428081;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.flags);
+        tl::__i64(out, self.channel_id);
+        tl::__string(out, &self.address);
+        if (self.flags) & 1 != 0 {
+            tl::__string(out, &self.domain);
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let flags: i32 = r.i32()?;
+        if flags < 0 {
+            return Result::Err("Variable of type # can't be negative");
+        }
+        let channel_id: i64 = r.i64()?;
+        let address: String = r.string()?;
+        let domain: String = if (flags & 1) != 0 {
+            r.string()?
+        } else {
+            Default::default()
+        };
+        Result::Ok(Self { flags, channel_id, address, domain })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "walletTransactionPeerChannel");
+        s.store_field_int("flags", self.flags as i64);
+        s.store_field_int("channel_id", self.channel_id);
+        s.store_field_str("address", &self.address);
+        if self.flags & 1 != 0 {
+            s.store_field_str("domain", &self.domain);
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct walletTransactionPeerTelegramGift {
+    pub flags: i32,
+    pub own_profile: bool,
+}
+
+impl walletTransactionPeerTelegramGift {
+    pub const ID: i32 = -193817447;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.flags | (self.own_profile as i32));
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let flags: i32 = r.i32()?;
+        if flags < 0 {
+            return Result::Err("Variable of type # can't be negative");
+        }
+        let own_profile: bool = (flags & 1) != 0;
+        Result::Ok(Self { flags, own_profile })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "walletTransactionPeerTelegramGift");
+        s.store_field_int("flags", self.flags as i64);
+        if self.flags & 1 != 0 { s.store_field_bool("own_profile", true); }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum WalletTransactionPeer {
     walletTransactionPeerUser(walletTransactionPeerUser),
     walletTransactionPeerAddress(walletTransactionPeerAddress),
     walletTransactionPeerOnramp(walletTransactionPeerOnramp),
     walletTransactionPeerUnsupported(walletTransactionPeerUnsupported),
+    walletTransactionPeerChannel(walletTransactionPeerChannel),
+    walletTransactionPeerTelegramGift(walletTransactionPeerTelegramGift),
 }
 
 impl WalletTransactionPeer {
@@ -117651,6 +120410,8 @@ impl WalletTransactionPeer {
             Self::walletTransactionPeerAddress(v) => v.store_boxed(out),
             Self::walletTransactionPeerOnramp(v) => v.store_boxed(out),
             Self::walletTransactionPeerUnsupported(v) => v.store_boxed(out),
+            Self::walletTransactionPeerChannel(v) => v.store_boxed(out),
+            Self::walletTransactionPeerTelegramGift(v) => v.store_boxed(out),
         }
     }
 
@@ -117665,6 +120426,8 @@ impl WalletTransactionPeer {
             self::walletTransactionPeerAddress::ID => Result::Ok(Self::walletTransactionPeerAddress(self::walletTransactionPeerAddress::read_bare(r)?)),
             self::walletTransactionPeerOnramp::ID => Result::Ok(Self::walletTransactionPeerOnramp(self::walletTransactionPeerOnramp::read_bare(r)?)),
             self::walletTransactionPeerUnsupported::ID => Result::Ok(Self::walletTransactionPeerUnsupported(self::walletTransactionPeerUnsupported::read_bare(r)?)),
+            self::walletTransactionPeerChannel::ID => Result::Ok(Self::walletTransactionPeerChannel(self::walletTransactionPeerChannel::read_bare(r)?)),
+            self::walletTransactionPeerTelegramGift::ID => Result::Ok(Self::walletTransactionPeerTelegramGift(self::walletTransactionPeerTelegramGift::read_bare(r)?)),
             _ => Result::Err("Unknown constructor"),
         }
     }
@@ -117675,6 +120438,8 @@ impl WalletTransactionPeer {
             Self::walletTransactionPeerAddress(v) => v.store_debug(s, field_name),
             Self::walletTransactionPeerOnramp(v) => v.store_debug(s, field_name),
             Self::walletTransactionPeerUnsupported(v) => v.store_debug(s, field_name),
+            Self::walletTransactionPeerChannel(v) => v.store_debug(s, field_name),
+            Self::walletTransactionPeerTelegramGift(v) => v.store_debug(s, field_name),
         }
     }
 
@@ -119520,6 +122285,256 @@ impl WebViewResult {
         let mut storer = TlStorerToString { out: &mut out, shift: 0 };
         self.store_debug(&mut storer, "");
         out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct widgetQueryTypeData {
+    pub flags: i32,
+    pub with_wallet: bool,
+}
+
+impl widgetQueryTypeData {
+    pub const ID: i32 = 383307531;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.flags | (self.with_wallet as i32));
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let flags: i32 = r.i32()?;
+        if flags < 0 {
+            return Result::Err("Variable of type # can't be negative");
+        }
+        let with_wallet: bool = (flags & 1) != 0;
+        Result::Ok(Self { flags, with_wallet })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "widgetQueryTypeData");
+        s.store_field_int("flags", self.flags as i64);
+        if self.flags & 1 != 0 { s.store_field_bool("with_wallet", true); }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct widgetQueryTypeSignData {
+    pub wallet: Option<UserWallet>,
+    pub sign_data: Option<DataJSON>,
+}
+
+impl widgetQueryTypeSignData {
+    pub const ID: i32 = 421545948;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let __d0 = Default::default();
+        let __m0 = self.wallet.as_ref().unwrap_or(&__d0);
+        __m0.store_boxed(out);
+        let __d1 = Default::default();
+        let __m1 = self.sign_data.as_ref().unwrap_or(&__d1);
+        __m1.store_boxed(out);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let wallet: Option<UserWallet> = Some(UserWallet::read(r)?);
+        let sign_data: Option<DataJSON> = Some(DataJSON::read(r)?);
+        Result::Ok(Self { wallet, sign_data })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "widgetQueryTypeSignData");
+        match &self.wallet {
+            Some(__m0) => __m0.store_debug(s, "wallet"),
+            None => s.store_null("wallet"),
+        }
+        match &self.sign_data {
+            Some(__m1) => __m1.store_debug(s, "sign_data"),
+            None => s.store_null("sign_data"),
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct widgetQueryTypeSentTransaction {
+    pub wallet: Option<UserWallet>,
+    pub msg_hash: String,
+}
+
+impl widgetQueryTypeSentTransaction {
+    pub const ID: i32 = -12897356;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let __d0 = Default::default();
+        let __m0 = self.wallet.as_ref().unwrap_or(&__d0);
+        __m0.store_boxed(out);
+        tl::__string(out, &self.msg_hash);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let wallet: Option<UserWallet> = Some(UserWallet::read(r)?);
+        let msg_hash: String = r.string()?;
+        Result::Ok(Self { wallet, msg_hash })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "widgetQueryTypeSentTransaction");
+        match &self.wallet {
+            Some(__m0) => __m0.store_debug(s, "wallet"),
+            None => s.store_null("wallet"),
+        }
+        s.store_field_str("msg_hash", &self.msg_hash);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum WidgetQueryType {
+    widgetQueryTypeData(widgetQueryTypeData),
+    widgetQueryTypeSignData(widgetQueryTypeSignData),
+    widgetQueryTypeSentTransaction(widgetQueryTypeSentTransaction),
+}
+
+impl WidgetQueryType {
+    pub fn store(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::widgetQueryTypeData(v) => v.store_boxed(out),
+            Self::widgetQueryTypeSignData(v) => v.store_boxed(out),
+            Self::widgetQueryTypeSentTransaction(v) => v.store_boxed(out),
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        match r.i32()? {
+            self::widgetQueryTypeData::ID => Result::Ok(Self::widgetQueryTypeData(self::widgetQueryTypeData::read_bare(r)?)),
+            self::widgetQueryTypeSignData::ID => Result::Ok(Self::widgetQueryTypeSignData(self::widgetQueryTypeSignData::read_bare(r)?)),
+            self::widgetQueryTypeSentTransaction::ID => Result::Ok(Self::widgetQueryTypeSentTransaction(self::widgetQueryTypeSentTransaction::read_bare(r)?)),
+            _ => Result::Err("Unknown constructor"),
+        }
+    }
+
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        match self {
+            Self::widgetQueryTypeData(v) => v.store_debug(s, field_name),
+            Self::widgetQueryTypeSignData(v) => v.store_debug(s, field_name),
+            Self::widgetQueryTypeSentTransaction(v) => v.store_debug(s, field_name),
+        }
+    }
+
+    /// td's `to_string(const BaseObject&)` for this type.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+impl Default for WidgetQueryType {
+    fn default() -> Self {
+        Self::widgetQueryTypeData(Default::default())
     }
 }
 
@@ -134660,6 +137675,77 @@ impl messages_BotResults {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+pub struct messages_BotWidgetQueryAnswer {
+    pub flags: i32,
+    pub result: String,
+}
+
+impl messages_BotWidgetQueryAnswer {
+    pub const ID: i32 = -1783156701;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.flags);
+        if (self.flags) & 1 != 0 {
+            tl::__string(out, &self.result);
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let flags: i32 = r.i32()?;
+        if flags < 0 {
+            return Result::Err("Variable of type # can't be negative");
+        }
+        let result: String = if (flags & 1) != 0 {
+            r.string()?
+        } else {
+            Default::default()
+        };
+        Result::Ok(Self { flags, result })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "messages.botWidgetQueryAnswer");
+        s.store_field_int("flags", self.flags as i64);
+        if self.flags & 1 != 0 {
+            s.store_field_str("result", &self.result);
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct messages_ChatAdminsWithInvites {
     pub admins: Vec<ChatAdminWithInvites>,
     pub users: Vec<User>,
@@ -143713,6 +146799,175 @@ impl messages_WebPagePreview {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+pub struct messages_widgetPublicDataNotModified {
+    pub period: i32,
+}
+
+impl messages_widgetPublicDataNotModified {
+    pub const ID: i32 = -1189515689;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.period);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let period: i32 = r.i32()?;
+        Result::Ok(Self { period })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "messages.widgetPublicDataNotModified");
+        s.store_field_int("period", self.period as i64);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct messages_widgetPublicData {
+    pub hash: i64,
+    pub data: String,
+    pub period: i32,
+}
+
+impl messages_widgetPublicData {
+    pub const ID: i32 = 71908351;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i64(out, self.hash);
+        tl::__string(out, &self.data);
+        tl::__i32(out, self.period);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let hash: i64 = r.i64()?;
+        let data: String = r.string()?;
+        let period: i32 = r.i32()?;
+        Result::Ok(Self { hash, data, period })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "messages.widgetPublicData");
+        s.store_field_int("hash", self.hash);
+        s.store_field_str("data", &self.data);
+        s.store_field_int("period", self.period as i64);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum messages_WidgetPublicData {
+    messages_widgetPublicDataNotModified(messages_widgetPublicDataNotModified),
+    messages_widgetPublicData(messages_widgetPublicData),
+}
+
+impl messages_WidgetPublicData {
+    pub fn store(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::messages_widgetPublicDataNotModified(v) => v.store_boxed(out),
+            Self::messages_widgetPublicData(v) => v.store_boxed(out),
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        match r.i32()? {
+            self::messages_widgetPublicDataNotModified::ID => Result::Ok(Self::messages_widgetPublicDataNotModified(self::messages_widgetPublicDataNotModified::read_bare(r)?)),
+            self::messages_widgetPublicData::ID => Result::Ok(Self::messages_widgetPublicData(self::messages_widgetPublicData::read_bare(r)?)),
+            _ => Result::Err("Unknown constructor"),
+        }
+    }
+
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        match self {
+            Self::messages_widgetPublicDataNotModified(v) => v.store_debug(s, field_name),
+            Self::messages_widgetPublicData(v) => v.store_debug(s, field_name),
+        }
+    }
+
+    /// td's `to_string(const BaseObject&)` for this type.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+impl Default for messages_WidgetPublicData {
+    fn default() -> Self {
+        Self::messages_widgetPublicDataNotModified(Default::default())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct payments_BankCardData {
     pub title: String,
     pub open_urls: Vec<BankCardOpenUrl>,
@@ -146835,6 +150090,70 @@ impl payments_StarGiftCollections {
 impl Default for payments_StarGiftCollections {
     fn default() -> Self {
         Self::payments_starGiftCollectionsNotModified(Default::default())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct payments_StarGiftDepositPayload {
+    pub nft_address: String,
+    pub payload: Vec<u8>,
+    pub amount: i64,
+}
+
+impl payments_StarGiftDepositPayload {
+    pub const ID: i32 = 1918612715;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__string(out, &self.nft_address);
+        tl::__string(out, &self.payload);
+        tl::__i64(out, self.amount);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let nft_address: String = r.string()?;
+        let payload: Vec<u8> = r.bytes()?;
+        let amount: i64 = r.i64()?;
+        Result::Ok(Self { nft_address, payload, amount })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "payments.starGiftDepositPayload");
+        s.store_field_str("nft_address", &self.nft_address);
+        s.store_bytes_field("payload", &self.payload);
+        s.store_field_int("amount", self.amount);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
     }
 }
 
@@ -155190,6 +158509,194 @@ impl Default for users_Users {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+pub struct wallet_Card {
+    pub flags: i32,
+    pub stickers: Vec<wallet_CardSticker>,
+    pub bg_nft_item: Option<wallet_NftItem>,
+    pub address: String,
+    pub balance: i64,
+}
+
+impl wallet_Card {
+    pub const ID: i32 = -1898953807;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.flags);
+        if (self.flags) & 1 != 0 {
+            tl::__i32(out, tl::VECTOR_ID);
+            tl::__i32(out, self.stickers.len() as i32);
+            for __v0 in &self.stickers {
+                (*__v0).store_boxed(out);
+            }
+        }
+        if (self.flags) & 1 << 1 != 0 {
+            let __d1 = Default::default();
+            let __m1 = self.bg_nft_item.as_ref().unwrap_or(&__d1);
+            __m1.store_boxed(out);
+        }
+        tl::__string(out, &self.address);
+        tl::__i64(out, self.balance);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let flags: i32 = r.i32()?;
+        if flags < 0 {
+            return Result::Err("Variable of type # can't be negative");
+        }
+        let stickers: Vec<wallet_CardSticker> = if (flags & 1) != 0 {
+            let __v0: Vec<wallet_CardSticker> = {
+                if r.i32()? != tl::VECTOR_ID {
+                    return Result::Err("Wrong constructor");
+                }
+                let count: u32 = r.i32()? as u32;
+                if count as usize > r.remaining() {
+                    return Result::Err("Wrong vector length");
+                }
+                let mut res = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    res.push(wallet_CardSticker::read(r)?);
+                }
+                res
+            };
+            __v0
+        } else {
+            Default::default()
+        };
+        let bg_nft_item: Option<wallet_NftItem> = if (flags & 1 << 1) != 0 {
+            Some(wallet_NftItem::read(r)?)
+        } else {
+            Default::default()
+        };
+        let address: String = r.string()?;
+        let balance: i64 = r.i64()?;
+        Result::Ok(Self { flags, stickers, bg_nft_item, address, balance })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "wallet.card");
+        s.store_field_int("flags", self.flags as i64);
+        if self.flags & 1 != 0 {
+            s.store_vector_begin("stickers", self.stickers.len());
+            for __v0 in &self.stickers {
+                __v0.store_debug(s, "");
+            }
+            s.store_class_end();
+        }
+        if self.flags & 1 << 1 != 0 {
+            match &self.bg_nft_item {
+                Some(__m1) => __m1.store_debug(s, "bg_nft_item"),
+                None => s.store_null("bg_nft_item"),
+            }
+        }
+        s.store_field_str("address", &self.address);
+        s.store_field_int("balance", self.balance);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct wallet_CardSticker {
+    pub coordinates: Option<MediaAreaCoordinates>,
+    pub nft: Option<wallet_NftItem>,
+}
+
+impl wallet_CardSticker {
+    pub const ID: i32 = -218035014;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let __d0 = Default::default();
+        let __m0 = self.coordinates.as_ref().unwrap_or(&__d0);
+        __m0.store_boxed(out);
+        let __d1 = Default::default();
+        let __m1 = self.nft.as_ref().unwrap_or(&__d1);
+        __m1.store_boxed(out);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let coordinates: Option<MediaAreaCoordinates> = Some(MediaAreaCoordinates::read(r)?);
+        let nft: Option<wallet_NftItem> = Some(wallet_NftItem::read(r)?);
+        Result::Ok(Self { coordinates, nft })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "wallet.cardSticker");
+        match &self.coordinates {
+            Some(__m0) => __m0.store_debug(s, "coordinates"),
+            None => s.store_null("coordinates"),
+        }
+        match &self.nft {
+            Some(__m1) => __m1.store_debug(s, "nft"),
+            None => s.store_null("nft"),
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct wallet_EncryptedSecretPhrasePart {
     pub data: Vec<u8>,
 }
@@ -155446,10 +158953,11 @@ pub struct wallet_NftItem {
     pub lottie: Option<WebDocument>,
     pub attributes: Vec<wallet_NftAttribute>,
     pub extra: Option<DataJSON>,
+    pub gift: Option<StarGift>,
 }
 
 impl wallet_NftItem {
-    pub const ID: i32 = 876739868;
+    pub const ID: i32 = 389937907;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -155501,6 +159009,11 @@ impl wallet_NftItem {
             let __d5 = Default::default();
             let __m5 = self.extra.as_ref().unwrap_or(&__d5);
             __m5.store_boxed(out);
+        }
+        if (self.flags) & 1 << 9 != 0 {
+            let __d6 = Default::default();
+            let __m6 = self.gift.as_ref().unwrap_or(&__d6);
+            __m6.store(out);
         }
     }
 
@@ -155588,7 +159101,12 @@ impl wallet_NftItem {
         } else {
             Default::default()
         };
-        Result::Ok(Self { flags, collection_address, address, owner_address, index, name, description, image, image_small, content_url, lottie, attributes, extra })
+        let gift: Option<StarGift> = if (flags & 1 << 9) != 0 {
+            Some(StarGift::read(r)?)
+        } else {
+            Default::default()
+        };
+        Result::Ok(Self { flags, collection_address, address, owner_address, index, name, description, image, image_small, content_url, lottie, attributes, extra, gift })
     }
 
     /// td's generated `Class::store(TlStorerToString&, const char*)`
@@ -155643,6 +159161,12 @@ impl wallet_NftItem {
             match &self.extra {
                 Some(__m5) => __m5.store_debug(s, "extra"),
                 None => s.store_null("extra"),
+            }
+        }
+        if self.flags & 1 << 9 != 0 {
+            match &self.gift {
+                Some(__m6) => __m6.store_debug(s, "gift"),
+                None => s.store_null("gift"),
             }
         }
         s.store_class_end();
@@ -173713,10 +177237,11 @@ pub struct channels_toggleForum {
     pub channel: Option<InputChannel>,
     pub enabled: bool,
     pub tabs: bool,
+    pub sidebar: bool,
 }
 
 impl channels_toggleForum {
-    pub const ID: i32 = 1073174324;
+    pub const ID: i32 = -1567282348;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -173729,6 +177254,7 @@ impl channels_toggleForum {
         __m0.store(out);
         tl::__bool(out, self.enabled);
         tl::__bool(out, self.tabs);
+        tl::__bool(out, self.sidebar);
     }
 
     pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
@@ -173752,7 +177278,8 @@ impl channels_toggleForum {
         let channel: Option<InputChannel> = Some(InputChannel::read(r)?);
         let enabled: bool = r.bool()?;
         let tabs: bool = r.bool()?;
-        Result::Ok(Self { channel, enabled, tabs })
+        let sidebar: bool = r.bool()?;
+        Result::Ok(Self { channel, enabled, tabs, sidebar })
     }
 
     /// td's generated `Class::store(TlStorerToString&, const char*)`
@@ -173765,6 +177292,7 @@ impl channels_toggleForum {
         }
         s.store_field_bool("enabled", self.enabled);
         s.store_field_bool("tabs", self.tabs);
+        s.store_field_bool("sidebar", self.sidebar);
         s.store_class_end();
     }
 
@@ -176731,6 +180259,71 @@ impl contacts_exportContactToken {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+pub struct contacts_exportNoPaidMessagesToken {
+    pub flags: i32,
+    pub revoke: bool,
+    pub temporary: bool,
+}
+
+impl contacts_exportNoPaidMessagesToken {
+    pub const ID: i32 = -2084206930;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.flags | (self.revoke as i32) | ((self.temporary as i32) << 1));
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let flags: i32 = r.i32()?;
+        if flags < 0 {
+            return Result::Err("Variable of type # can't be negative");
+        }
+        let revoke: bool = (flags & 1) != 0;
+        let temporary: bool = (flags & 1 << 1) != 0;
+        Result::Ok(Self { flags, revoke, temporary })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "contacts.exportNoPaidMessagesToken");
+        s.store_field_int("flags", self.flags as i64);
+        if self.flags & 1 != 0 { s.store_field_bool("revoke", true); }
+        if self.flags & 1 << 1 != 0 { s.store_field_bool("temporary", true); }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct contacts_getBirthdays;
 
 impl contacts_getBirthdays {
@@ -177433,6 +181026,71 @@ impl contacts_importContacts {
             __v0.store_debug(s, "");
         }
         s.store_class_end();
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct contacts_importNoPaidMessagesToken {
+    pub user_id: Option<InputUser>,
+    pub token: String,
+}
+
+impl contacts_importNoPaidMessagesToken {
+    pub const ID: i32 = 900187850;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let __d0 = Default::default();
+        let __m0 = self.user_id.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+        tl::__string(out, &self.token);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let user_id: Option<InputUser> = Some(InputUser::read(r)?);
+        let token: String = r.string()?;
+        Result::Ok(Self { user_id, token })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "contacts.importNoPaidMessagesToken");
+        match &self.user_id {
+            Some(__m0) => __m0.store_debug(s, "user_id"),
+            None => s.store_null("user_id"),
+        }
+        s.store_field_str("token", &self.token);
         s.store_class_end();
     }
 
@@ -181958,10 +185616,11 @@ pub struct messages_acceptUrlAuth {
     pub button_id: i32,
     pub url: String,
     pub match_code: String,
+    pub tonconnect_session: Option<InputTonConnectOauthSession>,
 }
 
 impl messages_acceptUrlAuth {
-    pub const ID: i32 = 1738797278;
+    pub const ID: i32 = 417156754;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -181986,6 +185645,11 @@ impl messages_acceptUrlAuth {
         }
         if (self.flags | (self.write_allowed as i32) | ((self.share_phone_number as i32) << 3)) & 1 << 4 != 0 {
             tl::__string(out, &self.match_code);
+        }
+        if (self.flags | (self.write_allowed as i32) | ((self.share_phone_number as i32) << 3)) & 1 << 5 != 0 {
+            let __d1 = Default::default();
+            let __m1 = self.tonconnect_session.as_ref().unwrap_or(&__d1);
+            __m1.store_boxed(out);
         }
     }
 
@@ -182038,7 +185702,12 @@ impl messages_acceptUrlAuth {
         } else {
             Default::default()
         };
-        Result::Ok(Self { flags, write_allowed, share_phone_number, peer, msg_id, button_id, url, match_code })
+        let tonconnect_session: Option<InputTonConnectOauthSession> = if (flags & 1 << 5) != 0 {
+            Some(InputTonConnectOauthSession::read(r)?)
+        } else {
+            Default::default()
+        };
+        Result::Ok(Self { flags, write_allowed, share_phone_number, peer, msg_id, button_id, url, match_code, tonconnect_session })
     }
 
     /// td's generated `Class::store(TlStorerToString&, const char*)`
@@ -182065,6 +185734,12 @@ impl messages_acceptUrlAuth {
         }
         if self.flags & 1 << 4 != 0 {
             s.store_field_str("match_code", &self.match_code);
+        }
+        if self.flags & 1 << 5 != 0 {
+            match &self.tonconnect_session {
+                Some(__m1) => __m1.store_debug(s, "tonconnect_session"),
+                None => s.store_null("tonconnect_session"),
+            }
         }
         s.store_class_end();
     }
@@ -185565,6 +189240,98 @@ impl messages_editInlineBotMessage {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+pub struct messages_editInlineBotMessageWidgetData {
+    pub flags: i32,
+    pub id: Option<InputBotInlineMessageID>,
+    pub public_data: String,
+    pub chat_data: String,
+}
+
+impl messages_editInlineBotMessageWidgetData {
+    pub const ID: i32 = 1670827563;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.flags);
+        let __d0 = Default::default();
+        let __m0 = self.id.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+        if (self.flags) & 1 != 0 {
+            tl::__string(out, &self.public_data);
+        }
+        if (self.flags) & 1 << 1 != 0 {
+            tl::__string(out, &self.chat_data);
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let flags: i32 = r.i32()?;
+        if flags < 0 {
+            return Result::Err("Variable of type # can't be negative");
+        }
+        let id: Option<InputBotInlineMessageID> = Some(InputBotInlineMessageID::read(r)?);
+        let public_data: String = if (flags & 1) != 0 {
+            r.string()?
+        } else {
+            Default::default()
+        };
+        let chat_data: String = if (flags & 1 << 1) != 0 {
+            r.string()?
+        } else {
+            Default::default()
+        };
+        Result::Ok(Self { flags, id, public_data, chat_data })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "messages.editInlineBotMessageWidgetData");
+        s.store_field_int("flags", self.flags as i64);
+        match &self.id {
+            Some(__m0) => __m0.store_debug(s, "id"),
+            None => s.store_null("id"),
+        }
+        if self.flags & 1 != 0 {
+            s.store_field_str("public_data", &self.public_data);
+        }
+        if self.flags & 1 << 1 != 0 {
+            s.store_field_str("chat_data", &self.chat_data);
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct messages_editMessage {
     pub flags: i32,
     pub no_webpage: bool,
@@ -185776,6 +189543,102 @@ impl messages_editMessage {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+pub struct messages_editMessageWidgetData {
+    pub flags: i32,
+    pub peer: Option<Box<InputPeer>>,
+    pub id: i32,
+    pub public_data: String,
+    pub chat_data: String,
+}
+
+impl messages_editMessageWidgetData {
+    pub const ID: i32 = -165364706;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.flags);
+        let __d0 = Default::default();
+        let __m0 = self.peer.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+        tl::__i32(out, self.id);
+        if (self.flags) & 1 != 0 {
+            tl::__string(out, &self.public_data);
+        }
+        if (self.flags) & 1 << 1 != 0 {
+            tl::__string(out, &self.chat_data);
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let flags: i32 = r.i32()?;
+        if flags < 0 {
+            return Result::Err("Variable of type # can't be negative");
+        }
+        let peer: Option<Box<InputPeer>> = Some(Box::new(InputPeer::read(r)?));
+        let id: i32 = r.i32()?;
+        let public_data: String = if (flags & 1) != 0 {
+            r.string()?
+        } else {
+            Default::default()
+        };
+        let chat_data: String = if (flags & 1 << 1) != 0 {
+            r.string()?
+        } else {
+            Default::default()
+        };
+        Result::Ok(Self { flags, peer, id, public_data, chat_data })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "messages.editMessageWidgetData");
+        s.store_field_int("flags", self.flags as i64);
+        match &self.peer {
+            Some(__m0) => __m0.store_debug(s, "peer"),
+            None => s.store_null("peer"),
+        }
+        s.store_field_int("id", self.id as i64);
+        if self.flags & 1 != 0 {
+            s.store_field_str("public_data", &self.public_data);
+        }
+        if self.flags & 1 << 1 != 0 {
+            s.store_field_str("chat_data", &self.chat_data);
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct messages_editQuickReplyShortcut {
     pub shortcut_id: i32,
     pub shortcut: String,
@@ -185823,6 +189686,85 @@ impl messages_editQuickReplyShortcut {
         s.store_class_begin(field_name, "messages.editQuickReplyShortcut");
         s.store_field_int("shortcut_id", self.shortcut_id as i64);
         s.store_field_str("shortcut", &self.shortcut);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct messages_editWidgetData {
+    pub flags: i32,
+    pub widget_id: i64,
+    pub public_data: String,
+    pub cache_time: i32,
+}
+
+impl messages_editWidgetData {
+    pub const ID: i32 = -356301888;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.flags);
+        tl::__i64(out, self.widget_id);
+        tl::__string(out, &self.public_data);
+        if (self.flags) & 1 != 0 {
+            tl::__i32(out, self.cache_time);
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let flags: i32 = r.i32()?;
+        if flags < 0 {
+            return Result::Err("Variable of type # can't be negative");
+        }
+        let widget_id: i64 = r.i64()?;
+        let public_data: String = r.string()?;
+        let cache_time: i32 = if (flags & 1) != 0 {
+            r.i32()?
+        } else {
+            Default::default()
+        };
+        Result::Ok(Self { flags, widget_id, public_data, cache_time })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "messages.editWidgetData");
+        s.store_field_int("flags", self.flags as i64);
+        s.store_field_int("widget_id", self.widget_id);
+        s.store_field_str("public_data", &self.public_data);
+        if self.flags & 1 != 0 {
+            s.store_field_int("cache_time", self.cache_time as i64);
+        }
         s.store_class_end();
     }
 
@@ -187010,6 +190952,84 @@ impl messages_getBotCallbackAnswer {
                 None => s.store_null("password"),
             }
         }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct messages_getBotWidgetQueryAnswer {
+    pub peer: Option<Box<InputPeer>>,
+    pub msg_id: i32,
+    pub query_type: Option<WidgetQueryType>,
+    pub data: Vec<u8>,
+}
+
+impl messages_getBotWidgetQueryAnswer {
+    pub const ID: i32 = 1549075833;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let __d0 = Default::default();
+        let __m0 = self.peer.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+        tl::__i32(out, self.msg_id);
+        let __d1 = Default::default();
+        let __m1 = self.query_type.as_ref().unwrap_or(&__d1);
+        __m1.store(out);
+        tl::__string(out, &self.data);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let peer: Option<Box<InputPeer>> = Some(Box::new(InputPeer::read(r)?));
+        let msg_id: i32 = r.i32()?;
+        let query_type: Option<WidgetQueryType> = Some(WidgetQueryType::read(r)?);
+        let data: Vec<u8> = r.bytes()?;
+        Result::Ok(Self { peer, msg_id, query_type, data })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "messages.getBotWidgetQueryAnswer");
+        match &self.peer {
+            Some(__m0) => __m0.store_debug(s, "peer"),
+            None => s.store_null("peer"),
+        }
+        s.store_field_int("msg_id", self.msg_id as i64);
+        match &self.query_type {
+            Some(__m1) => __m1.store_debug(s, "query_type"),
+            None => s.store_null("query_type"),
+        }
+        s.store_bytes_field("data", &self.data);
         s.store_class_end();
     }
 
@@ -192475,6 +196495,62 @@ impl messages_getSearchResultsPositions {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+pub struct messages_getShareThemeBackdrops {
+    pub hash: i32,
+}
+
+impl messages_getShareThemeBackdrops {
+    pub const ID: i32 = -195453198;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.hash);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let hash: i32 = r.i32()?;
+        Result::Ok(Self { hash })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "messages.getShareThemeBackdrops");
+        s.store_field_int("hash", self.hash as i64);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct messages_getSplitRanges;
 
 impl messages_getSplitRanges {
@@ -192833,6 +196909,82 @@ impl messages_getTopReactions {
         s.store_class_begin(field_name, "messages.getTopReactions");
         s.store_field_int("limit", self.limit as i64);
         s.store_field_int("hash", self.hash);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct messages_getTranscriptionLangs {
+    pub flags: i32,
+    pub peer: Option<Box<InputPeer>>,
+}
+
+impl messages_getTranscriptionLangs {
+    pub const ID: i32 = -1167271510;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.flags);
+        if (self.flags) & 1 != 0 {
+            let __d0 = Default::default();
+            let __m0 = self.peer.as_ref().unwrap_or(&__d0);
+            __m0.store(out);
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let flags: i32 = r.i32()?;
+        if flags < 0 {
+            return Result::Err("Variable of type # can't be negative");
+        }
+        let peer: Option<Box<InputPeer>> = if (flags & 1) != 0 {
+            Some(Box::new(InputPeer::read(r)?))
+        } else {
+            Default::default()
+        };
+        Result::Ok(Self { flags, peer })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "messages.getTranscriptionLangs");
+        s.store_field_int("flags", self.flags as i64);
+        if self.flags & 1 != 0 {
+            match &self.peer {
+                Some(__m0) => __m0.store_debug(s, "peer"),
+                None => s.store_null("peer"),
+            }
+        }
         s.store_class_end();
     }
 
@@ -193307,6 +197459,75 @@ impl messages_getWebPagePreview {
             }
             s.store_class_end();
         }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct messages_getWidgetPublicData {
+    pub peer: Option<Box<InputPeer>>,
+    pub msg_id: i32,
+    pub hash: i64,
+}
+
+impl messages_getWidgetPublicData {
+    pub const ID: i32 = 1875194241;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let __d0 = Default::default();
+        let __m0 = self.peer.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+        tl::__i32(out, self.msg_id);
+        tl::__i64(out, self.hash);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let peer: Option<Box<InputPeer>> = Some(Box::new(InputPeer::read(r)?));
+        let msg_id: i32 = r.i32()?;
+        let hash: i64 = r.i64()?;
+        Result::Ok(Self { peer, msg_id, hash })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "messages.getWidgetPublicData");
+        match &self.peer {
+            Some(__m0) => __m0.store_debug(s, "peer"),
+            None => s.store_null("peer"),
+        }
+        s.store_field_int("msg_id", self.msg_id as i64);
+        s.store_field_int("hash", self.hash);
         s.store_class_end();
     }
 
@@ -200291,6 +204512,81 @@ impl messages_setBotShippingResults {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+pub struct messages_setBotWidgetQueryAnswer {
+    pub flags: i32,
+    pub query_id: i64,
+    pub result: String,
+}
+
+impl messages_setBotWidgetQueryAnswer {
+    pub const ID: i32 = -120722326;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.flags);
+        tl::__i64(out, self.query_id);
+        if (self.flags) & 1 != 0 {
+            tl::__string(out, &self.result);
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let flags: i32 = r.i32()?;
+        if flags < 0 {
+            return Result::Err("Variable of type # can't be negative");
+        }
+        let query_id: i64 = r.i64()?;
+        let result: String = if (flags & 1) != 0 {
+            r.string()?
+        } else {
+            Default::default()
+        };
+        Result::Ok(Self { flags, query_id, result })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "messages.setBotWidgetQueryAnswer");
+        s.store_field_int("flags", self.flags as i64);
+        s.store_field_int("query_id", self.query_id);
+        if self.flags & 1 != 0 {
+            s.store_field_str("result", &self.result);
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct messages_setChatAvailableReactions {
     pub flags: i32,
     pub peer: Option<Box<InputPeer>>,
@@ -201139,6 +205435,76 @@ impl messages_setInlineGameScore {
             None => s.store_null("user_id"),
         }
         s.store_field_int("score", self.score as i64);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct messages_setShareTheme {
+    pub peer: Option<Box<InputPeer>>,
+    pub theme: Option<ShareTheme>,
+}
+
+impl messages_setShareTheme {
+    pub const ID: i32 = 1770691354;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let __d0 = Default::default();
+        let __m0 = self.peer.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+        let __d1 = Default::default();
+        let __m1 = self.theme.as_ref().unwrap_or(&__d1);
+        __m1.store(out);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let peer: Option<Box<InputPeer>> = Some(Box::new(InputPeer::read(r)?));
+        let theme: Option<ShareTheme> = Some(ShareTheme::read(r)?);
+        Result::Ok(Self { peer, theme })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "messages.setShareTheme");
+        match &self.peer {
+            Some(__m0) => __m0.store_debug(s, "peer"),
+            None => s.store_null("peer"),
+        }
+        match &self.theme {
+            Some(__m1) => __m1.store_debug(s, "theme"),
+            None => s.store_null("theme"),
+        }
         s.store_class_end();
     }
 
@@ -202344,6 +206710,67 @@ impl messages_transcribeAudio {
             None => s.store_null("peer"),
         }
         s.store_field_int("msg_id", self.msg_id as i64);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct messages_transcribeAudioFile {
+    pub file: Option<InputFile>,
+}
+
+impl messages_transcribeAudioFile {
+    pub const ID: i32 = 120401655;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let __d0 = Default::default();
+        let __m0 = self.file.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let file: Option<InputFile> = Some(InputFile::read(r)?);
+        Result::Ok(Self { file })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "messages.transcribeAudioFile");
+        match &self.file {
+            Some(__m0) => __m0.store_debug(s, "file"),
+            None => s.store_null("file"),
+        }
         s.store_class_end();
     }
 
@@ -204571,6 +208998,67 @@ impl payments_createStarGiftCollection {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+pub struct payments_deleteStarGift {
+    pub stargift: Option<InputSavedStarGift>,
+}
+
+impl payments_deleteStarGift {
+    pub const ID: i32 = 1020983466;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let __d0 = Default::default();
+        let __m0 = self.stargift.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let stargift: Option<InputSavedStarGift> = Some(InputSavedStarGift::read(r)?);
+        Result::Ok(Self { stargift })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "payments.deleteStarGift");
+        match &self.stargift {
+            Some(__m0) => __m0.store_debug(s, "stargift"),
+            None => s.store_null("stargift"),
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct payments_deleteStarGiftCollection {
     pub peer: Option<Box<InputPeer>>,
     pub collection_id: i32,
@@ -204623,6 +209111,161 @@ impl payments_deleteStarGiftCollection {
             None => s.store_null("peer"),
         }
         s.store_field_int("collection_id", self.collection_id as i64);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct payments_depositStarGift {
+    pub flags: i32,
+    pub hide_sender: bool,
+    pub peer: Option<Box<InputPeer>>,
+    pub slug: String,
+}
+
+impl payments_depositStarGift {
+    pub const ID: i32 = -1063064929;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.flags | (self.hide_sender as i32));
+        let __d0 = Default::default();
+        let __m0 = self.peer.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+        tl::__string(out, &self.slug);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let flags: i32 = r.i32()?;
+        if flags < 0 {
+            return Result::Err("Variable of type # can't be negative");
+        }
+        let hide_sender: bool = (flags & 1) != 0;
+        let peer: Option<Box<InputPeer>> = Some(Box::new(InputPeer::read(r)?));
+        let slug: String = r.string()?;
+        Result::Ok(Self { flags, hide_sender, peer, slug })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "payments.depositStarGift");
+        s.store_field_int("flags", self.flags as i64);
+        if self.flags & 1 != 0 { s.store_field_bool("hide_sender", true); }
+        match &self.peer {
+            Some(__m0) => __m0.store_debug(s, "peer"),
+            None => s.store_null("peer"),
+        }
+        s.store_field_str("slug", &self.slug);
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct payments_displayStarGift {
+    pub flags: i32,
+    pub peer: Option<Box<InputPeer>>,
+    pub slug: String,
+}
+
+impl payments_displayStarGift {
+    pub const ID: i32 = 1252389118;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.flags);
+        if (self.flags) & 1 != 0 {
+            let __d0 = Default::default();
+            let __m0 = self.peer.as_ref().unwrap_or(&__d0);
+            __m0.store(out);
+        }
+        tl::__string(out, &self.slug);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let flags: i32 = r.i32()?;
+        if flags < 0 {
+            return Result::Err("Variable of type # can't be negative");
+        }
+        let peer: Option<Box<InputPeer>> = if (flags & 1) != 0 {
+            Some(Box::new(InputPeer::read(r)?))
+        } else {
+            Default::default()
+        };
+        let slug: String = r.string()?;
+        Result::Ok(Self { flags, peer, slug })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "payments.displayStarGift");
+        s.store_field_int("flags", self.flags as i64);
+        if self.flags & 1 != 0 {
+            match &self.peer {
+                Some(__m0) => __m0.store_debug(s, "peer"),
+                None => s.store_null("peer"),
+            }
+        }
+        s.store_field_str("slug", &self.slug);
         s.store_class_end();
     }
 
@@ -206597,12 +211240,13 @@ impl payments_getStarGiftUpgradePreview {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct payments_getStarGiftWithdrawalUrl {
+    pub flags: i32,
     pub stargift: Option<InputSavedStarGift>,
-    pub password: Option<InputCheckPasswordSRP>,
+    pub tmp_password: Vec<u8>,
 }
 
 impl payments_getStarGiftWithdrawalUrl {
-    pub const ID: i32 = -798059608;
+    pub const ID: i32 = -926252677;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
@@ -206610,12 +211254,11 @@ impl payments_getStarGiftWithdrawalUrl {
     }
 
     pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.flags);
         let __d0 = Default::default();
         let __m0 = self.stargift.as_ref().unwrap_or(&__d0);
         __m0.store(out);
-        let __d1 = Default::default();
-        let __m1 = self.password.as_ref().unwrap_or(&__d1);
-        __m1.store(out);
+        tl::__string(out, &self.tmp_password);
     }
 
     pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
@@ -206636,23 +211279,25 @@ impl payments_getStarGiftWithdrawalUrl {
     }
 
     pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let flags: i32 = r.i32()?;
+        if flags < 0 {
+            return Result::Err("Variable of type # can't be negative");
+        }
         let stargift: Option<InputSavedStarGift> = Some(InputSavedStarGift::read(r)?);
-        let password: Option<InputCheckPasswordSRP> = Some(InputCheckPasswordSRP::read(r)?);
-        Result::Ok(Self { stargift, password })
+        let tmp_password: Vec<u8> = r.bytes()?;
+        Result::Ok(Self { flags, stargift, tmp_password })
     }
 
     /// td's generated `Class::store(TlStorerToString&, const char*)`
     /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
     pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
         s.store_class_begin(field_name, "payments.getStarGiftWithdrawalUrl");
+        s.store_field_int("flags", self.flags as i64);
         match &self.stargift {
             Some(__m0) => __m0.store_debug(s, "stargift"),
             None => s.store_null("stargift"),
         }
-        match &self.password {
-            Some(__m1) => __m1.store_debug(s, "password"),
-            None => s.store_null("password"),
-        }
+        s.store_bytes_field("tmp_password", &self.tmp_password);
         s.store_class_end();
     }
 
@@ -208936,6 +213581,81 @@ impl payments_validateRequestedInfo {
             Some(__m1) => __m1.store_debug(s, "info"),
             None => s.store_null("info"),
         }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct payments_withdrawStarGift {
+    pub flags: i32,
+    pub keep_on_profile: bool,
+    pub stargift: Option<InputSavedStarGift>,
+    pub tmp_password: Vec<u8>,
+}
+
+impl payments_withdrawStarGift {
+    pub const ID: i32 = -333434706;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.flags | (self.keep_on_profile as i32));
+        let __d0 = Default::default();
+        let __m0 = self.stargift.as_ref().unwrap_or(&__d0);
+        __m0.store(out);
+        tl::__string(out, &self.tmp_password);
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let flags: i32 = r.i32()?;
+        if flags < 0 {
+            return Result::Err("Variable of type # can't be negative");
+        }
+        let keep_on_profile: bool = (flags & 1) != 0;
+        let stargift: Option<InputSavedStarGift> = Some(InputSavedStarGift::read(r)?);
+        let tmp_password: Vec<u8> = r.bytes()?;
+        Result::Ok(Self { flags, keep_on_profile, stargift, tmp_password })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "payments.withdrawStarGift");
+        s.store_field_int("flags", self.flags as i64);
+        if self.flags & 1 != 0 { s.store_field_bool("keep_on_profile", true); }
+        match &self.stargift {
+            Some(__m0) => __m0.store_debug(s, "stargift"),
+            None => s.store_null("stargift"),
+        }
+        s.store_bytes_field("tmp_password", &self.tmp_password);
         s.store_class_end();
     }
 
@@ -220977,6 +225697,103 @@ impl wallet_sendTransfer {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+pub struct wallet_setCardStickers {
+    pub flags: i32,
+    pub stickers: Vec<InputWalletCardSticker>,
+    pub bg_nft_address: String,
+}
+
+impl wallet_setCardStickers {
+    pub const ID: i32 = 109382060;
+
+    pub fn store_boxed(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&Self::ID.to_le_bytes());
+        self.store(out);
+    }
+
+    pub fn store(&self, out: &mut Vec<u8>) {
+        tl::__i32(out, self.flags);
+        tl::__i32(out, tl::VECTOR_ID);
+        tl::__i32(out, self.stickers.len() as i32);
+        for __v0 in &self.stickers {
+            (*__v0).store_boxed(out);
+        }
+        if (self.flags) & 1 != 0 {
+            tl::__string(out, &self.bg_nft_address);
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read(&mut r)
+    }
+
+    pub fn parse_bare(input: &[u8]) -> Result<Self, &'static str> {
+        let mut r = tl::Reader::new(input);
+        Self::read_bare(&mut r)
+    }
+
+    pub fn read(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        if r.i32()? != Self::ID {
+            return Result::Err("Wrong constructor");
+        }
+        Self::read_bare(r)
+    }
+
+    pub fn read_bare(r: &mut tl::Reader<'_>) -> Result<Self, &'static str> {
+        let flags: i32 = r.i32()?;
+        if flags < 0 {
+            return Result::Err("Variable of type # can't be negative");
+        }
+        let __v0: Vec<InputWalletCardSticker> = {
+            if r.i32()? != tl::VECTOR_ID {
+                return Result::Err("Wrong constructor");
+            }
+            let count: u32 = r.i32()? as u32;
+            if count as usize > r.remaining() {
+                return Result::Err("Wrong vector length");
+            }
+            let mut res = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                res.push(InputWalletCardSticker::read(r)?);
+            }
+            res
+        };
+        let stickers: Vec<InputWalletCardSticker> = __v0;
+        let bg_nft_address: String = if (flags & 1) != 0 {
+            r.string()?
+        } else {
+            Default::default()
+        };
+        Result::Ok(Self { flags, stickers, bg_nft_address })
+    }
+
+    /// td's generated `Class::store(TlStorerToString&, const char*)`
+    /// (storer_type 1, the `LOG_IS_STRIPPED(ERROR)`-guarded print).
+    pub fn store_debug(&self, s: &mut TlStorerToString, field_name: &str) {
+        s.store_class_begin(field_name, "wallet.setCardStickers");
+        s.store_field_int("flags", self.flags as i64);
+        s.store_vector_begin("stickers", self.stickers.len());
+        for __v0 in &self.stickers {
+            __v0.store_debug(s, "");
+        }
+        s.store_class_end();
+        if self.flags & 1 != 0 {
+            s.store_field_str("bg_nft_address", &self.bg_nft_address);
+        }
+        s.store_class_end();
+    }
+
+    /// td's `to_string(const BaseObject&)` for this constructor.
+    pub fn to_debug_string(&self) -> String {
+        let mut out = String::new();
+        let mut storer = TlStorerToString { out: &mut out, shift: 0 };
+        self.store_debug(&mut storer, "");
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct wallet_tonConnectClaimRequest {
     pub flags: i32,
     pub declined: bool,
@@ -221911,6 +226728,7 @@ pub enum Function {
     contacts_deleteContacts(contacts_deleteContacts),
     contacts_editCloseFriends(contacts_editCloseFriends),
     contacts_exportContactToken(contacts_exportContactToken),
+    contacts_exportNoPaidMessagesToken(contacts_exportNoPaidMessagesToken),
     contacts_getBirthdays(contacts_getBirthdays),
     contacts_getBlocked(contacts_getBlocked),
     contacts_getContactIDs(contacts_getContactIDs),
@@ -221922,6 +226740,7 @@ pub enum Function {
     contacts_getTopPeers(contacts_getTopPeers),
     contacts_importContactToken(contacts_importContactToken),
     contacts_importContacts(contacts_importContacts),
+    contacts_importNoPaidMessagesToken(contacts_importNoPaidMessagesToken),
     contacts_resetSaved(contacts_resetSaved),
     contacts_resetTopPeerRating(contacts_resetTopPeerRating),
     contacts_resolvePhone(contacts_resolvePhone),
@@ -222033,8 +226852,11 @@ pub enum Function {
     messages_editFactCheck(messages_editFactCheck),
     messages_editForumTopic(messages_editForumTopic),
     messages_editInlineBotMessage(messages_editInlineBotMessage),
+    messages_editInlineBotMessageWidgetData(messages_editInlineBotMessageWidgetData),
     messages_editMessage(messages_editMessage),
+    messages_editMessageWidgetData(messages_editMessageWidgetData),
     messages_editQuickReplyShortcut(messages_editQuickReplyShortcut),
+    messages_editWidgetData(messages_editWidgetData),
     messages_exportChatInvite(messages_exportChatInvite),
     messages_faveSticker(messages_faveSticker),
     messages_forwardMessages(messages_forwardMessages),
@@ -222049,6 +226871,7 @@ pub enum Function {
     messages_getAvailableReactions(messages_getAvailableReactions),
     messages_getBotApp(messages_getBotApp),
     messages_getBotCallbackAnswer(messages_getBotCallbackAnswer),
+    messages_getBotWidgetQueryAnswer(messages_getBotWidgetQueryAnswer),
     messages_getChatInviteImporters(messages_getChatInviteImporters),
     messages_getChats(messages_getChats),
     messages_getCommonChats(messages_getCommonChats),
@@ -222123,17 +226946,20 @@ pub enum Function {
     messages_getSearchCounters(messages_getSearchCounters),
     messages_getSearchResultsCalendar(messages_getSearchResultsCalendar),
     messages_getSearchResultsPositions(messages_getSearchResultsPositions),
+    messages_getShareThemeBackdrops(messages_getShareThemeBackdrops),
     messages_getSplitRanges(messages_getSplitRanges),
     messages_getSponsoredMessages(messages_getSponsoredMessages),
     messages_getStickerSet(messages_getStickerSet),
     messages_getStickers(messages_getStickers),
     messages_getSuggestedDialogFilters(messages_getSuggestedDialogFilters),
     messages_getTopReactions(messages_getTopReactions),
+    messages_getTranscriptionLangs(messages_getTranscriptionLangs),
     messages_getUnreadMentions(messages_getUnreadMentions),
     messages_getUnreadPollVotes(messages_getUnreadPollVotes),
     messages_getUnreadReactions(messages_getUnreadReactions),
     messages_getWebPage(messages_getWebPage),
     messages_getWebPagePreview(messages_getWebPagePreview),
+    messages_getWidgetPublicData(messages_getWidgetPublicData),
     messages_hideAllChatJoinRequests(messages_hideAllChatJoinRequests),
     messages_hideChatJoinRequest(messages_hideChatJoinRequest),
     messages_hidePeerSettingsBar(messages_hidePeerSettingsBar),
@@ -222207,6 +227033,7 @@ pub enum Function {
     messages_setBotGuestChatResult(messages_setBotGuestChatResult),
     messages_setBotPrecheckoutResults(messages_setBotPrecheckoutResults),
     messages_setBotShippingResults(messages_setBotShippingResults),
+    messages_setBotWidgetQueryAnswer(messages_setBotWidgetQueryAnswer),
     messages_setChatAvailableReactions(messages_setChatAvailableReactions),
     messages_setChatTheme(messages_setChatTheme),
     messages_setChatWallPaper(messages_setChatWallPaper),
@@ -222217,6 +227044,7 @@ pub enum Function {
     messages_setHistoryTTL(messages_setHistoryTTL),
     messages_setInlineBotResults(messages_setInlineBotResults),
     messages_setInlineGameScore(messages_setInlineGameScore),
+    messages_setShareTheme(messages_setShareTheme),
     messages_setTyping(messages_setTyping),
     messages_startBot(messages_startBot),
     messages_startHistoryImport(messages_startHistoryImport),
@@ -222232,6 +227060,7 @@ pub enum Function {
     messages_toggleSuggestedPostApproval(messages_toggleSuggestedPostApproval),
     messages_toggleTodoCompleted(messages_toggleTodoCompleted),
     messages_transcribeAudio(messages_transcribeAudio),
+    messages_transcribeAudioFile(messages_transcribeAudioFile),
     messages_translateRichMessage(messages_translateRichMessage),
     messages_translateText(messages_translateText),
     messages_uninstallStickerSet(messages_uninstallStickerSet),
@@ -222259,7 +227088,10 @@ pub enum Function {
     payments_craftStarGift(payments_craftStarGift),
     payments_createOnrampSession(payments_createOnrampSession),
     payments_createStarGiftCollection(payments_createStarGiftCollection),
+    payments_deleteStarGift(payments_deleteStarGift),
     payments_deleteStarGiftCollection(payments_deleteStarGiftCollection),
+    payments_depositStarGift(payments_depositStarGift),
+    payments_displayStarGift(payments_displayStarGift),
     payments_editConnectedStarRefBot(payments_editConnectedStarRefBot),
     payments_exportInvoice(payments_exportInvoice),
     payments_fulfillStarsSubscription(payments_fulfillStarsSubscription),
@@ -222317,6 +227149,7 @@ pub enum Function {
     payments_updateStarGiftPrice(payments_updateStarGiftPrice),
     payments_upgradeStarGift(payments_upgradeStarGift),
     payments_validateRequestedInfo(payments_validateRequestedInfo),
+    payments_withdrawStarGift(payments_withdrawStarGift),
     phone_acceptCall(phone_acceptCall),
     phone_checkGroupCall(phone_checkGroupCall),
     phone_confirmCall(phone_confirmCall),
@@ -222467,6 +227300,7 @@ pub enum Function {
     wallet_getUserAddresses(wallet_getUserAddresses),
     wallet_replaceWallet(wallet_replaceWallet),
     wallet_sendTransfer(wallet_sendTransfer),
+    wallet_setCardStickers(wallet_setCardStickers),
     wallet_tonConnectClaimRequest(wallet_tonConnectClaimRequest),
     wallet_tonConnectCloseSession(wallet_tonConnectCloseSession),
     wallet_tonConnectCreateSession(wallet_tonConnectCreateSession),
@@ -222772,6 +227606,7 @@ impl Function {
             Self::contacts_deleteContacts(v) => v.store_boxed(out),
             Self::contacts_editCloseFriends(v) => v.store_boxed(out),
             Self::contacts_exportContactToken(v) => v.store_boxed(out),
+            Self::contacts_exportNoPaidMessagesToken(v) => v.store_boxed(out),
             Self::contacts_getBirthdays(v) => v.store_boxed(out),
             Self::contacts_getBlocked(v) => v.store_boxed(out),
             Self::contacts_getContactIDs(v) => v.store_boxed(out),
@@ -222783,6 +227618,7 @@ impl Function {
             Self::contacts_getTopPeers(v) => v.store_boxed(out),
             Self::contacts_importContactToken(v) => v.store_boxed(out),
             Self::contacts_importContacts(v) => v.store_boxed(out),
+            Self::contacts_importNoPaidMessagesToken(v) => v.store_boxed(out),
             Self::contacts_resetSaved(v) => v.store_boxed(out),
             Self::contacts_resetTopPeerRating(v) => v.store_boxed(out),
             Self::contacts_resolvePhone(v) => v.store_boxed(out),
@@ -222894,8 +227730,11 @@ impl Function {
             Self::messages_editFactCheck(v) => v.store_boxed(out),
             Self::messages_editForumTopic(v) => v.store_boxed(out),
             Self::messages_editInlineBotMessage(v) => v.store_boxed(out),
+            Self::messages_editInlineBotMessageWidgetData(v) => v.store_boxed(out),
             Self::messages_editMessage(v) => v.store_boxed(out),
+            Self::messages_editMessageWidgetData(v) => v.store_boxed(out),
             Self::messages_editQuickReplyShortcut(v) => v.store_boxed(out),
+            Self::messages_editWidgetData(v) => v.store_boxed(out),
             Self::messages_exportChatInvite(v) => v.store_boxed(out),
             Self::messages_faveSticker(v) => v.store_boxed(out),
             Self::messages_forwardMessages(v) => v.store_boxed(out),
@@ -222910,6 +227749,7 @@ impl Function {
             Self::messages_getAvailableReactions(v) => v.store_boxed(out),
             Self::messages_getBotApp(v) => v.store_boxed(out),
             Self::messages_getBotCallbackAnswer(v) => v.store_boxed(out),
+            Self::messages_getBotWidgetQueryAnswer(v) => v.store_boxed(out),
             Self::messages_getChatInviteImporters(v) => v.store_boxed(out),
             Self::messages_getChats(v) => v.store_boxed(out),
             Self::messages_getCommonChats(v) => v.store_boxed(out),
@@ -222984,17 +227824,20 @@ impl Function {
             Self::messages_getSearchCounters(v) => v.store_boxed(out),
             Self::messages_getSearchResultsCalendar(v) => v.store_boxed(out),
             Self::messages_getSearchResultsPositions(v) => v.store_boxed(out),
+            Self::messages_getShareThemeBackdrops(v) => v.store_boxed(out),
             Self::messages_getSplitRanges(v) => v.store_boxed(out),
             Self::messages_getSponsoredMessages(v) => v.store_boxed(out),
             Self::messages_getStickerSet(v) => v.store_boxed(out),
             Self::messages_getStickers(v) => v.store_boxed(out),
             Self::messages_getSuggestedDialogFilters(v) => v.store_boxed(out),
             Self::messages_getTopReactions(v) => v.store_boxed(out),
+            Self::messages_getTranscriptionLangs(v) => v.store_boxed(out),
             Self::messages_getUnreadMentions(v) => v.store_boxed(out),
             Self::messages_getUnreadPollVotes(v) => v.store_boxed(out),
             Self::messages_getUnreadReactions(v) => v.store_boxed(out),
             Self::messages_getWebPage(v) => v.store_boxed(out),
             Self::messages_getWebPagePreview(v) => v.store_boxed(out),
+            Self::messages_getWidgetPublicData(v) => v.store_boxed(out),
             Self::messages_hideAllChatJoinRequests(v) => v.store_boxed(out),
             Self::messages_hideChatJoinRequest(v) => v.store_boxed(out),
             Self::messages_hidePeerSettingsBar(v) => v.store_boxed(out),
@@ -223068,6 +227911,7 @@ impl Function {
             Self::messages_setBotGuestChatResult(v) => v.store_boxed(out),
             Self::messages_setBotPrecheckoutResults(v) => v.store_boxed(out),
             Self::messages_setBotShippingResults(v) => v.store_boxed(out),
+            Self::messages_setBotWidgetQueryAnswer(v) => v.store_boxed(out),
             Self::messages_setChatAvailableReactions(v) => v.store_boxed(out),
             Self::messages_setChatTheme(v) => v.store_boxed(out),
             Self::messages_setChatWallPaper(v) => v.store_boxed(out),
@@ -223078,6 +227922,7 @@ impl Function {
             Self::messages_setHistoryTTL(v) => v.store_boxed(out),
             Self::messages_setInlineBotResults(v) => v.store_boxed(out),
             Self::messages_setInlineGameScore(v) => v.store_boxed(out),
+            Self::messages_setShareTheme(v) => v.store_boxed(out),
             Self::messages_setTyping(v) => v.store_boxed(out),
             Self::messages_startBot(v) => v.store_boxed(out),
             Self::messages_startHistoryImport(v) => v.store_boxed(out),
@@ -223093,6 +227938,7 @@ impl Function {
             Self::messages_toggleSuggestedPostApproval(v) => v.store_boxed(out),
             Self::messages_toggleTodoCompleted(v) => v.store_boxed(out),
             Self::messages_transcribeAudio(v) => v.store_boxed(out),
+            Self::messages_transcribeAudioFile(v) => v.store_boxed(out),
             Self::messages_translateRichMessage(v) => v.store_boxed(out),
             Self::messages_translateText(v) => v.store_boxed(out),
             Self::messages_uninstallStickerSet(v) => v.store_boxed(out),
@@ -223120,7 +227966,10 @@ impl Function {
             Self::payments_craftStarGift(v) => v.store_boxed(out),
             Self::payments_createOnrampSession(v) => v.store_boxed(out),
             Self::payments_createStarGiftCollection(v) => v.store_boxed(out),
+            Self::payments_deleteStarGift(v) => v.store_boxed(out),
             Self::payments_deleteStarGiftCollection(v) => v.store_boxed(out),
+            Self::payments_depositStarGift(v) => v.store_boxed(out),
+            Self::payments_displayStarGift(v) => v.store_boxed(out),
             Self::payments_editConnectedStarRefBot(v) => v.store_boxed(out),
             Self::payments_exportInvoice(v) => v.store_boxed(out),
             Self::payments_fulfillStarsSubscription(v) => v.store_boxed(out),
@@ -223178,6 +228027,7 @@ impl Function {
             Self::payments_updateStarGiftPrice(v) => v.store_boxed(out),
             Self::payments_upgradeStarGift(v) => v.store_boxed(out),
             Self::payments_validateRequestedInfo(v) => v.store_boxed(out),
+            Self::payments_withdrawStarGift(v) => v.store_boxed(out),
             Self::phone_acceptCall(v) => v.store_boxed(out),
             Self::phone_checkGroupCall(v) => v.store_boxed(out),
             Self::phone_confirmCall(v) => v.store_boxed(out),
@@ -223328,6 +228178,7 @@ impl Function {
             Self::wallet_getUserAddresses(v) => v.store_boxed(out),
             Self::wallet_replaceWallet(v) => v.store_boxed(out),
             Self::wallet_sendTransfer(v) => v.store_boxed(out),
+            Self::wallet_setCardStickers(v) => v.store_boxed(out),
             Self::wallet_tonConnectClaimRequest(v) => v.store_boxed(out),
             Self::wallet_tonConnectCloseSession(v) => v.store_boxed(out),
             Self::wallet_tonConnectCreateSession(v) => v.store_boxed(out),
@@ -223638,6 +228489,7 @@ impl Function {
             self::contacts_deleteContacts::ID => Result::Ok(Self::contacts_deleteContacts(self::contacts_deleteContacts::read_bare(r)?)),
             self::contacts_editCloseFriends::ID => Result::Ok(Self::contacts_editCloseFriends(self::contacts_editCloseFriends::read_bare(r)?)),
             self::contacts_exportContactToken::ID => Result::Ok(Self::contacts_exportContactToken(self::contacts_exportContactToken::read_bare(r)?)),
+            self::contacts_exportNoPaidMessagesToken::ID => Result::Ok(Self::contacts_exportNoPaidMessagesToken(self::contacts_exportNoPaidMessagesToken::read_bare(r)?)),
             self::contacts_getBirthdays::ID => Result::Ok(Self::contacts_getBirthdays(self::contacts_getBirthdays::read_bare(r)?)),
             self::contacts_getBlocked::ID => Result::Ok(Self::contacts_getBlocked(self::contacts_getBlocked::read_bare(r)?)),
             self::contacts_getContactIDs::ID => Result::Ok(Self::contacts_getContactIDs(self::contacts_getContactIDs::read_bare(r)?)),
@@ -223649,6 +228501,7 @@ impl Function {
             self::contacts_getTopPeers::ID => Result::Ok(Self::contacts_getTopPeers(self::contacts_getTopPeers::read_bare(r)?)),
             self::contacts_importContactToken::ID => Result::Ok(Self::contacts_importContactToken(self::contacts_importContactToken::read_bare(r)?)),
             self::contacts_importContacts::ID => Result::Ok(Self::contacts_importContacts(self::contacts_importContacts::read_bare(r)?)),
+            self::contacts_importNoPaidMessagesToken::ID => Result::Ok(Self::contacts_importNoPaidMessagesToken(self::contacts_importNoPaidMessagesToken::read_bare(r)?)),
             self::contacts_resetSaved::ID => Result::Ok(Self::contacts_resetSaved(self::contacts_resetSaved::read_bare(r)?)),
             self::contacts_resetTopPeerRating::ID => Result::Ok(Self::contacts_resetTopPeerRating(self::contacts_resetTopPeerRating::read_bare(r)?)),
             self::contacts_resolvePhone::ID => Result::Ok(Self::contacts_resolvePhone(self::contacts_resolvePhone::read_bare(r)?)),
@@ -223756,8 +228609,11 @@ impl Function {
             self::messages_editFactCheck::ID => Result::Ok(Self::messages_editFactCheck(self::messages_editFactCheck::read_bare(r)?)),
             self::messages_editForumTopic::ID => Result::Ok(Self::messages_editForumTopic(self::messages_editForumTopic::read_bare(r)?)),
             self::messages_editInlineBotMessage::ID => Result::Ok(Self::messages_editInlineBotMessage(self::messages_editInlineBotMessage::read_bare(r)?)),
+            self::messages_editInlineBotMessageWidgetData::ID => Result::Ok(Self::messages_editInlineBotMessageWidgetData(self::messages_editInlineBotMessageWidgetData::read_bare(r)?)),
             self::messages_editMessage::ID => Result::Ok(Self::messages_editMessage(self::messages_editMessage::read_bare(r)?)),
+            self::messages_editMessageWidgetData::ID => Result::Ok(Self::messages_editMessageWidgetData(self::messages_editMessageWidgetData::read_bare(r)?)),
             self::messages_editQuickReplyShortcut::ID => Result::Ok(Self::messages_editQuickReplyShortcut(self::messages_editQuickReplyShortcut::read_bare(r)?)),
+            self::messages_editWidgetData::ID => Result::Ok(Self::messages_editWidgetData(self::messages_editWidgetData::read_bare(r)?)),
             self::messages_exportChatInvite::ID => Result::Ok(Self::messages_exportChatInvite(self::messages_exportChatInvite::read_bare(r)?)),
             self::messages_faveSticker::ID => Result::Ok(Self::messages_faveSticker(self::messages_faveSticker::read_bare(r)?)),
             self::messages_forwardMessages::ID => Result::Ok(Self::messages_forwardMessages(self::messages_forwardMessages::read_bare(r)?)),
@@ -223772,6 +228628,7 @@ impl Function {
             self::messages_getAvailableReactions::ID => Result::Ok(Self::messages_getAvailableReactions(self::messages_getAvailableReactions::read_bare(r)?)),
             self::messages_getBotApp::ID => Result::Ok(Self::messages_getBotApp(self::messages_getBotApp::read_bare(r)?)),
             self::messages_getBotCallbackAnswer::ID => Result::Ok(Self::messages_getBotCallbackAnswer(self::messages_getBotCallbackAnswer::read_bare(r)?)),
+            self::messages_getBotWidgetQueryAnswer::ID => Result::Ok(Self::messages_getBotWidgetQueryAnswer(self::messages_getBotWidgetQueryAnswer::read_bare(r)?)),
             self::messages_getChatInviteImporters::ID => Result::Ok(Self::messages_getChatInviteImporters(self::messages_getChatInviteImporters::read_bare(r)?)),
             self::messages_getChats::ID => Result::Ok(Self::messages_getChats(self::messages_getChats::read_bare(r)?)),
             self::messages_getCommonChats::ID => Result::Ok(Self::messages_getCommonChats(self::messages_getCommonChats::read_bare(r)?)),
@@ -223846,17 +228703,20 @@ impl Function {
             self::messages_getSearchCounters::ID => Result::Ok(Self::messages_getSearchCounters(self::messages_getSearchCounters::read_bare(r)?)),
             self::messages_getSearchResultsCalendar::ID => Result::Ok(Self::messages_getSearchResultsCalendar(self::messages_getSearchResultsCalendar::read_bare(r)?)),
             self::messages_getSearchResultsPositions::ID => Result::Ok(Self::messages_getSearchResultsPositions(self::messages_getSearchResultsPositions::read_bare(r)?)),
+            self::messages_getShareThemeBackdrops::ID => Result::Ok(Self::messages_getShareThemeBackdrops(self::messages_getShareThemeBackdrops::read_bare(r)?)),
             self::messages_getSplitRanges::ID => Result::Ok(Self::messages_getSplitRanges(self::messages_getSplitRanges::read_bare(r)?)),
             self::messages_getSponsoredMessages::ID => Result::Ok(Self::messages_getSponsoredMessages(self::messages_getSponsoredMessages::read_bare(r)?)),
             self::messages_getStickerSet::ID => Result::Ok(Self::messages_getStickerSet(self::messages_getStickerSet::read_bare(r)?)),
             self::messages_getStickers::ID => Result::Ok(Self::messages_getStickers(self::messages_getStickers::read_bare(r)?)),
             self::messages_getSuggestedDialogFilters::ID => Result::Ok(Self::messages_getSuggestedDialogFilters(self::messages_getSuggestedDialogFilters::read_bare(r)?)),
             self::messages_getTopReactions::ID => Result::Ok(Self::messages_getTopReactions(self::messages_getTopReactions::read_bare(r)?)),
+            self::messages_getTranscriptionLangs::ID => Result::Ok(Self::messages_getTranscriptionLangs(self::messages_getTranscriptionLangs::read_bare(r)?)),
             self::messages_getUnreadMentions::ID => Result::Ok(Self::messages_getUnreadMentions(self::messages_getUnreadMentions::read_bare(r)?)),
             self::messages_getUnreadPollVotes::ID => Result::Ok(Self::messages_getUnreadPollVotes(self::messages_getUnreadPollVotes::read_bare(r)?)),
             self::messages_getUnreadReactions::ID => Result::Ok(Self::messages_getUnreadReactions(self::messages_getUnreadReactions::read_bare(r)?)),
             self::messages_getWebPage::ID => Result::Ok(Self::messages_getWebPage(self::messages_getWebPage::read_bare(r)?)),
             self::messages_getWebPagePreview::ID => Result::Ok(Self::messages_getWebPagePreview(self::messages_getWebPagePreview::read_bare(r)?)),
+            self::messages_getWidgetPublicData::ID => Result::Ok(Self::messages_getWidgetPublicData(self::messages_getWidgetPublicData::read_bare(r)?)),
             self::messages_hideAllChatJoinRequests::ID => Result::Ok(Self::messages_hideAllChatJoinRequests(self::messages_hideAllChatJoinRequests::read_bare(r)?)),
             self::messages_hideChatJoinRequest::ID => Result::Ok(Self::messages_hideChatJoinRequest(self::messages_hideChatJoinRequest::read_bare(r)?)),
             self::messages_hidePeerSettingsBar::ID => Result::Ok(Self::messages_hidePeerSettingsBar(self::messages_hidePeerSettingsBar::read_bare(r)?)),
@@ -223930,6 +228790,7 @@ impl Function {
             self::messages_setBotGuestChatResult::ID => Result::Ok(Self::messages_setBotGuestChatResult(self::messages_setBotGuestChatResult::read_bare(r)?)),
             self::messages_setBotPrecheckoutResults::ID => Result::Ok(Self::messages_setBotPrecheckoutResults(self::messages_setBotPrecheckoutResults::read_bare(r)?)),
             self::messages_setBotShippingResults::ID => Result::Ok(Self::messages_setBotShippingResults(self::messages_setBotShippingResults::read_bare(r)?)),
+            self::messages_setBotWidgetQueryAnswer::ID => Result::Ok(Self::messages_setBotWidgetQueryAnswer(self::messages_setBotWidgetQueryAnswer::read_bare(r)?)),
             self::messages_setChatAvailableReactions::ID => Result::Ok(Self::messages_setChatAvailableReactions(self::messages_setChatAvailableReactions::read_bare(r)?)),
             self::messages_setChatTheme::ID => Result::Ok(Self::messages_setChatTheme(self::messages_setChatTheme::read_bare(r)?)),
             self::messages_setChatWallPaper::ID => Result::Ok(Self::messages_setChatWallPaper(self::messages_setChatWallPaper::read_bare(r)?)),
@@ -223940,6 +228801,7 @@ impl Function {
             self::messages_setHistoryTTL::ID => Result::Ok(Self::messages_setHistoryTTL(self::messages_setHistoryTTL::read_bare(r)?)),
             self::messages_setInlineBotResults::ID => Result::Ok(Self::messages_setInlineBotResults(self::messages_setInlineBotResults::read_bare(r)?)),
             self::messages_setInlineGameScore::ID => Result::Ok(Self::messages_setInlineGameScore(self::messages_setInlineGameScore::read_bare(r)?)),
+            self::messages_setShareTheme::ID => Result::Ok(Self::messages_setShareTheme(self::messages_setShareTheme::read_bare(r)?)),
             self::messages_setTyping::ID => Result::Ok(Self::messages_setTyping(self::messages_setTyping::read_bare(r)?)),
             self::messages_startBot::ID => Result::Ok(Self::messages_startBot(self::messages_startBot::read_bare(r)?)),
             self::messages_startHistoryImport::ID => Result::Ok(Self::messages_startHistoryImport(self::messages_startHistoryImport::read_bare(r)?)),
@@ -223955,6 +228817,7 @@ impl Function {
             self::messages_toggleSuggestedPostApproval::ID => Result::Ok(Self::messages_toggleSuggestedPostApproval(self::messages_toggleSuggestedPostApproval::read_bare(r)?)),
             self::messages_toggleTodoCompleted::ID => Result::Ok(Self::messages_toggleTodoCompleted(self::messages_toggleTodoCompleted::read_bare(r)?)),
             self::messages_transcribeAudio::ID => Result::Ok(Self::messages_transcribeAudio(self::messages_transcribeAudio::read_bare(r)?)),
+            self::messages_transcribeAudioFile::ID => Result::Ok(Self::messages_transcribeAudioFile(self::messages_transcribeAudioFile::read_bare(r)?)),
             self::messages_translateRichMessage::ID => Result::Ok(Self::messages_translateRichMessage(self::messages_translateRichMessage::read_bare(r)?)),
             self::messages_translateText::ID => Result::Ok(Self::messages_translateText(self::messages_translateText::read_bare(r)?)),
             self::messages_uninstallStickerSet::ID => Result::Ok(Self::messages_uninstallStickerSet(self::messages_uninstallStickerSet::read_bare(r)?)),
@@ -223982,7 +228845,10 @@ impl Function {
             self::payments_craftStarGift::ID => Result::Ok(Self::payments_craftStarGift(self::payments_craftStarGift::read_bare(r)?)),
             self::payments_createOnrampSession::ID => Result::Ok(Self::payments_createOnrampSession(self::payments_createOnrampSession::read_bare(r)?)),
             self::payments_createStarGiftCollection::ID => Result::Ok(Self::payments_createStarGiftCollection(self::payments_createStarGiftCollection::read_bare(r)?)),
+            self::payments_deleteStarGift::ID => Result::Ok(Self::payments_deleteStarGift(self::payments_deleteStarGift::read_bare(r)?)),
             self::payments_deleteStarGiftCollection::ID => Result::Ok(Self::payments_deleteStarGiftCollection(self::payments_deleteStarGiftCollection::read_bare(r)?)),
+            self::payments_depositStarGift::ID => Result::Ok(Self::payments_depositStarGift(self::payments_depositStarGift::read_bare(r)?)),
+            self::payments_displayStarGift::ID => Result::Ok(Self::payments_displayStarGift(self::payments_displayStarGift::read_bare(r)?)),
             self::payments_editConnectedStarRefBot::ID => Result::Ok(Self::payments_editConnectedStarRefBot(self::payments_editConnectedStarRefBot::read_bare(r)?)),
             self::payments_exportInvoice::ID => Result::Ok(Self::payments_exportInvoice(self::payments_exportInvoice::read_bare(r)?)),
             self::payments_fulfillStarsSubscription::ID => Result::Ok(Self::payments_fulfillStarsSubscription(self::payments_fulfillStarsSubscription::read_bare(r)?)),
@@ -224040,6 +228906,7 @@ impl Function {
             self::payments_updateStarGiftPrice::ID => Result::Ok(Self::payments_updateStarGiftPrice(self::payments_updateStarGiftPrice::read_bare(r)?)),
             self::payments_upgradeStarGift::ID => Result::Ok(Self::payments_upgradeStarGift(self::payments_upgradeStarGift::read_bare(r)?)),
             self::payments_validateRequestedInfo::ID => Result::Ok(Self::payments_validateRequestedInfo(self::payments_validateRequestedInfo::read_bare(r)?)),
+            self::payments_withdrawStarGift::ID => Result::Ok(Self::payments_withdrawStarGift(self::payments_withdrawStarGift::read_bare(r)?)),
             self::phone_acceptCall::ID => Result::Ok(Self::phone_acceptCall(self::phone_acceptCall::read_bare(r)?)),
             self::phone_checkGroupCall::ID => Result::Ok(Self::phone_checkGroupCall(self::phone_checkGroupCall::read_bare(r)?)),
             self::phone_confirmCall::ID => Result::Ok(Self::phone_confirmCall(self::phone_confirmCall::read_bare(r)?)),
@@ -224190,6 +229057,7 @@ impl Function {
             self::wallet_getUserAddresses::ID => Result::Ok(Self::wallet_getUserAddresses(self::wallet_getUserAddresses::read_bare(r)?)),
             self::wallet_replaceWallet::ID => Result::Ok(Self::wallet_replaceWallet(self::wallet_replaceWallet::read_bare(r)?)),
             self::wallet_sendTransfer::ID => Result::Ok(Self::wallet_sendTransfer(self::wallet_sendTransfer::read_bare(r)?)),
+            self::wallet_setCardStickers::ID => Result::Ok(Self::wallet_setCardStickers(self::wallet_setCardStickers::read_bare(r)?)),
             self::wallet_tonConnectClaimRequest::ID => Result::Ok(Self::wallet_tonConnectClaimRequest(self::wallet_tonConnectClaimRequest::read_bare(r)?)),
             self::wallet_tonConnectCloseSession::ID => Result::Ok(Self::wallet_tonConnectCloseSession(self::wallet_tonConnectCloseSession::read_bare(r)?)),
             self::wallet_tonConnectCreateSession::ID => Result::Ok(Self::wallet_tonConnectCreateSession(self::wallet_tonConnectCreateSession::read_bare(r)?)),
@@ -224496,6 +229364,7 @@ impl Function {
             Self::contacts_deleteContacts(v) => v.store_debug(s, field_name),
             Self::contacts_editCloseFriends(v) => v.store_debug(s, field_name),
             Self::contacts_exportContactToken(v) => v.store_debug(s, field_name),
+            Self::contacts_exportNoPaidMessagesToken(v) => v.store_debug(s, field_name),
             Self::contacts_getBirthdays(v) => v.store_debug(s, field_name),
             Self::contacts_getBlocked(v) => v.store_debug(s, field_name),
             Self::contacts_getContactIDs(v) => v.store_debug(s, field_name),
@@ -224507,6 +229376,7 @@ impl Function {
             Self::contacts_getTopPeers(v) => v.store_debug(s, field_name),
             Self::contacts_importContactToken(v) => v.store_debug(s, field_name),
             Self::contacts_importContacts(v) => v.store_debug(s, field_name),
+            Self::contacts_importNoPaidMessagesToken(v) => v.store_debug(s, field_name),
             Self::contacts_resetSaved(v) => v.store_debug(s, field_name),
             Self::contacts_resetTopPeerRating(v) => v.store_debug(s, field_name),
             Self::contacts_resolvePhone(v) => v.store_debug(s, field_name),
@@ -224618,8 +229488,11 @@ impl Function {
             Self::messages_editFactCheck(v) => v.store_debug(s, field_name),
             Self::messages_editForumTopic(v) => v.store_debug(s, field_name),
             Self::messages_editInlineBotMessage(v) => v.store_debug(s, field_name),
+            Self::messages_editInlineBotMessageWidgetData(v) => v.store_debug(s, field_name),
             Self::messages_editMessage(v) => v.store_debug(s, field_name),
+            Self::messages_editMessageWidgetData(v) => v.store_debug(s, field_name),
             Self::messages_editQuickReplyShortcut(v) => v.store_debug(s, field_name),
+            Self::messages_editWidgetData(v) => v.store_debug(s, field_name),
             Self::messages_exportChatInvite(v) => v.store_debug(s, field_name),
             Self::messages_faveSticker(v) => v.store_debug(s, field_name),
             Self::messages_forwardMessages(v) => v.store_debug(s, field_name),
@@ -224634,6 +229507,7 @@ impl Function {
             Self::messages_getAvailableReactions(v) => v.store_debug(s, field_name),
             Self::messages_getBotApp(v) => v.store_debug(s, field_name),
             Self::messages_getBotCallbackAnswer(v) => v.store_debug(s, field_name),
+            Self::messages_getBotWidgetQueryAnswer(v) => v.store_debug(s, field_name),
             Self::messages_getChatInviteImporters(v) => v.store_debug(s, field_name),
             Self::messages_getChats(v) => v.store_debug(s, field_name),
             Self::messages_getCommonChats(v) => v.store_debug(s, field_name),
@@ -224708,17 +229582,20 @@ impl Function {
             Self::messages_getSearchCounters(v) => v.store_debug(s, field_name),
             Self::messages_getSearchResultsCalendar(v) => v.store_debug(s, field_name),
             Self::messages_getSearchResultsPositions(v) => v.store_debug(s, field_name),
+            Self::messages_getShareThemeBackdrops(v) => v.store_debug(s, field_name),
             Self::messages_getSplitRanges(v) => v.store_debug(s, field_name),
             Self::messages_getSponsoredMessages(v) => v.store_debug(s, field_name),
             Self::messages_getStickerSet(v) => v.store_debug(s, field_name),
             Self::messages_getStickers(v) => v.store_debug(s, field_name),
             Self::messages_getSuggestedDialogFilters(v) => v.store_debug(s, field_name),
             Self::messages_getTopReactions(v) => v.store_debug(s, field_name),
+            Self::messages_getTranscriptionLangs(v) => v.store_debug(s, field_name),
             Self::messages_getUnreadMentions(v) => v.store_debug(s, field_name),
             Self::messages_getUnreadPollVotes(v) => v.store_debug(s, field_name),
             Self::messages_getUnreadReactions(v) => v.store_debug(s, field_name),
             Self::messages_getWebPage(v) => v.store_debug(s, field_name),
             Self::messages_getWebPagePreview(v) => v.store_debug(s, field_name),
+            Self::messages_getWidgetPublicData(v) => v.store_debug(s, field_name),
             Self::messages_hideAllChatJoinRequests(v) => v.store_debug(s, field_name),
             Self::messages_hideChatJoinRequest(v) => v.store_debug(s, field_name),
             Self::messages_hidePeerSettingsBar(v) => v.store_debug(s, field_name),
@@ -224792,6 +229669,7 @@ impl Function {
             Self::messages_setBotGuestChatResult(v) => v.store_debug(s, field_name),
             Self::messages_setBotPrecheckoutResults(v) => v.store_debug(s, field_name),
             Self::messages_setBotShippingResults(v) => v.store_debug(s, field_name),
+            Self::messages_setBotWidgetQueryAnswer(v) => v.store_debug(s, field_name),
             Self::messages_setChatAvailableReactions(v) => v.store_debug(s, field_name),
             Self::messages_setChatTheme(v) => v.store_debug(s, field_name),
             Self::messages_setChatWallPaper(v) => v.store_debug(s, field_name),
@@ -224802,6 +229680,7 @@ impl Function {
             Self::messages_setHistoryTTL(v) => v.store_debug(s, field_name),
             Self::messages_setInlineBotResults(v) => v.store_debug(s, field_name),
             Self::messages_setInlineGameScore(v) => v.store_debug(s, field_name),
+            Self::messages_setShareTheme(v) => v.store_debug(s, field_name),
             Self::messages_setTyping(v) => v.store_debug(s, field_name),
             Self::messages_startBot(v) => v.store_debug(s, field_name),
             Self::messages_startHistoryImport(v) => v.store_debug(s, field_name),
@@ -224817,6 +229696,7 @@ impl Function {
             Self::messages_toggleSuggestedPostApproval(v) => v.store_debug(s, field_name),
             Self::messages_toggleTodoCompleted(v) => v.store_debug(s, field_name),
             Self::messages_transcribeAudio(v) => v.store_debug(s, field_name),
+            Self::messages_transcribeAudioFile(v) => v.store_debug(s, field_name),
             Self::messages_translateRichMessage(v) => v.store_debug(s, field_name),
             Self::messages_translateText(v) => v.store_debug(s, field_name),
             Self::messages_uninstallStickerSet(v) => v.store_debug(s, field_name),
@@ -224844,7 +229724,10 @@ impl Function {
             Self::payments_craftStarGift(v) => v.store_debug(s, field_name),
             Self::payments_createOnrampSession(v) => v.store_debug(s, field_name),
             Self::payments_createStarGiftCollection(v) => v.store_debug(s, field_name),
+            Self::payments_deleteStarGift(v) => v.store_debug(s, field_name),
             Self::payments_deleteStarGiftCollection(v) => v.store_debug(s, field_name),
+            Self::payments_depositStarGift(v) => v.store_debug(s, field_name),
+            Self::payments_displayStarGift(v) => v.store_debug(s, field_name),
             Self::payments_editConnectedStarRefBot(v) => v.store_debug(s, field_name),
             Self::payments_exportInvoice(v) => v.store_debug(s, field_name),
             Self::payments_fulfillStarsSubscription(v) => v.store_debug(s, field_name),
@@ -224902,6 +229785,7 @@ impl Function {
             Self::payments_updateStarGiftPrice(v) => v.store_debug(s, field_name),
             Self::payments_upgradeStarGift(v) => v.store_debug(s, field_name),
             Self::payments_validateRequestedInfo(v) => v.store_debug(s, field_name),
+            Self::payments_withdrawStarGift(v) => v.store_debug(s, field_name),
             Self::phone_acceptCall(v) => v.store_debug(s, field_name),
             Self::phone_checkGroupCall(v) => v.store_debug(s, field_name),
             Self::phone_confirmCall(v) => v.store_debug(s, field_name),
@@ -225052,6 +229936,7 @@ impl Function {
             Self::wallet_getUserAddresses(v) => v.store_debug(s, field_name),
             Self::wallet_replaceWallet(v) => v.store_debug(s, field_name),
             Self::wallet_sendTransfer(v) => v.store_debug(s, field_name),
+            Self::wallet_setCardStickers(v) => v.store_debug(s, field_name),
             Self::wallet_tonConnectClaimRequest(v) => v.store_debug(s, field_name),
             Self::wallet_tonConnectCloseSession(v) => v.store_debug(s, field_name),
             Self::wallet_tonConnectCreateSession(v) => v.store_debug(s, field_name),
@@ -225079,9 +229964,9 @@ impl Default for Function {
     }
 }
 
-pub const SCHEME_TYPES: usize = 660;
-pub const SCHEME_CTORS: usize = 1715;
-pub const SCHEME_FUNCTIONS: usize = 856;
+pub const SCHEME_TYPES: usize = 673;
+pub const SCHEME_CTORS: usize = 1750;
+pub const SCHEME_FUNCTIONS: usize = 873;
 pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "account.acceptAuthorization",
     "account.cancelPasswordEmail",
@@ -225374,6 +230259,7 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "contacts.deleteContacts",
     "contacts.editCloseFriends",
     "contacts.exportContactToken",
+    "contacts.exportNoPaidMessagesToken",
     "contacts.getBirthdays",
     "contacts.getBlocked",
     "contacts.getContactIDs",
@@ -225385,6 +230271,7 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "contacts.getTopPeers",
     "contacts.importContactToken",
     "contacts.importContacts",
+    "contacts.importNoPaidMessagesToken",
     "contacts.resetSaved",
     "contacts.resetTopPeerRating",
     "contacts.resolvePhone",
@@ -225496,8 +230383,11 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "messages.editFactCheck",
     "messages.editForumTopic",
     "messages.editInlineBotMessage",
+    "messages.editInlineBotMessageWidgetData",
     "messages.editMessage",
+    "messages.editMessageWidgetData",
     "messages.editQuickReplyShortcut",
+    "messages.editWidgetData",
     "messages.exportChatInvite",
     "messages.faveSticker",
     "messages.forwardMessages",
@@ -225512,6 +230402,7 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "messages.getAvailableReactions",
     "messages.getBotApp",
     "messages.getBotCallbackAnswer",
+    "messages.getBotWidgetQueryAnswer",
     "messages.getChatInviteImporters",
     "messages.getChats",
     "messages.getCommonChats",
@@ -225586,17 +230477,20 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "messages.getSearchCounters",
     "messages.getSearchResultsCalendar",
     "messages.getSearchResultsPositions",
+    "messages.getShareThemeBackdrops",
     "messages.getSplitRanges",
     "messages.getSponsoredMessages",
     "messages.getStickerSet",
     "messages.getStickers",
     "messages.getSuggestedDialogFilters",
     "messages.getTopReactions",
+    "messages.getTranscriptionLangs",
     "messages.getUnreadMentions",
     "messages.getUnreadPollVotes",
     "messages.getUnreadReactions",
     "messages.getWebPage",
     "messages.getWebPagePreview",
+    "messages.getWidgetPublicData",
     "messages.hideAllChatJoinRequests",
     "messages.hideChatJoinRequest",
     "messages.hidePeerSettingsBar",
@@ -225670,6 +230564,7 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "messages.setBotGuestChatResult",
     "messages.setBotPrecheckoutResults",
     "messages.setBotShippingResults",
+    "messages.setBotWidgetQueryAnswer",
     "messages.setChatAvailableReactions",
     "messages.setChatTheme",
     "messages.setChatWallPaper",
@@ -225680,6 +230575,7 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "messages.setHistoryTTL",
     "messages.setInlineBotResults",
     "messages.setInlineGameScore",
+    "messages.setShareTheme",
     "messages.setTyping",
     "messages.startBot",
     "messages.startHistoryImport",
@@ -225695,6 +230591,7 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "messages.toggleSuggestedPostApproval",
     "messages.toggleTodoCompleted",
     "messages.transcribeAudio",
+    "messages.transcribeAudioFile",
     "messages.translateRichMessage",
     "messages.translateText",
     "messages.uninstallStickerSet",
@@ -225722,7 +230619,10 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "payments.craftStarGift",
     "payments.createOnrampSession",
     "payments.createStarGiftCollection",
+    "payments.deleteStarGift",
     "payments.deleteStarGiftCollection",
+    "payments.depositStarGift",
+    "payments.displayStarGift",
     "payments.editConnectedStarRefBot",
     "payments.exportInvoice",
     "payments.fulfillStarsSubscription",
@@ -225780,6 +230680,7 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "payments.updateStarGiftPrice",
     "payments.upgradeStarGift",
     "payments.validateRequestedInfo",
+    "payments.withdrawStarGift",
     "phone.acceptCall",
     "phone.checkGroupCall",
     "phone.confirmCall",
@@ -225930,6 +230831,7 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "wallet.getUserAddresses",
     "wallet.replaceWallet",
     "wallet.sendTransfer",
+    "wallet.setCardStickers",
     "wallet.tonConnectClaimRequest",
     "wallet.tonConnectCloseSession",
     "wallet.tonConnectCreateSession",
@@ -225940,8 +230842,8 @@ pub const ALL_FUNCTION_NAMES: &[&str] = &[
     "wallet.tonConnectSubmitConnectResult",
     "wallet.tonConnectSubmitResponse",
 ];
-pub const GENERATED_STRUCTS: usize = 2562;
-pub const GENERATED_ENUMS: usize = 247;
+pub const GENERATED_STRUCTS: usize = 2614;
+pub const GENERATED_ENUMS: usize = 251;
 #[cfg(any(test, feature = "conformance-samples"))]
 #[allow(non_snake_case, dead_code)]
 pub mod samples {
@@ -226394,6 +231296,10 @@ pub mod samples {
         s_ExportedMessageLink(depth)
     }
 
+    pub fn t_ExportedNoPaidMessagesToken(depth: u32) -> ExportedNoPaidMessagesToken {
+        s_ExportedNoPaidMessagesToken(depth)
+    }
+
     pub fn t_ExportedStoryLink(depth: u32) -> ExportedStoryLink {
         s_ExportedStoryLink(depth)
     }
@@ -226738,12 +231644,20 @@ pub mod samples {
         s_InputThemeSettings(depth)
     }
 
+    pub fn t_InputTonConnectOauthSession(depth: u32) -> InputTonConnectOauthSession {
+        s_InputTonConnectOauthSession(depth)
+    }
+
     pub fn t_InputUser(depth: u32) -> InputUser {
         InputUser::inputUserEmpty(s_inputUserEmpty(depth))
     }
 
     pub fn t_InputWallPaper(depth: u32) -> InputWallPaper {
         InputWallPaper::inputWallPaper(s_inputWallPaper(depth))
+    }
+
+    pub fn t_InputWalletCardSticker(depth: u32) -> InputWalletCardSticker {
+        s_InputWalletCardSticker(depth)
     }
 
     pub fn t_InputWalletReplacement(depth: u32) -> InputWalletReplacement {
@@ -227322,6 +232236,18 @@ pub mod samples {
         SendMessageAction::sendMessageTypingAction(s_sendMessageTypingAction(depth))
     }
 
+    pub fn t_ShareTheme(depth: u32) -> ShareTheme {
+        ShareTheme::shareThemeDefault(s_shareThemeDefault(depth))
+    }
+
+    pub fn t_ShareThemeBackdropOption(depth: u32) -> ShareThemeBackdropOption {
+        s_ShareThemeBackdropOption(depth)
+    }
+
+    pub fn t_ShareThemeBackdrops(depth: u32) -> ShareThemeBackdrops {
+        ShareThemeBackdrops::shareThemeBackdropsNotModified(s_shareThemeBackdropsNotModified(depth))
+    }
+
     pub fn t_ShippingOption(depth: u32) -> ShippingOption {
         s_ShippingOption(depth)
     }
@@ -227610,6 +232536,10 @@ pub mod samples {
         UserStatus::userStatusEmpty(s_userStatusEmpty(depth))
     }
 
+    pub fn t_UserWallet(depth: u32) -> UserWallet {
+        s_UserWallet(depth)
+    }
+
     pub fn t_Username(depth: u32) -> Username {
         s_Username(depth)
     }
@@ -227680,6 +232610,10 @@ pub mod samples {
 
     pub fn t_WebViewResult(depth: u32) -> WebViewResult {
         s_WebViewResult(depth)
+    }
+
+    pub fn t_WidgetQueryType(depth: u32) -> WidgetQueryType {
+        WidgetQueryType::widgetQueryTypeData(s_widgetQueryTypeData(depth))
     }
 
     pub fn t_account_AuthorizationForm(depth: u32) -> account_AuthorizationForm {
@@ -228078,6 +233012,10 @@ pub mod samples {
         s_messages_BotResults(depth)
     }
 
+    pub fn t_messages_BotWidgetQueryAnswer(depth: u32) -> messages_BotWidgetQueryAnswer {
+        s_messages_BotWidgetQueryAnswer(depth)
+    }
+
     pub fn t_messages_ChatAdminsWithInvites(depth: u32) -> messages_ChatAdminsWithInvites {
         s_messages_ChatAdminsWithInvites(depth)
     }
@@ -228298,6 +233236,10 @@ pub mod samples {
         s_messages_WebPagePreview(depth)
     }
 
+    pub fn t_messages_WidgetPublicData(depth: u32) -> messages_WidgetPublicData {
+        messages_WidgetPublicData::messages_widgetPublicDataNotModified(s_messages_widgetPublicDataNotModified(depth))
+    }
+
     pub fn t_payments_BankCardData(depth: u32) -> payments_BankCardData {
         s_payments_BankCardData(depth)
     }
@@ -228364,6 +233306,10 @@ pub mod samples {
 
     pub fn t_payments_StarGiftCollections(depth: u32) -> payments_StarGiftCollections {
         payments_StarGiftCollections::payments_starGiftCollectionsNotModified(s_payments_starGiftCollectionsNotModified(depth))
+    }
+
+    pub fn t_payments_StarGiftDepositPayload(depth: u32) -> payments_StarGiftDepositPayload {
+        s_payments_StarGiftDepositPayload(depth)
     }
 
     pub fn t_payments_StarGiftUpgradeAttributes(depth: u32) -> payments_StarGiftUpgradeAttributes {
@@ -228584,6 +233530,14 @@ pub mod samples {
 
     pub fn t_users_Users(depth: u32) -> users_Users {
         users_Users::users_users(s_users_users(depth))
+    }
+
+    pub fn t_wallet_Card(depth: u32) -> wallet_Card {
+        s_wallet_Card(depth)
+    }
+
+    pub fn t_wallet_CardSticker(depth: u32) -> wallet_CardSticker {
+        s_wallet_CardSticker(depth)
     }
 
     pub fn t_wallet_EncryptedSecretPhrasePart(depth: u32) -> wallet_EncryptedSecretPhrasePart {
@@ -229152,6 +234106,24 @@ pub mod samples {
             flags: 4i32,
             reply_markup: Some(t_ReplyMarkup((depth).saturating_sub(1))),
             rich_message: Some(t_RichMessage((depth).saturating_sub(1))),
+        }
+    }
+
+    pub fn s_botInlineMessageWidget(depth: u32) -> botInlineMessageWidget {
+        let _ = depth;
+        botInlineMessageWidget {
+            flags: 63i32,
+            invert_media: true,
+            width: 0x1234_5678i32,
+            height: 0x1234_5678i32,
+            payload: b"tl\x00\x01".to_vec(),
+            public_data: "tl-sample".to_owned(),
+            public_data_hash: 0x1234_5678_9abc_def0i64,
+            chat_data: "tl-sample".to_owned(),
+            reply_markup: Some(t_ReplyMarkup((depth).saturating_sub(1))),
+            widget_id: 0x1234_5678_9abc_def0i64,
+            message: "tl-sample".to_owned(),
+            entities: if depth == 0 { Vec::new() } else { vec![t_MessageEntity((depth - 1).saturating_sub(1))] },
         }
     }
 
@@ -230078,6 +235050,8 @@ pub mod samples {
             broadcast_messages_allowed: true,
             monoforum: true,
             forum_tabs: true,
+            in_news: true,
+            forum_sidebar: true,
             id: 0x1234_5678_9abc_def0i64,
             access_hash: 0x1234_5678_9abc_def0i64,
             title: "tl-sample".to_owned(),
@@ -230100,6 +235074,7 @@ pub mod samples {
             send_paid_messages_stars: 0x1234_5678_9abc_def0i64,
             linked_monoforum_id: 0x1234_5678_9abc_def0i64,
             linked_community_id: 0x1234_5678_9abc_def0i64,
+            pinned_msg_id: 0x1234_5678i32,
         }
     }
 
@@ -230313,6 +235288,7 @@ pub mod samples {
             send_paid_messages_stars: 0x1234_5678_9abc_def0i64,
             main_tab: Some(t_ProfileTab((depth).saturating_sub(1))),
             guard_bot_id: 0x1234_5678_9abc_def0i64,
+            share_theme: Some(t_ShareTheme((depth).saturating_sub(1))),
         }
     }
 
@@ -230530,12 +235506,13 @@ pub mod samples {
     pub fn s_Config(depth: u32) -> Config {
         let _ = depth;
         Config {
-            flags: 122845i32,
+            flags: 253917i32,
             default_p2p_contacts: true,
             preload_featured_stickers: true,
             revoke_pm_inbox: true,
             blocked_mode: true,
             force_try_ipv6: true,
+            fpnv_allowed: true,
             date: 0x1234_5678i32,
             expires: 0x1234_5678i32,
             test_mode: true,
@@ -231262,6 +236239,16 @@ pub mod samples {
         }
     }
 
+    pub fn s_ExportedNoPaidMessagesToken(depth: u32) -> ExportedNoPaidMessagesToken {
+        let _ = depth;
+        ExportedNoPaidMessagesToken {
+            flags: 1i32,
+            token: "tl-sample".to_owned(),
+            url: "tl-sample".to_owned(),
+            expires: 0x1234_5678i32,
+        }
+    }
+
     pub fn s_ExportedStoryLink(depth: u32) -> ExportedStoryLink {
         let _ = depth;
         ExportedStoryLink {
@@ -231844,6 +236831,37 @@ pub mod samples {
             flags: 4i32,
             reply_markup: Some(t_ReplyMarkup((depth).saturating_sub(1))),
             rich_message: Some(t_InputRichMessage((depth).saturating_sub(1))),
+        }
+    }
+
+    pub fn s_inputBotInlineMessageWidget(depth: u32) -> inputBotInlineMessageWidget {
+        let _ = depth;
+        inputBotInlineMessageWidget {
+            flags: 127i32,
+            allow_queries: true,
+            shared_widget: true,
+            invert_media: true,
+            width: 0x1234_5678i32,
+            height: 0x1234_5678i32,
+            html: "tl-sample".to_owned(),
+            public_data: "tl-sample".to_owned(),
+            chat_data: "tl-sample".to_owned(),
+            reply_markup: Some(t_ReplyMarkup((depth).saturating_sub(1))),
+            message: "tl-sample".to_owned(),
+            entities: if depth == 0 { Vec::new() } else { vec![t_MessageEntity((depth - 1).saturating_sub(1))] },
+        }
+    }
+
+    pub fn s_inputBotInlineMessageWidgetId(depth: u32) -> inputBotInlineMessageWidgetId {
+        let _ = depth;
+        inputBotInlineMessageWidgetId {
+            flags: 15i32,
+            invert_media: true,
+            widget_id: 0x1234_5678_9abc_def0i64,
+            chat_data: "tl-sample".to_owned(),
+            reply_markup: Some(t_ReplyMarkup((depth).saturating_sub(1))),
+            message: "tl-sample".to_owned(),
+            entities: if depth == 0 { Vec::new() } else { vec![t_MessageEntity((depth - 1).saturating_sub(1))] },
         }
     }
 
@@ -232717,6 +237735,29 @@ pub mod samples {
         }
     }
 
+    pub fn s_inputMediaWidget(depth: u32) -> inputMediaWidget {
+        let _ = depth;
+        inputMediaWidget {
+            flags: 15i32,
+            allow_queries: true,
+            shared_widget: true,
+            width: 0x1234_5678i32,
+            height: 0x1234_5678i32,
+            html: "tl-sample".to_owned(),
+            public_data: "tl-sample".to_owned(),
+            chat_data: "tl-sample".to_owned(),
+        }
+    }
+
+    pub fn s_inputMediaWidgetId(depth: u32) -> inputMediaWidgetId {
+        let _ = depth;
+        inputMediaWidgetId {
+            flags: 1i32,
+            widget_id: 0x1234_5678_9abc_def0i64,
+            chat_data: "tl-sample".to_owned(),
+        }
+    }
+
     pub fn s_inputMessageID(depth: u32) -> inputMessageID {
         let _ = depth;
         inputMessageID {
@@ -233093,7 +238134,7 @@ pub mod samples {
     pub fn s_inputReplyToMessage(depth: u32) -> inputReplyToMessage {
         let _ = depth;
         inputReplyToMessage {
-            flags: 255i32,
+            flags: 511i32,
             reply_to_msg_id: 0x1234_5678i32,
             top_msg_id: 0x1234_5678i32,
             reply_to_peer_id: Some(Box::new(t_InputPeer((depth).saturating_sub(1)))),
@@ -233103,6 +238144,7 @@ pub mod samples {
             monoforum_peer_id: Some(Box::new(t_InputPeer((depth).saturating_sub(1)))),
             todo_item_id: 0x1234_5678i32,
             poll_option: b"tl\x00\x01".to_vec(),
+            quote_rich: if depth == 0 { Vec::new() } else { vec![Box::new(t_RichText((depth - 1).saturating_sub(1)))] },
         }
     }
 
@@ -233490,6 +238532,16 @@ pub mod samples {
         }
     }
 
+    pub fn s_InputTonConnectOauthSession(depth: u32) -> InputTonConnectOauthSession {
+        let _ = depth;
+        InputTonConnectOauthSession {
+            session_id: 0x1234_5678_9abc_def0i64,
+            challenge_answer: b"tl\x00\x01".to_vec(),
+            body: b"tl\x00\x01".to_vec(),
+            proof: Some(t_WalletOwnershipProof((depth).saturating_sub(1))),
+        }
+    }
+
     pub fn s_inputUserEmpty(depth: u32) -> inputUserEmpty {
         let _ = depth;
         inputUserEmpty
@@ -233536,6 +238588,14 @@ pub mod samples {
         let _ = depth;
         inputWallPaperNoFile {
             id: 0x1234_5678_9abc_def0i64,
+        }
+    }
+
+    pub fn s_InputWalletCardSticker(depth: u32) -> InputWalletCardSticker {
+        let _ = depth;
+        InputWalletCardSticker {
+            coordinates: Some(t_MediaAreaCoordinates((depth).saturating_sub(1))),
+            nft_address: "tl-sample".to_owned(),
         }
     }
 
@@ -234674,6 +239734,11 @@ pub mod samples {
         }
     }
 
+    pub fn s_messageActionNoPaidMessagesTokenUsed(depth: u32) -> messageActionNoPaidMessagesTokenUsed {
+        let _ = depth;
+        messageActionNoPaidMessagesTokenUsed
+    }
+
     pub fn s_messageEntityUnknown(depth: u32) -> messageEntityUnknown {
         let _ = depth;
         messageEntityUnknown {
@@ -235144,6 +240209,23 @@ pub mod samples {
         }
     }
 
+    pub fn s_messageMediaWidget(depth: u32) -> messageMediaWidget {
+        let _ = depth;
+        messageMediaWidget {
+            flags: 63i32,
+            is_copy: true,
+            can_query: true,
+            background_query: true,
+            width: 0x1234_5678i32,
+            height: 0x1234_5678i32,
+            payload: b"tl\x00\x01".to_vec(),
+            public_data: "tl-sample".to_owned(),
+            public_data_hash: 0x1234_5678_9abc_def0i64,
+            chat_data: "tl-sample".to_owned(),
+            widget_id: 0x1234_5678_9abc_def0i64,
+        }
+    }
+
     pub fn s_MessagePeerReaction(depth: u32) -> MessagePeerReaction {
         let _ = depth;
         MessagePeerReaction {
@@ -235233,7 +240315,7 @@ pub mod samples {
     pub fn s_messageReplyHeader(depth: u32) -> messageReplyHeader {
         let _ = depth;
         messageReplyHeader {
-            flags: 16383i32,
+            flags: 32767i32,
             reply_to_scheduled: true,
             forum_topic: true,
             quote: true,
@@ -235248,6 +240330,7 @@ pub mod samples {
             quote_offset: 0x1234_5678i32,
             todo_item_id: 0x1234_5678i32,
             poll_option: b"tl\x00\x01".to_vec(),
+            quote_rich: if depth == 0 { Vec::new() } else { vec![Box::new(t_RichText((depth - 1).saturating_sub(1)))] },
         }
     }
 
@@ -237946,6 +243029,59 @@ pub mod samples {
         }
     }
 
+    pub fn s_shareThemeDefault(depth: u32) -> shareThemeDefault {
+        let _ = depth;
+        shareThemeDefault
+    }
+
+    pub fn s_shareThemeEmojiBackdrop(depth: u32) -> shareThemeEmojiBackdrop {
+        let _ = depth;
+        shareThemeEmojiBackdrop {
+            flags: 3i32,
+            backdrop_id: 0x1234_5678i32,
+            emojis: if depth == 0 { Vec::new() } else { vec![t_Reaction((depth - 1).saturating_sub(1))] },
+        }
+    }
+
+    pub fn s_shareThemeGift(depth: u32) -> shareThemeGift {
+        let _ = depth;
+        shareThemeGift {
+            stargift: Some(t_StarGift((depth).saturating_sub(1))),
+        }
+    }
+
+    pub fn s_inputShareThemeGift(depth: u32) -> inputShareThemeGift {
+        let _ = depth;
+        inputShareThemeGift {
+            stargift: Some(t_InputSavedStarGift((depth).saturating_sub(1))),
+        }
+    }
+
+    pub fn s_ShareThemeBackdropOption(depth: u32) -> ShareThemeBackdropOption {
+        let _ = depth;
+        ShareThemeBackdropOption {
+            backdrop_id: 0x1234_5678i32,
+            name: "tl-sample".to_owned(),
+            center_color: 0x1234_5678i32,
+            edge_color: 0x1234_5678i32,
+            pattern_color: 0x1234_5678i32,
+            text_color: 0x1234_5678i32,
+        }
+    }
+
+    pub fn s_shareThemeBackdropsNotModified(depth: u32) -> shareThemeBackdropsNotModified {
+        let _ = depth;
+        shareThemeBackdropsNotModified
+    }
+
+    pub fn s_shareThemeBackdrops(depth: u32) -> shareThemeBackdrops {
+        let _ = depth;
+        shareThemeBackdrops {
+            hash: 0x1234_5678i32,
+            backdrops: if depth == 0 { Vec::new() } else { vec![t_ShareThemeBackdropOption((depth - 1).saturating_sub(1))] },
+        }
+    }
+
     pub fn s_ShippingOption(depth: u32) -> ShippingOption {
         let _ = depth;
         ShippingOption {
@@ -240522,6 +245658,89 @@ pub mod samples {
         }
     }
 
+    pub fn s_updateEditForumTopic(depth: u32) -> updateEditForumTopic {
+        let _ = depth;
+        updateEditForumTopic {
+            flags: 15i32,
+            peer: Some(t_Peer((depth).saturating_sub(1))),
+            topic_id: 0x1234_5678i32,
+            title: "tl-sample".to_owned(),
+            icon_emoji_id: 0x1234_5678_9abc_def0i64,
+            closed: true,
+            hidden: true,
+        }
+    }
+
+    pub fn s_updateBotWidgetQuery(depth: u32) -> updateBotWidgetQuery {
+        let _ = depth;
+        updateBotWidgetQuery {
+            flags: 3i32,
+            query_id: 0x1234_5678_9abc_def0i64,
+            query_type: Some(t_WidgetQueryType((depth).saturating_sub(1))),
+            user_id: 0x1234_5678_9abc_def0i64,
+            peer: Some(t_Peer((depth).saturating_sub(1))),
+            msg_id: 0x1234_5678i32,
+            chat_instance: 0x1234_5678_9abc_def0i64,
+            chat_type: "tl-sample".to_owned(),
+            data: b"tl\x00\x01".to_vec(),
+            widget_id: 0x1234_5678_9abc_def0i64,
+            wallet_card: Some(t_wallet_Card((depth).saturating_sub(1))),
+        }
+    }
+
+    pub fn s_updateInlineBotWidgetQuery(depth: u32) -> updateInlineBotWidgetQuery {
+        let _ = depth;
+        updateInlineBotWidgetQuery {
+            flags: 3i32,
+            query_id: 0x1234_5678_9abc_def0i64,
+            query_type: Some(t_WidgetQueryType((depth).saturating_sub(1))),
+            user_id: 0x1234_5678_9abc_def0i64,
+            inline_message_id: Some(t_InputBotInlineMessageID((depth).saturating_sub(1))),
+            chat_instance: 0x1234_5678_9abc_def0i64,
+            chat_type: "tl-sample".to_owned(),
+            data: b"tl\x00\x01".to_vec(),
+            widget_id: 0x1234_5678_9abc_def0i64,
+            wallet_card: Some(t_wallet_Card((depth).saturating_sub(1))),
+        }
+    }
+
+    pub fn s_updateBotWidgetCopyQuery(depth: u32) -> updateBotWidgetCopyQuery {
+        let _ = depth;
+        updateBotWidgetCopyQuery {
+            flags: 2i32,
+            query_id: 0x1234_5678_9abc_def0i64,
+            query_type: Some(t_WidgetQueryType((depth).saturating_sub(1))),
+            user_id: 0x1234_5678_9abc_def0i64,
+            data: b"tl\x00\x01".to_vec(),
+            widget_id: 0x1234_5678_9abc_def0i64,
+            wallet_card: Some(t_wallet_Card((depth).saturating_sub(1))),
+        }
+    }
+
+    pub fn s_updateMessageWidgetData(depth: u32) -> updateMessageWidgetData {
+        let _ = depth;
+        updateMessageWidgetData {
+            flags: 3i32,
+            peer: Some(t_Peer((depth).saturating_sub(1))),
+            msg_id: 0x1234_5678i32,
+            public_data: "tl-sample".to_owned(),
+            public_data_hash: 0x1234_5678_9abc_def0i64,
+            chat_data: "tl-sample".to_owned(),
+            pts: 0x1234_5678i32,
+            pts_count: 0x1234_5678i32,
+        }
+    }
+
+    pub fn s_updateTranscribedAudioFile(depth: u32) -> updateTranscribedAudioFile {
+        let _ = depth;
+        updateTranscribedAudioFile {
+            flags: 1i32,
+            pending: true,
+            transcription_id: 0x1234_5678_9abc_def0i64,
+            text: "tl-sample".to_owned(),
+        }
+    }
+
     pub fn s_updatesTooLong(depth: u32) -> updatesTooLong {
         let _ = depth;
         updatesTooLong
@@ -240621,11 +245840,12 @@ pub mod samples {
     pub fn s_urlAuthResultRequest(depth: u32) -> urlAuthResultRequest {
         let _ = depth;
         urlAuthResultRequest {
-            flags: 255i32,
+            flags: 2047i32,
             request_write_access: true,
             request_phone_number: true,
             match_codes_first: true,
             is_app: true,
+            request_wallet: true,
             bot: Some(t_User((depth).saturating_sub(1))),
             domain: "tl-sample".to_owned(),
             browser: "tl-sample".to_owned(),
@@ -240635,6 +245855,8 @@ pub mod samples {
             match_codes: if depth == 0 { Vec::new() } else { vec!["tl-sample".to_owned()] },
             user_id_hint: 0x1234_5678_9abc_def0i64,
             verified_app_name: "tl-sample".to_owned(),
+            tc_session_id: 0x1234_5678_9abc_def0i64,
+            tc_client_id: "tl-sample".to_owned(),
         }
     }
 
@@ -240693,6 +245915,7 @@ pub mod samples {
             bot_can_manage_bots: true,
             bot_guestchat: true,
             bot_guard: true,
+            bot_forum_sidebar: true,
             id: 0x1234_5678_9abc_def0i64,
             access_hash: 0x1234_5678_9abc_def0i64,
             first_name: "tl-sample".to_owned(),
@@ -240720,7 +245943,7 @@ pub mod samples {
     pub fn s_UserFull(depth: u32) -> UserFull {
         let _ = depth;
         UserFull {
-            flags: 2146959359i32,
+            flags: 2147483647i32,
             blocked: true,
             phone_calls_available: true,
             phone_calls_private: true,
@@ -240734,7 +245957,7 @@ pub mod samples {
             wallpaper_overridden: true,
             contact_require_premium: true,
             read_dates_private: true,
-            flags2: 2146959359i32,
+            flags2: 2147483647i32,
             sponsored_enabled: true,
             can_view_revenue: true,
             bot_can_manage_emoji_status: true,
@@ -240780,6 +246003,8 @@ pub mod samples {
             saved_music: Some(t_Document((depth).saturating_sub(1))),
             note: Some(t_TextWithEntities((depth).saturating_sub(1))),
             bot_manager_id: 0x1234_5678_9abc_def0i64,
+            wallet_card: Some(t_wallet_Card((depth).saturating_sub(1))),
+            share_theme: Some(t_ShareTheme((depth).saturating_sub(1))),
         }
     }
 
@@ -240840,6 +246065,17 @@ pub mod samples {
         userStatusLastMonth {
             flags: 1i32,
             by_me: true,
+        }
+    }
+
+    pub fn s_UserWallet(depth: u32) -> UserWallet {
+        let _ = depth;
+        UserWallet {
+            flags: 1i32,
+            address: "tl-sample".to_owned(),
+            balance: 0x1234_5678_9abc_def0i64,
+            public_key: b"tl\x00\x01".to_vec(),
+            state_init: b"tl\x00\x01".to_vec(),
         }
     }
 
@@ -241008,6 +246244,24 @@ pub mod samples {
     pub fn s_walletTransactionPeerUnsupported(depth: u32) -> walletTransactionPeerUnsupported {
         let _ = depth;
         walletTransactionPeerUnsupported
+    }
+
+    pub fn s_walletTransactionPeerChannel(depth: u32) -> walletTransactionPeerChannel {
+        let _ = depth;
+        walletTransactionPeerChannel {
+            flags: 1i32,
+            channel_id: 0x1234_5678_9abc_def0i64,
+            address: "tl-sample".to_owned(),
+            domain: "tl-sample".to_owned(),
+        }
+    }
+
+    pub fn s_walletTransactionPeerTelegramGift(depth: u32) -> walletTransactionPeerTelegramGift {
+        let _ = depth;
+        walletTransactionPeerTelegramGift {
+            flags: 1i32,
+            own_profile: true,
+        }
     }
 
     pub fn s_WalletUserAddress(depth: u32) -> WalletUserAddress {
@@ -241196,6 +246450,30 @@ pub mod samples {
             same_origin: true,
             query_id: 0x1234_5678_9abc_def0i64,
             url: "tl-sample".to_owned(),
+        }
+    }
+
+    pub fn s_widgetQueryTypeData(depth: u32) -> widgetQueryTypeData {
+        let _ = depth;
+        widgetQueryTypeData {
+            flags: 1i32,
+            with_wallet: true,
+        }
+    }
+
+    pub fn s_widgetQueryTypeSignData(depth: u32) -> widgetQueryTypeSignData {
+        let _ = depth;
+        widgetQueryTypeSignData {
+            wallet: Some(t_UserWallet((depth).saturating_sub(1))),
+            sign_data: Some(t_DataJSON((depth).saturating_sub(1))),
+        }
+    }
+
+    pub fn s_widgetQueryTypeSentTransaction(depth: u32) -> widgetQueryTypeSentTransaction {
+        let _ = depth;
+        widgetQueryTypeSentTransaction {
+            wallet: Some(t_UserWallet((depth).saturating_sub(1))),
+            msg_hash: "tl-sample".to_owned(),
         }
     }
 
@@ -242470,6 +247748,14 @@ pub mod samples {
         }
     }
 
+    pub fn s_messages_BotWidgetQueryAnswer(depth: u32) -> messages_BotWidgetQueryAnswer {
+        let _ = depth;
+        messages_BotWidgetQueryAnswer {
+            flags: 1i32,
+            result: "tl-sample".to_owned(),
+        }
+    }
+
     pub fn s_messages_ChatAdminsWithInvites(depth: u32) -> messages_ChatAdminsWithInvites {
         let _ = depth;
         messages_ChatAdminsWithInvites {
@@ -243179,6 +248465,22 @@ pub mod samples {
         }
     }
 
+    pub fn s_messages_widgetPublicDataNotModified(depth: u32) -> messages_widgetPublicDataNotModified {
+        let _ = depth;
+        messages_widgetPublicDataNotModified {
+            period: 0x1234_5678i32,
+        }
+    }
+
+    pub fn s_messages_widgetPublicData(depth: u32) -> messages_widgetPublicData {
+        let _ = depth;
+        messages_widgetPublicData {
+            hash: 0x1234_5678_9abc_def0i64,
+            data: "tl-sample".to_owned(),
+            period: 0x1234_5678i32,
+        }
+    }
+
     pub fn s_payments_BankCardData(depth: u32) -> payments_BankCardData {
         let _ = depth;
         payments_BankCardData {
@@ -243444,6 +248746,15 @@ pub mod samples {
         let _ = depth;
         payments_starGiftCollections {
             collections: if depth == 0 { Vec::new() } else { vec![t_StarGiftCollection((depth - 1).saturating_sub(1))] },
+        }
+    }
+
+    pub fn s_payments_StarGiftDepositPayload(depth: u32) -> payments_StarGiftDepositPayload {
+        let _ = depth;
+        payments_StarGiftDepositPayload {
+            nft_address: "tl-sample".to_owned(),
+            payload: b"tl\x00\x01".to_vec(),
+            amount: 0x1234_5678_9abc_def0i64,
         }
     }
 
@@ -244172,6 +249483,25 @@ pub mod samples {
         }
     }
 
+    pub fn s_wallet_Card(depth: u32) -> wallet_Card {
+        let _ = depth;
+        wallet_Card {
+            flags: 3i32,
+            stickers: if depth == 0 { Vec::new() } else { vec![t_wallet_CardSticker((depth - 1).saturating_sub(1))] },
+            bg_nft_item: Some(t_wallet_NftItem((depth).saturating_sub(1))),
+            address: "tl-sample".to_owned(),
+            balance: 0x1234_5678_9abc_def0i64,
+        }
+    }
+
+    pub fn s_wallet_CardSticker(depth: u32) -> wallet_CardSticker {
+        let _ = depth;
+        wallet_CardSticker {
+            coordinates: Some(t_MediaAreaCoordinates((depth).saturating_sub(1))),
+            nft: Some(t_wallet_NftItem((depth).saturating_sub(1))),
+        }
+    }
+
     pub fn s_wallet_EncryptedSecretPhrasePart(depth: u32) -> wallet_EncryptedSecretPhrasePart {
         let _ = depth;
         wallet_EncryptedSecretPhrasePart {
@@ -244207,7 +249537,7 @@ pub mod samples {
     pub fn s_wallet_NftItem(depth: u32) -> wallet_NftItem {
         let _ = depth;
         wallet_NftItem {
-            flags: 511i32,
+            flags: 1023i32,
             collection_address: "tl-sample".to_owned(),
             address: "tl-sample".to_owned(),
             owner_address: "tl-sample".to_owned(),
@@ -244220,6 +249550,7 @@ pub mod samples {
             lottie: Some(t_WebDocument((depth).saturating_sub(1))),
             attributes: if depth == 0 { Vec::new() } else { vec![t_wallet_NftAttribute((depth - 1).saturating_sub(1))] },
             extra: Some(t_DataJSON((depth).saturating_sub(1))),
+            gift: Some(t_StarGift((depth).saturating_sub(1))),
         }
     }
 
@@ -246302,6 +251633,7 @@ pub mod samples {
             channel: Some(t_InputChannel((depth).saturating_sub(1))),
             enabled: true,
             tabs: true,
+            sidebar: true,
         }
     }
 
@@ -246648,6 +251980,15 @@ pub mod samples {
         contacts_exportContactToken
     }
 
+    pub fn s_contacts_exportNoPaidMessagesToken(depth: u32) -> contacts_exportNoPaidMessagesToken {
+        let _ = depth;
+        contacts_exportNoPaidMessagesToken {
+            flags: 3i32,
+            revoke: true,
+            temporary: true,
+        }
+    }
+
     pub fn s_contacts_getBirthdays(depth: u32) -> contacts_getBirthdays {
         let _ = depth;
         contacts_getBirthdays
@@ -246735,6 +252076,14 @@ pub mod samples {
         let _ = depth;
         contacts_importContacts {
             contacts: if depth == 0 { Vec::new() } else { vec![t_InputContact((depth - 1).saturating_sub(1))] },
+        }
+    }
+
+    pub fn s_contacts_importNoPaidMessagesToken(depth: u32) -> contacts_importNoPaidMessagesToken {
+        let _ = depth;
+        contacts_importNoPaidMessagesToken {
+            user_id: Some(t_InputUser((depth).saturating_sub(1))),
+            token: "tl-sample".to_owned(),
         }
     }
 
@@ -247260,7 +252609,7 @@ pub mod samples {
     pub fn s_messages_acceptUrlAuth(depth: u32) -> messages_acceptUrlAuth {
         let _ = depth;
         messages_acceptUrlAuth {
-            flags: 31i32,
+            flags: 63i32,
             write_allowed: true,
             share_phone_number: true,
             peer: Some(Box::new(t_InputPeer((depth).saturating_sub(1)))),
@@ -247268,6 +252617,7 @@ pub mod samples {
             button_id: 0x1234_5678i32,
             url: "tl-sample".to_owned(),
             match_code: "tl-sample".to_owned(),
+            tonconnect_session: Some(t_InputTonConnectOauthSession((depth).saturating_sub(1))),
         }
     }
 
@@ -247676,6 +253026,16 @@ pub mod samples {
         }
     }
 
+    pub fn s_messages_editInlineBotMessageWidgetData(depth: u32) -> messages_editInlineBotMessageWidgetData {
+        let _ = depth;
+        messages_editInlineBotMessageWidgetData {
+            flags: 3i32,
+            id: Some(t_InputBotInlineMessageID((depth).saturating_sub(1))),
+            public_data: "tl-sample".to_owned(),
+            chat_data: "tl-sample".to_owned(),
+        }
+    }
+
     pub fn s_messages_editMessage(depth: u32) -> messages_editMessage {
         let _ = depth;
         messages_editMessage {
@@ -247695,11 +253055,32 @@ pub mod samples {
         }
     }
 
+    pub fn s_messages_editMessageWidgetData(depth: u32) -> messages_editMessageWidgetData {
+        let _ = depth;
+        messages_editMessageWidgetData {
+            flags: 3i32,
+            peer: Some(Box::new(t_InputPeer((depth).saturating_sub(1)))),
+            id: 0x1234_5678i32,
+            public_data: "tl-sample".to_owned(),
+            chat_data: "tl-sample".to_owned(),
+        }
+    }
+
     pub fn s_messages_editQuickReplyShortcut(depth: u32) -> messages_editQuickReplyShortcut {
         let _ = depth;
         messages_editQuickReplyShortcut {
             shortcut_id: 0x1234_5678i32,
             shortcut: "tl-sample".to_owned(),
+        }
+    }
+
+    pub fn s_messages_editWidgetData(depth: u32) -> messages_editWidgetData {
+        let _ = depth;
+        messages_editWidgetData {
+            flags: 1i32,
+            widget_id: 0x1234_5678_9abc_def0i64,
+            public_data: "tl-sample".to_owned(),
+            cache_time: 0x1234_5678i32,
         }
     }
 
@@ -247836,6 +253217,16 @@ pub mod samples {
             msg_id: 0x1234_5678i32,
             data: b"tl\x00\x01".to_vec(),
             password: Some(t_InputCheckPasswordSRP((depth).saturating_sub(1))),
+        }
+    }
+
+    pub fn s_messages_getBotWidgetQueryAnswer(depth: u32) -> messages_getBotWidgetQueryAnswer {
+        let _ = depth;
+        messages_getBotWidgetQueryAnswer {
+            peer: Some(Box::new(t_InputPeer((depth).saturating_sub(1)))),
+            msg_id: 0x1234_5678i32,
+            query_type: Some(t_WidgetQueryType((depth).saturating_sub(1))),
+            data: b"tl\x00\x01".to_vec(),
         }
     }
 
@@ -248480,6 +253871,13 @@ pub mod samples {
         }
     }
 
+    pub fn s_messages_getShareThemeBackdrops(depth: u32) -> messages_getShareThemeBackdrops {
+        let _ = depth;
+        messages_getShareThemeBackdrops {
+            hash: 0x1234_5678i32,
+        }
+    }
+
     pub fn s_messages_getSplitRanges(depth: u32) -> messages_getSplitRanges {
         let _ = depth;
         messages_getSplitRanges
@@ -248520,6 +253918,14 @@ pub mod samples {
         messages_getTopReactions {
             limit: 0x1234_5678i32,
             hash: 0x1234_5678_9abc_def0i64,
+        }
+    }
+
+    pub fn s_messages_getTranscriptionLangs(depth: u32) -> messages_getTranscriptionLangs {
+        let _ = depth;
+        messages_getTranscriptionLangs {
+            flags: 1i32,
+            peer: Some(Box::new(t_InputPeer((depth).saturating_sub(1)))),
         }
     }
 
@@ -248580,6 +253986,15 @@ pub mod samples {
             flags: 8i32,
             message: "tl-sample".to_owned(),
             entities: if depth == 0 { Vec::new() } else { vec![t_MessageEntity((depth - 1).saturating_sub(1))] },
+        }
+    }
+
+    pub fn s_messages_getWidgetPublicData(depth: u32) -> messages_getWidgetPublicData {
+        let _ = depth;
+        messages_getWidgetPublicData {
+            peer: Some(Box::new(t_InputPeer((depth).saturating_sub(1)))),
+            msg_id: 0x1234_5678i32,
+            hash: 0x1234_5678_9abc_def0i64,
         }
     }
 
@@ -249379,6 +254794,15 @@ pub mod samples {
         }
     }
 
+    pub fn s_messages_setBotWidgetQueryAnswer(depth: u32) -> messages_setBotWidgetQueryAnswer {
+        let _ = depth;
+        messages_setBotWidgetQueryAnswer {
+            flags: 1i32,
+            query_id: 0x1234_5678_9abc_def0i64,
+            result: "tl-sample".to_owned(),
+        }
+    }
+
     pub fn s_messages_setChatAvailableReactions(depth: u32) -> messages_setChatAvailableReactions {
         let _ = depth;
         messages_setChatAvailableReactions {
@@ -249478,6 +254902,14 @@ pub mod samples {
             id: Some(t_InputBotInlineMessageID((depth).saturating_sub(1))),
             user_id: Some(t_InputUser((depth).saturating_sub(1))),
             score: 0x1234_5678i32,
+        }
+    }
+
+    pub fn s_messages_setShareTheme(depth: u32) -> messages_setShareTheme {
+        let _ = depth;
+        messages_setShareTheme {
+            peer: Some(Box::new(t_InputPeer((depth).saturating_sub(1)))),
+            theme: Some(t_ShareTheme((depth).saturating_sub(1))),
         }
     }
 
@@ -249621,6 +255053,13 @@ pub mod samples {
         messages_transcribeAudio {
             peer: Some(Box::new(t_InputPeer((depth).saturating_sub(1)))),
             msg_id: 0x1234_5678i32,
+        }
+    }
+
+    pub fn s_messages_transcribeAudioFile(depth: u32) -> messages_transcribeAudioFile {
+        let _ = depth;
+        messages_transcribeAudioFile {
+            file: Some(t_InputFile((depth).saturating_sub(1))),
         }
     }
 
@@ -249868,11 +255307,37 @@ pub mod samples {
         }
     }
 
+    pub fn s_payments_deleteStarGift(depth: u32) -> payments_deleteStarGift {
+        let _ = depth;
+        payments_deleteStarGift {
+            stargift: Some(t_InputSavedStarGift((depth).saturating_sub(1))),
+        }
+    }
+
     pub fn s_payments_deleteStarGiftCollection(depth: u32) -> payments_deleteStarGiftCollection {
         let _ = depth;
         payments_deleteStarGiftCollection {
             peer: Some(Box::new(t_InputPeer((depth).saturating_sub(1)))),
             collection_id: 0x1234_5678i32,
+        }
+    }
+
+    pub fn s_payments_depositStarGift(depth: u32) -> payments_depositStarGift {
+        let _ = depth;
+        payments_depositStarGift {
+            flags: 1i32,
+            hide_sender: true,
+            peer: Some(Box::new(t_InputPeer((depth).saturating_sub(1)))),
+            slug: "tl-sample".to_owned(),
+        }
+    }
+
+    pub fn s_payments_displayStarGift(depth: u32) -> payments_displayStarGift {
+        let _ = depth;
+        payments_displayStarGift {
+            flags: 1i32,
+            peer: Some(Box::new(t_InputPeer((depth).saturating_sub(1)))),
+            slug: "tl-sample".to_owned(),
         }
     }
 
@@ -250119,8 +255584,9 @@ pub mod samples {
     pub fn s_payments_getStarGiftWithdrawalUrl(depth: u32) -> payments_getStarGiftWithdrawalUrl {
         let _ = depth;
         payments_getStarGiftWithdrawalUrl {
+            flags: 0i32,
             stargift: Some(t_InputSavedStarGift((depth).saturating_sub(1))),
-            password: Some(t_InputCheckPasswordSRP((depth).saturating_sub(1))),
+            tmp_password: b"tl\x00\x01".to_vec(),
         }
     }
 
@@ -250386,6 +255852,16 @@ pub mod samples {
             save: true,
             invoice: Some(t_InputInvoice((depth).saturating_sub(1))),
             info: Some(t_PaymentRequestedInfo((depth).saturating_sub(1))),
+        }
+    }
+
+    pub fn s_payments_withdrawStarGift(depth: u32) -> payments_withdrawStarGift {
+        let _ = depth;
+        payments_withdrawStarGift {
+            flags: 1i32,
+            keep_on_profile: true,
+            stargift: Some(t_InputSavedStarGift((depth).saturating_sub(1))),
+            tmp_password: b"tl\x00\x01".to_vec(),
         }
     }
 
@@ -251729,6 +257205,15 @@ pub mod samples {
         }
     }
 
+    pub fn s_wallet_setCardStickers(depth: u32) -> wallet_setCardStickers {
+        let _ = depth;
+        wallet_setCardStickers {
+            flags: 1i32,
+            stickers: if depth == 0 { Vec::new() } else { vec![t_InputWalletCardSticker((depth - 1).saturating_sub(1))] },
+            bg_nft_address: "tl-sample".to_owned(),
+        }
+    }
+
     pub fn s_wallet_tonConnectClaimRequest(depth: u32) -> wallet_tonConnectClaimRequest {
         let _ = depth;
         wallet_tonConnectClaimRequest {
@@ -252340,6 +257825,16 @@ pub mod samples {
             let mut out = Vec::new();
             BotInlineMessage::botInlineMessageRichMessage(s_botInlineMessageRichMessage(3)).store(&mut out);
             std::println!("{tag} T 174161531 botInlineMessageRichMessage {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            BotInlineMessage::botInlineMessageWidget(s_botInlineMessageWidget(1)).store(&mut out);
+            std::println!("{tag} T -1163823052 botInlineMessageWidget {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            BotInlineMessage::botInlineMessageWidget(s_botInlineMessageWidget(3)).store(&mut out);
+            std::println!("{tag} T -1163823052 botInlineMessageWidget {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
@@ -253394,12 +258889,12 @@ pub mod samples {
         {
             let mut out = Vec::new();
             Chat::channel(s_channel(1)).store(&mut out);
-            std::println!("{tag} T -727763770 channel {}", __hex(&out));
+            std::println!("{tag} T 2060538432 channel {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
             Chat::channel(s_channel(3)).store(&mut out);
-            std::println!("{tag} T -727763770 channel {}", __hex(&out));
+            std::println!("{tag} T 2060538432 channel {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
@@ -253474,12 +258969,12 @@ pub mod samples {
         {
             let mut out = Vec::new();
             ChatFull::channelFull(s_channelFull(1)).store(&mut out);
-            std::println!("{tag} T -1605464774 channelFull {}", __hex(&out));
+            std::println!("{tag} T -993731264 channelFull {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
             ChatFull::channelFull(s_channelFull(3)).store(&mut out);
-            std::println!("{tag} T -1605464774 channelFull {}", __hex(&out));
+            std::println!("{tag} T -993731264 channelFull {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
@@ -254383,6 +259878,16 @@ pub mod samples {
         }
         {
             let mut out = Vec::new();
+            s_ExportedNoPaidMessagesToken(1).store_boxed(&mut out);
+            std::println!("{tag} T 1767755842 exportedNoPaidMessagesToken {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            s_ExportedNoPaidMessagesToken(3).store_boxed(&mut out);
+            std::println!("{tag} T 1767755842 exportedNoPaidMessagesToken {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
             s_ExportedStoryLink(1).store_boxed(&mut out);
             std::println!("{tag} T 1070138683 exportedStoryLink {}", __hex(&out));
         }
@@ -254970,6 +260475,26 @@ pub mod samples {
             let mut out = Vec::new();
             InputBotInlineMessage::inputBotInlineMessageRichMessage(s_inputBotInlineMessageRichMessage(3)).store(&mut out);
             std::println!("{tag} T -1271007892 inputBotInlineMessageRichMessage {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            InputBotInlineMessage::inputBotInlineMessageWidget(s_inputBotInlineMessageWidget(1)).store(&mut out);
+            std::println!("{tag} T -174611472 inputBotInlineMessageWidget {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            InputBotInlineMessage::inputBotInlineMessageWidget(s_inputBotInlineMessageWidget(3)).store(&mut out);
+            std::println!("{tag} T -174611472 inputBotInlineMessageWidget {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            InputBotInlineMessage::inputBotInlineMessageWidgetId(s_inputBotInlineMessageWidgetId(1)).store(&mut out);
+            std::println!("{tag} T -24413909 inputBotInlineMessageWidgetId {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            InputBotInlineMessage::inputBotInlineMessageWidgetId(s_inputBotInlineMessageWidgetId(3)).store(&mut out);
+            std::println!("{tag} T -24413909 inputBotInlineMessageWidgetId {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
@@ -255933,6 +261458,26 @@ pub mod samples {
         }
         {
             let mut out = Vec::new();
+            InputMedia::inputMediaWidget(s_inputMediaWidget(1)).store(&mut out);
+            std::println!("{tag} T 1157021774 inputMediaWidget {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            InputMedia::inputMediaWidget(s_inputMediaWidget(3)).store(&mut out);
+            std::println!("{tag} T 1157021774 inputMediaWidget {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            InputMedia::inputMediaWidgetId(s_inputMediaWidgetId(1)).store(&mut out);
+            std::println!("{tag} T 2089114805 inputMediaWidgetId {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            InputMedia::inputMediaWidgetId(s_inputMediaWidgetId(3)).store(&mut out);
+            std::println!("{tag} T 2089114805 inputMediaWidgetId {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
             InputMessage::inputMessageID(s_inputMessageID(1)).store(&mut out);
             std::println!("{tag} T -1502174430 inputMessageID {}", __hex(&out));
         }
@@ -256504,12 +262049,12 @@ pub mod samples {
         {
             let mut out = Vec::new();
             InputReplyTo::inputReplyToMessage(s_inputReplyToMessage(1)).store(&mut out);
-            std::println!("{tag} T 1003796418 inputReplyToMessage {}", __hex(&out));
+            std::println!("{tag} T 1975627120 inputReplyToMessage {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
             InputReplyTo::inputReplyToMessage(s_inputReplyToMessage(3)).store(&mut out);
-            std::println!("{tag} T 1003796418 inputReplyToMessage {}", __hex(&out));
+            std::println!("{tag} T 1975627120 inputReplyToMessage {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
@@ -256953,6 +262498,16 @@ pub mod samples {
         }
         {
             let mut out = Vec::new();
+            s_InputTonConnectOauthSession(1).store_boxed(&mut out);
+            std::println!("{tag} T 1654613710 inputTonConnectOauthSession {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            s_InputTonConnectOauthSession(3).store_boxed(&mut out);
+            std::println!("{tag} T 1654613710 inputTonConnectOauthSession {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
             InputUser::inputUserEmpty(s_inputUserEmpty(1)).store(&mut out);
             std::println!("{tag} T -1182234929 inputUserEmpty {}", __hex(&out));
         }
@@ -257020,6 +262575,16 @@ pub mod samples {
             let mut out = Vec::new();
             InputWallPaper::inputWallPaperNoFile(s_inputWallPaperNoFile(3)).store(&mut out);
             std::println!("{tag} T -1770371538 inputWallPaperNoFile {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            s_InputWalletCardSticker(1).store_boxed(&mut out);
+            std::println!("{tag} T 1474250151 inputWalletCardSticker {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            s_InputWalletCardSticker(3).store_boxed(&mut out);
+            std::println!("{tag} T 1474250151 inputWalletCardSticker {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
@@ -258193,6 +263758,16 @@ pub mod samples {
         }
         {
             let mut out = Vec::new();
+            MessageAction::messageActionNoPaidMessagesTokenUsed(s_messageActionNoPaidMessagesTokenUsed(1)).store(&mut out);
+            std::println!("{tag} T -1043140154 messageActionNoPaidMessagesTokenUsed {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            MessageAction::messageActionNoPaidMessagesTokenUsed(s_messageActionNoPaidMessagesTokenUsed(3)).store(&mut out);
+            std::println!("{tag} T -1043140154 messageActionNoPaidMessagesTokenUsed {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
             MessageEntity::messageEntityUnknown(s_messageEntityUnknown(1)).store(&mut out);
             std::println!("{tag} T -1148011883 messageEntityUnknown {}", __hex(&out));
         }
@@ -258673,6 +264248,16 @@ pub mod samples {
         }
         {
             let mut out = Vec::new();
+            MessageMedia::messageMediaWidget(s_messageMediaWidget(1)).store(&mut out);
+            std::println!("{tag} T 574157332 messageMediaWidget {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            MessageMedia::messageMediaWidget(s_messageMediaWidget(3)).store(&mut out);
+            std::println!("{tag} T 574157332 messageMediaWidget {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
             s_MessagePeerReaction(1).store_boxed(&mut out);
             std::println!("{tag} T -1938180548 messagePeerReaction {}", __hex(&out));
         }
@@ -258754,12 +264339,12 @@ pub mod samples {
         {
             let mut out = Vec::new();
             MessageReplyHeader::messageReplyHeader(s_messageReplyHeader(1)).store(&mut out);
-            std::println!("{tag} T 462937446 messageReplyHeader {}", __hex(&out));
+            std::println!("{tag} T -575296651 messageReplyHeader {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
             MessageReplyHeader::messageReplyHeader(s_messageReplyHeader(3)).store(&mut out);
-            std::println!("{tag} T 462937446 messageReplyHeader {}", __hex(&out));
+            std::println!("{tag} T -575296651 messageReplyHeader {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
@@ -262083,6 +267668,76 @@ pub mod samples {
         }
         {
             let mut out = Vec::new();
+            ShareTheme::shareThemeDefault(s_shareThemeDefault(1)).store(&mut out);
+            std::println!("{tag} T -1783830449 shareThemeDefault {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            ShareTheme::shareThemeDefault(s_shareThemeDefault(3)).store(&mut out);
+            std::println!("{tag} T -1783830449 shareThemeDefault {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            ShareTheme::shareThemeEmojiBackdrop(s_shareThemeEmojiBackdrop(1)).store(&mut out);
+            std::println!("{tag} T 1689466081 shareThemeEmojiBackdrop {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            ShareTheme::shareThemeEmojiBackdrop(s_shareThemeEmojiBackdrop(3)).store(&mut out);
+            std::println!("{tag} T 1689466081 shareThemeEmojiBackdrop {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            ShareTheme::shareThemeGift(s_shareThemeGift(1)).store(&mut out);
+            std::println!("{tag} T -336796051 shareThemeGift {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            ShareTheme::shareThemeGift(s_shareThemeGift(3)).store(&mut out);
+            std::println!("{tag} T -336796051 shareThemeGift {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            ShareTheme::inputShareThemeGift(s_inputShareThemeGift(1)).store(&mut out);
+            std::println!("{tag} T 1069099867 inputShareThemeGift {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            ShareTheme::inputShareThemeGift(s_inputShareThemeGift(3)).store(&mut out);
+            std::println!("{tag} T 1069099867 inputShareThemeGift {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            s_ShareThemeBackdropOption(1).store_boxed(&mut out);
+            std::println!("{tag} T 1170331218 shareThemeBackdropOption {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            s_ShareThemeBackdropOption(3).store_boxed(&mut out);
+            std::println!("{tag} T 1170331218 shareThemeBackdropOption {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            ShareThemeBackdrops::shareThemeBackdropsNotModified(s_shareThemeBackdropsNotModified(1)).store(&mut out);
+            std::println!("{tag} T 2050977279 shareThemeBackdropsNotModified {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            ShareThemeBackdrops::shareThemeBackdropsNotModified(s_shareThemeBackdropsNotModified(3)).store(&mut out);
+            std::println!("{tag} T 2050977279 shareThemeBackdropsNotModified {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            ShareThemeBackdrops::shareThemeBackdrops(s_shareThemeBackdrops(1)).store(&mut out);
+            std::println!("{tag} T -1427448608 shareThemeBackdrops {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            ShareThemeBackdrops::shareThemeBackdrops(s_shareThemeBackdrops(3)).store(&mut out);
+            std::println!("{tag} T -1427448608 shareThemeBackdrops {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
             s_ShippingOption(1).store_boxed(&mut out);
             std::println!("{tag} T -1239335713 shippingOption {}", __hex(&out));
         }
@@ -264833,6 +270488,66 @@ pub mod samples {
         }
         {
             let mut out = Vec::new();
+            Update::updateEditForumTopic(s_updateEditForumTopic(1)).store(&mut out);
+            std::println!("{tag} T 593913436 updateEditForumTopic {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Update::updateEditForumTopic(s_updateEditForumTopic(3)).store(&mut out);
+            std::println!("{tag} T 593913436 updateEditForumTopic {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Update::updateBotWidgetQuery(s_updateBotWidgetQuery(1)).store(&mut out);
+            std::println!("{tag} T -1284243864 updateBotWidgetQuery {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Update::updateBotWidgetQuery(s_updateBotWidgetQuery(3)).store(&mut out);
+            std::println!("{tag} T -1284243864 updateBotWidgetQuery {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Update::updateInlineBotWidgetQuery(s_updateInlineBotWidgetQuery(1)).store(&mut out);
+            std::println!("{tag} T -1510965752 updateInlineBotWidgetQuery {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Update::updateInlineBotWidgetQuery(s_updateInlineBotWidgetQuery(3)).store(&mut out);
+            std::println!("{tag} T -1510965752 updateInlineBotWidgetQuery {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Update::updateBotWidgetCopyQuery(s_updateBotWidgetCopyQuery(1)).store(&mut out);
+            std::println!("{tag} T -91635977 updateBotWidgetCopyQuery {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Update::updateBotWidgetCopyQuery(s_updateBotWidgetCopyQuery(3)).store(&mut out);
+            std::println!("{tag} T -91635977 updateBotWidgetCopyQuery {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Update::updateMessageWidgetData(s_updateMessageWidgetData(1)).store(&mut out);
+            std::println!("{tag} T -1146062627 updateMessageWidgetData {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Update::updateMessageWidgetData(s_updateMessageWidgetData(3)).store(&mut out);
+            std::println!("{tag} T -1146062627 updateMessageWidgetData {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Update::updateTranscribedAudioFile(s_updateTranscribedAudioFile(1)).store(&mut out);
+            std::println!("{tag} T 1934372475 updateTranscribedAudioFile {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Update::updateTranscribedAudioFile(s_updateTranscribedAudioFile(3)).store(&mut out);
+            std::println!("{tag} T 1934372475 updateTranscribedAudioFile {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
             Updates::updatesTooLong(s_updatesTooLong(1)).store(&mut out);
             std::println!("{tag} T -484987010 updatesTooLong {}", __hex(&out));
         }
@@ -264904,12 +270619,12 @@ pub mod samples {
         {
             let mut out = Vec::new();
             UrlAuthResult::urlAuthResultRequest(s_urlAuthResultRequest(1)).store(&mut out);
-            std::println!("{tag} T 1020666860 urlAuthResultRequest {}", __hex(&out));
+            std::println!("{tag} T -1110810265 urlAuthResultRequest {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
             UrlAuthResult::urlAuthResultRequest(s_urlAuthResultRequest(3)).store(&mut out);
-            std::println!("{tag} T 1020666860 urlAuthResultRequest {}", __hex(&out));
+            std::println!("{tag} T -1110810265 urlAuthResultRequest {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
@@ -264954,12 +270669,12 @@ pub mod samples {
         {
             let mut out = Vec::new();
             s_UserFull(1).store_boxed(&mut out);
-            std::println!("{tag} T 114026053 userFull {}", __hex(&out));
+            std::println!("{tag} T -1190384899 userFull {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
             s_UserFull(3).store_boxed(&mut out);
-            std::println!("{tag} T 114026053 userFull {}", __hex(&out));
+            std::println!("{tag} T -1190384899 userFull {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
@@ -265040,6 +270755,16 @@ pub mod samples {
             let mut out = Vec::new();
             UserStatus::userStatusLastMonth(s_userStatusLastMonth(3)).store(&mut out);
             std::println!("{tag} T 1703516023 userStatusLastMonth {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            s_UserWallet(1).store_boxed(&mut out);
+            std::println!("{tag} T 1162684215 userWallet {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            s_UserWallet(3).store_boxed(&mut out);
+            std::println!("{tag} T 1162684215 userWallet {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
@@ -265190,6 +270915,26 @@ pub mod samples {
             let mut out = Vec::new();
             WalletTransactionPeer::walletTransactionPeerUnsupported(s_walletTransactionPeerUnsupported(3)).store(&mut out);
             std::println!("{tag} T 1921772890 walletTransactionPeerUnsupported {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            WalletTransactionPeer::walletTransactionPeerChannel(s_walletTransactionPeerChannel(1)).store(&mut out);
+            std::println!("{tag} T 1424428081 walletTransactionPeerChannel {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            WalletTransactionPeer::walletTransactionPeerChannel(s_walletTransactionPeerChannel(3)).store(&mut out);
+            std::println!("{tag} T 1424428081 walletTransactionPeerChannel {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            WalletTransactionPeer::walletTransactionPeerTelegramGift(s_walletTransactionPeerTelegramGift(1)).store(&mut out);
+            std::println!("{tag} T -193817447 walletTransactionPeerTelegramGift {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            WalletTransactionPeer::walletTransactionPeerTelegramGift(s_walletTransactionPeerTelegramGift(3)).store(&mut out);
+            std::println!("{tag} T -193817447 walletTransactionPeerTelegramGift {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
@@ -265370,6 +271115,36 @@ pub mod samples {
             let mut out = Vec::new();
             s_WebViewResult(3).store_boxed(&mut out);
             std::println!("{tag} T 1294139288 webViewResultUrl {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            WidgetQueryType::widgetQueryTypeData(s_widgetQueryTypeData(1)).store(&mut out);
+            std::println!("{tag} T 383307531 widgetQueryTypeData {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            WidgetQueryType::widgetQueryTypeData(s_widgetQueryTypeData(3)).store(&mut out);
+            std::println!("{tag} T 383307531 widgetQueryTypeData {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            WidgetQueryType::widgetQueryTypeSignData(s_widgetQueryTypeSignData(1)).store(&mut out);
+            std::println!("{tag} T 421545948 widgetQueryTypeSignData {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            WidgetQueryType::widgetQueryTypeSignData(s_widgetQueryTypeSignData(3)).store(&mut out);
+            std::println!("{tag} T 421545948 widgetQueryTypeSignData {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            WidgetQueryType::widgetQueryTypeSentTransaction(s_widgetQueryTypeSentTransaction(1)).store(&mut out);
+            std::println!("{tag} T -12897356 widgetQueryTypeSentTransaction {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            WidgetQueryType::widgetQueryTypeSentTransaction(s_widgetQueryTypeSentTransaction(3)).store(&mut out);
+            std::println!("{tag} T -12897356 widgetQueryTypeSentTransaction {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
@@ -266913,6 +272688,16 @@ pub mod samples {
         }
         {
             let mut out = Vec::new();
+            s_messages_BotWidgetQueryAnswer(1).store_boxed(&mut out);
+            std::println!("{tag} T -1783156701 messages.botWidgetQueryAnswer {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            s_messages_BotWidgetQueryAnswer(3).store_boxed(&mut out);
+            std::println!("{tag} T -1783156701 messages.botWidgetQueryAnswer {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
             s_messages_ChatAdminsWithInvites(1).store_boxed(&mut out);
             std::println!("{tag} T -1231326505 messages.chatAdminsWithInvites {}", __hex(&out));
         }
@@ -267733,6 +273518,26 @@ pub mod samples {
         }
         {
             let mut out = Vec::new();
+            messages_WidgetPublicData::messages_widgetPublicDataNotModified(s_messages_widgetPublicDataNotModified(1)).store(&mut out);
+            std::println!("{tag} T -1189515689 messages.widgetPublicDataNotModified {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            messages_WidgetPublicData::messages_widgetPublicDataNotModified(s_messages_widgetPublicDataNotModified(3)).store(&mut out);
+            std::println!("{tag} T -1189515689 messages.widgetPublicDataNotModified {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            messages_WidgetPublicData::messages_widgetPublicData(s_messages_widgetPublicData(1)).store(&mut out);
+            std::println!("{tag} T 71908351 messages.widgetPublicData {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            messages_WidgetPublicData::messages_widgetPublicData(s_messages_widgetPublicData(3)).store(&mut out);
+            std::println!("{tag} T 71908351 messages.widgetPublicData {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
             s_payments_BankCardData(1).store_boxed(&mut out);
             std::println!("{tag} T 1042605427 payments.bankCardData {}", __hex(&out));
         }
@@ -267980,6 +273785,16 @@ pub mod samples {
             let mut out = Vec::new();
             payments_StarGiftCollections::payments_starGiftCollections(s_payments_starGiftCollections(3)).store(&mut out);
             std::println!("{tag} T -1977011469 payments.starGiftCollections {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            s_payments_StarGiftDepositPayload(1).store_boxed(&mut out);
+            std::println!("{tag} T 1918612715 payments.starGiftDepositPayload {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            s_payments_StarGiftDepositPayload(3).store_boxed(&mut out);
+            std::println!("{tag} T 1918612715 payments.starGiftDepositPayload {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
@@ -268753,6 +274568,26 @@ pub mod samples {
         }
         {
             let mut out = Vec::new();
+            s_wallet_Card(1).store_boxed(&mut out);
+            std::println!("{tag} T -1898953807 wallet.card {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            s_wallet_Card(3).store_boxed(&mut out);
+            std::println!("{tag} T -1898953807 wallet.card {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            s_wallet_CardSticker(1).store_boxed(&mut out);
+            std::println!("{tag} T -218035014 wallet.cardSticker {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            s_wallet_CardSticker(3).store_boxed(&mut out);
+            std::println!("{tag} T -218035014 wallet.cardSticker {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
             s_wallet_EncryptedSecretPhrasePart(1).store_boxed(&mut out);
             std::println!("{tag} T 417867063 wallet.encryptedSecretPhrasePart {}", __hex(&out));
         }
@@ -268794,12 +274629,12 @@ pub mod samples {
         {
             let mut out = Vec::new();
             s_wallet_NftItem(1).store_boxed(&mut out);
-            std::println!("{tag} T 876739868 wallet.nftItem {}", __hex(&out));
+            std::println!("{tag} T 389937907 wallet.nftItem {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
             s_wallet_NftItem(3).store_boxed(&mut out);
-            std::println!("{tag} T 876739868 wallet.nftItem {}", __hex(&out));
+            std::println!("{tag} T 389937907 wallet.nftItem {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
@@ -271384,12 +277219,12 @@ pub mod samples {
         {
             let mut out = Vec::new();
             Function::channels_toggleForum(s_channels_toggleForum(1)).store(&mut out);
-            std::println!("{tag} F 1073174324 channels.toggleForum {}", __hex(&out));
+            std::println!("{tag} F -1567282348 channels.toggleForum {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
             Function::channels_toggleForum(s_channels_toggleForum(3)).store(&mut out);
-            std::println!("{tag} F 1073174324 channels.toggleForum {}", __hex(&out));
+            std::println!("{tag} F -1567282348 channels.toggleForum {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
@@ -271793,6 +277628,16 @@ pub mod samples {
         }
         {
             let mut out = Vec::new();
+            Function::contacts_exportNoPaidMessagesToken(s_contacts_exportNoPaidMessagesToken(1)).store(&mut out);
+            std::println!("{tag} F -2084206930 contacts.exportNoPaidMessagesToken {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Function::contacts_exportNoPaidMessagesToken(s_contacts_exportNoPaidMessagesToken(3)).store(&mut out);
+            std::println!("{tag} F -2084206930 contacts.exportNoPaidMessagesToken {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
             Function::contacts_getBirthdays(s_contacts_getBirthdays(1)).store(&mut out);
             std::println!("{tag} F -621959068 contacts.getBirthdays {}", __hex(&out));
         }
@@ -271900,6 +277745,16 @@ pub mod samples {
             let mut out = Vec::new();
             Function::contacts_importContacts(s_contacts_importContacts(3)).store(&mut out);
             std::println!("{tag} F 746589157 contacts.importContacts {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Function::contacts_importNoPaidMessagesToken(s_contacts_importNoPaidMessagesToken(1)).store(&mut out);
+            std::println!("{tag} F 900187850 contacts.importNoPaidMessagesToken {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Function::contacts_importNoPaidMessagesToken(s_contacts_importNoPaidMessagesToken(3)).store(&mut out);
+            std::println!("{tag} F 900187850 contacts.importNoPaidMessagesToken {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
@@ -272514,12 +278369,12 @@ pub mod samples {
         {
             let mut out = Vec::new();
             Function::messages_acceptUrlAuth(s_messages_acceptUrlAuth(1)).store(&mut out);
-            std::println!("{tag} F 1738797278 messages.acceptUrlAuth {}", __hex(&out));
+            std::println!("{tag} F 417156754 messages.acceptUrlAuth {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
             Function::messages_acceptUrlAuth(s_messages_acceptUrlAuth(3)).store(&mut out);
-            std::println!("{tag} F 1738797278 messages.acceptUrlAuth {}", __hex(&out));
+            std::println!("{tag} F 417156754 messages.acceptUrlAuth {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
@@ -272973,6 +278828,16 @@ pub mod samples {
         }
         {
             let mut out = Vec::new();
+            Function::messages_editInlineBotMessageWidgetData(s_messages_editInlineBotMessageWidgetData(1)).store(&mut out);
+            std::println!("{tag} F 1670827563 messages.editInlineBotMessageWidgetData {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Function::messages_editInlineBotMessageWidgetData(s_messages_editInlineBotMessageWidgetData(3)).store(&mut out);
+            std::println!("{tag} F 1670827563 messages.editInlineBotMessageWidgetData {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
             Function::messages_editMessage(s_messages_editMessage(1)).store(&mut out);
             std::println!("{tag} F -1324947860 messages.editMessage {}", __hex(&out));
         }
@@ -272983,6 +278848,16 @@ pub mod samples {
         }
         {
             let mut out = Vec::new();
+            Function::messages_editMessageWidgetData(s_messages_editMessageWidgetData(1)).store(&mut out);
+            std::println!("{tag} F -165364706 messages.editMessageWidgetData {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Function::messages_editMessageWidgetData(s_messages_editMessageWidgetData(3)).store(&mut out);
+            std::println!("{tag} F -165364706 messages.editMessageWidgetData {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
             Function::messages_editQuickReplyShortcut(s_messages_editQuickReplyShortcut(1)).store(&mut out);
             std::println!("{tag} F 1543519471 messages.editQuickReplyShortcut {}", __hex(&out));
         }
@@ -272990,6 +278865,16 @@ pub mod samples {
             let mut out = Vec::new();
             Function::messages_editQuickReplyShortcut(s_messages_editQuickReplyShortcut(3)).store(&mut out);
             std::println!("{tag} F 1543519471 messages.editQuickReplyShortcut {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Function::messages_editWidgetData(s_messages_editWidgetData(1)).store(&mut out);
+            std::println!("{tag} F -356301888 messages.editWidgetData {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Function::messages_editWidgetData(s_messages_editWidgetData(3)).store(&mut out);
+            std::println!("{tag} F -356301888 messages.editWidgetData {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
@@ -273130,6 +279015,16 @@ pub mod samples {
             let mut out = Vec::new();
             Function::messages_getBotCallbackAnswer(s_messages_getBotCallbackAnswer(3)).store(&mut out);
             std::println!("{tag} F -1824339449 messages.getBotCallbackAnswer {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Function::messages_getBotWidgetQueryAnswer(s_messages_getBotWidgetQueryAnswer(1)).store(&mut out);
+            std::println!("{tag} F 1549075833 messages.getBotWidgetQueryAnswer {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Function::messages_getBotWidgetQueryAnswer(s_messages_getBotWidgetQueryAnswer(3)).store(&mut out);
+            std::println!("{tag} F 1549075833 messages.getBotWidgetQueryAnswer {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
@@ -273873,6 +279768,16 @@ pub mod samples {
         }
         {
             let mut out = Vec::new();
+            Function::messages_getShareThemeBackdrops(s_messages_getShareThemeBackdrops(1)).store(&mut out);
+            std::println!("{tag} F -195453198 messages.getShareThemeBackdrops {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Function::messages_getShareThemeBackdrops(s_messages_getShareThemeBackdrops(3)).store(&mut out);
+            std::println!("{tag} F -195453198 messages.getShareThemeBackdrops {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
             Function::messages_getSplitRanges(s_messages_getSplitRanges(1)).store(&mut out);
             std::println!("{tag} F 486505992 messages.getSplitRanges {}", __hex(&out));
         }
@@ -273933,6 +279838,16 @@ pub mod samples {
         }
         {
             let mut out = Vec::new();
+            Function::messages_getTranscriptionLangs(s_messages_getTranscriptionLangs(1)).store(&mut out);
+            std::println!("{tag} F -1167271510 messages.getTranscriptionLangs {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Function::messages_getTranscriptionLangs(s_messages_getTranscriptionLangs(3)).store(&mut out);
+            std::println!("{tag} F -1167271510 messages.getTranscriptionLangs {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
             Function::messages_getUnreadMentions(s_messages_getUnreadMentions(1)).store(&mut out);
             std::println!("{tag} F -251140208 messages.getUnreadMentions {}", __hex(&out));
         }
@@ -273980,6 +279895,16 @@ pub mod samples {
             let mut out = Vec::new();
             Function::messages_getWebPagePreview(s_messages_getWebPagePreview(3)).store(&mut out);
             std::println!("{tag} F 1460498287 messages.getWebPagePreview {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Function::messages_getWidgetPublicData(s_messages_getWidgetPublicData(1)).store(&mut out);
+            std::println!("{tag} F 1875194241 messages.getWidgetPublicData {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Function::messages_getWidgetPublicData(s_messages_getWidgetPublicData(3)).store(&mut out);
+            std::println!("{tag} F 1875194241 messages.getWidgetPublicData {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
@@ -274713,6 +280638,16 @@ pub mod samples {
         }
         {
             let mut out = Vec::new();
+            Function::messages_setBotWidgetQueryAnswer(s_messages_setBotWidgetQueryAnswer(1)).store(&mut out);
+            std::println!("{tag} F -120722326 messages.setBotWidgetQueryAnswer {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Function::messages_setBotWidgetQueryAnswer(s_messages_setBotWidgetQueryAnswer(3)).store(&mut out);
+            std::println!("{tag} F -120722326 messages.setBotWidgetQueryAnswer {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
             Function::messages_setChatAvailableReactions(s_messages_setChatAvailableReactions(1)).store(&mut out);
             std::println!("{tag} F -2041895551 messages.setChatAvailableReactions {}", __hex(&out));
         }
@@ -274810,6 +280745,16 @@ pub mod samples {
             let mut out = Vec::new();
             Function::messages_setInlineGameScore(s_messages_setInlineGameScore(3)).store(&mut out);
             std::println!("{tag} F 363700068 messages.setInlineGameScore {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Function::messages_setShareTheme(s_messages_setShareTheme(1)).store(&mut out);
+            std::println!("{tag} F 1770691354 messages.setShareTheme {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Function::messages_setShareTheme(s_messages_setShareTheme(3)).store(&mut out);
+            std::println!("{tag} F 1770691354 messages.setShareTheme {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
@@ -274960,6 +280905,16 @@ pub mod samples {
             let mut out = Vec::new();
             Function::messages_transcribeAudio(s_messages_transcribeAudio(3)).store(&mut out);
             std::println!("{tag} F 647928393 messages.transcribeAudio {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Function::messages_transcribeAudioFile(s_messages_transcribeAudioFile(1)).store(&mut out);
+            std::println!("{tag} F 120401655 messages.transcribeAudioFile {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Function::messages_transcribeAudioFile(s_messages_transcribeAudioFile(3)).store(&mut out);
+            std::println!("{tag} F 120401655 messages.transcribeAudioFile {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
@@ -275233,6 +281188,16 @@ pub mod samples {
         }
         {
             let mut out = Vec::new();
+            Function::payments_deleteStarGift(s_payments_deleteStarGift(1)).store(&mut out);
+            std::println!("{tag} F 1020983466 payments.deleteStarGift {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Function::payments_deleteStarGift(s_payments_deleteStarGift(3)).store(&mut out);
+            std::println!("{tag} F 1020983466 payments.deleteStarGift {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
             Function::payments_deleteStarGiftCollection(s_payments_deleteStarGiftCollection(1)).store(&mut out);
             std::println!("{tag} F -1386854168 payments.deleteStarGiftCollection {}", __hex(&out));
         }
@@ -275240,6 +281205,26 @@ pub mod samples {
             let mut out = Vec::new();
             Function::payments_deleteStarGiftCollection(s_payments_deleteStarGiftCollection(3)).store(&mut out);
             std::println!("{tag} F -1386854168 payments.deleteStarGiftCollection {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Function::payments_depositStarGift(s_payments_depositStarGift(1)).store(&mut out);
+            std::println!("{tag} F -1063064929 payments.depositStarGift {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Function::payments_depositStarGift(s_payments_depositStarGift(3)).store(&mut out);
+            std::println!("{tag} F -1063064929 payments.depositStarGift {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Function::payments_displayStarGift(s_payments_displayStarGift(1)).store(&mut out);
+            std::println!("{tag} F 1252389118 payments.displayStarGift {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Function::payments_displayStarGift(s_payments_displayStarGift(3)).store(&mut out);
+            std::println!("{tag} F 1252389118 payments.displayStarGift {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
@@ -275514,12 +281499,12 @@ pub mod samples {
         {
             let mut out = Vec::new();
             Function::payments_getStarGiftWithdrawalUrl(s_payments_getStarGiftWithdrawalUrl(1)).store(&mut out);
-            std::println!("{tag} F -798059608 payments.getStarGiftWithdrawalUrl {}", __hex(&out));
+            std::println!("{tag} F -926252677 payments.getStarGiftWithdrawalUrl {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
             Function::payments_getStarGiftWithdrawalUrl(s_payments_getStarGiftWithdrawalUrl(3)).store(&mut out);
-            std::println!("{tag} F -798059608 payments.getStarGiftWithdrawalUrl {}", __hex(&out));
+            std::println!("{tag} F -926252677 payments.getStarGiftWithdrawalUrl {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
@@ -275810,6 +281795,16 @@ pub mod samples {
             let mut out = Vec::new();
             Function::payments_validateRequestedInfo(s_payments_validateRequestedInfo(3)).store(&mut out);
             std::println!("{tag} F -1228345045 payments.validateRequestedInfo {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Function::payments_withdrawStarGift(s_payments_withdrawStarGift(1)).store(&mut out);
+            std::println!("{tag} F -333434706 payments.withdrawStarGift {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Function::payments_withdrawStarGift(s_payments_withdrawStarGift(3)).store(&mut out);
+            std::println!("{tag} F -333434706 payments.withdrawStarGift {}", __hex(&out));
         }
         {
             let mut out = Vec::new();
@@ -277313,6 +283308,16 @@ pub mod samples {
         }
         {
             let mut out = Vec::new();
+            Function::wallet_setCardStickers(s_wallet_setCardStickers(1)).store(&mut out);
+            std::println!("{tag} F 109382060 wallet.setCardStickers {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
+            Function::wallet_setCardStickers(s_wallet_setCardStickers(3)).store(&mut out);
+            std::println!("{tag} F 109382060 wallet.setCardStickers {}", __hex(&out));
+        }
+        {
+            let mut out = Vec::new();
             Function::wallet_tonConnectClaimRequest(s_wallet_tonConnectClaimRequest(1)).store(&mut out);
             std::println!("{tag} F 1723169601 wallet.tonConnectClaimRequest {}", __hex(&out));
         }
@@ -278160,6 +284165,19 @@ fn __rt_botInlineMessageRichMessage() {
         let mut out = Vec::new();
         v.store(&mut out);
         let w = BotInlineMessage::parse(&out).expect("botInlineMessageRichMessage parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_botInlineMessageWidget() {
+    samples::__stack(move || {
+        let v = BotInlineMessage::botInlineMessageWidget(samples::s_botInlineMessageWidget(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = BotInlineMessage::parse(&out).expect("botInlineMessageWidget parse");
         assert_eq!(v, w);
     });
 }
@@ -280999,6 +287017,23 @@ fn __rt_ExportedMessageLink() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_ExportedNoPaidMessagesToken() {
+    samples::__stack(move || {
+        let v = samples::s_ExportedNoPaidMessagesToken(3);
+        let mut out = Vec::new();
+        v.store_boxed(&mut out);
+        let w = ExportedNoPaidMessagesToken::parse(&out).expect("ExportedNoPaidMessagesToken parse");
+        assert_eq!(v, w);
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = ExportedNoPaidMessagesToken::parse_bare(&out).expect("ExportedNoPaidMessagesToken bare parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_ExportedStoryLink() {
     samples::__stack(move || {
         let v = samples::s_ExportedStoryLink(3);
@@ -281839,6 +287874,32 @@ fn __rt_inputBotInlineMessageRichMessage() {
         let mut out = Vec::new();
         v.store(&mut out);
         let w = InputBotInlineMessage::parse(&out).expect("inputBotInlineMessageRichMessage parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_inputBotInlineMessageWidget() {
+    samples::__stack(move || {
+        let v = InputBotInlineMessage::inputBotInlineMessageWidget(samples::s_inputBotInlineMessageWidget(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = InputBotInlineMessage::parse(&out).expect("inputBotInlineMessageWidget parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_inputBotInlineMessageWidgetId() {
+    samples::__stack(move || {
+        let v = InputBotInlineMessage::inputBotInlineMessageWidgetId(samples::s_inputBotInlineMessageWidgetId(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = InputBotInlineMessage::parse(&out).expect("inputBotInlineMessageWidgetId parse");
         assert_eq!(v, w);
     });
 }
@@ -283131,6 +289192,32 @@ fn __rt_inputMediaStakeDice() {
         let mut out = Vec::new();
         v.store(&mut out);
         let w = InputMedia::parse(&out).expect("inputMediaStakeDice parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_inputMediaWidget() {
+    samples::__stack(move || {
+        let v = InputMedia::inputMediaWidget(samples::s_inputMediaWidget(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = InputMedia::parse(&out).expect("inputMediaWidget parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_inputMediaWidgetId() {
+    samples::__stack(move || {
+        let v = InputMedia::inputMediaWidgetId(samples::s_inputMediaWidgetId(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = InputMedia::parse(&out).expect("inputMediaWidgetId parse");
         assert_eq!(v, w);
     });
 }
@@ -284500,6 +290587,23 @@ fn __rt_InputThemeSettings() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_InputTonConnectOauthSession() {
+    samples::__stack(move || {
+        let v = samples::s_InputTonConnectOauthSession(3);
+        let mut out = Vec::new();
+        v.store_boxed(&mut out);
+        let w = InputTonConnectOauthSession::parse(&out).expect("InputTonConnectOauthSession parse");
+        assert_eq!(v, w);
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = InputTonConnectOauthSession::parse_bare(&out).expect("InputTonConnectOauthSession bare parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_inputUserEmpty() {
     samples::__stack(move || {
         let v = InputUser::inputUserEmpty(samples::s_inputUserEmpty(3));
@@ -284584,6 +290688,23 @@ fn __rt_inputWallPaperNoFile() {
         let mut out = Vec::new();
         v.store(&mut out);
         let w = InputWallPaper::parse(&out).expect("inputWallPaperNoFile parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_InputWalletCardSticker() {
+    samples::__stack(move || {
+        let v = samples::s_InputWalletCardSticker(3);
+        let mut out = Vec::new();
+        v.store_boxed(&mut out);
+        let w = InputWalletCardSticker::parse(&out).expect("InputWalletCardSticker parse");
+        assert_eq!(v, w);
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = InputWalletCardSticker::parse_bare(&out).expect("InputWalletCardSticker bare parse");
         assert_eq!(v, w);
     });
 }
@@ -286168,6 +292289,19 @@ fn __rt_messageActionWalletTonConnectRequest() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_messageActionNoPaidMessagesTokenUsed() {
+    samples::__stack(move || {
+        let v = MessageAction::messageActionNoPaidMessagesTokenUsed(samples::s_messageActionNoPaidMessagesTokenUsed(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = MessageAction::parse(&out).expect("messageActionNoPaidMessagesTokenUsed parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_messageEntityUnknown() {
     samples::__stack(move || {
         let v = MessageEntity::messageEntityUnknown(samples::s_messageEntityUnknown(3));
@@ -286789,6 +292923,19 @@ fn __rt_messageMediaVideoStream() {
         let mut out = Vec::new();
         v.store(&mut out);
         let w = MessageMedia::parse(&out).expect("messageMediaVideoStream parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_messageMediaWidget() {
+    samples::__stack(move || {
+        let v = MessageMedia::messageMediaWidget(samples::s_messageMediaWidget(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = MessageMedia::parse(&out).expect("messageMediaWidget parse");
         assert_eq!(v, w);
     });
 }
@@ -291477,6 +297624,101 @@ fn __rt_sendMessageStopDraftAction() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_shareThemeDefault() {
+    samples::__stack(move || {
+        let v = ShareTheme::shareThemeDefault(samples::s_shareThemeDefault(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = ShareTheme::parse(&out).expect("shareThemeDefault parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_shareThemeEmojiBackdrop() {
+    samples::__stack(move || {
+        let v = ShareTheme::shareThemeEmojiBackdrop(samples::s_shareThemeEmojiBackdrop(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = ShareTheme::parse(&out).expect("shareThemeEmojiBackdrop parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_shareThemeGift() {
+    samples::__stack(move || {
+        let v = ShareTheme::shareThemeGift(samples::s_shareThemeGift(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = ShareTheme::parse(&out).expect("shareThemeGift parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_inputShareThemeGift() {
+    samples::__stack(move || {
+        let v = ShareTheme::inputShareThemeGift(samples::s_inputShareThemeGift(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = ShareTheme::parse(&out).expect("inputShareThemeGift parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_ShareThemeBackdropOption() {
+    samples::__stack(move || {
+        let v = samples::s_ShareThemeBackdropOption(3);
+        let mut out = Vec::new();
+        v.store_boxed(&mut out);
+        let w = ShareThemeBackdropOption::parse(&out).expect("ShareThemeBackdropOption parse");
+        assert_eq!(v, w);
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = ShareThemeBackdropOption::parse_bare(&out).expect("ShareThemeBackdropOption bare parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_shareThemeBackdropsNotModified() {
+    samples::__stack(move || {
+        let v = ShareThemeBackdrops::shareThemeBackdropsNotModified(samples::s_shareThemeBackdropsNotModified(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = ShareThemeBackdrops::parse(&out).expect("shareThemeBackdropsNotModified parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_shareThemeBackdrops() {
+    samples::__stack(move || {
+        let v = ShareThemeBackdrops::shareThemeBackdrops(samples::s_shareThemeBackdrops(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = ShareThemeBackdrops::parse(&out).expect("shareThemeBackdrops parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_ShippingOption() {
     samples::__stack(move || {
         let v = samples::s_ShippingOption(3);
@@ -295252,6 +301494,84 @@ fn __rt_updateWalletTonConnectPendingDisconnect() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_updateEditForumTopic() {
+    samples::__stack(move || {
+        let v = Update::updateEditForumTopic(samples::s_updateEditForumTopic(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Update::parse(&out).expect("updateEditForumTopic parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_updateBotWidgetQuery() {
+    samples::__stack(move || {
+        let v = Update::updateBotWidgetQuery(samples::s_updateBotWidgetQuery(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Update::parse(&out).expect("updateBotWidgetQuery parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_updateInlineBotWidgetQuery() {
+    samples::__stack(move || {
+        let v = Update::updateInlineBotWidgetQuery(samples::s_updateInlineBotWidgetQuery(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Update::parse(&out).expect("updateInlineBotWidgetQuery parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_updateBotWidgetCopyQuery() {
+    samples::__stack(move || {
+        let v = Update::updateBotWidgetCopyQuery(samples::s_updateBotWidgetCopyQuery(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Update::parse(&out).expect("updateBotWidgetCopyQuery parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_updateMessageWidgetData() {
+    samples::__stack(move || {
+        let v = Update::updateMessageWidgetData(samples::s_updateMessageWidgetData(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Update::parse(&out).expect("updateMessageWidgetData parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_updateTranscribedAudioFile() {
+    samples::__stack(move || {
+        let v = Update::updateTranscribedAudioFile(samples::s_updateTranscribedAudioFile(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Update::parse(&out).expect("updateTranscribedAudioFile parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_updatesTooLong() {
     samples::__stack(move || {
         let v = Updates::updatesTooLong(samples::s_updatesTooLong(3));
@@ -295529,6 +301849,23 @@ fn __rt_userStatusLastMonth() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_UserWallet() {
+    samples::__stack(move || {
+        let v = samples::s_UserWallet(3);
+        let mut out = Vec::new();
+        v.store_boxed(&mut out);
+        let w = UserWallet::parse(&out).expect("UserWallet parse");
+        assert_eq!(v, w);
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = UserWallet::parse_bare(&out).expect("UserWallet bare parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_Username() {
     samples::__stack(move || {
         let v = samples::s_Username(3);
@@ -295733,6 +302070,32 @@ fn __rt_walletTransactionPeerUnsupported() {
         let mut out = Vec::new();
         v.store(&mut out);
         let w = WalletTransactionPeer::parse(&out).expect("walletTransactionPeerUnsupported parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_walletTransactionPeerChannel() {
+    samples::__stack(move || {
+        let v = WalletTransactionPeer::walletTransactionPeerChannel(samples::s_walletTransactionPeerChannel(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = WalletTransactionPeer::parse(&out).expect("walletTransactionPeerChannel parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_walletTransactionPeerTelegramGift() {
+    samples::__stack(move || {
+        let v = WalletTransactionPeer::walletTransactionPeerTelegramGift(samples::s_walletTransactionPeerTelegramGift(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = WalletTransactionPeer::parse(&out).expect("walletTransactionPeerTelegramGift parse");
         assert_eq!(v, w);
     });
 }
@@ -295987,6 +302350,45 @@ fn __rt_WebViewResult() {
         let mut out = Vec::new();
         v.store(&mut out);
         let w = WebViewResult::parse_bare(&out).expect("WebViewResult bare parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_widgetQueryTypeData() {
+    samples::__stack(move || {
+        let v = WidgetQueryType::widgetQueryTypeData(samples::s_widgetQueryTypeData(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = WidgetQueryType::parse(&out).expect("widgetQueryTypeData parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_widgetQueryTypeSignData() {
+    samples::__stack(move || {
+        let v = WidgetQueryType::widgetQueryTypeSignData(samples::s_widgetQueryTypeSignData(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = WidgetQueryType::parse(&out).expect("widgetQueryTypeSignData parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_widgetQueryTypeSentTransaction() {
+    samples::__stack(move || {
+        let v = WidgetQueryType::widgetQueryTypeSentTransaction(samples::s_widgetQueryTypeSentTransaction(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = WidgetQueryType::parse(&out).expect("widgetQueryTypeSentTransaction parse");
         assert_eq!(v, w);
     });
 }
@@ -298240,6 +304642,23 @@ fn __rt_messages_BotResults() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_messages_BotWidgetQueryAnswer() {
+    samples::__stack(move || {
+        let v = samples::s_messages_BotWidgetQueryAnswer(3);
+        let mut out = Vec::new();
+        v.store_boxed(&mut out);
+        let w = messages_BotWidgetQueryAnswer::parse(&out).expect("messages_BotWidgetQueryAnswer parse");
+        assert_eq!(v, w);
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = messages_BotWidgetQueryAnswer::parse_bare(&out).expect("messages_BotWidgetQueryAnswer bare parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_messages_ChatAdminsWithInvites() {
     samples::__stack(move || {
         let v = samples::s_messages_ChatAdminsWithInvites(3);
@@ -299434,6 +305853,32 @@ fn __rt_messages_WebPagePreview() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_messages_widgetPublicDataNotModified() {
+    samples::__stack(move || {
+        let v = messages_WidgetPublicData::messages_widgetPublicDataNotModified(samples::s_messages_widgetPublicDataNotModified(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = messages_WidgetPublicData::parse(&out).expect("messages_widgetPublicDataNotModified parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_messages_widgetPublicData() {
+    samples::__stack(move || {
+        let v = messages_WidgetPublicData::messages_widgetPublicData(samples::s_messages_widgetPublicData(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = messages_WidgetPublicData::parse(&out).expect("messages_widgetPublicData parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_payments_BankCardData() {
     samples::__stack(move || {
         let v = samples::s_payments_BankCardData(3);
@@ -299792,6 +306237,23 @@ fn __rt_payments_starGiftCollections() {
         let mut out = Vec::new();
         v.store(&mut out);
         let w = payments_StarGiftCollections::parse(&out).expect("payments_starGiftCollections parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_payments_StarGiftDepositPayload() {
+    samples::__stack(move || {
+        let v = samples::s_payments_StarGiftDepositPayload(3);
+        let mut out = Vec::new();
+        v.store_boxed(&mut out);
+        let w = payments_StarGiftDepositPayload::parse(&out).expect("payments_StarGiftDepositPayload parse");
+        assert_eq!(v, w);
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = payments_StarGiftDepositPayload::parse_bare(&out).expect("payments_StarGiftDepositPayload bare parse");
         assert_eq!(v, w);
     });
 }
@@ -300969,6 +307431,40 @@ fn __rt_users_usersSlice() {
         let mut out = Vec::new();
         v.store(&mut out);
         let w = users_Users::parse(&out).expect("users_usersSlice parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_wallet_Card() {
+    samples::__stack(move || {
+        let v = samples::s_wallet_Card(3);
+        let mut out = Vec::new();
+        v.store_boxed(&mut out);
+        let w = wallet_Card::parse(&out).expect("wallet_Card parse");
+        assert_eq!(v, w);
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = wallet_Card::parse_bare(&out).expect("wallet_Card bare parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_wallet_CardSticker() {
+    samples::__stack(move || {
+        let v = samples::s_wallet_CardSticker(3);
+        let mut out = Vec::new();
+        v.store_boxed(&mut out);
+        let w = wallet_CardSticker::parse(&out).expect("wallet_CardSticker parse");
+        assert_eq!(v, w);
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = wallet_CardSticker::parse_bare(&out).expect("wallet_CardSticker bare parse");
         assert_eq!(v, w);
     });
 }
@@ -304980,6 +311476,19 @@ fn __rt_contacts_exportContactToken() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_contacts_exportNoPaidMessagesToken() {
+    samples::__stack(move || {
+        let v = Function::contacts_exportNoPaidMessagesToken(samples::s_contacts_exportNoPaidMessagesToken(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("contacts_exportNoPaidMessagesToken parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_contacts_getBirthdays() {
     samples::__stack(move || {
         let v = Function::contacts_getBirthdays(samples::s_contacts_getBirthdays(3));
@@ -305116,6 +311625,19 @@ fn __rt_contacts_importContacts() {
         let mut out = Vec::new();
         v.store(&mut out);
         let w = Function::parse(&out).expect("contacts_importContacts parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_contacts_importNoPaidMessagesToken() {
+    samples::__stack(move || {
+        let v = Function::contacts_importNoPaidMessagesToken(samples::s_contacts_importNoPaidMessagesToken(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("contacts_importNoPaidMessagesToken parse");
         assert_eq!(v, w);
     });
 }
@@ -306514,6 +313036,19 @@ fn __rt_messages_editInlineBotMessage() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_messages_editInlineBotMessageWidgetData() {
+    samples::__stack(move || {
+        let v = Function::messages_editInlineBotMessageWidgetData(samples::s_messages_editInlineBotMessageWidgetData(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("messages_editInlineBotMessageWidgetData parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_messages_editMessage() {
     samples::__stack(move || {
         let v = Function::messages_editMessage(samples::s_messages_editMessage(3));
@@ -306527,12 +313062,38 @@ fn __rt_messages_editMessage() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_messages_editMessageWidgetData() {
+    samples::__stack(move || {
+        let v = Function::messages_editMessageWidgetData(samples::s_messages_editMessageWidgetData(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("messages_editMessageWidgetData parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_messages_editQuickReplyShortcut() {
     samples::__stack(move || {
         let v = Function::messages_editQuickReplyShortcut(samples::s_messages_editQuickReplyShortcut(3));
         let mut out = Vec::new();
         v.store(&mut out);
         let w = Function::parse(&out).expect("messages_editQuickReplyShortcut parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_messages_editWidgetData() {
+    samples::__stack(move || {
+        let v = Function::messages_editWidgetData(samples::s_messages_editWidgetData(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("messages_editWidgetData parse");
         assert_eq!(v, w);
     });
 }
@@ -306715,6 +313276,19 @@ fn __rt_messages_getBotCallbackAnswer() {
         let mut out = Vec::new();
         v.store(&mut out);
         let w = Function::parse(&out).expect("messages_getBotCallbackAnswer parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_messages_getBotWidgetQueryAnswer() {
+    samples::__stack(move || {
+        let v = Function::messages_getBotWidgetQueryAnswer(samples::s_messages_getBotWidgetQueryAnswer(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("messages_getBotWidgetQueryAnswer parse");
         assert_eq!(v, w);
     });
 }
@@ -307684,6 +314258,19 @@ fn __rt_messages_getSearchResultsPositions() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_messages_getShareThemeBackdrops() {
+    samples::__stack(move || {
+        let v = Function::messages_getShareThemeBackdrops(samples::s_messages_getShareThemeBackdrops(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("messages_getShareThemeBackdrops parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_messages_getSplitRanges() {
     samples::__stack(move || {
         let v = Function::messages_getSplitRanges(samples::s_messages_getSplitRanges(3));
@@ -307762,6 +314349,19 @@ fn __rt_messages_getTopReactions() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_messages_getTranscriptionLangs() {
+    samples::__stack(move || {
+        let v = Function::messages_getTranscriptionLangs(samples::s_messages_getTranscriptionLangs(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("messages_getTranscriptionLangs parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_messages_getUnreadMentions() {
     samples::__stack(move || {
         let v = Function::messages_getUnreadMentions(samples::s_messages_getUnreadMentions(3));
@@ -307820,6 +314420,19 @@ fn __rt_messages_getWebPagePreview() {
         let mut out = Vec::new();
         v.store(&mut out);
         let w = Function::parse(&out).expect("messages_getWebPagePreview parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_messages_getWidgetPublicData() {
+    samples::__stack(move || {
+        let v = Function::messages_getWidgetPublicData(samples::s_messages_getWidgetPublicData(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("messages_getWidgetPublicData parse");
         assert_eq!(v, w);
     });
 }
@@ -308776,6 +315389,19 @@ fn __rt_messages_setBotShippingResults() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_messages_setBotWidgetQueryAnswer() {
+    samples::__stack(move || {
+        let v = Function::messages_setBotWidgetQueryAnswer(samples::s_messages_setBotWidgetQueryAnswer(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("messages_setBotWidgetQueryAnswer parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_messages_setChatAvailableReactions() {
     samples::__stack(move || {
         let v = Function::messages_setChatAvailableReactions(samples::s_messages_setChatAvailableReactions(3));
@@ -308899,6 +315525,19 @@ fn __rt_messages_setInlineGameScore() {
         let mut out = Vec::new();
         v.store(&mut out);
         let w = Function::parse(&out).expect("messages_setInlineGameScore parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_messages_setShareTheme() {
+    samples::__stack(move || {
+        let v = Function::messages_setShareTheme(samples::s_messages_setShareTheme(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("messages_setShareTheme parse");
         assert_eq!(v, w);
     });
 }
@@ -309094,6 +315733,19 @@ fn __rt_messages_transcribeAudio() {
         let mut out = Vec::new();
         v.store(&mut out);
         let w = Function::parse(&out).expect("messages_transcribeAudio parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_messages_transcribeAudioFile() {
+    samples::__stack(move || {
+        let v = Function::messages_transcribeAudioFile(samples::s_messages_transcribeAudioFile(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("messages_transcribeAudioFile parse");
         assert_eq!(v, w);
     });
 }
@@ -309452,12 +316104,51 @@ fn __rt_payments_createStarGiftCollection() {
 #[cfg(test)]
 #[test]
 #[allow(non_snake_case)]
+fn __rt_payments_deleteStarGift() {
+    samples::__stack(move || {
+        let v = Function::payments_deleteStarGift(samples::s_payments_deleteStarGift(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("payments_deleteStarGift parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
 fn __rt_payments_deleteStarGiftCollection() {
     samples::__stack(move || {
         let v = Function::payments_deleteStarGiftCollection(samples::s_payments_deleteStarGiftCollection(3));
         let mut out = Vec::new();
         v.store(&mut out);
         let w = Function::parse(&out).expect("payments_deleteStarGiftCollection parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_payments_depositStarGift() {
+    samples::__stack(move || {
+        let v = Function::payments_depositStarGift(samples::s_payments_depositStarGift(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("payments_depositStarGift parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_payments_displayStarGift() {
+    samples::__stack(move || {
+        let v = Function::payments_displayStarGift(samples::s_payments_displayStarGift(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("payments_displayStarGift parse");
         assert_eq!(v, w);
     });
 }
@@ -310199,6 +316890,19 @@ fn __rt_payments_validateRequestedInfo() {
         let mut out = Vec::new();
         v.store(&mut out);
         let w = Function::parse(&out).expect("payments_validateRequestedInfo parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_payments_withdrawStarGift() {
+    samples::__stack(move || {
+        let v = Function::payments_withdrawStarGift(samples::s_payments_withdrawStarGift(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("payments_withdrawStarGift parse");
         assert_eq!(v, w);
     });
 }
@@ -312149,6 +318853,19 @@ fn __rt_wallet_sendTransfer() {
         let mut out = Vec::new();
         v.store(&mut out);
         let w = Function::parse(&out).expect("wallet_sendTransfer parse");
+        assert_eq!(v, w);
+    });
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)]
+fn __rt_wallet_setCardStickers() {
+    samples::__stack(move || {
+        let v = Function::wallet_setCardStickers(samples::s_wallet_setCardStickers(3));
+        let mut out = Vec::new();
+        v.store(&mut out);
+        let w = Function::parse(&out).expect("wallet_setCardStickers parse");
         assert_eq!(v, w);
     });
 }

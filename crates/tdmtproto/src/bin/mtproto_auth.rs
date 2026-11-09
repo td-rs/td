@@ -189,7 +189,7 @@ impl AuthCallback {
 fn wrap_query(api_id: i32, query: telegram_api::Function) -> Vec<u8> {
     let mut out = Vec::new();
     telegram_api::invokeWithLayer {
-        layer: 230,
+        layer: 233,
         query: Some(Box::new(telegram_api::Function::initConnection(
             telegram_api::initConnection {
                 flags: 0,

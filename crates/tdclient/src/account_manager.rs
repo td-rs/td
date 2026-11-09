@@ -123,6 +123,13 @@ pub trait AccountManagerEnv {
     fn send_export_contact_token_query(&mut self) {
         tdutils::log_info!("Send contacts.exportContactToken — [net-inert]");
     }
+    /// `ExportNoPaidMessagesTokenQuery::send` (AccountManager.cpp:1365)
+    /// — `contacts.exportNoPaidMessagesToken(revoke, temporary)`.
+    fn send_export_no_paid_messages_token_query(&mut self, revoke: bool, temporary: bool) {
+        tdutils::log_info!(
+            "Send contacts.exportNoPaidMessagesToken(revoke = {revoke}, temporary = {temporary}) — [net-inert]"
+        );
+    }
 
     fn send_set_account_ttl_query(&mut self, account_ttl: i32) {
         tdutils::log_info!("Send account.setAccountTTL({account_ttl}) — [net-inert]");
@@ -485,6 +492,10 @@ pub struct AccountManager {
     /// The `ExportContactTokenQuery` promise lot (the token arm of
     /// `get_user_link`).
     pub(crate) pending_user_link: Vec<Promise<td_api::UserLink>>,
+    /// The `ExportNoPaidMessagesTokenQuery` promise lot (the
+    /// `remove_messages_fee` arm of `get_user_link`; the resolved lot
+    /// re-enters through `create_user_link`).
+    pub(crate) pending_no_paid_token_link: Vec<Promise<td_api::UserLink>>,
     /// The `td_api::Sessions`-typed promises parked at the
     /// GetAuthorizations seam.
     pub parked_sessions_promises: Vec<Promise<td_api::Sessions>>,
@@ -810,27 +821,67 @@ impl AccountManager {
         env.send_get_account_ttl_query();
     }
 
-    /// `get_user_link` (cpp:1205-1253) — the get_me chain collapses into
-    /// the direct username check (the M.4 `get_me` is sync): the username
-    /// form answers the public link directly, the empty username parks at
-    /// the ExportContactToken query.
+    /// `get_user_link` (cpp:1335-1356) — the `remove_messages_fee=false`
+    /// form answers the plain public link directly; the fee form exports
+    /// the no-paid-messages token first, then re-enters through
+    /// `create_user_link`. The `return_permanent_link` flag only rides
+    /// the wire query's `temporary` bit (inverted).
     pub fn get_user_link(
         &mut self,
         env: &mut impl AccountManagerEnv,
+        remove_messages_fee: bool,
+        return_permanent_link: bool,
+        revoke_previous_links: bool,
+        promise: Promise<td_api::UserLink>,
+    ) {
+        if !remove_messages_fee {
+            return self.create_user_link(env, String::new(), 0, promise);
+        }
+        self.pending_no_paid_token_link.push(promise);
+        env.send_export_no_paid_messages_token_query(revoke_previous_links, !return_permanent_link);
+    }
+
+    /// `create_user_link` (cpp:1372-1398) — the username form answers the
+    /// public link (`?free=` query when a token exists) with
+    /// `can_get_permanent_link = true`; the empty username parks at the
+    /// phone-number/ExportContactToken path.
+    pub fn create_user_link(
+        &mut self,
+        env: &mut impl AccountManagerEnv,
+        unpaid_messages_token: String,
+        unpaid_messages_token_expire_date: i32,
         mut promise: Promise<td_api::UserLink>,
     ) {
         let username = env.get_my_first_username();
         if !username.is_empty() {
             // `LinkManager::get_public_dialog_link(username, "", false,
-            // false)` — the t_me_url prefix.
+            // unpaid_messages_token, false)` — the t_me_url prefix plus
+            // the `?free=` query (get_dialog_link_query rewrites the
+            // leading separator).
             let base = env.get_option_string("t_me_url", "https://t.me/");
             let mut url = base;
             if !url.ends_with('/') {
                 url.push('/');
             }
             url.push_str(&username);
-            return promise.set_value(td_api::UserLink { url, expires_in: 0 });
+            if !unpaid_messages_token.is_empty() {
+                url.push_str("?free=");
+                url.push_str(&unpaid_messages_token);
+            }
+            // `get_user_link_expires_in` (cpp:571-574) — the max(…, 1)
+            // clamp; expire 0 with a live clock still clamps to 1.
+            let expires_in = (unpaid_messages_token_expire_date - env.unix_time()).max(1);
+            return promise.set_value(td_api::UserLink {
+                url,
+                expires_in,
+                can_get_permanent_link: true,
+            });
         }
+        // The phone-number privacy arm and the ExportContactToken
+        // unpaid-token injection round-trip (cpp:1407-1427) ride the
+        // unpaid-links family follow-up; the plain token export keeps
+        // the 1.8.68 behavior.
+        let _ = unpaid_messages_token_expire_date;
         self.pending_user_link.push(promise);
         env.send_export_contact_token_query();
     }

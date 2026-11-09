@@ -2936,6 +2936,8 @@ mod tests {
             default_p2p_contacts: false,
             preload_featured_stickers: false,
             revoke_pm_inbox: true,
+            // 1.8.70: the fpnv flag defaults off in the fixture.
+            fpnv_allowed: false,
             blocked_mode: true,
             force_try_ipv6: false,
             date: 1000,

@@ -533,6 +533,8 @@ impl CommunityManager {
             permissions: Some(td_api::CommunityPermissions {
                 can_edit_chat_list: !community.collapsed_in_dialogs,
             }),
+            // `c->collapsed_in_dialogs` (CommunityManager.cpp:2195).
+            are_chats_collapsed: community.collapsed_in_dialogs,
         })
     }
 
@@ -587,6 +589,9 @@ impl CommunityManager {
             administrator_count: community_full.administrator_count,
             banned_count: community_full.banned_count,
             add_chat_request_count: community_full.peer_link_requests_pending,
+            // The per-community notification-settings plane is the
+            // community-settings family follow-up (#113).
+            notification_settings: None,
         })
     }
 

@@ -10,6 +10,7 @@ addChatMembers	dispatched
 addChatToList	dispatched
 addChatWelcomeMessage	dispatched
 addChecklistTasks	dispatched
+addCommunityChat	interim
 addContact	dispatched
 addCustomServerLanguagePack	dispatched
 addFavoriteSticker	dispatched
@@ -48,7 +49,9 @@ answerPreCheckoutQuery	dispatched
 answerShippingQuery	dispatched
 answerTonConnectRequest	dispatched
 answerWebAppQuery	dispatched
+answerWidgetQuery	interim
 applyPremiumGiftCode	dispatched
+applyUnpaidMessagesToken	interim
 approveSuggestedPost	dispatched
 assignStoreTransaction	dispatched
 banChatMember	dispatched
@@ -182,6 +185,7 @@ deleteDirectMessagesChatTopicMessagesByDate	dispatched
 deleteEphemeralMessage	dispatched
 deleteFile	dispatched
 deleteForumTopic	dispatched
+deleteGift	interim
 deleteGiftCollection	dispatched
 deleteGroupCallMessages	dispatched
 deleteGroupCallMessagesBySender	dispatched
@@ -215,6 +219,7 @@ disconnectAllWebsites	dispatched
 disconnectTonConnectSession	dispatched
 disconnectWebsite	dispatched
 dismissWebToken	dispatched
+displayUpgradedGift	interim
 downloadFile	dispatched
 dropGiftOriginalDetails	dispatched
 editBotMediaPreview	dispatched
@@ -240,6 +245,7 @@ editInlineMessageLiveLocation	dispatched
 editInlineMessageMedia	dispatched
 editInlineMessageReplyMarkup	dispatched
 editInlineMessageText	dispatched
+editInlineMessageWidgetData	interim
 editMessageCaption	dispatched
 editMessageChecklist	dispatched
 editMessageLiveLocation	dispatched
@@ -247,13 +253,16 @@ editMessageMedia	dispatched
 editMessageReplyMarkup	dispatched
 editMessageSchedulingState	dispatched
 editMessageText	dispatched
+editMessageWidgetData	interim
 editProxy	dispatched
 editQuickReplyMessage	dispatched
 editStarSubscription	dispatched
 editStory	dispatched
 editStoryCover	dispatched
+editStoryMusic	interim
 editTextCompositionStyle	dispatched
 editUserStarSubscription	dispatched
+editWidgetData	interim
 enableProxy	dispatched
 enableTonWalletBackup	dispatched
 encryptGroupCallData	dispatched
@@ -261,6 +270,8 @@ endGroupCall	dispatched
 endGroupCallRecording	dispatched
 endGroupCallScreenSharing	dispatched
 finishFileGeneration	dispatched
+fixRecognizedRichMessageWithAi	interim
+fixRecognizedTextWithAi	interim
 fixRichMessageWithAi	dispatched
 fixTextWithAi	dispatched
 forwardMessages	dispatched
@@ -354,7 +365,9 @@ getChatsToPostStories	dispatched
 getCloseFriends	dispatched
 getCollectibleItemInfo	dispatched
 getCommands	dispatched
+getCommunityAddChatRequests	interim
 getCommunityFullInfo	dispatched
+getCommunityMemberChats	interim
 getConnectedAffiliateProgram	dispatched
 getConnectedAffiliatePrograms	dispatched
 getConnectedWebsites	dispatched
@@ -424,6 +437,7 @@ getInstalledBackgrounds	dispatched
 getInstalledStickerSets	dispatched
 getInternalLink	dispatched
 getInternalLinkType	dispatched
+getJoinedCommunities	interim
 getJsonString	sync
 getJsonValue	sync
 getKeywordEmojis	dispatched
@@ -506,6 +520,7 @@ getPremiumStickerExamples	dispatched
 getPremiumStickers	dispatched
 getPreparedInlineMessage	dispatched
 getPreparedKeyboardButton	dispatched
+getProfileShareThemeBackdrops	interim
 getProxies	dispatched
 getPublicPostSearchLimits	dispatched
 getPushReceiverId	sync
@@ -533,6 +548,7 @@ getScopeNotificationSettings	dispatched
 getSearchSponsoredChats	dispatched
 getSearchedForTags	dispatched
 getSecretChat	dispatched
+getSpeechRecognitionLanguages	interim
 getStakeDiceState	dispatched
 getStarAdAccountUrl	dispatched
 getStarGiftPaymentOptions	dispatched
@@ -560,6 +576,7 @@ getStoryPublicForwards	dispatched
 getStoryStatistics	dispatched
 getSuggestedFileName	dispatched
 getSuggestedStickerSetName	dispatched
+getSuitableCommunityChats	interim
 getSuitableDiscussionChats	dispatched
 getSuitablePersonalChats	dispatched
 getSupergroup	dispatched
@@ -569,6 +586,7 @@ getSupportName	dispatched
 getSupportUser	dispatched
 getTemporaryPasswordState	dispatched
 getTextCompositionStyleExample	dispatched
+getTextEmojiRanges	interim
 getTextEntities	sync
 getThemeParametersJsonString	sync
 getThemedChatEmojiStatuses	dispatched
@@ -580,6 +598,7 @@ getTonConnectSessionNextEventId	dispatched
 getTonConnectSessionPendingRequests	dispatched
 getTonConnectSessions	dispatched
 getTonTransactions	dispatched
+getTonWalletCardBackgroundGiftCollectionNames	interim
 getTonWalletNfts	dispatched
 getTonWalletOwnershipProofChallenge	dispatched
 getTonWalletSecretPhrase	dispatched
@@ -589,6 +608,7 @@ getTonWalletTransactions	dispatched
 getTopChats	dispatched
 getTrendingStickerSets	dispatched
 getUpgradedGift	dispatched
+getUpgradedGiftDepositInfo	interim
 getUpgradedGiftEmojiStatuses	dispatched
 getUpgradedGiftValueInfo	dispatched
 getUpgradedGiftVariants	dispatched
@@ -611,6 +631,8 @@ getWebAppLinkUrl	dispatched
 getWebAppPlaceholder	dispatched
 getWebAppUrl	dispatched
 getWebPageInstantView	dispatched
+getWidgetPublicData	interim
+getWidgetQueryAnswer	interim
 giftPremiumWithStars	dispatched
 hideContactCloseBirthdays	dispatched
 hideSuggestedAction	dispatched
@@ -662,8 +684,11 @@ processChatFolderNewChats	dispatched
 processChatHasProtectedContentDisableRequest	dispatched
 processChatJoinRequest	dispatched
 processChatJoinRequests	dispatched
+processCommunityAddChatRequest	interim
+processCommunityAddChatRequests	interim
 processGiftPurchaseOffer	dispatched
 processPushNotification	dispatched
+processWebProxyCarrierMessage	interim
 rateSpeechRecognition	dispatched
 readAllChatMentions	dispatched
 readAllChatPollVotes	dispatched
@@ -677,6 +702,7 @@ readChatList	dispatched
 readFilePart	dispatched
 readdQuickReplyShortcutMessages	dispatched
 recognizeSpeech	dispatched
+recognizeSpeechInFile	interim
 recoverAuthenticationPassword	dispatched
 recoverPassword	dispatched
 refundStarPayment	dispatched
@@ -686,6 +712,7 @@ removeAllFilesFromDownloads	dispatched
 removeAllWebBrowserSettingsExceptions	dispatched
 removeBusinessConnectedBotFromChat	dispatched
 removeChatActionBar	dispatched
+removeCommunityChat	interim
 removeContacts	dispatched
 removeFavoriteSticker	dispatched
 removeFileFromDownloads	dispatched
@@ -739,6 +766,7 @@ reportStory	dispatched
 reportSupergroupAntiSpamFalsePositive	dispatched
 reportSupergroupSpam	dispatched
 reportVideoMessageAdvertisement	dispatched
+reportWebProxyCarrierError	interim
 requestAuthenticationPasswordRecovery	dispatched
 requestPasswordRecovery	dispatched
 requestQrCodeAuthentication	dispatched
@@ -885,6 +913,7 @@ setChatTitle	dispatched
 setCloseFriends	dispatched
 setCommands	dispatched
 setCommunityName	dispatched
+setCommunityNotificationSettings	interim
 setCommunityPermissions	dispatched
 setCommunityPhoto	dispatched
 setCustomEmojiStickerSetThumbnail	dispatched
@@ -938,6 +967,7 @@ setPollAnswer	dispatched
 setProfileAccentColor	dispatched
 setProfileAudioPosition	dispatched
 setProfilePhoto	dispatched
+setProfileShareTheme	interim
 setQuickReplyShortcutName	dispatched
 setReactionNotificationSettings	dispatched
 setReadDatePrivacySettings	dispatched
@@ -960,6 +990,7 @@ setSupergroupUnrestrictBoostCount	dispatched
 setSupergroupUsername	dispatched
 setTdlibParameters	dispatched
 setTonConnectSessionWalletClientId	dispatched
+setTonWalletCardStickers	interim
 setUpgradedGiftColors	dispatched
 setUserEmojiStatus	dispatched
 setUserNote	dispatched
@@ -1011,6 +1042,8 @@ toggleChatIsMarkedAsUnread	dispatched
 toggleChatIsPinned	dispatched
 toggleChatIsTranslatable	dispatched
 toggleChatViewAsTopics	dispatched
+toggleCommunityAreChatsCollapsed	interim
+toggleCommunityMemberIsBanned	interim
 toggleDirectMessagesChatTopicCanSendUnpaidMessages	dispatched
 toggleDownloadIsPaused	dispatched
 toggleForumTopicIsClosed	dispatched
@@ -1062,4 +1095,5 @@ viewPremiumFeature	dispatched
 viewSponsoredChat	dispatched
 viewTrendingStickerSets	dispatched
 viewVideoMessageAdvertisement	dispatched
+withdrawUpgradedGift	interim
 writeGeneratedFilePart	dispatched
