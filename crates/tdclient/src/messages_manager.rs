@@ -31824,6 +31824,7 @@ pub fn is_editable_message_content(content_type: MessageContentType) -> bool {
             | MessageContentType::ToDoList
             | MessageContentType::Video
             | MessageContentType::VoiceNote
+            | MessageContentType::Widget
     )
 }
 
@@ -39808,6 +39809,7 @@ mod tests {
         assert_eq!(MessageContentType::ChatJoinedViaCommunity as i32, 95);
         assert_eq!(MessageContentType::GramTransfer as i32, 96);
         assert_eq!(MessageContentType::WalletTonConnectRequest as i32, 97);
+        assert_eq!(MessageContentType::Widget as i32, 99);
         assert_eq!(MessageContentType::default(), MessageContentType::Text);
     }
 
