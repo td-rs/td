@@ -868,9 +868,14 @@ impl AccountManager {
                 url.push_str("?free=");
                 url.push_str(&unpaid_messages_token);
             }
-            // `get_user_link_expires_in` (cpp:571-574) — the max(…, 1)
-            // clamp; expire 0 with a live clock still clamps to 1.
-            let expires_in = (unpaid_messages_token_expire_date - env.unix_time()).max(1);
+            // `get_user_link_expires_in` (cpp:571-576) — the zero
+            // guard first (plain links answer 0), then the max(…, 1)
+            // clamp.
+            let expires_in = if unpaid_messages_token_expire_date == 0 {
+                0
+            } else {
+                (unpaid_messages_token_expire_date - env.unix_time()).max(1)
+            };
             return promise.set_value(td_api::UserLink {
                 url,
                 expires_in,
@@ -881,7 +886,6 @@ impl AccountManager {
         // unpaid-token injection round-trip (cpp:1407-1427) ride the
         // unpaid-links family follow-up; the plain token export keeps
         // the 1.8.68 behavior.
-        let _ = unpaid_messages_token_expire_date;
         self.pending_user_link.push(promise);
         env.send_export_contact_token_query();
     }

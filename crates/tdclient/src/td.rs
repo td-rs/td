@@ -25463,7 +25463,13 @@ impl Td {
                 match telegram_api::ExportedContactToken::parse(query.ok()) {
                     Ok(ptr) => {
                         if let Some(mut promise) = promise {
-                            let expires_in = (ptr.expires - self.global.unix_time()).max(1);
+                            // get_user_link_expires_in (cpp:571-576)
+                            // — the zero guard before the clamp.
+                            let expires_in = if ptr.expires == 0 {
+                                0
+                            } else {
+                                (ptr.expires - self.global.unix_time()).max(1)
+                            };
                             promise.set_value(td_api::UserLink {
                                 url: ptr.url,
                                 expires_in,
@@ -39649,19 +39655,14 @@ impl AccountManagerEnv for AccountEnv<'_> {
     /// `ExportNoPaidMessagesTokenQuery::send` (cpp:1365-1368) — the
     /// flags pair `revoke` (bit 0) and `temporary` (bit 1).
     fn send_export_no_paid_messages_token_query(&mut self, revoke: bool, temporary: bool) {
-        let mut flags = 0i32;
-        if revoke {
-            flags |= 1;
-        }
-        if temporary {
-            flags |= 2;
-        }
         match self.net.clone() {
             Some(net) => net.dispatch(
                 AccountNetKind::ExportNoPaidMessagesToken,
                 telegram_api::Function::contacts_exportNoPaidMessagesToken(
+                    // flags stay 0 — the generated store ORs the
+                    // revoke/temporary bits itself.
                     telegram_api::contacts_exportNoPaidMessagesToken {
-                        flags,
+                        flags: 0,
                         revoke,
                         temporary,
                     },

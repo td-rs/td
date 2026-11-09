@@ -8557,15 +8557,17 @@ mod tests {
         );
 
         // the answer half settles a parked promise with the url
-        manager
-            .pending
-            .star_gift_withdrawal_url
-            .push(recording_promise().0);
+        let (parked, parked_recorded) = recording_promise();
+        manager.pending.star_gift_withdrawal_url.push(parked);
         manager.on_get_star_gift_withdrawal_url(Result::Ok(
             telegram_api::payments_StarGiftWithdrawalUrl {
                 url: "https://fragment.io/withdraw".to_owned(),
             },
         ));
+        assert_eq!(
+            parked_recorded.value().expect("answered").expect("ok"),
+            "https://fragment.io/withdraw"
+        );
 
         // the error half forwards
         manager.on_get_star_gift_withdrawal_url(Result::Err(Status::error(

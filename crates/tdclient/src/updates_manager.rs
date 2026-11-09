@@ -4819,7 +4819,9 @@ impl<S: UpdatesSink> UpdatesManager<S> {
             // (TranscriptionManager.cpp:653-659).
             PendingUpdate::Wire(telegram_api::Update::updateTranscribedAudioFile(update)) => {
                 let audio_update = telegram_api::updateTranscribedAudio {
-                    flags: i32::from(update.pending),
+                    // flags stay 0 — the generated store ORs the pending
+                    // bit itself.
+                    flags: 0,
                     pending: update.pending,
                     peer: None,
                     msg_id: 0,
