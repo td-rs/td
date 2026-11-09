@@ -62,24 +62,25 @@ A release is parity-clean when **all** of the following are green:
 - [ ] cargo-deny advisories clean (or every exception explicitly signed
       off — see the open `rsa` RUSTSEC-2023-0071 decision)
 
-Current status (2026-11-09, the 0.1.0 release audit over master `331907b`,
-pinned upstream `c15d3f5a5de6e3ba5839822c451152e5e18bb700` / tdlib 1.8.68):
-the census reads 26 sync / 1,039 dispatched / 0 interim of 1,065 arms and
-every differential gate ran green against a pristine c15d3f5a C++
+Current status (2026-11-09, the 1.8.70 upstream sync over branch
+`upstream-1.8.70` @ 825dacc + docs, pinned upstream
+`23383aef218a3123f02b744bfa91bde21056a814` / tdlib 1.8.70, layer 233):
+the census reads 26 sync / 1,040 dispatched / 33 interim of 1,099 arms
+and every differential gate ran green against a pristine 23383aef C++
 checkout — scheme_parity (local + upstream drift), the S04/S06/S07/S08/
 S10/S12/S15 source oracles, the S68 `tdjson_oracle` over a fresh Release
-`TD_BUILD` (37 lines byte-identical), `requests_gate`, the 14/14/0 symbol
-audit, and byte-identical vendored headers; the release cdylib is built
-from the tagged tree. Workspace gates green (fmt, clippy 1.95, rustdoc
-`-D warnings`, `cargo test --workspace --locked` 8,851/0). cargo-deny
-green after clearing the 2026 advisory wave (rustls family bumps +
-libz-sys + the crypto-bigint 0.6→0.7.11 SRP/DH modpow migration); tokio
-pins 1.53.1 with the RUSTSEC-2026-0386 no-call-site exception (see
-`deny.toml` — 1.54.1 regresses the tdcli exit path). Deferred per owner
-decision 2026-11-09: soak 3600, the bench flagged-row re-run, the S75
-corpus replay (TD_RECORD_* secrets), and the fuzz week (skipped since the
-09-27 decision; the Sep 14–23 log's findings were triaged by M.3.10.3) —
-0.1.x follow-ups, not parity claims.
+`TD_BUILD` (`libtdjson.so.1.8.70`; 37 lines byte-identical),
+`requests_gate`, the 14/14/0 symbol audit, and byte-identical vendored
+headers. Workspace gates green on both machines (fmt, clippy 1.95,
+rustdoc `-D warnings`, `cargo test --workspace --locked` 9,045/0/3).
+cargo-deny green carrying the two pinned ignores (RUSTSEC-2023-0071 rsa,
+RUSTSEC-2026-0386 tokio; `deny.toml` unchanged — 1.54.1 still regresses
+the tdcli exit path). The 33 interim arms are the sync's recorded
+divergence — one follow-up family issue each (§4's 1.8.70 entry).
+Deferred per owner decision 2026-11-09, restated at the sync: soak 3600,
+the bench flagged-row re-run, the S75 corpus replay (TD_RECORD_* secrets),
+and the fuzz week (skipped since the 09-27 decision) — 0.1.x follow-ups,
+not parity claims.
 
 ## 4. Changelog + version
 
@@ -90,6 +91,50 @@ corpus replay (TD_RECORD_* secrets), and the fuzz week (skipped since the
   milestones (S76 walking skeleton → 0.1.0 tag with the first release
   artifacts; S81 bindings validation → 0.2.0; S84 first full-parity
   release → 1.0.0-candidate).
+- **2026-11-09 upstream sync (TDLib 1.8.68 → 1.8.70)**, pin bump
+  `c15d3f5a5de6e3ba5839822c451152e5e18bb700` →
+  `23383aef218a3123f02b744bfa91bde21056a814` (tdlib 1.8.70, layer 233),
+  branch `upstream-1.8.70` (spec td-rs/td#109; tickets #110–#117): the
+  five-scheme sha256 pin moved as one deliberate change, the committed
+  generated modules regenerated (`generated_drift` green), the layer
+  constant and version strings moved 230/1.8.68 → 233/1.8.70:
+  - Oracle set green against a pristine 23383aef C++ worktree plus a
+    fresh Release `TD_BUILD` (`libtdjson.so.1.8.70`), Desktop 2026-11-09:
+    `cpp_dump` (S04, 5/5 blobs), `tl_oracle` tokens/scheme/tlo (S06
+    89,459 tokens over 5 schemes; S07 td_api 818 types / 2,308
+    constructors / 1,099 functions; S08 `.tlo` bytes identical),
+    `tl_store_oracle` (S10, 10/10 over the regenerated layer-233
+    constructors), `tl_json_oracle` (S12, 37/37), `tl_replay_oracle`
+    (S15, 5,552 samples, 0 failures), `tdjson_oracle` (S68, 37/37 vs the
+    C++ `libtdjson.so.1.8.70`).
+  - `requests_gate` green; census **1,040 dispatched / 33 interim / 26
+    sync of 1,099** — the spec's floor was 1,039/34/26, and #113's
+    promotion of `setCommunityNotificationSettings` moved one interim
+    arm to dispatched (+1/−1, the reason the changelog census differs
+    from the spec's). m7 fan-out 56 C++ intakes = 2 live / 3 seam / 51
+    documented drop; `verify_symbols.sh` 14 required / 14 exported /
+    0 extra; vendored headers 2/2 byte-identical; the tdjson surface
+    answers `version = "1.8.70"` at layer 233 byte-exact.
+  - Triage of the 298 upstream commits: 86 ported (46 by the family
+    tickets — #112 ephemeral 17, #113 community-notif 17, #117 quotes
+    12 — and 40 by the #114 predecessor + sweep commits), ~98 absorbed
+    at the sync base or by the scheme regen, ~114 site-less with
+    reasons — the sync REMAINING doc is the canonical record
+    (`docs/UPSTREAM_SYNC_23383AEF_REMAINING_20261109.md`, git-excluded
+    by design; the PR body carries its digest).
+  - Workspace verification green on both machines 2026-11-09 (Desktop
+    and ThinkPad, rustup 1.95): fmt, clippy `-D warnings`, rustdoc
+    `-D warnings`, `cargo test --workspace --locked` — 56 suites,
+    9,045 passed / 0 failed / 3 ignored (the ThinkPad's first test run
+    hit the known tdcli harness load flake; solo rerun + full rerun
+    green). cargo-deny green (advisories/bans/licenses/sources) with no
+    new exceptions.
+  - Deferred restated (same set as the 0.1.0 audit, owner decision
+    2026-11-09): soak 3600, bench flagged rows, S75 corpus replay, fuzz
+    week. CI conformance pin moved `c15d3f5a` → `23383aef`
+    (`main.yml` ×2, AGENTS.md); README tracks 1.8.70. No crate version
+    bump, no tag (the workspace stays 0.1.0; versions bump on release
+    milestones).
 - **2026-11-09 release audit (the 0.1.0 tag)**, against the pinned
   upstream `c15d3f5a5de6e3ba5839822c451152e5e18bb700` (tdlib 1.8.68,
   layer 230), using a pristine td worktree at the pin plus a fresh
