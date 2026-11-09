@@ -55,7 +55,7 @@ cargo test --workspace --locked
 ## Conformance / oracles
 
 - Differential gates: `conformance/*/verify.sh <path-to-td-checkout>`, pinned
-  to upstream commit `d1085f9cebc5a62379991ae1652673954f229c1f` (see
+  to upstream commit `c15d3f5a5de6e3ba5839822c451152e5e18bb700` (see
   `.github/workflows/main.yml`). They need a C++ td build (cmake, gperf,
   php) — slow, so they run in Main CI, not PR CI.
 - Live-session recording requires the `TD_BOT_TOKEN` / `TD_BOT_USERNAME` /
@@ -70,6 +70,31 @@ cargo test --workspace --locked
 - `wasm32-unknown-unknown` does not build clean (getrandom `js` feature gap);
   its CI job is advisory. The emscripten target
   (`wasm32-unknown-emscripten`) is configured in `.cargo/config.toml`.
+
+## Distributed development and build strategy
+
+Permanent principles for every campaign. The worker pool is two machines:
+**Desktop** (12 cores, 32 GB RAM) and **ThinkPad** (12 cores, 16 GB RAM).
+
+- **Two implementers per machine** (four total), each in an independent Git
+  worktree with its own local Cargo target directory.
+- **SSH coordinates remote execution**: dispatch and monitor jobs on the
+  other worker over SSH.
+- **One shared remote sccache** serves both workers; evaluate distributed
+  Rust compilation before adopting it.
+- **Schedule by live capacity**: assign Cargo builds and verification jobs
+  by currently available CPU, RAM, and system load.
+- **Cap concurrency to measured memory headroom** — linking is the
+  memory-heavy phase, so concurrent linkers per machine stay within it.
+- **Distribute verification**: package-level tests, Clippy, and Rustdoc run
+  across both machines; integration merges serialize pool-wide.
+- **The Definition of Done is unchanged**: distributed runs parallelize
+  work, never weaken the gate — the full-workspace Verification commands
+  above must pass authoritatively before work counts as complete.
+
+Every resource limit and scheduling policy comes from actual hardware
+inspection and benchmarks of these machines; the specs above identify the
+pool and license no assumed limits.
 
 ## Conventions
 

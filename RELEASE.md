@@ -62,16 +62,24 @@ A release is parity-clean when **all** of the following are green:
 - [ ] cargo-deny advisories clean (or every exception explicitly signed
       off — see the open `rsa` RUSTSEC-2023-0071 decision)
 
-Current status (2026-10-09, after the c15d3f5a completion pass over
-`docs/UPSTREAM_SYNC_C15D3F5A_REMAINING_20261009.md`): **the interim set is
-empty** — the request census pins the tree at
-26 sync / 1,039 dispatched / 0 interim of 1,065 arms
-(`crates/tdclient/src/testdata/request_census.txt`; the TonWalletManager
-plane, the community write family, dismissWebToken and the tde2e keychain
-subset landed over the `[blocked: net]` query seams). The count is the
-release-blocking metric, not a quality one; the net/db tails still park at
-their seams and the S07/S04 oracle gates need the C++ c15d3f5a build
-(§2 below) before the 1.8.68 release entry.
+Current status (2026-11-09, the 0.1.0 release audit over master `331907b`,
+pinned upstream `c15d3f5a5de6e3ba5839822c451152e5e18bb700` / tdlib 1.8.68):
+the census reads 26 sync / 1,039 dispatched / 0 interim of 1,065 arms and
+every differential gate ran green against a pristine c15d3f5a C++
+checkout — scheme_parity (local + upstream drift), the S04/S06/S07/S08/
+S10/S12/S15 source oracles, the S68 `tdjson_oracle` over a fresh Release
+`TD_BUILD` (37 lines byte-identical), `requests_gate`, the 14/14/0 symbol
+audit, and byte-identical vendored headers; the release cdylib is built
+from the tagged tree. Workspace gates green (fmt, clippy 1.95, rustdoc
+`-D warnings`, `cargo test --workspace --locked` 8,851/0). cargo-deny
+green after clearing the 2026 advisory wave (rustls family bumps +
+libz-sys + the crypto-bigint 0.6→0.7.11 SRP/DH modpow migration); tokio
+pins 1.53.1 with the RUSTSEC-2026-0386 no-call-site exception (see
+`deny.toml` — 1.54.1 regresses the tdcli exit path). Deferred per owner
+decision 2026-11-09: soak 3600, the bench flagged-row re-run, the S75
+corpus replay (TD_RECORD_* secrets), and the fuzz week (skipped since the
+09-27 decision; the Sep 14–23 log's findings were triaged by M.3.10.3) —
+0.1.x follow-ups, not parity claims.
 
 ## 4. Changelog + version
 
@@ -82,6 +90,35 @@ their seams and the S07/S04 oracle gates need the C++ c15d3f5a build
   milestones (S76 walking skeleton → 0.1.0 tag with the first release
   artifacts; S81 bindings validation → 0.2.0; S84 first full-parity
   release → 1.0.0-candidate).
+- **2026-11-09 release audit (the 0.1.0 tag)**, against the pinned
+  upstream `c15d3f5a5de6e3ba5839822c451152e5e18bb700` (tdlib 1.8.68,
+  layer 230), using a pristine td worktree at the pin plus a fresh
+  Release `TD_BUILD`:
+  - `conformance/scheme_parity/check.sh` — the five schemes
+    byte-identical to the pin (local + upstream drift).
+  - Oracle set green: `cpp_dump` (S04), `tl_oracle` tokens/scheme/tlo
+    (S06/S07/S08), `tl_store_oracle` (S10, over the regenerated
+    layer-230 constructors), `tl_json_oracle` (S12),
+    `tl_replay_oracle` (S15), `tdjson_oracle` (S68, 37 lines
+    byte-identical against the C++ `libtdjson.so.1.8.68`).
+  - `requests_gate` green; census 1,039 dispatched / 0 interim / 26 sync
+    of 1,065; `verify_symbols.sh` 14 required / 14 exported / 0 extra;
+    vendored headers byte-identical; the tdjson surface answers
+    `version = "1.8.68"` byte-exact.
+  - Workspace verification green on the tagged tree (fmt, clippy 1.95,
+    rustdoc `-D warnings`, `cargo test --workspace --locked` — 8,851
+    passed / 0 failed).
+  - Advisory wave cleared: rustls 0.23.46, rustls-webpki 0.103.16,
+    webpki-roots 1.0.11, libz-sys 1.1.32, and crypto-bigint 0.6→0.7.11
+    (the RUSTSEC-2026-0387 SRP/DH modpow migration in
+    `tdutils/bignum.rs`). tokio pins 1.53.1: 1.54.1 regresses the tdcli
+    exit path (four harness cases hang), and RUSTSEC-2026-0386 has no
+    `AsyncFd` call site in the tree — the exception and the regression
+    are recorded in `deny.toml`.
+  - Deferred per owner decision 2026-11-09: soak 3600, bench flagged
+    rows, S75 corpus replay (needs the TD_RECORD_* secrets); the fuzz
+    week stays skipped (09-27 decision). CI conformance pin moved
+    `d1085f9c` → `c15d3f5a` (`main.yml` ×2, AGENTS.md).
 - **2026-09-23 changelog-parity audit (S84)**, against the pinned upstream
   `d1085f9cebc5a62379991ae1652673954f229c1f` (tdlib 1.8.67):
   - `conformance/scheme_parity/check.sh` — the five schemes match the S03
