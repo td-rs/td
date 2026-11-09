@@ -1069,7 +1069,7 @@ impl DialogFilterManager {
         if dialog_ids.is_empty() {
             return;
         }
-        let Some(dialog_filter) = self.get_dialog_filter(dialog_filter_id).cloned() else {
+        let Some(dialog_filter) = self.get_dialog_filter(dialog_filter_id) else {
             return;
         };
         let mut new_dialog_filter = dialog_filter.clone();
@@ -1080,7 +1080,7 @@ impl DialogFilterManager {
             self.delete_dialog_filter(env, dialog_filter_id, Vec::new(), Promise::default());
             return;
         }
-        if new_dialog_filter != dialog_filter {
+        if new_dialog_filter != *dialog_filter {
             if let Some(slot) = self.get_dialog_filter_mut(dialog_filter_id) {
                 *slot = new_dialog_filter;
             }

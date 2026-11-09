@@ -129,10 +129,9 @@ pub trait CommunityManagerEnv {
     fn send_get_community_notify_settings_query(
         &mut self,
         community_id: CommunityId,
-        input_community: telegram_api::InputChannel,
+        _input_community: telegram_api::InputChannel,
     ) {
         tdutils::log_info!("Send account_getNotifySettings for {community_id:?} — [net-inert]");
-        let _ = input_community;
     }
 
     /// `UpdateCommunityNotifySettingsQuery::send` (99302f0e2,
@@ -156,10 +155,9 @@ pub trait CommunityManagerEnv {
     fn reload_community_full(
         &mut self,
         community_id: CommunityId,
-        input_community: telegram_api::InputChannel,
+        _input_community: telegram_api::InputChannel,
     ) {
         tdutils::log_info!("Reload community full {community_id:?} — [net-inert]");
-        let _ = input_community;
     }
 
     /// The `MessagesManager::on_update_dialog_community_notification_settings`
@@ -474,9 +472,8 @@ impl CommunityManager {
         env: &mut impl CommunityManagerEnv,
         community_id: CommunityId,
         peer_notify_settings: Option<&telegram_api::PeerNotifySettings>,
-        source: &str,
+        _source: &str,
     ) {
-        let _ = source;
         if env.auth_is_bot() {
             return;
         }
@@ -695,9 +692,8 @@ impl CommunityManager {
         env: &mut impl CommunityManagerEnv,
         community_id: CommunityId,
         new_settings: DialogNotificationSettings,
-        source: &str,
+        _source: &str,
     ) -> bool {
-        let _ = source;
         let Some(community_full) = self.communities_full.get_mut(&community_id.get()) else {
             // The C++ CHECK(community_full != nullptr) band: every caller
             // holds a loaded full.
