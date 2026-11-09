@@ -2177,6 +2177,10 @@ impl FullRemoteFileLocation {
         let file_type = FileType::from_raw(raw_type);
         let dc_id_value = parser.i32_()?;
         let dc_id = DcId::from_value(dc_id_value);
+        // 4429b5468 — an encrypted thumbnail carries no DC
+        if file_type == FileType::EncryptedThumbnail && dc_id != DcId::invalid() {
+            return Err("Invalid DcId for file type");
+        }
 
         let mut file_reference = String::new();
         if has_file_reference {
@@ -12030,6 +12034,37 @@ mod tests {
             parser.fetch_end().unwrap();
             assert_eq!(parsed, location);
         }
+
+        // 4429b5468 — an EncryptedThumbnail with a non-invalid DcId is
+        // rejected on parse (the encrypted thumbnail carries no DC)
+        let mut out = Vec::new();
+        let thumbnail = FullRemoteFileLocation::from_photo(
+            PhotoSizeSource::thumbnail(FileType::EncryptedThumbnail, b'a' as i32),
+            8,
+            9,
+            DcId::internal(2),
+            String::new(),
+        );
+        thumbnail.store(&mut out);
+        let mut parser = Parser::new(&out);
+        assert_eq!(
+            FullRemoteFileLocation::parse_from(&mut parser),
+            Err("Invalid DcId for file type")
+        );
+        // the invalid DcId passes the band
+        let mut out = Vec::new();
+        let thumbnail = FullRemoteFileLocation::from_photo(
+            PhotoSizeSource::thumbnail(FileType::EncryptedThumbnail, b'a' as i32),
+            8,
+            9,
+            DcId::invalid(),
+            String::new(),
+        );
+        thumbnail.store(&mut out);
+        let mut parser = Parser::new(&out);
+        let parsed = FullRemoteFileLocation::parse_from(&mut parser).unwrap();
+        parser.fetch_end().unwrap();
+        assert_eq!(parsed, thumbnail);
 
         // is_web/is_photo/is_common classification and accessors
         let web = FullRemoteFileLocation::from_web(
