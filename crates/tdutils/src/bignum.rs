@@ -13,10 +13,11 @@ use num_traits::{One, ToPrimitive, Zero};
 const MONT_LIMBS: usize = 64;
 
 /// `base^exponent mod modulus` through `crypto-bigint`'s Montgomery
-/// `MontyForm`, zero-padding each operand into the `LIMBS`-limb budget
+/// `FixedMontyForm` (0.7's name for the runtime-modulus `MontyForm`),
+/// zero-padding each operand into the `LIMBS`-limb budget
 /// (`from_le_slice` wants exactly that many bytes). The modulus must be
 /// odd — callers gate on that. Written as per-width functions because
-/// `MontyParams::new` needs `Concat`/`Split` bounds a generic `LIMBS`
+/// `FixedMontyParams::new` needs `Concat`/`Split` bounds a generic `LIMBS`
 /// cannot name.
 macro_rules! montgomery_modpow_fn {
     ($name:ident, $LIMBS:literal) => {
@@ -27,23 +28,23 @@ macro_rules! montgomery_modpow_fn {
                 out[..bytes.len()].copy_from_slice(&bytes);
                 out
             };
-            let params = crypto_bigint::modular::MontyParams::<$LIMBS>::new(
+            let params = crypto_bigint::modular::FixedMontyParams::<$LIMBS>::new(
                 crypto_bigint::Odd::new(crypto_bigint::Uint::<$LIMBS>::from_le_slice(&to_padded(
                     modulus.magnitude(),
                 )))
                 .unwrap(),
             );
-            let reduced = crypto_bigint::modular::MontyForm::<$LIMBS>::new(
+            let reduced = crypto_bigint::modular::FixedMontyForm::<$LIMBS>::new(
                 &crypto_bigint::Uint::<$LIMBS>::from_le_slice(&to_padded(
                     (base % modulus).magnitude(),
                 )),
-                params,
+                &params,
             )
             .pow(&crypto_bigint::Uint::<$LIMBS>::from_le_slice(&to_padded(
                 exponent.magnitude(),
             )))
             .retrieve();
-            BigUint::from_bytes_le(&reduced.to_le_bytes()).into()
+            BigUint::from_bytes_le(reduced.to_le_bytes().as_slice()).into()
         }
     };
 }
