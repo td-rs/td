@@ -346,23 +346,9 @@ pub use crate::files::{FileId, FileSourceId, FileUploadId};
 /// canonical module (`crate::story_ids`).
 pub use crate::story_ids::StoryId;
 
-/// `td::CommunityId` (CommunityId.h).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CommunityId(i64);
-
-impl CommunityId {
-    pub fn new(id: i64) -> CommunityId {
-        CommunityId(id)
-    }
-
-    pub fn is_valid(self) -> bool {
-        self.0 > 0
-    }
-
-    pub fn get(self) -> i64 {
-        self.0
-    }
-}
+/// `td::CommunityId` (CommunityId.h) — the local twin unified on the
+/// canonical module by the community notification-settings slice (#113).
+pub use crate::community_id::CommunityId;
 
 /// `td::ProfilePhoto` (DialogPhoto.h:31-34) — the DialogPhoto base fields
 /// plus the photo id. The `FileId`s stay placeholders until the Files step
@@ -2844,6 +2830,12 @@ impl UserManager {
 
     pub fn get_user(&self, user_id: UserId) -> Option<&User> {
         self.users.get(&user_id.get())
+    }
+
+    /// `get_user_linked_community_id` (UserManager.cpp:5481-5487).
+    pub fn get_user_linked_community_id(&self, user_id: UserId) -> CommunityId {
+        self.get_user(user_id)
+            .map_or_else(CommunityId::default, |user| user.linked_community_id)
     }
 
     pub fn get_user_full(&self, user_id: UserId) -> Option<&UserFull> {

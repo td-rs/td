@@ -1980,44 +1980,9 @@ impl ToDoCompletion {
     }
 }
 
-/// `td::CommunityId` (CommunityId.h) — the id of a (newer-tree) community;
-/// `0` is the unset default and the only invalid value.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct CommunityId(i64);
-
-impl CommunityId {
-    pub fn new(id: i64) -> CommunityId {
-        CommunityId(id)
-    }
-
-    /// `CommunityId::is_valid` (CommunityId.h).
-    pub fn is_valid(self) -> bool {
-        self.0 > 0
-    }
-
-    pub fn get(self) -> i64 {
-        self.0
-    }
-
-    /// `CommunityId::get_fake_dialog_id` (CommunityId.h) — the community
-    /// reuses the channel dialog-id band.
-    pub fn get_fake_dialog_id(self) -> DialogId {
-        DialogId::from_channel_id(ChannelId::new(self.0))
-    }
-
-    /// `CommunityId::store` — raw `store_long`.
-    pub fn store(self, out: &mut Vec<u8>) {
-        store_i64(out, self.0);
-    }
-
-    /// `CommunityId::parse` — raw `fetch_long`.
-    pub fn parse_value(input: &[u8]) -> Result<CommunityId, &'static str> {
-        let mut parser = Parser::new(input);
-        let id = parser.i64_()?;
-        parser.fetch_end()?;
-        Ok(CommunityId(id))
-    }
-}
+/// `td::CommunityId` (CommunityId.h) — the local twin unified on the
+/// canonical module by the community notification-settings slice (#113).
+pub use crate::community_id::CommunityId;
 
 /// `td::SharedDialog` (SharedDialog.h:21-60) — a dialog shared through a
 /// `messageActionRequestedDialog`; `first_name`/`last_name`/`username`/
@@ -20878,8 +20843,9 @@ mod tests {
 
         let mut bytes = Vec::new();
         CommunityId::new(123456789).store(&mut bytes);
+        let mut parser = crate::store_parse::Parser::new(&bytes);
         assert_eq!(
-            CommunityId::parse_value(&bytes).unwrap(),
+            CommunityId::parse_from(&mut parser).unwrap(),
             CommunityId::new(123456789)
         );
     }
