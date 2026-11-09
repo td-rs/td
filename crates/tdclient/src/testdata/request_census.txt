@@ -913,7 +913,7 @@ setChatTitle	dispatched
 setCloseFriends	dispatched
 setCommands	dispatched
 setCommunityName	dispatched
-setCommunityNotificationSettings	interim
+setCommunityNotificationSettings	dispatched
 setCommunityPermissions	dispatched
 setCommunityPhoto	dispatched
 setCustomEmojiStickerSetThumbnail	dispatched
