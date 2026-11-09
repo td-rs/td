@@ -3128,11 +3128,11 @@ enum CommunityNetKind {
     /// cache-load plane (no ported flow dispatches it yet).
     #[allow(dead_code)]
     GetCommunities,
-    /// `GetFullCommunityQuery` (cpp:83) — the community-full cache load;
-    /// the notification-settings postpone reload rides it with the id
-    /// (the reload promise resolves on error too, applying the parked
-    /// settings).
-    GetFullCommunity { community_id: Option<CommunityId> },
+    /// `GetFullCommunityQuery` (cpp:83) — the notification-settings
+    /// postpone reload (the reload promise resolves on error too,
+    /// applying the parked settings); the general community-full
+    /// cache-load plane reuses the kind when it lands.
+    GetFullCommunity { community_id: CommunityId },
     /// `CreateCommunityQuery` (cpp:120) — the error ladder's
     /// `on_get_dialog_error` keys on the request dialog.
     CreateCommunity { dialog_id: DialogId },
@@ -25073,10 +25073,7 @@ impl Td {
                 // every failure branch applies the parked settings (the
                 // `on_reload_community_full_for_notification_settings`
                 // chain).
-                let failed_reload = |td: &mut Self, community_id: Option<CommunityId>| {
-                    let Some(community_id) = community_id else {
-                        return;
-                    };
+                let failed_reload = |td: &mut Self, community_id: CommunityId| {
                     let mut manager = std::mem::take(&mut td.community_manager);
                     let mut env = CommunityEnv { td: &mut *td };
                     manager
@@ -25204,13 +25201,20 @@ impl Td {
             }
             // `UpdateCommunityNotifySettingsQuery` (99302f0e2, cpp:140-168)
             // — the false-as-result 400 band, the error-arm repair query
-            // and the promise settle.
+            // and the promise settle (the promise pairs by community, as
+            // the C++ query carries its own).
             CommunityNetKind::UpdateNotifySettings { community_id } => {
-                let promise = self.community_manager.take_promise(
-                    |m: &mut crate::community_manager::CommunityManager| {
-                        &mut m.pending_set_notification_settings
-                    },
-                );
+                let promise = self
+                    .community_manager
+                    .pending_set_notification_settings
+                    .iter()
+                    .position(|(id, _)| *id == community_id.get())
+                    .map(|index| {
+                        self.community_manager
+                            .pending_set_notification_settings
+                            .remove(index)
+                            .1
+                    });
                 let Some(mut promise) = promise else {
                     return;
                 };
@@ -40271,9 +40275,7 @@ impl CommunityManagerEnv for CommunityEnv<'_> {
     ) {
         match self.td.community_net() {
             Some(net) => net.dispatch(
-                CommunityNetKind::GetFullCommunity {
-                    community_id: Some(community_id),
-                },
+                CommunityNetKind::GetFullCommunity { community_id },
                 telegram_api::Function::channels_getFullChannel(
                     telegram_api::channels_getFullChannel {
                         channel: Some(input_community),
@@ -58821,8 +58823,6 @@ mod tests {
     }
 
     fn community_notification_settings_ride_the_dispatcher_impl() {
-        use crate::community_id::CommunityId;
-
         let (mut td, rec, callback) = netted_td_with_callback("netfix-cm-notify-settings");
         const BOOL_TRUE: i32 = 0x9972_75b5u32 as i32;
         let unix_time = td.get_unix_time();

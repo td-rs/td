@@ -253,9 +253,11 @@ pub struct CommunityManager {
     pub pending_permissions: Vec<Promise<()>>,
     /// The `DeleteCommunityQuery` promise lot.
     pub pending_delete: Vec<Promise<()>>,
-    /// The `UpdateCommunityNotifySettingsQuery` promise lot
-    /// (`setCommunityNotificationSettings`).
-    pub pending_set_notification_settings: Vec<Promise<()>>,
+    /// The `UpdateCommunityNotifySettingsQuery` promises keyed by
+    /// community (`setCommunityNotificationSettings`; the C++ promise
+    /// rides its own query — the answer kind's community_id pairs it
+    /// exactly, unlike the single-community FIFO lots above).
+    pub pending_set_notification_settings: Vec<(i64, Promise<()>)>,
     /// `get_community_notification_settings_queries_` (ea8219749,
     /// 09634ee46) — the communities with an in-flight
     /// `GetCommunityNotifySettingsQuery`.
@@ -490,7 +492,8 @@ impl CommunityManager {
         self.update_community_notification_settings(env, community_id, notification_settings);
     }
 
-    /// `need_update_community_dialogs` (c9ed2c390) — whether the change
+    /// `need_update_community_dialogs` (c9ed2c390,
+    /// CommunityManager.cpp:1641-1656) — whether the change
     /// can affect the notification state of the community chats
     /// (maintained by MessagesManager); a `-1` triple is the
     /// unsynchronized/`use_default` "unknown" state.
@@ -770,7 +773,8 @@ impl CommunityManager {
     }
 
     /// `get_community_notification_settings` (ea8219749, 09634ee46,
-    /// 5ab6224b7) — the settings read; an unsynchronized community
+    /// 5ab6224b7; CommunityManager.cpp:1769-1791) — the settings read; an
+    /// unsynchronized community
     /// triggers the query once. The C++ pointer return becomes a clone
     /// (the manager borrow ends at the read), and 5ab6224b7's
     /// load-in-flight gate is site-less (no community db plane).
@@ -811,14 +815,16 @@ impl CommunityManager {
         )
     }
 
-    /// `on_get_community_notification_settings_error` (09634ee46) — the
+    /// `on_get_community_notification_settings_error`
+    /// (09634ee46; CommunityManager.cpp:1793-1795) — the
     /// failed query erases its map entry so the next read re-sends.
     pub fn on_get_community_notification_settings_error(&mut self, community_id: CommunityId) {
         self.get_community_notification_settings_queries
             .remove(&community_id.get());
     }
 
-    /// `reset_all_community_notification_settings` (8d2a35e05) — every
+    /// `reset_all_community_notification_settings`
+    /// (8d2a35e05; CommunityManager.cpp:1797-1814) — every
     /// cached community resets to the synchronized defaults.
     pub fn reset_all_community_notification_settings(
         &mut self,
@@ -843,7 +849,8 @@ impl CommunityManager {
         }
     }
 
-    /// `set_community_notification_settings` (99302f0e2, a45f737cf) — the
+    /// `set_community_notification_settings` (99302f0e2,
+    /// a45f737cf; CommunityManager.cpp:1831-1853) — the
     /// `setCommunityNotificationSettings` request half; the
     /// `get_community_full_force` load collapses to the memory lookup.
     pub fn set_community_notification_settings(
@@ -896,16 +903,21 @@ impl CommunityManager {
                 input_community,
                 &wire_settings,
             );
-            self.pending_set_notification_settings.push(promise);
+            self.pending_set_notification_settings
+                .push((community_id.get(), promise));
         } else {
             promise.set_error(Status::error(500, "Community not found"));
         }
     }
 
     /// The earliest community unmute deadline — the Td timeout slot merge
-    /// point (the `community_unmute_timeout_` MultiTimeout).
+    /// point (the `community_unmute_timeout_` MultiTimeout heap; the
+    /// slot map is key-ordered, so the minimum is walked explicitly).
     pub fn next_deadline(&self) -> Option<f64> {
-        self.community_unmute_timeout.values().next().copied()
+        self.community_unmute_timeout
+            .values()
+            .copied()
+            .reduce(f64::min)
     }
 
     /// The `community_unmute_timeout_` callback pump — fires every due
