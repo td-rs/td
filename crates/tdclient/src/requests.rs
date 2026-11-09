@@ -18354,21 +18354,23 @@ fn run_misc_glue_requests(td: &mut Td, id: u64, function: Function) {
             td.ton_wallet_manager = manager;
         }
         Function::getTonWalletSecretPhrase(request) => {
-            // Requests.cpp:8002-8008 — CREATE_TEXT_REQUEST_PROMISE.
+            // Requests.cpp:8002-8008 — CREATE_REQUEST_PROMISE over the
+            // tonWalletSecretPhrase object (662c027f2; the 1.8.68 arm
+            // answered td_api::text).
             if !check_is_user(td, id) {
                 return;
             }
             let Some(password) = crate::misc::clean_input_string(&request.password) else {
                 return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
             };
-            // CREATE_TEXT_REQUEST_PROMISE — the string answer maps to the
-            // td_api::text object.
-            let mut outbox = td.deferred_promise::<td_api::Text, _>(id, Object::text);
+            let mut outbox = td.deferred_promise::<td_api::TonWalletSecretPhrase, _>(
+                id,
+                Object::tonWalletSecretPhrase,
+            );
             let promise = tdutils::promise::PromiseCreator::lambda_result(
                 move |result: tdutils::status::Result<String>| match result {
-                    tdutils::status::Result::Ok(phrase) => {
-                        outbox.set_value(td_api::Text { text: phrase })
-                    }
+                    tdutils::status::Result::Ok(phrase) => outbox
+                        .set_value(td_api::TonWalletSecretPhrase { secret_phrase: phrase }),
                     tdutils::status::Result::Err(status) => outbox.set_error(status),
                 },
             );

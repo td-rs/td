@@ -10552,6 +10552,26 @@ impl Td {
         self.user_manager = user_manager;
     }
 
+    /// `td_->user_manager_->invalidate_user_full(td_->user_manager_->get_my_id())`
+    /// — the 788e3b74c self-UserFull invalidation of the wallet-replace
+    /// answer (the take/env/restore shape of the intake helpers).
+    fn invalidate_my_user_full(&mut self) {
+        let my_id = self.user_manager.get_my_id();
+        let mut user_manager = std::mem::take(&mut self.user_manager);
+        let is_bot = self.auth_manager.is_bot();
+        let Some(options) = self.option_manager.as_mut() else {
+            self.user_manager = user_manager;
+            return;
+        };
+        let mut env = crate::user_manager::UserEnv {
+            global: &mut self.global,
+            options,
+            auth_is_bot: is_bot,
+        };
+        user_manager.invalidate_user_full(&mut env, my_id);
+        self.user_manager = user_manager;
+    }
+
     /// `G()->get_webfile_dc_id()` (Global.cpp:254-264) — the toncenter
     /// perform request rides the webfile DC like the C++; the config
     /// seam answers the empty id until the option lands (the dispatcher
@@ -10789,7 +10809,9 @@ impl Td {
             // `EnableWalletBackupQuery` (cpp:294-322),
             // `DisableWalletBackupQuery` (cpp:324-361) and
             // `ReplaceWalletQuery` (cpp:419-450) — the WalletState answer
-            // feeds `on_update_wallet_state`, then the promise value.
+            // feeds `on_update_wallet_state`, then the promise value; the
+            // replace flow additionally invalidates the self UserFull
+            // (788e3b74c — the TON wallet card has changed).
             TonWalletNetKind::EnableBackup
             | TonWalletNetKind::DisableBackup
             | TonWalletNetKind::ReplaceWallet => {
@@ -10810,6 +10832,11 @@ impl Td {
                                 let mut env = TonWalletEnv { td: &mut *self };
                                 manager.on_update_wallet_state(&mut env, wallet_state);
                                 self.ton_wallet_manager = manager;
+                                if matches!(kind, TonWalletNetKind::ReplaceWallet) {
+                                    // 788e3b74c — the TON wallet card has
+                                    // changed: invalidate the self UserFull
+                                    self.invalidate_my_user_full();
+                                }
                                 promise.set_value(());
                             }
                             Err(_) => promise.set_error(parse_error("the wallet backup answer")),
