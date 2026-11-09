@@ -561,12 +561,10 @@ impl CommunityManager {
             if !self
                 .pending_community_notification_settings
                 .contains_key(&community_id.get())
-            {
-                if let Some(input_community) =
+                && let Some(input_community) =
                     self.get_input_community_impl(env.auth_is_bot(), community_id)
-                {
-                    env.reload_community_full(community_id, input_community);
-                }
+            {
+                env.reload_community_full(community_id, input_community);
             }
             self.pending_community_notification_settings
                 .insert(community_id.get(), new_settings);
@@ -828,8 +826,10 @@ impl CommunityManager {
     ) {
         let community_ids: Vec<i64> = self.communities.keys().copied().collect();
         for community_id_int in community_ids {
-            let mut new_settings = DialogNotificationSettings::default();
-            new_settings.is_synchronized = true;
+            let new_settings = DialogNotificationSettings {
+                is_synchronized: true,
+                ..DialogNotificationSettings::default()
+            };
             let community_id = CommunityId::new(community_id_int);
             if self.communities_full.contains_key(&community_id_int) {
                 self.update_community_full_notification_settings(
@@ -1691,11 +1691,12 @@ mod tests {
 
     /// A synchronized settings form with an explicit mute.
     fn muted_settings(mute_until: i32) -> DialogNotificationSettings {
-        let mut settings = DialogNotificationSettings::default();
-        settings.is_synchronized = true;
-        settings.use_default_mute_until = false;
-        settings.mute_until = mute_until;
-        settings
+        DialogNotificationSettings {
+            is_synchronized: true,
+            use_default_mute_until: false,
+            mute_until,
+            ..DialogNotificationSettings::default()
+        }
     }
 
     fn wire_community_full(id: i64) -> telegram_api::communityFull {
@@ -1734,8 +1735,10 @@ mod tests {
         // c9ed2c390: the state trio (mute/pinned/mention) with -1 for the
         // unsynchronized and use_default "unknown" states.
         let unsync = DialogNotificationSettings::default();
-        let mut synced_default = DialogNotificationSettings::default();
-        synced_default.is_synchronized = true;
+        let synced_default = DialogNotificationSettings {
+            is_synchronized: true,
+            ..DialogNotificationSettings::default()
+        };
         let muted = muted_settings(500);
 
         // unsync and the all-defaults synchronized state share the
@@ -1765,9 +1768,11 @@ mod tests {
             &other_mute
         ));
         // use_default reads as the unknown -1
-        let mut use_default = DialogNotificationSettings::default();
-        use_default.is_synchronized = true;
-        use_default.mute_until = 500;
+        let use_default = DialogNotificationSettings {
+            is_synchronized: true,
+            mute_until: 500,
+            ..DialogNotificationSettings::default()
+        };
         assert!(CommunityManager::need_update_community_dialogs(
             &use_default,
             &muted

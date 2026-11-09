@@ -1981,18 +1981,20 @@ mod tests {
         let mut env = TestSettingsEnv::new();
         env.dialog_scope = NotificationSettingsScope::Group;
         env.linked_community = CommunityId::new(7);
-        let mut community = DialogNotificationSettings::default();
-        community.is_synchronized = true;
-        community.use_default_mute_until = false;
-        community.mute_until = 500;
-        community.use_default_show_preview = false;
-        community.show_preview = false;
-        community.use_default_mute_stories = false;
-        community.mute_stories = true;
-        community.sound = Some(NotificationSound::Ringtone { ringtone_id: 11 });
-        community.story_sound = Some(NotificationSound::NoSound);
-        community.use_default_hide_story_sender = false;
-        community.hide_story_sender = true;
+        let community = DialogNotificationSettings {
+            is_synchronized: true,
+            use_default_mute_until: false,
+            mute_until: 500,
+            use_default_show_preview: false,
+            show_preview: false,
+            use_default_mute_stories: false,
+            mute_stories: true,
+            sound: Some(NotificationSound::Ringtone { ringtone_id: 11 }),
+            story_sound: Some(NotificationSound::NoSound),
+            use_default_hide_story_sender: false,
+            hide_story_sender: true,
+            ..DialogNotificationSettings::default()
+        };
         env.community_settings = Some(community);
 
         let manager = NotificationSettingsManager::new();
@@ -2041,12 +2043,14 @@ mod tests {
         let mut env = TestSettingsEnv::new();
         env.dialog_scope = NotificationSettingsScope::Group;
         let mut manager = NotificationSettingsManager::new();
-        let mut scope_settings = ScopeNotificationSettings::default();
         // a future mute (the store form collapses expired mutes)
-        scope_settings.mute_until = 1_000_300;
-        scope_settings.show_preview = false;
-        scope_settings.sound = Some(NotificationSound::Ringtone { ringtone_id: 4 });
-        scope_settings.is_synchronized = true;
+        let scope_settings = ScopeNotificationSettings {
+            mute_until: 1_000_300,
+            show_preview: false,
+            sound: Some(NotificationSound::Ringtone { ringtone_id: 4 }),
+            is_synchronized: true,
+            ..ScopeNotificationSettings::default()
+        };
         env.seed_scope_settings(NotificationSettingsScope::Group, &scope_settings);
         manager.init(&mut env);
         env.time = 0.0;

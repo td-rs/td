@@ -3639,12 +3639,13 @@ pub fn get_dialog_notification_settings_from_telegram(
         .unwrap_or((true, false));
 
     let Some(settings) = settings else {
-        let mut result = DialogNotificationSettings::default();
-        result.use_default_disable_pinned_message_notifications = old_use_default_disable_pinned;
-        result.disable_pinned_message_notifications = old_disable_pinned;
-        result.use_default_disable_mention_notifications = old_use_default_disable_mention;
-        result.disable_mention_notifications = old_disable_mention;
-        return result;
+        return DialogNotificationSettings {
+            use_default_disable_pinned_message_notifications: old_use_default_disable_pinned,
+            disable_pinned_message_notifications: old_disable_pinned,
+            use_default_disable_mention_notifications: old_use_default_disable_mention,
+            disable_mention_notifications: old_disable_mention,
+            ..DialogNotificationSettings::default()
+        };
     };
 
     // The flag bits are the peerNotifySettings masks (show_previews `0`,
@@ -38036,26 +38037,34 @@ mod tests {
     #[test]
     fn fix_mute_until_bands() {
         // b1afb1e44: a bot, a default mute and an expired mute all clear.
-        let mut bot = DialogNotificationSettings::default();
-        bot.use_default_mute_until = false;
-        bot.mute_until = i32::MAX;
+        let mut bot = DialogNotificationSettings {
+            use_default_mute_until: false,
+            mute_until: i32::MAX,
+            ..DialogNotificationSettings::default()
+        };
         bot.fix_mute_until(true, 100);
         assert_eq!(bot.mute_until, 0);
 
-        let mut default = DialogNotificationSettings::default();
-        default.mute_until = 500;
+        let mut default = DialogNotificationSettings {
+            mute_until: 500,
+            ..DialogNotificationSettings::default()
+        };
         default.fix_mute_until(false, 100);
         assert_eq!(default.mute_until, 0, "use_default_mute_until clears");
 
-        let mut expired = DialogNotificationSettings::default();
-        expired.use_default_mute_until = false;
-        expired.mute_until = 100;
+        let mut expired = DialogNotificationSettings {
+            use_default_mute_until: false,
+            mute_until: 100,
+            ..DialogNotificationSettings::default()
+        };
         expired.fix_mute_until(false, 100);
         assert_eq!(expired.mute_until, 0, "mute_until == now clears");
 
-        let mut live = DialogNotificationSettings::default();
-        live.use_default_mute_until = false;
-        live.mute_until = 101;
+        let mut live = DialogNotificationSettings {
+            use_default_mute_until: false,
+            mute_until: 101,
+            ..DialogNotificationSettings::default()
+        };
         live.fix_mute_until(false, 100);
         assert_eq!(live.mute_until, 101, "a future mute survives");
     }
@@ -38064,13 +38073,15 @@ mod tests {
     fn chat_notification_settings_object_bands() {
         // get_chat_notification_settings_object: the remaining-mute clamp
         // and the inverted story-poster field.
-        let mut settings = DialogNotificationSettings::default();
-        settings.use_default_mute_until = false;
-        settings.mute_until = 1_000;
-        settings.sound = Some(NotificationSound::Ringtone { ringtone_id: 7 });
-        settings.story_sound = Some(NotificationSound::NoSound);
-        settings.use_default_hide_story_sender = false;
-        settings.hide_story_sender = true;
+        let settings = DialogNotificationSettings {
+            use_default_mute_until: false,
+            mute_until: 1_000,
+            sound: Some(NotificationSound::Ringtone { ringtone_id: 7 }),
+            story_sound: Some(NotificationSound::NoSound),
+            use_default_hide_story_sender: false,
+            hide_story_sender: true,
+            ..DialogNotificationSettings::default()
+        };
         let object = get_chat_notification_settings_object(&settings, 400);
         assert_eq!(object.mute_for, 600);
         assert!(!object.use_default_mute_for);
@@ -38173,9 +38184,11 @@ mod tests {
     fn dialog_notification_settings_from_telegram_bands() {
         // absent settings → the unsynchronized default with the local
         // pinned/mention fields preserved from the old settings
-        let mut old = DialogNotificationSettings::default();
-        old.use_default_disable_pinned_message_notifications = false;
-        old.disable_pinned_message_notifications = true;
+        let old = DialogNotificationSettings {
+            use_default_disable_pinned_message_notifications: false,
+            disable_pinned_message_notifications: true,
+            ..DialogNotificationSettings::default()
+        };
         let absent = get_dialog_notification_settings_from_telegram(None, Some(&old), 100);
         assert!(!absent.is_synchronized);
         assert!(!absent.use_default_disable_pinned_message_notifications);
@@ -38245,16 +38258,20 @@ mod tests {
         assert!(verdict.are_changed);
 
         // equivalent-but-different Local sounds count as changed only
-        let mut with_local = base.clone();
-        with_local.sound = Some(NotificationSound::Local {
-            title: "a".to_owned(),
-            data: String::new(),
-        });
-        let mut with_other_local = base.clone();
-        with_other_local.sound = Some(NotificationSound::Local {
-            title: "b".to_owned(),
-            data: String::new(),
-        });
+        let with_local = DialogNotificationSettings {
+            sound: Some(NotificationSound::Local {
+                title: "a".to_owned(),
+                data: String::new(),
+            }),
+            ..base.clone()
+        };
+        let with_other_local = DialogNotificationSettings {
+            sound: Some(NotificationSound::Local {
+                title: "b".to_owned(),
+                data: String::new(),
+            }),
+            ..base.clone()
+        };
         let verdict = need_update_dialog_notification_settings(&with_local, &with_other_local);
         assert!(!verdict.need_update_server);
         assert!(verdict.are_changed);
