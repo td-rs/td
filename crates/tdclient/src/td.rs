@@ -49417,6 +49417,16 @@ impl crate::forum_topic_manager::ForumTopicEnv for ForumTopicTdEnv<'_> {
         DialogId::from_user_id(self.user_manager.get_my_id())
     }
 
+    fn get_user_first_username(&self, user_id: i64) -> String {
+        self.user_manager
+            .get_user_first_username_of(crate::user_manager::UserId::new(user_id))
+            .to_owned()
+    }
+
+    fn get_my_user_id(&self) -> i64 {
+        self.user_manager.get_my_id().get()
+    }
+
     // `td_->dialog_manager_->get_input_peer(dialog_id, rights)` — the
     // `StoryEnv::story_input_peer` split (the per-type reads over the
     // user/chat managers).

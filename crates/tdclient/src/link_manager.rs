@@ -2775,6 +2775,34 @@ fn get_ton_connect_connect_request_object(
     })
 }
 
+/// `get_ton_connect_query_from_startapp` (LinkManager.cpp:243-262,
+/// extracted by e3f0a2489): the `tonconnect-` startapp payload decodes
+/// `__`→`=`, `--`→`%`, `-`→`&` into the `?`-rooted connect query; a
+/// non-tonconnect startapp answers the empty query.
+fn get_ton_connect_query_from_startapp(startapp: &str) -> String {
+    let Some(stripped) = startapp.strip_prefix("tonconnect-") else {
+        return String::new();
+    };
+    let mut connect_query: Vec<u8> = b"?".to_vec();
+    let bytes = stripped.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'_' && i + 1 < bytes.len() && bytes[i + 1] == b'_' {
+            i += 1;
+            connect_query.push(b'=');
+        } else if bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            i += 1;
+            connect_query.push(b'%');
+        } else if bytes[i] == b'-' {
+            connect_query.push(b'&');
+        } else {
+            connect_query.push(bytes[i]);
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&connect_query).into_owned()
+}
+
 /// `get_internal_link_ton_connect` (LinkManager.cpp:3157-3172).
 fn get_internal_link_ton_connect(query: &str, check_path: bool) -> Option<InternalLink> {
     let url_query = parse_url_query(query);
@@ -2958,6 +2986,16 @@ fn parse_tg_link_query(
                 copy_arg(&mut copied, &url_query, &mut is_first_arg, "domain");
                 copy_arg(&mut copied, &url_query, &mut is_first_arg, "startapp");
                 return Some(InternalLink::Oauth { url: copied });
+            }
+            if username == "sendgrams" && has_arg("startapp") {
+                // e3f0a2489 — tg://resolve?domain=sendgrams&startapp=
+                // tonconnect-... is the TON Connect link too
+                if let Some(link) = get_internal_link_ton_connect(
+                    &get_ton_connect_query_from_startapp(&get_arg("startapp")),
+                    true,
+                ) {
+                    return Some(link);
+                }
             }
             for (key, value) in &url_query.args {
                 if (key == "voicechat" || key == "videochat" || key == "livestream")
@@ -4322,30 +4360,13 @@ fn parse_t_me_link_query(
         }
     } else if path[0] == "sendgrams" {
         // /sendgrams?to=<receiver>&amount=<amount>
-        // /sendgrams?startapp=tonconnect-... (23d3991c4)
-        let startapp = get_arg("startapp");
-        if let Some(stripped) = startapp.strip_prefix("tonconnect-") {
-            let mut connect_query: Vec<u8> = b"?".to_vec();
-            let bytes = stripped.as_bytes();
-            let mut i = 0usize;
-            while i < bytes.len() {
-                if bytes[i] == b'_' && i + 1 < bytes.len() && bytes[i + 1] == b'_' {
-                    i += 1;
-                    connect_query.push(b'=');
-                } else if bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
-                    i += 1;
-                    connect_query.push(b'%');
-                } else if bytes[i] == b'-' {
-                    connect_query.push(b'&');
-                } else {
-                    connect_query.push(bytes[i]);
-                }
-                i += 1;
-            }
-            let connect_query = String::from_utf8_lossy(&connect_query).into_owned();
-            if let Some(link) = get_internal_link_ton_connect(&connect_query, true) {
-                return Some(link);
-            }
+        // /sendgrams?startapp=tonconnect-... (23d3991c4; the decode moved
+        // into get_ton_connect_query_from_startapp with e3f0a2489)
+        if let Some(link) = get_internal_link_ton_connect(
+            &get_ton_connect_query_from_startapp(&get_arg("startapp")),
+            true,
+        ) {
+            return Some(link);
         }
         let receiver = get_arg("to");
         let amount = get_arg("amount");
@@ -7534,6 +7555,49 @@ impl LinkManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The e3f0a2489 upstream vector (`test/link.cpp`): the
+    /// tg://resolve?domain=sendgrams&startapp=tonconnect-... form parses
+    /// into the TON Connect link exactly like the t.me path.
+    #[test]
+    fn tg_sendgrams_startapp_parses_like_ton_connect() {
+        struct SendgramsEnv;
+        impl LinkEnv for SendgramsEnv {}
+        let mut env = SendgramsEnv;
+        let link = parse_internal_link(
+                &mut env,
+                "tg:resolve/\
+    ?domain=sendgrams&startapp=tonconnect-v__2-id__c745acd825f83bf7ef88d671ea69c90fd1c7e71f78b1079ec8ad3c231fed7a65-\
+    trace--5Fid__01a0b488--2D27a9--2D7419--2D89bc--2D169fc31ba6fd-r__--7B--22manifestUrl--22--3A--22https--3A--2F--\
+    2Ftonconnect--2Dsdk--2Ddemo--2Ddapp--2Evercel--2Eapp--2Ftonconnect--2Dmanifest--2Ejson--22--2C--22items--22--3A-\
+    -5B--7B--22name--22--3A--22ton--5Faddr--22--7D--5D--7D-ret__none",
+                false,
+            )
+            .expect("the tg sendgrams startapp link parses");
+        match link {
+            InternalLink::TonConnect {
+                version,
+                dapp_client_id,
+                connect_request,
+                return_strategy,
+                rpc_request,
+                trace_id,
+            } => {
+                assert_eq!(version, 2);
+                assert_eq!(
+                    dapp_client_id,
+                    "c745acd825f83bf7ef88d671ea69c90fd1c7e71f78b1079ec8ad3c231fed7a65"
+                );
+                assert_eq!(return_strategy, "none");
+                assert_eq!(rpc_request, "");
+                assert_eq!(trace_id, "01a0b488-27a9-7419-89bc-169fc31ba6fd");
+                assert_eq!(
+                    connect_request,
+                    "{\"manifestUrl\":\"https://tonconnect-sdk-demo-dapp.vercel.app/tonconnect-manifest.json\",\"items\":[{\"name\":\"ton_addr\"}]}"
+                );
+            }
+            other => panic!("the TON Connect link: {other:?}"),
+        }
+    }
 
     /// The `start_up` line (LinkManager.cpp:1901): the token starts
     /// empty and its update time a year in the past — the autologin url
