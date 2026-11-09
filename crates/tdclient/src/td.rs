@@ -28955,31 +28955,11 @@ impl Td {
                     promise: Some(promise),
                     convert_queue: Arc::clone(&self.convert_gift_queue),
                 };
+                // cb4cb24a9 — the reload-user-full/channel-full chain
+                // leaves (it double-counted the gift): the promise
+                // settles directly
                 let mut chain_promise: Promise<()> = Promise::from_interface(chain);
-                let my_dialog_id = crate::dialog_manager::get_my_dialog_id(self);
-                if dialog_id == my_dialog_id {
-                    let my_id = self.user_manager.get_my_id();
-                    self.with_user_manager_env(|user_manager, env| {
-                        user_manager.reload_user_full(
-                            env,
-                            my_id,
-                            chain_promise,
-                            "ConvertStarGiftQuery",
-                        )
-                    });
-                } else if dialog_id.get_type() == crate::dialog_id::DialogType::Channel {
-                    let channel_id = dialog_id.get_channel_id();
-                    self.with_chat_manager_env(|chat_manager, _user_manager, env| {
-                        chat_manager.reload_channel_full(
-                            env,
-                            channel_id,
-                            chain_promise,
-                            "ConvertStarGiftQuery",
-                        )
-                    });
-                } else {
-                    chain_promise.set_value(());
-                }
+                chain_promise.set_value(());
             }
             // `SaveStarGiftQuery::on_result`/`on_error`
             // (StarGiftManager.cpp:549-561).
