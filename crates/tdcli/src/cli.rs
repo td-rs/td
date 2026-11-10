@@ -5391,6 +5391,24 @@ impl CliClient {
                 name,
             }));
             true
+        } else if op == "acc" || op == "acch" {
+            // cli.cpp:3910-3914 — the visible (`acc`) and hidden (`acch`)
+            // addCommunityChat arms.
+            let (community_id, chat_id) = tokenizer::split(args, ' ');
+            self.send_request(Function::addCommunityChat(td_api::addCommunityChat {
+                community_id: tokenizer::to_integer_i64(trim_td(&community_id)),
+                chat_id: self.as_chat_id(&chat_id),
+                is_hidden: op == "acch",
+            }));
+            true
+        } else if op == "rcc" {
+            // cli.cpp:3915-3919 — removeCommunityChat.
+            let (community_id, chat_id) = tokenizer::split(args, ' ');
+            self.send_request(Function::removeCommunityChat(td_api::removeCommunityChat {
+                community_id: tokenizer::to_integer_i64(trim_td(&community_id)),
+                chat_id: self.as_chat_id(&chat_id),
+            }));
+            true
         } else if op == "tcmib" {
             // cli.cpp:3942-3947 — the member ban toggle over the
             // message-sender form of the member id.
@@ -16159,6 +16177,8 @@ mod tests {
             ("ug", 1),
             ("voi", 1),
             ("q", 18),
+            ("acc", 2),
+            ("acch", 2),
             ("acslp", 2),
             ("alpk", 2),
             ("amr", 2),
@@ -16238,6 +16258,7 @@ mod tests {
             ("pcacr", 2),
             ("pcacrs", 2),
             ("radmctr", 2),
+            ("rcc", 2),
             ("react", 2),
             ("reactbot", 2),
             ("reactbotbig", 2),

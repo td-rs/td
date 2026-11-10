@@ -10,7 +10,7 @@ addChatMembers	dispatched
 addChatToList	dispatched
 addChatWelcomeMessage	dispatched
 addChecklistTasks	dispatched
-addCommunityChat	interim
+addCommunityChat	dispatched
 addContact	dispatched
 addCustomServerLanguagePack	dispatched
 addFavoriteSticker	dispatched
@@ -712,7 +712,7 @@ removeAllFilesFromDownloads	dispatched
 removeAllWebBrowserSettingsExceptions	dispatched
 removeBusinessConnectedBotFromChat	dispatched
 removeChatActionBar	dispatched
-removeCommunityChat	interim
+removeCommunityChat	dispatched
 removeContacts	dispatched
 removeFavoriteSticker	dispatched
 removeFileFromDownloads	dispatched

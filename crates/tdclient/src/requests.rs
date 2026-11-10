@@ -7183,6 +7183,42 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             manager.get_joined_communities(&mut env, promise);
             td.community_manager = manager;
         }
+        Function::addCommunityChat(request) => {
+            // Requests.cpp:3497-3502 (1747ecde1 + the da0e19cf3 owner
+            // gate) — CHECK_IS_USER, then CommunityManager::
+            // add_community_dialog (the communities.togglePeerLink send
+            // and the change-settle ride the net answer drain).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut manager, mut env) = community_split(td);
+            manager.add_community_dialog(
+                &mut env,
+                CommunityId::new(request.community_id),
+                crate::dialog_id::DialogId::new(request.chat_id),
+                request.is_hidden,
+                promise,
+            );
+            td.community_manager = manager;
+        }
+        Function::removeCommunityChat(request) => {
+            // Requests.cpp:3504-3509 (f027a2d06) — CHECK_IS_USER, then
+            // CommunityManager::remove_community_dialog (the deleted-band
+            // toggle and the change-settle ride the net answer drain).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut manager, mut env) = community_split(td);
+            manager.remove_community_dialog(
+                &mut env,
+                CommunityId::new(request.community_id),
+                crate::dialog_id::DialogId::new(request.chat_id),
+                promise,
+            );
+            td.community_manager = manager;
+        }
         Function::toggleCommunityAreChatsCollapsed(request) => {
             // Requests.cpp:3533-3538 — CHECK_IS_USER, then
             // CommunityManager::toggle_community_are_dialogs_collapsed
@@ -20366,7 +20402,7 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 26, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            1061,
+            1063,
             "dispatched count"
         );
         // the 23383aef sync base (1.8.70): the 34 new scheme functions
@@ -20428,6 +20464,14 @@ mod request_census_tests {
         // processCommunityAddChatRequests whose Bool answers settle
         // through the change-settle): 1,055 + 3 = 1,058 dispatched /
         // 18 - 3 = 15 interim, sync unmoved 26.
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 12, "interim count");
+        // The community family slice (#131) flipped the link-mutator pair
+        // (addCommunityChat — the visible and hidden bands of the shared
+        // communities.togglePeerLink query over the is_dialog_owner gate,
+        // removeCommunityChat — the deleted band over the
+        // linked-peer-administrator-or-owner gate; both settle through
+        // the #127 change-settle): 1,058 + 2 = 1,060 dispatched /
+        // 15 - 2 = 13 interim, sync unmoved 26 (the #131-over-#128/#133
+        // merge pin).
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 10, "interim count");
     }
 }
