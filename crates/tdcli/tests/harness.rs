@@ -129,6 +129,13 @@ fn normalize(stderr: &str) -> Vec<String> {
 struct Session {
     child: Child,
     tmpdir: std::path::PathBuf,
+    /// The concurrently-drained stderr: the CLI's teardown can flood the
+    /// td_requests receive bookends past the OS pipe buffer (64 KB), and a
+    /// stderr nobody reads until after exit deadlocks the child there —
+    /// it must exit before its transcript can be read. The drain thread
+    /// owns the pipe; `stderr` joins it after the exit wait.
+    stderr_slot: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    stderr_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Session {
@@ -150,9 +157,31 @@ impl Session {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let stderr_slot = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let drain_slot = std::sync::Arc::clone(&stderr_slot);
+        let stderr_thread = std::thread::Builder::new()
+            .name("harness-stderr-drain".to_owned())
+            .spawn(move || {
+                use std::io::Read;
+                let mut stderr = stderr;
+                let mut buf = [0u8; 8192];
+                loop {
+                    match stderr.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => drain_slot.lock().unwrap().extend_from_slice(&buf[..n]),
+                    }
+                }
+            })
+            .unwrap();
         child.stdin.take().unwrap().write_all(input).unwrap();
         // stdin closes here — EOF right after the input
-        Session { child, tmpdir }
+        Session {
+            child,
+            tmpdir,
+            stderr_slot,
+            stderr_thread: Some(stderr_thread),
+        }
     }
 
     fn wait_exit(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
@@ -181,15 +210,11 @@ impl Session {
     }
 
     fn stderr(&mut self) -> String {
-        let mut out = String::new();
-        use std::io::Read;
-        self.child
-            .stderr
-            .take()
-            .unwrap()
-            .read_to_string(&mut out)
-            .unwrap();
-        out
+        if let Some(thread) = self.stderr_thread.take() {
+            let _ = thread.join();
+        }
+        let bytes = std::mem::take(&mut *self.stderr_slot.lock().unwrap());
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 
     fn assert_exit_0_and_stderr(&mut self, expected: &[&str]) {
