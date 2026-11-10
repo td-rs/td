@@ -251,7 +251,7 @@ pub fn can_be_secret_message_content(content_type: MessageContentType) -> bool {
     use MessageContentType::*;
     matches!(
         content_type,
-        Animation | Audio | Photo | Video | VideoNote | VoiceNote | Widget
+        Animation | Audio | Photo | Video | VideoNote | VoiceNote
     )
 }
 
@@ -13257,7 +13257,6 @@ pub fn is_allowed_media_group_content(content_type: MessageContentType) -> bool 
             | MessageContentType::Video
             | MessageContentType::ExpiredPhoto
             | MessageContentType::ExpiredVideo
-            | MessageContentType::Widget
     )
 }
 

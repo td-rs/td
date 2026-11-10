@@ -2,7 +2,7 @@
 //! widgets family (#119): the bot widget-query plane. The C++ manager is
 //! stateless besides `td_` (every method immediately converts to a wire
 //! query through a `Td::ResultHandler`); this port collapses the handlers
-//! into the [`WidgetNetKind`] completed queue with per-family FIFO
+//! into the `WidgetNetKind` completed queue with per-family FIFO
 //! promise lots on [`WidgetManager`]. The three inbound
 //! `updateBot*WidgetQuery` updates route from `UpdatesManager` into the
 //! [`WidgetManagerEnv::send_update`] outbox as the td_api
