@@ -259,7 +259,7 @@ editQuickReplyMessage	dispatched
 editStarSubscription	dispatched
 editStory	dispatched
 editStoryCover	dispatched
-editStoryMusic	interim
+editStoryMusic	dispatched
 editTextCompositionStyle	dispatched
 editUserStarSubscription	dispatched
 editWidgetData	dispatched
@@ -586,7 +586,7 @@ getSupportName	dispatched
 getSupportUser	dispatched
 getTemporaryPasswordState	dispatched
 getTextCompositionStyleExample	dispatched
-getTextEmojiRanges	interim
+getTextEmojiRanges	sync
 getTextEntities	sync
 getThemeParametersJsonString	sync
 getThemedChatEmojiStatuses	dispatched

@@ -9,10 +9,10 @@
 //! `SynchronousRequests::do_request` tail over the language pack
 //! database). The countries glue slice flips `getCountryFlagEmoji` and
 //! `getPhoneNumberInfoSync` (the CountryInfoManager statics), and the
-//! push-id function landed with its manager. `searchQuote`,
-//! `checkQuickReplyShortcutName` and `cleanFileName` still land with
-//! theirs; until then they report "The method can't be executed
-//! synchronously", like any other request.
+//! push-id function landed with its manager. The misc-family slice adds
+//! `getTextEmojiRanges` (the `find_emojis` walk over the tdutils emoji
+//! table). `searchQuote` answers through its `run_request` dispatcher arm;
+//! `checkQuickReplyShortcutName` and `cleanFileName` are flipped here too.
 
 use std::sync::Mutex;
 
@@ -81,6 +81,7 @@ pub fn is_synchronous_request(function: &Function) -> bool {
     matches!(
         function,
         Function::getTextEntities(_)
+            | Function::getTextEmojiRanges(_)
             | Function::parseTextEntities(_)
             | Function::parseMarkdown(_)
             | Function::getMarkdownText(_)
@@ -107,7 +108,8 @@ pub fn is_synchronous_request(function: &Function) -> bool {
             | Function::getPhoneNumberInfoSync(_)
             | Function::cleanFileName(_)
     ) || matches!(function, Function::getOption(g) if option_manager::is_synchronous_option(&g.name))
-    // Not ported yet (need their managers): searchQuote.
+    // searchQuote answers through its run_request dispatcher arm instead
+    // of the C++ synchronous plane.
 }
 
 /// `JsonValue.cpp:get_json_value_object`: `tdutils::JsonValue` → td_api.
@@ -432,6 +434,27 @@ pub fn run_request(function: Function) -> Object {
                     i32::MAX,
                 ),
             })
+        }
+        Function::getTextEmojiRanges(request) => {
+            // `do_request(getTextEmojiRanges)` (SynchronousRequests.cpp
+            // :151-166) — the UTF-8 gate, then the emoji walk; the offsets
+            // and lengths are UTF-16 code units.
+            if !tdutils::utf8::check_utf8(request.text.as_bytes()) {
+                return make_error(400, "Text must be encoded in UTF-8");
+            }
+            let text = &request.text;
+            let mut ranges = Vec::new();
+            let mut offset: i32 = 0; // in UTF-16 code units
+            let mut last_end = 0usize;
+            for emoji in tdutils::emoji::find_emojis(text) {
+                let emoji_start = emoji.as_ptr() as usize - text.as_ptr() as usize;
+                offset += tdutils::utf8::utf8_utf16_length(&text[last_end..emoji_start]) as i32;
+                let length = tdutils::utf8::utf8_utf16_length(emoji) as i32;
+                ranges.push(td_api::TextRange { offset, length });
+                offset += length;
+                last_end = emoji_start + emoji.len();
+            }
+            Object::textRanges(td_api::TextRanges { ranges })
         }
         Function::parseTextEntities(request) => {
             // must not use clean_input_string, because \r may be used as a separator
@@ -843,6 +866,41 @@ mod tests {
             checked += 1;
         }
         assert_eq!(checked, 1164, "the corpus shrank");
+    }
+
+    /// The misc-family `getTextEmojiRanges` arm — the `find_emojis` walk
+    /// with UTF-16 offsets (SynchronousRequests.cpp:151-166). The UTF-8
+    /// gate is the raw-string band: a typed Rust `String` is always valid
+    /// UTF-8, so it is exercised at the JSON plane, not here.
+    #[test]
+    fn get_text_emoji_ranges_walks_the_emoji_table() {
+        let function = Function::getTextEmojiRanges(td_api::getTextEmojiRanges {
+            text: "a👍🏻b".to_string(),
+        });
+        assert!(is_synchronous_request(&function));
+        assert_eq!(
+            run_request(function).to_json(),
+            r#"{"@type":"textRanges","ranges":[{"@type":"textRange","offset":1,"length":4}]}"#
+        );
+
+        // UTF-16 offsets: the astral leading emoji is 2 units, the ZWJ
+        // family is one 8-unit match, the keycap one 3-unit match.
+        let function = Function::getTextEmojiRanges(td_api::getTextEmojiRanges {
+            text: "😀👨\u{200D}👩\u{200D}👦1️⃣".to_string(),
+        });
+        assert_eq!(
+            run_request(function).to_json(),
+            r#"{"@type":"textRanges","ranges":[{"@type":"textRange","offset":0,"length":2},{"@type":"textRange","offset":2,"length":8},{"@type":"textRange","offset":10,"length":3}]}"#
+        );
+
+        // No emoji — the empty ranges answer.
+        assert_eq!(
+            run_request(Function::getTextEmojiRanges(td_api::getTextEmojiRanges {
+                text: String::new(),
+            }))
+            .to_json(),
+            r#"{"@type":"textRanges","ranges":[]}"#
+        );
     }
 
     #[test]

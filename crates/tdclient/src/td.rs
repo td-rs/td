@@ -6379,6 +6379,9 @@ pub struct Td {
     /// twin.
     pub(crate) saved_music_upload_callback:
         Arc<parking_lot::Mutex<dyn crate::files::UploadCallback>>,
+    /// `AudiosManager::upload_audio_file_callback_`
+    /// (AudiosManager.cpp:83-95) — the story-music upload outbox bridge.
+    pub(crate) audios_upload_callback: Arc<parking_lot::Mutex<dyn crate::files::UploadCallback>>,
     /// `TranscriptionManager`'s `UploadAudioFileCallback`
     /// (TranscriptionManager.cpp:500-515) — the
     /// `recognizeSpeechInFile` upload outbox bridge.
@@ -7056,6 +7059,10 @@ impl Td {
             Arc::new(Mutex::new(TdSavedMusicUploadCallback {
                 events: Arc::clone(&file_shared.lock().saved_music_upload_events),
             }));
+        let audios_upload_callback: Arc<parking_lot::Mutex<dyn crate::files::UploadCallback>> =
+            Arc::new(Mutex::new(TdAudiosUploadCallback {
+                events: Arc::clone(&file_shared.lock().audios_upload_events),
+            }));
         let audio_upload_callback: Arc<parking_lot::Mutex<dyn crate::files::UploadCallback>> =
             Arc::new(Mutex::new(TdAudioUploadCallback {
                 events: Arc::clone(&file_shared.lock().audio_upload_events),
@@ -7220,6 +7227,7 @@ impl Td {
             file_load_manager,
             profile_photo_upload_callback,
             saved_music_upload_callback,
+            audios_upload_callback,
             audio_upload_callback,
             download_manager,
             file_shared,
@@ -10520,6 +10528,7 @@ impl Td {
             voice_notes_manager,
             video_notes_manager,
             notification_updates,
+            audios_upload_callback,
             ..
         } = self;
         let mut env = StoryEnv {
@@ -10539,6 +10548,7 @@ impl Td {
             video_notes: video_notes_manager,
             updates: notification_updates,
             net,
+            audios_upload_callback: audios_upload_callback.clone(),
         };
         run(&mut env, story_manager)
     }
@@ -14055,6 +14065,240 @@ impl Td {
                         }),
                         Err(_) => promise.set_error(parse_error("stories.editStory")),
                     },
+                }
+            }
+            // `EditStoryMusicQuery` (StoryManager.cpp:638-676) — the
+            // Updates ride the engine with the caller promise (the
+            // STORY_NOT_MODIFIED !bot value band); the file-reference
+            // band deletes the bad reference, runs the repair seam and
+            // continues in the reupload chain; the other errors run the
+            // dialog-error head.
+            StoryNetKind::EditStoryMusic {
+                dialog_id,
+                story_id,
+                music_file_id,
+            } => {
+                let Some((file_reference, mut promise)) =
+                    self.story_manager.take_edit_story_music_query_promise()
+                else {
+                    return;
+                };
+                let status = match story_error(&query) {
+                    Some(status) => status,
+                    None => match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => {
+                            self.um_send(UmMessage::OnGetUpdates {
+                                updates: Box::new(updates),
+                                promise,
+                            });
+                            return;
+                        }
+                        Err(_) => parse_error("stories.editStory"),
+                    },
+                };
+                if status.message() == "STORY_NOT_MODIFIED" && !self.auth_manager.is_bot() {
+                    promise.set_value(());
+                } else if !self.auth_manager.is_bot()
+                    && music_file_id.is_valid()
+                    && crate::files::is_file_reference_error(&status)
+                {
+                    // cpp:648-668 — the reference delete, then the repair
+                    // seam: `repair_file_reference` is [blocked: net], and
+                    // the collapse answers the failure the C++ promise
+                    // would eventually carry, so the repair-failure band
+                    // runs at once — the profile-audio reupload chain
+                    // (`AudiosManager::reupload_audio`) with the story
+                    // tail keyed by the resumed upload (the C++ lambda
+                    // captures).
+                    tdutils::log_info!(
+                        "Receive {status} for the story music file reference repair"
+                    );
+                    self.file_manager
+                        .lock()
+                        .delete_file_reference(music_file_id, file_reference.as_bytes());
+                    let file_upload_id = {
+                        let mut files = self.file_manager.lock();
+                        let mut fllm = self.file_load_manager.lock();
+                        self.audios_manager.reupload_audio(
+                            &mut files,
+                            &mut fllm,
+                            &self.audios_upload_callback,
+                            music_file_id,
+                            tdutils::promise::Promise::default(),
+                        )
+                    };
+                    self.story_manager.park_edit_story_music_upload_tail(
+                        file_upload_id,
+                        dialog_id,
+                        story_id,
+                        promise,
+                    );
+                } else {
+                    // cpp:670-673 — the expected-error head + the
+                    // promise error
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        &status,
+                        "EditStoryMusicQuery",
+                    );
+                    promise.set_error(status);
+                }
+            }
+            // `AudiosManager::UploadAudioFileQuery::on_result`/`on_error`
+            // (AudiosManager.cpp:63-79) over the `on_uploaded_audio_file`
+            // bands (:478-512) — the story-music `messages.uploadMedia`
+            // leg; the ok tail merges the parsed document, cancels the
+            // upload and refires `do_edit_story_music` through the keyed
+            // story tail, the error band runs the parts/partial-location
+            // machinery and fails the layer-1 carrier + the tail.
+            StoryNetKind::UploadStoryMusic {
+                file_upload_id,
+                is_url,
+                was_uploaded,
+            } => {
+                // the `is_url` member is signature parity (the C++
+                // `on_uploaded_audio_file` body never reads it)
+                let _ = is_url;
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::MessageMedia::parse(query.ok())
+                        .map_err(|_| parse_error("messages_uploadMedia"))
+                };
+                let file_id = file_upload_id.file_id;
+                // the C++ `UploadAudioFileQuery::on_error` band
+                // (AudiosManager.cpp:70-87) — the parts/partial machinery,
+                // the upload cancel, then the layer-1 carrier + the keyed
+                // story tail fail together (the C++ promise_ error passes
+                // through the edit lambda)
+                let fail_query = |td: &mut Self, status: &Status| {
+                    let close_flag = td.global.close_flag();
+                    {
+                        let mut files = td.file_manager.lock();
+                        let mut fllm = td.file_load_manager.lock();
+                        if was_uploaded {
+                            debug_assert!(file_upload_id.is_valid());
+                            let bad_parts = crate::files::get_missing_file_parts(status);
+                            if bad_parts.is_empty() {
+                                // `delete_partial_remote_location_if_needed`
+                                files.delete_partial_remote_location_on_error(
+                                    file_upload_id,
+                                    status,
+                                    close_flag,
+                                    &mut fllm,
+                                );
+                            } else {
+                                // TODO on_upload_audio_file_parts_missing
+                                // (the C++ carries the same TODO)
+                            }
+                        } else if crate::files::is_file_reference_error(status) {
+                            tdutils::log_error!(
+                                "Receive file reference error for UploadAudioFileQuery"
+                            );
+                        }
+                        files.cancel_upload(file_upload_id, &mut fllm);
+                    }
+                    if let Some(mut carrier) =
+                        td.story_manager.take_upload_story_music_query_promise()
+                    {
+                        carrier.set_error(status.clone());
+                    }
+                    if let Some((_, _, mut tail)) = td
+                        .story_manager
+                        .take_edit_story_music_upload_tail(file_upload_id)
+                    {
+                        tail.set_error(status.clone());
+                    }
+                };
+                // the `on_uploaded_audio_file` 400 bands — the partial
+                // location drop + the error that passes through the edit
+                // lambda to the caller promise
+                let fail_uploaded = |td: &mut Self, message: &str| {
+                    {
+                        let mut files = td.file_manager.lock();
+                        let mut fllm = td.file_load_manager.lock();
+                        files.delete_partial_remote_location(file_upload_id, &mut fllm);
+                    }
+                    if let Some(mut carrier) =
+                        td.story_manager.take_upload_story_music_query_promise()
+                    {
+                        carrier.set_error(Status::error(400, message));
+                    }
+                    if let Some((_, _, mut tail)) = td
+                        .story_manager
+                        .take_edit_story_music_upload_tail(file_upload_id)
+                    {
+                        tail.set_error(Status::error(400, message));
+                    }
+                };
+                match result {
+                    Ok(telegram_api::MessageMedia::messageMediaDocument(media)) => {
+                        let Some(document) = media.document else {
+                            // the C++ `document_` null is the wrong-type band
+                            fail_uploaded(self, "Can't upload audio file: wrong file type");
+                            return;
+                        };
+                        match document {
+                            telegram_api::Document::documentEmpty(_) => {
+                                fail_uploaded(self, "Can't upload audio file: empty file");
+                            }
+                            telegram_api::Document::document(document) => {
+                                let (mut denv, documents) = self.documents_env();
+                                let parsed = documents.on_get_document(
+                                    &mut denv,
+                                    crate::documents_manager::RemoteDocument::from_server_document(
+                                        document,
+                                    ),
+                                    crate::messages_manager::DialogId::default(),
+                                    false,
+                                    false,
+                                    crate::document::DocumentType::General,
+                                    crate::documents_manager::Subtype::Other,
+                                );
+                                if parsed.type_ != crate::document::DocumentType::Audio {
+                                    fail_uploaded(self, "Wrong file type");
+                                    return;
+                                }
+                                if parsed.file_id != file_id {
+                                    // must not delete the old audio, because
+                                    // the file_id could be used for
+                                    // simultaneous URL uploads
+                                    self.audios_manager.merge_audios(parsed.file_id, file_id);
+                                }
+                                let mut files = self.file_manager.lock();
+                                let mut fllm = self.file_load_manager.lock();
+                                files.cancel_upload(file_upload_id, &mut fllm);
+                                drop(files);
+                                drop(fllm);
+                                // the `promise_.set_value` hop: the story
+                                // lambda's ok band refires
+                                // `do_edit_story_music` with the file id
+                                if let Some(mut carrier) =
+                                    self.story_manager.take_upload_story_music_query_promise()
+                                {
+                                    carrier.set_value(());
+                                }
+                                if let Some((dialog_id, story_id, tail)) = self
+                                    .story_manager
+                                    .take_edit_story_music_upload_tail(file_upload_id)
+                                {
+                                    self.with_story_manager(|env, manager| {
+                                        manager.do_edit_story_music(
+                                            env, dialog_id, story_id, file_id, tail,
+                                        );
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        // `media->get_id() != messageMediaDocument::ID`
+                        fail_uploaded(self, "Can't upload audio file: wrong file type");
+                    }
+                    Err(status) => {
+                        fail_query(self, &status);
+                    }
                 }
             }
             // `ToggleStoryPinnedQuery` (StoryManager.cpp:653-687) — the C++
@@ -31329,6 +31573,14 @@ impl Td {
         for event in saved_music_uploads {
             self.run_saved_music_upload_event(event);
         }
+        // the `AudiosManager::UploadAudioFileCallback` hops — the
+        // `send_closure_later` re-entries of the C++ story-music upload
+        // callback (AudiosManager.cpp:83-95) replay here
+        let audios_uploads =
+            std::mem::take(&mut *self.file_shared.lock().audios_upload_events.lock());
+        for event in audios_uploads {
+            self.run_audios_upload_event(event);
+        }
         // the `UploadAudioFileCallback` hops — the
         // `send_closure_later` re-entries of the C++ speech-recognition
         // upload callback (TranscriptionManager.cpp:500-515) replay here
@@ -31427,6 +31679,76 @@ impl Td {
             }
         }
         self.user_manager = user_manager;
+    }
+
+    /// One `AudiosManager::UploadAudioFileCallback` hop — the C++
+    /// `on_upload_audio_file[_error]` re-entries (AudiosManager.cpp
+    /// :427-457): the ok resolves the audios input media (the env locks
+    /// the file manager, so it runs before the story tail takes the
+    /// borrow) and continues in the `UploadStoryMusic` query send; the
+    /// close gate keeps the parked promises (the C++ early return).
+    fn run_audios_upload_event(&mut self, event: UserUploadEvent) {
+        if self.global.close_flag() {
+            return;
+        }
+        match event {
+            UserUploadEvent::Ok {
+                file_upload_id,
+                input_file,
+            } => {
+                tdutils::log_info!("Audio {file_upload_id:?} has been uploaded");
+                let promise = self
+                    .audios_manager
+                    .take_uploaded_audio_promise(file_upload_id);
+                let had_input_file = input_file.is_some();
+                let input_media = self
+                    .audios_manager
+                    .get_input_media(self, file_upload_id.file_id, input_file, None)
+                    .expect("CHECK(input_media != nullptr)");
+                let was_uploaded = crate::files::extract_was_uploaded(&input_media);
+                if had_input_file && !was_uploaded {
+                    // if we had InputFile, but has failed to use it for
+                    // input_media, then we need to immediately cancel file
+                    // upload so the next upload with the same file can
+                    // succeed
+                    let mut files = self.file_manager.lock();
+                    let mut fllm = self.file_load_manager.lock();
+                    files.cancel_upload(file_upload_id, &mut fllm);
+                }
+                self.with_story_manager(|_, manager| {
+                    manager.do_upload_story_music_query(
+                        file_upload_id,
+                        !had_input_file,
+                        was_uploaded,
+                        input_media,
+                        promise,
+                    );
+                });
+            }
+            UserUploadEvent::Error {
+                file_upload_id,
+                status,
+            } => {
+                tdutils::log_warning!("Audio {file_upload_id:?} has upload error {status}");
+                let mut promise = self
+                    .audios_manager
+                    .take_uploaded_audio_promise(file_upload_id);
+                // the C++ band: `status.code() > 0 ? status.code() : 500`
+                let status = if status.code() > 0 {
+                    status
+                } else {
+                    tdutils::status::Status::error(500, status.message())
+                };
+                promise.set_error(status.clone());
+                // the story lambda's error pass-through
+                if let Some((_, _, mut tail)) = self
+                    .story_manager
+                    .take_edit_story_music_upload_tail(file_upload_id)
+                {
+                    tail.set_error(status);
+                }
+            }
+        }
     }
 
     /// One `UploadSavedMusicCallback` hop — the C++
@@ -33567,6 +33889,10 @@ pub(crate) struct TdFileShared {
     /// both completions re-enter
     /// `UserManager::on_upload_saved_music[_error]` at the drive end.
     pub(crate) saved_music_upload_events: Arc<parking_lot::Mutex<Vec<UserUploadEvent>>>,
+    /// The `AudiosManager::UploadAudioFileCallback` hops
+    /// (AudiosManager.cpp:83-95) — both completions re-enter the story
+    /// music upload's `on_upload_audio_file[_error]` at the drive end.
+    pub(crate) audios_upload_events: Arc<parking_lot::Mutex<Vec<UserUploadEvent>>>,
     /// The `UploadAudioFileCallback` hops (TranscriptionManager.cpp:
     /// 500-515) — both completions re-enter
     /// `TranscriptionManager::on_upload_audio_file[_error]` at the
@@ -33620,6 +33946,7 @@ impl TdFileShared {
             user_download_finished_events: Arc::new(Mutex::new(Vec::new())),
             profile_photo_upload_events: Arc::new(Mutex::new(Vec::new())),
             saved_music_upload_events: Arc::new(Mutex::new(Vec::new())),
+            audios_upload_events: Arc::new(Mutex::new(Vec::new())),
             audio_upload_events: Arc::new(Mutex::new(Vec::new())),
             files_dir: String::new(),
             secure_files_dir: String::new(),
@@ -34215,6 +34542,36 @@ struct TdAudioUploadCallback {
 }
 
 impl crate::files::UploadCallback for TdAudioUploadCallback {
+    fn on_upload_ok(
+        &mut self,
+        file_upload_id: crate::files::FileUploadId,
+        input_file: Option<telegram_api::InputFile>,
+    ) {
+        self.events.lock().push(UserUploadEvent::Ok {
+            file_upload_id,
+            input_file,
+        });
+    }
+
+    fn on_upload_error(
+        &mut self,
+        file_upload_id: crate::files::FileUploadId,
+        status: tdutils::status::Status,
+    ) {
+        self.events.lock().push(UserUploadEvent::Error {
+            file_upload_id,
+            status,
+        });
+    }
+}
+
+/// `AudiosManager::UploadAudioFileCallback` (AudiosManager.cpp:83-95)
+/// — the story-music upload twin of [`TdProfilePhotoUploadCallback`].
+struct TdAudiosUploadCallback {
+    events: Arc<parking_lot::Mutex<Vec<UserUploadEvent>>>,
+}
+
+impl crate::files::UploadCallback for TdAudiosUploadCallback {
     fn on_upload_ok(
         &mut self,
         file_upload_id: crate::files::FileUploadId,
@@ -49700,6 +50057,11 @@ pub(crate) struct StoryEnv<'a> {
     /// The story net dispatch surface — `None` keeps the net-inert
     /// posture (the §3.5 net-drain 20 families dispatch through it).
     pub net: Option<StoryNetHandle>,
+    /// The `AudiosManager::upload_audio_file_callback_` outbox bridge —
+    /// the story-music upload leg registers the file-plane uploads
+    /// through it.
+    pub audios_upload_callback:
+        std::sync::Arc<parking_lot::Mutex<dyn crate::files::UploadCallback>>,
 }
 
 impl<'a> StoryEnv<'a> {
@@ -51067,6 +51429,51 @@ impl<'a> crate::story_manager::StoryManagerEnv for StoryEnv<'a> {
             },
             None => tdutils::log_info!("Send stories.editStory (business) — [net-inert]"),
         }
+    }
+
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn get_story_music_input_document(
+        &mut self,
+        music_file_id: crate::files::FileId,
+    ) -> tdutils::status::Result<telegram_api::InputDocument> {
+        // `get_story_music_input_document` (StoryManager.cpp:6637-6648)
+        // — the empty/audio-type/main-remote gates, then the wire form.
+        const INVALID_AUDIO_FILE_ID: &str = "Invalid audio file identifier specified";
+        let files = self.file_manager.lock();
+        let Some(file_view) = files.get_file_view(music_file_id) else {
+            return tdutils::status::Result::Err(Status::error(400, INVALID_AUDIO_FILE_ID));
+        };
+        if file_view.get_type() != crate::files::FileType::Audio {
+            return tdutils::status::Result::Err(Status::error(400, INVALID_AUDIO_FILE_ID));
+        }
+        let Some(main_remote_location) = file_view.get_main_remote_location() else {
+            return tdutils::status::Result::Err(Status::error(400, INVALID_AUDIO_FILE_ID));
+        };
+        if main_remote_location.is_web() {
+            return tdutils::status::Result::Err(Status::error(400, INVALID_AUDIO_FILE_ID));
+        }
+        tdutils::status::Result::Ok(telegram_api::InputDocument::inputDocument(
+            main_remote_location.as_input_document(),
+        ))
+    }
+
+    fn upload_story_music_audio(
+        &mut self,
+        input_audio: td_api::InputAudio,
+        promise: tdutils::promise::Promise<()>,
+    ) -> tdutils::status::Result<crate::audios_manager::AudioUploadOutcome> {
+        let mut files = self.file_manager.lock();
+        let mut fllm = self.file_load_manager.lock();
+        self.audios.upload_audio(
+            &mut files,
+            &mut fllm,
+            &self.audios_upload_callback,
+            Some(input_audio),
+            promise,
+        )
     }
 }
 
@@ -85387,6 +85794,145 @@ mod tests {
         }
         .store_boxed(&mut answer);
         answer
+    }
+
+    #[test]
+    fn story_music_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(story_music_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn story_music_rides_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain19-story-music");
+        let my_dialog = seed_my_story_identity(&mut td);
+        let my_chat = my_dialog.get();
+
+        // seed my story 15 with photo content (the updates-engine
+        // storyItem intake)
+        td.with_story_manager(|env, manager| {
+            manager.on_get_story(
+                env,
+                my_dialog,
+                Some(wire_photo_story(15, false, 2_000_000_000)),
+            );
+        });
+
+        // 1. the gates — an unknown story answers 400 before any query
+        td.request(
+            1,
+            Function::editStoryMusic(td_api::editStoryMusic {
+                story_poster_chat_id: my_chat,
+                story_id: 99,
+                music: None,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 1);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Story not found")
+        );
+        assert_not_sent(&rec, telegram_api::stories_editStory::ID, "the gate");
+
+        // 2. the null-music band — the music-only editStory constructor
+        td.request(
+            2,
+            Function::editStoryMusic(td_api::editStoryMusic {
+                story_poster_chat_id: my_chat,
+                story_id: 15,
+                music: None,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_editStory::ID,
+        );
+        let body = telegram_api::stories_editStory::parse(sent.query()).expect("the body");
+        assert_eq!(body.flags, 1 << 4); // MUSIC_MASK only
+        assert_eq!(body.id, 15);
+        assert!(matches!(
+            body.music,
+            Some(telegram_api::InputDocument::inputDocumentEmpty(_))
+        ));
+        match body.peer.as_deref() {
+            // the owner dialog is the client's own user — the self peer
+            Some(telegram_api::InputPeer::inputPeerSelf(_)) => {}
+            other => panic!("the write peer: {other:?}"),
+        }
+        // the STORY_NOT_MODIFIED value band answers ok (non-bot)
+        net_fail(sent, 400, "STORY_NOT_MODIFIED");
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 3. the remote-audio fast path — the wire document rides the
+        //    registered audio's main remote
+        let audio_file_id = td.file_manager.lock().register_remote(
+            crate::files::FullRemoteFileLocation::from_document(
+                crate::files::FileType::Audio,
+                500,
+                42,
+                crate::chat_manager::DcId::main(),
+                "ref".to_owned(),
+            ),
+            crate::files::FileLocationSource::FromServer,
+            crate::messages_manager::DialogId::default(),
+            128,
+            128,
+            "song.mp3".to_owned(),
+        );
+        td.request(
+            3,
+            Function::editStoryMusic(td_api::editStoryMusic {
+                story_poster_chat_id: my_chat,
+                story_id: 15,
+                music: Some(td_api::InputAudio {
+                    audio: Some(td_api::InputFile::inputFileId(td_api::inputFileId {
+                        id: audio_file_id.get(),
+                    })),
+                    album_cover_thumbnail: None,
+                    duration: 180,
+                    title: "Song".to_owned(),
+                    performer: "Artist".to_owned(),
+                }),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_editStory::ID,
+        );
+        let body = telegram_api::stories_editStory::parse(sent.query()).expect("the body");
+        assert_eq!(body.flags, 1 << 4); // MUSIC_MASK only
+        match body.music {
+            Some(telegram_api::InputDocument::inputDocument(document)) => {
+                assert_eq!(document.id, 500);
+                assert_eq!(document.access_hash, 42);
+                assert_eq!(document.file_reference, b"ref");
+            }
+            other => panic!("the music document: {other:?}"),
+        }
+        // 4. the FILE_REFERENCE band — the reference delete + the
+        //    reupload chain park the caller promise (the repair seam is
+        //    [blocked: net]; the resumed upload idles in the outbox)
+        net_fail(sent, 400, "FILE_REFERENCE_EXPIRED");
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 3).is_empty(),
+            "the promise parks across the repair"
+        );
+        assert_eq!(
+            td.audios_manager.being_uploaded_audio_files.len(),
+            1,
+            "the reupload registered"
+        );
     }
 
     #[test]

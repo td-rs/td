@@ -8023,6 +8023,23 @@ fn run_story_requests(td: &mut Td, id: u64, function: Function) {
             });
         }
 
+        // editStoryMusic (Requests.cpp:4965-4971)
+        Function::editStoryMusic(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            story_arm(td, |env, manager| {
+                manager.edit_story_music(
+                    env,
+                    crate::dialog_id::DialogId::new(request.story_poster_chat_id),
+                    crate::story_ids::StoryId::new(request.story_id),
+                    request.music,
+                    promise,
+                );
+            });
+        }
+
         // setStoryPrivacySettings (Requests.cpp:4796-4801)
         Function::setStoryPrivacySettings(request) => {
             if !check_is_user(td, id) {
@@ -20520,10 +20537,10 @@ mod request_census_tests {
         // setGiftSettings (the GlobalPrivacySettings gift leg over the
         // StarGiftSettings value plane) (986 + 10 = 996 dispatched /
         // 10 - 10 = 0 interim, sync unmoved 26 — the census closes).
-        assert_eq!(*counts.get("sync").unwrap_or(&0), 26, "sync count");
+        assert_eq!(*counts.get("sync").unwrap_or(&0), 27, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            1061,
+            1062,
             "dispatched count"
         );
         // the 23383aef sync base (1.8.70): the 34 new scheme functions
@@ -20573,7 +20590,16 @@ mod request_census_tests {
         // getWidgetQueryAnswer) over the WidgetManager plane:
         // 1,055 + 6 = 1,061 dispatched / 18 - 6 = 12 interim, sync
         // unmoved 26.
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 12, "interim count");
+        // The #126 misc-family slice flipped the pair: editStoryMusic
+        // (the StoryManager edit_story_music arm over the
+        // AudiosManager::upload_audio plane — the remote fast path, the
+        // url band and the fresh-upload outbox live; the
+        // EditStoryMusicQuery + UploadStoryMusic kinds ride the story
+        // net family, the repair band runs the [blocked: net] repair
+        // seam + the reupload chain) and getTextEmojiRanges (the
+        // synchronous arm over the tdutils find_emojis walk): 1,061 + 1
+        // = 1,062 dispatched / 12 - 2 = 10 interim, 26 + 1 = 27 sync.
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 10, "interim count");
     }
 }
 
