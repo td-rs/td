@@ -20274,7 +20274,7 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 26, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            1054,
+            1056,
             "dispatched count"
         );
         // the 23383aef sync base (1.8.70): the 34 new scheme functions
@@ -20315,6 +20315,13 @@ mod request_census_tests {
         // getSuitableCommunityChats (the ForCommunityDialog plane of the
         // created-public-dialogs cache): 1,053 + 1 = 1,054 dispatched /
         // 20 - 1 = 19 interim, sync unmoved 26.
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 19, "interim count");
+        // The community member pair slice (#133) flipped the pair
+        // (toggleCommunityMemberIsBanned — the participant-banned wire
+        // toggle whose ignored Bool settles through the #127
+        // change-settle; getCommunityMemberChats — the
+        // participant-joined-chats query whose answer splits the owned
+        // vs joined chat ids over the per-channel known gate): 1,054 + 2
+        // = 1,056 dispatched / 19 - 2 = 17 interim, sync unmoved 26.
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 17, "interim count");
     }
 }
