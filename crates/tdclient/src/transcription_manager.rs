@@ -523,9 +523,10 @@ pub trait TranscriptionManagerEnv {
     fn close_status(&self) -> Status;
     /// `td_->file_manager_->get_input_file_id(FileType::
     /// SpeechRecognitionAudio, audio_file, DialogId(), false, false)`
-    /// (TranscriptionManager.cpp:482-484; the C++ five-argument overload
-    /// defaults `is_encrypted`/`get_by_hash`/`is_secure`/
-    /// `force_reuse` off).
+    /// (TranscriptionManager.cpp:482-484) — the C++ five-argument
+    /// overload (`is_encrypted` defaulted off; the
+    /// `get_by_hash`/`is_secure`/`force_reuse`/`never_reuse` tail keeps
+    /// the C++ defaults).
     fn fm_get_input_file_id(
         &mut self,
         audio_file: Option<td_api::InputFile>,
@@ -1468,23 +1469,7 @@ impl TranscriptionManager {
             self.pending_audio_transcription_timeouts
                 .remove(&update.transcription_id);
         }
-        match handler {
-            PendingTranscription::Message(file_info) => {
-                self.on_transcribed_audio_update(
-                    env,
-                    file_info,
-                    false,
-                    tdutils::status::Result::Ok(update),
-                );
-            }
-            PendingTranscription::File(file_upload_id) => {
-                self.on_transcribed_audio_file_update(
-                    env,
-                    file_upload_id,
-                    tdutils::status::Result::Ok(update),
-                );
-            }
-        }
+        self.dispatch_pending_transcription(env, handler, tdutils::status::Result::Ok(update));
     }
 
     /// `TranscriptionManager::on_pending_audio_transcription_failed`
@@ -1504,21 +1489,24 @@ impl TranscriptionManager {
         self.pending_audio_transcription_timeouts
             .remove(&transcription_id);
 
+        self.dispatch_pending_transcription(env, handler, tdutils::status::Result::Err(error));
+    }
+
+    /// The stored handler's call — the C++ invokes the popped closure
+    /// with the result (TranscriptionManager.cpp:433-439/565-569/647/:674);
+    /// the closure's free variable rides the enum.
+    fn dispatch_pending_transcription(
+        &mut self,
+        env: &mut impl TranscriptionManagerEnv,
+        handler: PendingTranscription,
+        r_update: tdutils::status::Result<telegram_api::updateTranscribedAudio>,
+    ) {
         match handler {
             PendingTranscription::Message(file_info) => {
-                self.on_transcribed_audio_update(
-                    env,
-                    file_info,
-                    false,
-                    tdutils::status::Result::Err(error),
-                );
+                self.on_transcribed_audio_update(env, file_info, false, r_update);
             }
             PendingTranscription::File(file_upload_id) => {
-                self.on_transcribed_audio_file_update(
-                    env,
-                    file_upload_id,
-                    tdutils::status::Result::Err(error),
-                );
+                self.on_transcribed_audio_file_update(env, file_upload_id, r_update);
             }
         }
     }

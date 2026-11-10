@@ -1133,7 +1133,7 @@ impl TranslationManager {
     }
 
     /// `TranslationManager::get_recognized_speech_input_ai_compose_tone`
-    /// (TranslationManager.cpp:827-830) — the shared tone of the
+    /// (TranslationManager.cpp:798-802) — the shared tone of the
     /// fix-recognized pair: the default tone with the "voice" prompt.
     fn get_recognized_speech_input_ai_compose_tone() -> Option<telegram_api::InputAiComposeTone> {
         Some(telegram_api::InputAiComposeTone::inputAiComposeToneDefault(
@@ -1144,7 +1144,7 @@ impl TranslationManager {
     }
 
     /// `TranslationManager::fix_recognized_text_with_ai`
-    /// (TranslationManager.cpp:832-838) — the recognized-text fix rides
+    /// (TranslationManager.cpp:804-810) — the recognized-text fix rides
     /// the same `messages.composeMessageWithAI` query as the compose
     /// family, with no language code, the "voice" tone and no emojify.
     pub fn fix_recognized_text_with_ai(
@@ -1170,7 +1170,7 @@ impl TranslationManager {
     }
 
     /// `TranslationManager::fix_recognized_rich_message_with_ai`
-    /// (TranslationManager.cpp:840-848) — [blocked: RichMessage], like
+    /// (TranslationManager.cpp:811-816) — [blocked: RichMessage], like
     /// the rest of the rich family.
     pub fn fix_recognized_rich_message_with_ai(
         &self,
@@ -1925,7 +1925,7 @@ mod tests {
         assert_eq!(env.queries, vec!["compose"]);
         // no language code, the "voice" default tone, no emojify — the
         // recognized-speech form of the shared compose query
-        // (TranslationManager.cpp:832-838).
+        // (TranslationManager.cpp:804-810).
         assert_eq!(env.last_compose_lang, "");
         assert_eq!(env.last_compose_tone.as_deref(), Some("voice"));
         assert!(!env.last_compose_emojify);
