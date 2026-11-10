@@ -8554,16 +8554,6 @@ impl Td {
             self.close_flag = 4;
             self.global.set_close_flag();
             self.clear_requests();
-            // `web_proxy_manager_.reset()` (Td.cpp:804) — the reset fires the
-            // manager's `hangup`, so the carrier-closed updates precede the
-            // Closing announcement; the `clear()` half (Td.cpp:699) is
-            // idempotent over the emptied registry.
-            {
-                let (mut web_proxy_manager, mut web_proxy_env) = web_proxy_env_split(self);
-                web_proxy_manager.hangup(&mut web_proxy_env);
-                self.web_proxy_manager = web_proxy_manager;
-            }
-            self.flush_user_updates();
             self.send_update(Object::updateAuthorizationState(
                 td_api::updateAuthorizationState {
                     authorization_state: Some(
@@ -8573,6 +8563,19 @@ impl Td {
                     ),
                 },
             ));
+            // `web_proxy_manager_.reset()` (Td.cpp:804) — the reset queues
+            // the manager's `hangup`, so the C++ client sees the Closing
+            // announcement FIRST and the carrier-closed updates only when
+            // the event loop runs the hangup; the collapsed world runs the
+            // same hangup after the announcement for the same observable
+            // order. The `clear()` half (Td.cpp:699) is idempotent over the
+            // emptied registry.
+            {
+                let (mut web_proxy_manager, mut web_proxy_env) = web_proxy_env_split(self);
+                web_proxy_manager.hangup(&mut web_proxy_env);
+                self.web_proxy_manager = web_proxy_manager;
+            }
+            self.flush_user_updates();
         } else {
             self.state = State::Close;
             self.close_flag = 1;

@@ -310,7 +310,8 @@ pub(crate) struct WebProxyManager {
     network_flag: bool,
 
     /// `max_endpoint_id_` / `active_endpoint_id_` / `endpoints_` (h:115-117;
-    /// the C++ `std::map` iterates by ascending id).
+    /// the C++ `FlatHashMap` is unordered — the `BTreeMap` keeps the
+    /// collapsed-world sweeps deterministic).
     max_endpoint_id: i64,
     active_endpoint_id: i64,
     endpoints: BTreeMap<i64, Endpoint>,
@@ -1067,7 +1068,7 @@ impl WebProxyManager {
         let state = self.endpoints[&endpoint_id].state;
         if state != CarrierState::Ready {
             if frame_type != FRAME_WELCOME || stream_id != 0 || !payload.is_empty() {
-                return Err("unexpected frame before welcome".to_string());
+                return Err("Unexpected frame before welcome".to_string());
             }
             self.on_carrier_welcome(env, endpoint_id);
             return Ok(());
@@ -1077,13 +1078,13 @@ impl WebProxyManager {
             return match frame_type {
                 FRAME_PING => {
                     if payload.len() > MAX_PING_PAYLOAD_SIZE {
-                        return Err("too long ping".to_string());
+                        return Err("Too long ping".to_string());
                     }
                     self.send_frame(env, endpoint_id, FRAME_PONG, 0, payload);
                     Ok(())
                 }
-                FRAME_BYE => Err("relay said goodbye".to_string()),
-                _ => Err(format!("unexpected session frame {}", frame_type as i32)),
+                FRAME_BYE => Err("Relay said goodbye".to_string()),
+                _ => Err(format!("Unexpected session frame {}", frame_type as i32)),
             };
         }
 
@@ -1093,7 +1094,7 @@ impl WebProxyManager {
                 Some(&stream_key) => stream_key,
                 None => {
                     if !endpoint.closed_stream_ids.contains(&stream_id) {
-                        return Err("frame for an unknown stream".to_string());
+                        return Err("Frame for an unknown stream".to_string());
                     }
                     // the frame crossed our CLOSE (cpp:776-787)
                     let is_valid = (frame_type == FRAME_DATA && !payload.is_empty())
@@ -1102,7 +1103,7 @@ impl WebProxyManager {
                             && read_uint32(payload) != 0)
                         || (frame_type == FRAME_CLOSE && payload.is_empty());
                     if !is_valid {
-                        return Err("invalid frame for a closed stream".to_string());
+                        return Err("Invalid frame for a closed stream".to_string());
                     }
                     return Ok(());
                 }
@@ -1120,7 +1121,7 @@ impl WebProxyManager {
         match frame_type {
             FRAME_DATA => {
                 if payload.is_empty() || payload.len() > receive_window as usize {
-                    return Err("data beyond the receive window".to_string());
+                    return Err("Data beyond the receive window".to_string());
                 }
                 let stream = self.streams.get_mut(&stream_key).unwrap();
                 stream.receive_window -= payload.len() as u32;
@@ -1130,18 +1131,18 @@ impl WebProxyManager {
             }
             FRAME_WINDOW => {
                 if payload.len() != 4 {
-                    return Err("invalid window frame".to_string());
+                    return Err("Invalid window frame".to_string());
                 }
                 let amount = read_uint32(payload);
                 if amount == 0 {
-                    return Err("empty window frame".to_string());
+                    return Err("Empty window frame".to_string());
                 }
                 env.stream_add_send_window(stream_key, amount);
                 Ok(())
             }
             FRAME_CLOSE => {
                 if !payload.is_empty() {
-                    return Err("invalid close frame".to_string());
+                    return Err("Invalid close frame".to_string());
                 }
                 // released, because destroying the actor would drop the data
                 // that is still being written (cpp:816-818)
@@ -1149,7 +1150,7 @@ impl WebProxyManager {
                 self.close_stream(env, endpoint_id, stream_key, false);
                 Ok(())
             }
-            _ => Err(format!("unexpected stream frame {}", frame_type as i32)),
+            _ => Err(format!("Unexpected stream frame {}", frame_type as i32)),
         }
     }
 

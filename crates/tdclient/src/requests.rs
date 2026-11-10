@@ -17514,9 +17514,11 @@ fn run_proxy_network_requests(td: &mut Td, id: u64, function: Function) {
         Function::processWebProxyCarrierMessage(request) => {
             // Requests.cpp:9908-9913 — CREATE_OK_REQUEST_PROMISE, then the
             // web-proxy manager's carrier-message intake. The C++ answers
-            // ok before the intake and redacts the receive log (the page
-            // messages carry relay traffic); the collapsed world has no
-            // receive log, and the manager settles the promise first.
+            // ok before the intake. The receive-log redaction that
+            // adfdfb71b added (the page messages carry relay traffic)
+            // was reverted by bb15e2139 before the 23383aef pin — the
+            // pinned Td.cpp:294 logs every request in full — and the
+            // collapsed world has no receive log either way.
             let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             let (mut manager, mut env) = crate::td::web_proxy_env_split(td);
             manager.process_carrier_message(&mut env, request.carrier_id, request.message, promise);
