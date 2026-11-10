@@ -21830,6 +21830,46 @@ impl Td {
                     }
                 }
             }
+            // `EditInlineMessageWidgetDataQuery::on_result`/`on_error`
+            // (InlineMessageManager.cpp:163-171) — the false Bool is only
+            // logged, the promise settles either way.
+            K::EditInlineMessageWidgetData => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else if let Some(value) = parse_wire_bool_value(query.ok()) {
+                    if !value {
+                        tdutils::log_error!(
+                            "Receive false in result of editInlineBotMessageWidgetData"
+                        );
+                    }
+                    Ok(())
+                } else {
+                    tdutils::log_error!("Can't parse Bool");
+                    Err(Status::error(
+                        500,
+                        "Failed to parse the messages_editInlineBotMessageWidgetData answer",
+                    ))
+                };
+                if let Err(status) = &result {
+                    tdutils::log_info!(
+                        "Receive error for EditInlineMessageWidgetDataQuery: {status}"
+                    );
+                }
+                let promise = if self.inline_message_net_pending.widget_edits.is_empty() {
+                    None
+                } else {
+                    Some(self.inline_message_net_pending.widget_edits.remove(0))
+                };
+                match (result, promise) {
+                    (Ok(()), Some(mut promise)) => promise.set_value(()),
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    (_, None) => {
+                        tdutils::log_info!(
+                            "Receive an unexpected messages.editInlineBotMessageWidgetData answer"
+                        )
+                    }
+                }
+            }
         }
     }
 
@@ -52333,6 +52373,35 @@ impl crate::inline_message_manager::InlineMessageManagerEnv for TdInlineEnv<'_> 
             ),
             None => {
                 tdutils::log_info!("Send messages.editInlineBotMessage — [net-inert]");
+            }
+        }
+    }
+
+    /// `EditInlineMessageWidgetDataQuery::send`
+    /// (InlineMessageManager.cpp:144-161) — the 1.8.70 widgets family,
+    /// the same per-DC routing.
+    fn send_edit_inline_message_widget_data_query(
+        &mut self,
+        query: telegram_api::messages_editInlineBotMessageWidgetData,
+        promise: Promise<()>,
+    ) {
+        self.pending.widget_edits.push(promise);
+        let dc_id = tdnet::net_query::DcId::internal(
+            crate::inline_message_manager::get_inline_message_dc_id(
+                query
+                    .id
+                    .as_ref()
+                    .expect("the manager validation resolved the id"),
+            ),
+        );
+        match self.net.clone() {
+            Some(net) => net.dispatch_dc(
+                crate::inline_message_manager::InlineMessageNetKind::EditInlineMessageWidgetData,
+                telegram_api::Function::messages_editInlineBotMessageWidgetData(query),
+                dc_id,
+            ),
+            None => {
+                tdutils::log_info!("Send messages.editInlineBotMessageWidgetData — [net-inert]");
             }
         }
     }
