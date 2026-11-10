@@ -220,6 +220,31 @@ pub(crate) struct TdSink {
     /// sink's batching boundary: the tuple parks here, the drain runs
     /// the ported machine (the gap detector of the M.10.19 design note).
     pub(crate) pending_channel_updates: Vec<ChannelDifferencePendingUpdate>,
+    /// The 1.8.70 widgets family intake — the three direct-routed bot
+    /// query updates (UpdatesManager.cpp:5233-5255) and the applied
+    /// `updateMessageWidgetData` pts arm (the in-place widget-data
+    /// apply); the drain runs the WidgetManager guards and the messages
+    /// walk.
+    pub(crate) widget_intakes: Vec<WidgetIntake>,
+}
+
+/// One parked widget intake — the drain's WidgetManager hop input.
+pub(crate) enum WidgetIntake {
+    /// `updateBotWidgetQuery` → `on_new_widget_query`.
+    Query(tdmtproto::telegram_api::updateBotWidgetQuery),
+    /// `updateInlineBotWidgetQuery` → `on_new_inline_widget_query`.
+    InlineQuery(tdmtproto::telegram_api::updateInlineBotWidgetQuery),
+    /// `updateBotWidgetCopyQuery` → `on_new_widget_copy_query`.
+    CopyQuery(tdmtproto::telegram_api::updateBotWidgetCopyQuery),
+    /// The applied `updateMessageWidgetData` pts arm →
+    /// `on_update_message_widget_data` (cpp:5822-5827's
+    /// `update_chat_data = true`).
+    DataEdit {
+        message_full_id: crate::messages_manager::MessageFullId,
+        public_data: String,
+        public_data_hash: i64,
+        chat_data: String,
+    },
 }
 
 /// One parked channel-pts update — the drain's
@@ -398,6 +423,27 @@ impl UpdatesSink for TdSink {
             .push(WalletIntake::TonConnectDisconnect(session_ids));
     }
 
+    fn on_update_bot_widget_query(
+        &mut self,
+        update: tdmtproto::telegram_api::updateBotWidgetQuery,
+    ) {
+        self.widget_intakes.push(WidgetIntake::Query(update));
+    }
+
+    fn on_update_inline_bot_widget_query(
+        &mut self,
+        update: tdmtproto::telegram_api::updateInlineBotWidgetQuery,
+    ) {
+        self.widget_intakes.push(WidgetIntake::InlineQuery(update));
+    }
+
+    fn on_update_bot_widget_copy_query(
+        &mut self,
+        update: tdmtproto::telegram_api::updateBotWidgetCopyQuery,
+    ) {
+        self.widget_intakes.push(WidgetIntake::CopyQuery(update));
+    }
+
     fn on_user(&mut self, user: tdmtproto::telegram_api::User) {
         self.users.push(user);
     }
@@ -522,6 +568,31 @@ impl UpdatesSink for TdSink {
             }
             // `updateReadMessagesContents` (read_message_content_from_updates,
             // MessagesManager.cpp:9325) rides the TTL content-read plane,
+            PendingUpdate::Wire(telegram_api::Update::updateMessageWidgetData(update)) => {
+                // `MessagesManager::process_update`'s Widget case
+                // (MessagesManager.cpp:5822-5827) — `update_chat_data =
+                // true` from the update; the peer is the pts machine's
+                // dialog gate.
+                match update.peer {
+                    Some(peer) => {
+                        let message_full_id = crate::messages_manager::MessageFullId::new(
+                            crate::messages_manager::DialogId::from_peer(&peer),
+                            crate::messages_manager::MessageId::from_server_message_id(
+                                crate::messages_manager::ServerMessageId::new(update.msg_id),
+                            ),
+                        );
+                        self.widget_intakes.push(WidgetIntake::DataEdit {
+                            message_full_id,
+                            public_data: update.public_data,
+                            public_data_hash: update.public_data_hash,
+                            chat_data: update.chat_data,
+                        });
+                    }
+                    None => {
+                        tdutils::log_error!("Receive updateMessageWidgetData without the peer");
+                    }
+                }
+            }
             // `updatePinnedMessages`/`updatePinnedChannelMessages` the
             // M.10.14 pinned tail, and `updateReadChannelInbox` the
             // `on_read_channel_inbox` pts/reconcile machine
@@ -3200,6 +3271,34 @@ enum CommunityNetKind {
 /// The cloned community dispatch surface the [`CommunityEnv`] senders
 /// use — the answers drain through [`Td::on_community_net_answer`].
 type CommunityNetHandle = NetKindHandle<CommunityNetKind>;
+
+/// The WidgetManager in-flight query kinds — the C++ `ResultHandler`
+/// classes of WidgetManager.cpp:125-313 (the 1.8.70 widgets family,
+/// #119). The handlers are stateless besides their promises; the promise
+/// lots live on `crate::widget_manager::WidgetManager`.
+#[derive(Clone, Copy)]
+enum WidgetNetKind {
+    /// `GetBotWidgetQueryAnswerQuery` (cpp:125-166).
+    GetBotWidgetQueryAnswer,
+    /// `SetBotWidgetQueryAnswerQuery` (cpp:168-196).
+    SetBotWidgetQueryAnswer,
+    /// `EditMessageWidgetDataQuery` (cpp:198-244) — the answer is an
+    /// Updates umbrella routed through the updates pipe.
+    EditMessageWidgetData,
+    /// `EditWidgetDataQuery` (cpp:246-275).
+    EditWidgetData,
+    /// `GetWidgetPublicDataQuery` (cpp:277-313) — the answer routes into
+    /// `WidgetManager::on_get_widget_public_data`; the handler carries
+    /// the request pair for the not-modified re-read (the C++
+    /// dialog_id_/message_id_ members).
+    GetWidgetPublicData {
+        message_full_id: crate::messages_manager::MessageFullId,
+    },
+}
+
+/// The cloned widget dispatch surface the [`WidgetEnv`] senders use —
+/// the answers drain through [`Td::on_widget_net_answer`].
+type WidgetNetHandle = NetKindHandle<WidgetNetKind>;
 
 /// The AccountManager in-flight query kinds — the C++ ResultHandler
 /// classes of AccountManager.cpp:180-612 (the sessions/authorizations,
@@ -6127,6 +6226,8 @@ pub struct Td {
     /// The community plane's `send_update` outbox; drained by
     /// [`Td::flush_user_updates`].
     pub(crate) community_updates: Vec<td_api::Update>,
+    /// `Td::widget_manager_` (the C++ init_managers block, Td.h:312).
+    pub(crate) widget_manager: crate::widget_manager::WidgetManager,
     /// `Td::ton_wallet_manager_` (the C++ init_managers block).
     pub(crate) ton_wallet_manager: crate::ton_wallet::TonWalletManager,
     /// `Td::device_token_manager_` (`Td.cpp:1345`, M.13S).
@@ -6322,6 +6423,9 @@ pub struct Td {
     /// twin.
     pub(crate) saved_music_upload_callback:
         Arc<parking_lot::Mutex<dyn crate::files::UploadCallback>>,
+    /// `AudiosManager::upload_audio_file_callback_`
+    /// (AudiosManager.cpp:83-95) — the story-music upload outbox bridge.
+    pub(crate) audios_upload_callback: Arc<parking_lot::Mutex<dyn crate::files::UploadCallback>>,
     /// `TranscriptionManager`'s `UploadAudioFileCallback`
     /// (TranscriptionManager.cpp:500-515) — the
     /// `recognizeSpeechInFile` upload outbox bridge.
@@ -6362,6 +6466,9 @@ pub struct Td {
     /// The callback-parked CommunityManager query answers, parked by
     /// kind (the `Td::on_community_net_answer` drain).
     community_net_completed: Arc<Mutex<Vec<(CommunityNetKind, NetQuery)>>>,
+    /// The callback-parked WidgetManager query answers, parked by kind
+    /// (the `Td::on_widget_net_answer` drain).
+    widget_net_completed: Arc<Mutex<Vec<(WidgetNetKind, NetQuery)>>>,
     /// The callback-parked AccountManager query answers, parked by kind
     /// (the `Td::on_account_net_answer` drain).
     account_net_completed: Arc<Mutex<Vec<(AccountNetKind, NetQuery)>>>,
@@ -6996,6 +7103,10 @@ impl Td {
             Arc::new(Mutex::new(TdSavedMusicUploadCallback {
                 events: Arc::clone(&file_shared.lock().saved_music_upload_events),
             }));
+        let audios_upload_callback: Arc<parking_lot::Mutex<dyn crate::files::UploadCallback>> =
+            Arc::new(Mutex::new(TdAudiosUploadCallback {
+                events: Arc::clone(&file_shared.lock().audios_upload_events),
+            }));
         let audio_upload_callback: Arc<parking_lot::Mutex<dyn crate::files::UploadCallback>> =
             Arc::new(Mutex::new(TdAudioUploadCallback {
                 events: Arc::clone(&file_shared.lock().audio_upload_events),
@@ -7097,6 +7208,7 @@ impl Td {
             statistics_net_completed: Arc::new(Mutex::new(Vec::new())),
             community_manager: CommunityManager::new(),
             community_updates: Vec::new(),
+            widget_manager: crate::widget_manager::WidgetManager::default(),
             ton_wallet_manager: crate::ton_wallet::TonWalletManager::new(),
             device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
             language_pack_manager: crate::language_pack_manager::LanguagePackManager::new(),
@@ -7159,6 +7271,7 @@ impl Td {
             file_load_manager,
             profile_photo_upload_callback,
             saved_music_upload_callback,
+            audios_upload_callback,
             audio_upload_callback,
             download_manager,
             file_shared,
@@ -7172,6 +7285,7 @@ impl Td {
             updates_net_completed: Arc::new(Mutex::new(Vec::new())),
             ton_wallet_net_completed: Arc::new(Mutex::new(Vec::new())),
             community_net_completed: Arc::new(Mutex::new(Vec::new())),
+            widget_net_completed: Arc::new(Mutex::new(Vec::new())),
             account_net_completed: Arc::new(Mutex::new(Vec::new())),
             star_net_completed: Arc::new(Mutex::new(Vec::new())),
             link_net_completed: Arc::new(Mutex::new(Vec::new())),
@@ -8492,16 +8606,6 @@ impl Td {
             self.close_flag = 4;
             self.global.set_close_flag();
             self.clear_requests();
-            // `web_proxy_manager_.reset()` (Td.cpp:804) — the reset fires the
-            // manager's `hangup`, so the carrier-closed updates precede the
-            // Closing announcement; the `clear()` half (Td.cpp:699) is
-            // idempotent over the emptied registry.
-            {
-                let (mut web_proxy_manager, mut web_proxy_env) = web_proxy_env_split(self);
-                web_proxy_manager.hangup(&mut web_proxy_env);
-                self.web_proxy_manager = web_proxy_manager;
-            }
-            self.flush_user_updates();
             self.send_update(Object::updateAuthorizationState(
                 td_api::updateAuthorizationState {
                     authorization_state: Some(
@@ -8511,6 +8615,19 @@ impl Td {
                     ),
                 },
             ));
+            // `web_proxy_manager_.reset()` (Td.cpp:804) — the reset queues
+            // the manager's `hangup`, so the C++ client sees the Closing
+            // announcement FIRST and the carrier-closed updates only when
+            // the event loop runs the hangup; the collapsed world runs the
+            // same hangup after the announcement for the same observable
+            // order. The `clear()` half (Td.cpp:699) is idempotent over the
+            // emptied registry.
+            {
+                let (mut web_proxy_manager, mut web_proxy_env) = web_proxy_env_split(self);
+                web_proxy_manager.hangup(&mut web_proxy_env);
+                self.web_proxy_manager = web_proxy_manager;
+            }
+            self.flush_user_updates();
         } else {
             self.state = State::Close;
             self.close_flag = 1;
@@ -9608,6 +9725,7 @@ impl Td {
         self.dispatch_completed_updates_net();
         self.dispatch_completed_ton_wallet_net();
         self.dispatch_completed_community_net();
+        self.dispatch_completed_widget_net();
         self.dispatch_completed_account_net();
         self.dispatch_completed_star_net();
         self.dispatch_completed_link_net();
@@ -9781,6 +9899,16 @@ impl Td {
         Some(CommunityNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.community_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned widget dispatch surface for the [`WidgetEnv`]
+    /// senders — `None` keeps the net-inert posture.
+    fn widget_net(&self) -> Option<WidgetNetHandle> {
+        Some(WidgetNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.widget_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -10444,6 +10572,7 @@ impl Td {
             voice_notes_manager,
             video_notes_manager,
             notification_updates,
+            audios_upload_callback,
             ..
         } = self;
         let mut env = StoryEnv {
@@ -10463,6 +10592,7 @@ impl Td {
             video_notes: video_notes_manager,
             updates: notification_updates,
             net,
+            audios_upload_callback: audios_upload_callback.clone(),
         };
         run(&mut env, story_manager)
     }
@@ -11620,6 +11750,17 @@ impl Td {
         let completed = std::mem::take(&mut *self.community_net_completed.lock());
         for (kind, query) in completed {
             self.on_community_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Drain the callback-parked WidgetManager answers — the C++
+    /// ResultHandler `on_result`/`on_error` halves (WidgetManager.cpp:
+    /// 125-313).
+    fn dispatch_completed_widget_net(&mut self) {
+        let completed = std::mem::take(&mut *self.widget_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_widget_net_answer(kind, query);
         }
         self.drain_sink();
     }
@@ -13968,6 +14109,240 @@ impl Td {
                         }),
                         Err(_) => promise.set_error(parse_error("stories.editStory")),
                     },
+                }
+            }
+            // `EditStoryMusicQuery` (StoryManager.cpp:638-676) — the
+            // Updates ride the engine with the caller promise (the
+            // STORY_NOT_MODIFIED !bot value band); the file-reference
+            // band deletes the bad reference, runs the repair seam and
+            // continues in the reupload chain; the other errors run the
+            // dialog-error head.
+            StoryNetKind::EditStoryMusic {
+                dialog_id,
+                story_id,
+                music_file_id,
+            } => {
+                let Some((file_reference, mut promise)) =
+                    self.story_manager.take_edit_story_music_query_promise()
+                else {
+                    return;
+                };
+                let status = match story_error(&query) {
+                    Some(status) => status,
+                    None => match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => {
+                            self.um_send(UmMessage::OnGetUpdates {
+                                updates: Box::new(updates),
+                                promise,
+                            });
+                            return;
+                        }
+                        Err(_) => parse_error("stories.editStory"),
+                    },
+                };
+                if status.message() == "STORY_NOT_MODIFIED" && !self.auth_manager.is_bot() {
+                    promise.set_value(());
+                } else if !self.auth_manager.is_bot()
+                    && music_file_id.is_valid()
+                    && crate::files::is_file_reference_error(&status)
+                {
+                    // cpp:648-668 — the reference delete, then the repair
+                    // seam: `repair_file_reference` is [blocked: net], and
+                    // the collapse answers the failure the C++ promise
+                    // would eventually carry, so the repair-failure band
+                    // runs at once — the profile-audio reupload chain
+                    // (`AudiosManager::reupload_audio`) with the story
+                    // tail keyed by the resumed upload (the C++ lambda
+                    // captures).
+                    tdutils::log_info!(
+                        "Receive {status} for the story music file reference repair"
+                    );
+                    self.file_manager
+                        .lock()
+                        .delete_file_reference(music_file_id, file_reference.as_bytes());
+                    let file_upload_id = {
+                        let mut files = self.file_manager.lock();
+                        let mut fllm = self.file_load_manager.lock();
+                        self.audios_manager.reupload_audio(
+                            &mut files,
+                            &mut fllm,
+                            &self.audios_upload_callback,
+                            music_file_id,
+                            tdutils::promise::Promise::default(),
+                        )
+                    };
+                    self.story_manager.park_edit_story_music_upload_tail(
+                        file_upload_id,
+                        dialog_id,
+                        story_id,
+                        promise,
+                    );
+                } else {
+                    // cpp:670-673 — the expected-error head + the
+                    // promise error
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        &status,
+                        "EditStoryMusicQuery",
+                    );
+                    promise.set_error(status);
+                }
+            }
+            // `AudiosManager::UploadAudioFileQuery::on_result`/`on_error`
+            // (AudiosManager.cpp:63-79) over the `on_uploaded_audio_file`
+            // bands (:478-512) — the story-music `messages.uploadMedia`
+            // leg; the ok tail merges the parsed document, cancels the
+            // upload and refires `do_edit_story_music` through the keyed
+            // story tail, the error band runs the parts/partial-location
+            // machinery and fails the layer-1 carrier + the tail.
+            StoryNetKind::UploadStoryMusic {
+                file_upload_id,
+                is_url,
+                was_uploaded,
+            } => {
+                // the `is_url` member is signature parity (the C++
+                // `on_uploaded_audio_file` body never reads it)
+                let _ = is_url;
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::MessageMedia::parse(query.ok())
+                        .map_err(|_| parse_error("messages_uploadMedia"))
+                };
+                let file_id = file_upload_id.file_id;
+                // the C++ `UploadAudioFileQuery::on_error` band
+                // (AudiosManager.cpp:70-87) — the parts/partial machinery,
+                // the upload cancel, then the layer-1 carrier + the keyed
+                // story tail fail together (the C++ promise_ error passes
+                // through the edit lambda)
+                let fail_query = |td: &mut Self, status: &Status| {
+                    let close_flag = td.global.close_flag();
+                    {
+                        let mut files = td.file_manager.lock();
+                        let mut fllm = td.file_load_manager.lock();
+                        if was_uploaded {
+                            debug_assert!(file_upload_id.is_valid());
+                            let bad_parts = crate::files::get_missing_file_parts(status);
+                            if bad_parts.is_empty() {
+                                // `delete_partial_remote_location_if_needed`
+                                files.delete_partial_remote_location_on_error(
+                                    file_upload_id,
+                                    status,
+                                    close_flag,
+                                    &mut fllm,
+                                );
+                            } else {
+                                // TODO on_upload_audio_file_parts_missing
+                                // (the C++ carries the same TODO)
+                            }
+                        } else if crate::files::is_file_reference_error(status) {
+                            tdutils::log_error!(
+                                "Receive file reference error for UploadAudioFileQuery"
+                            );
+                        }
+                        files.cancel_upload(file_upload_id, &mut fllm);
+                    }
+                    if let Some(mut carrier) =
+                        td.story_manager.take_upload_story_music_query_promise()
+                    {
+                        carrier.set_error(status.clone());
+                    }
+                    if let Some((_, _, mut tail)) = td
+                        .story_manager
+                        .take_edit_story_music_upload_tail(file_upload_id)
+                    {
+                        tail.set_error(status.clone());
+                    }
+                };
+                // the `on_uploaded_audio_file` 400 bands — the partial
+                // location drop + the error that passes through the edit
+                // lambda to the caller promise
+                let fail_uploaded = |td: &mut Self, message: &str| {
+                    {
+                        let mut files = td.file_manager.lock();
+                        let mut fllm = td.file_load_manager.lock();
+                        files.delete_partial_remote_location(file_upload_id, &mut fllm);
+                    }
+                    if let Some(mut carrier) =
+                        td.story_manager.take_upload_story_music_query_promise()
+                    {
+                        carrier.set_error(Status::error(400, message));
+                    }
+                    if let Some((_, _, mut tail)) = td
+                        .story_manager
+                        .take_edit_story_music_upload_tail(file_upload_id)
+                    {
+                        tail.set_error(Status::error(400, message));
+                    }
+                };
+                match result {
+                    Ok(telegram_api::MessageMedia::messageMediaDocument(media)) => {
+                        let Some(document) = media.document else {
+                            // the C++ `document_` null is the wrong-type band
+                            fail_uploaded(self, "Can't upload audio file: wrong file type");
+                            return;
+                        };
+                        match document {
+                            telegram_api::Document::documentEmpty(_) => {
+                                fail_uploaded(self, "Can't upload audio file: empty file");
+                            }
+                            telegram_api::Document::document(document) => {
+                                let (mut denv, documents) = self.documents_env();
+                                let parsed = documents.on_get_document(
+                                    &mut denv,
+                                    crate::documents_manager::RemoteDocument::from_server_document(
+                                        document,
+                                    ),
+                                    crate::messages_manager::DialogId::default(),
+                                    false,
+                                    false,
+                                    crate::document::DocumentType::General,
+                                    crate::documents_manager::Subtype::Other,
+                                );
+                                if parsed.type_ != crate::document::DocumentType::Audio {
+                                    fail_uploaded(self, "Wrong file type");
+                                    return;
+                                }
+                                if parsed.file_id != file_id {
+                                    // must not delete the old audio, because
+                                    // the file_id could be used for
+                                    // simultaneous URL uploads
+                                    self.audios_manager.merge_audios(parsed.file_id, file_id);
+                                }
+                                let mut files = self.file_manager.lock();
+                                let mut fllm = self.file_load_manager.lock();
+                                files.cancel_upload(file_upload_id, &mut fllm);
+                                drop(files);
+                                drop(fllm);
+                                // the `promise_.set_value` hop: the story
+                                // lambda's ok band refires
+                                // `do_edit_story_music` with the file id
+                                if let Some(mut carrier) =
+                                    self.story_manager.take_upload_story_music_query_promise()
+                                {
+                                    carrier.set_value(());
+                                }
+                                if let Some((dialog_id, story_id, tail)) = self
+                                    .story_manager
+                                    .take_edit_story_music_upload_tail(file_upload_id)
+                                {
+                                    self.with_story_manager(|env, manager| {
+                                        manager.do_edit_story_music(
+                                            env, dialog_id, story_id, file_id, tail,
+                                        );
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        // `media->get_id() != messageMediaDocument::ID`
+                        fail_uploaded(self, "Can't upload audio file: wrong file type");
+                    }
+                    Err(status) => {
+                        fail_query(self, &status);
+                    }
                 }
             }
             // `ToggleStoryPinnedQuery` (StoryManager.cpp:653-687) — the C++
@@ -21817,6 +22192,46 @@ impl Td {
                     }
                 }
             }
+            // `EditInlineMessageWidgetDataQuery::on_result`/`on_error`
+            // (InlineMessageManager.cpp:163-171) — the false Bool is only
+            // logged, the promise settles either way.
+            K::EditInlineMessageWidgetData => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else if let Some(value) = parse_wire_bool_value(query.ok()) {
+                    if !value {
+                        tdutils::log_error!(
+                            "Receive false in result of editInlineBotMessageWidgetData"
+                        );
+                    }
+                    Ok(())
+                } else {
+                    tdutils::log_error!("Can't parse Bool");
+                    Err(Status::error(
+                        500,
+                        "Failed to parse the messages_editInlineBotMessageWidgetData answer",
+                    ))
+                };
+                if let Err(status) = &result {
+                    tdutils::log_info!(
+                        "Receive error for EditInlineMessageWidgetDataQuery: {status}"
+                    );
+                }
+                let promise = if self.inline_message_net_pending.widget_edits.is_empty() {
+                    None
+                } else {
+                    Some(self.inline_message_net_pending.widget_edits.remove(0))
+                };
+                match (result, promise) {
+                    (Ok(()), Some(mut promise)) => promise.set_value(()),
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    (_, None) => {
+                        tdutils::log_info!(
+                            "Receive an unexpected messages.editInlineBotMessageWidgetData answer"
+                        )
+                    }
+                }
+            }
         }
     }
 
@@ -23844,6 +24259,9 @@ impl Td {
     /// (ThemeManager.cpp:798-803/863-871/948-956/1024-1027).
     fn on_theme_net_answer(&mut self, kind: crate::theme_manager::ThemeNetKind, query: NetQuery) {
         let parse_error = || Status::error(500, "Failed to parse the theme answer");
+        // snapshotted before the env split (the SetShareTheme refetch
+        // band compares against it)
+        let my_dialog_id = crate::dialog_manager::get_my_dialog_id(self);
         let mut manager = std::mem::take(&mut self.theme_manager);
         {
             let mut env = ThemeEnv {
@@ -23900,6 +24318,84 @@ impl Td {
                             .map_err(|_| parse_error())
                     };
                     manager.on_get_unique_gift_chat_themes(&mut env, result);
+                }
+                crate::theme_manager::ThemeNetKind::ShareThemeBackdrops => {
+                    let result = if query.is_error() {
+                        Err(query.error().clone())
+                    } else {
+                        telegram_api::ShareThemeBackdrops::parse(query.ok())
+                            .map_err(|_| parse_error())
+                    };
+                    manager.on_get_share_theme_backdrops(&mut env, result);
+                }
+                crate::theme_manager::ThemeNetKind::SetShareTheme { dialog_id } => {
+                    // `SetShareThemeQuery::on_result`/`on_error`
+                    // (ThemeManager.cpp:286-304): the ok answer refetches
+                    // the owning *Full record with the parked promise;
+                    // the dialog-error fan-out runs first. The env is
+                    // destructured for the refetch halves (the
+                    // `on_get_users` slice convention).
+                    let crate::td::ThemeEnv {
+                        global,
+                        options,
+                        auth_is_bot,
+                        user_manager,
+                        chat_manager,
+                        ..
+                    } = env;
+                    let result = if query.is_error() {
+                        Err(query.error().clone())
+                    } else {
+                        parse_wire_bool_value(query.ok()).ok_or_else(parse_error)
+                    };
+                    if let Err(status) = &result {
+                        crate::dialog_manager::on_get_dialog_error(
+                            global,
+                            dialog_id,
+                            status,
+                            "SetShareThemeQuery",
+                        );
+                    }
+                    // no early returns here — the taken manager must
+                    // always reach the restore at the fn tail (the
+                    // defensive no-promise / no-options bands fall
+                    // through with the promise error-set)
+                    if let Some(mut promise) = manager.pop_pending_set_share_theme() {
+                        if let Some(options) = options {
+                            let mut user_env = crate::user_manager::UserEnv {
+                                global,
+                                options,
+                                auth_is_bot,
+                            };
+                            match result {
+                                Ok(_) if dialog_id == my_dialog_id => {
+                                    let my_id = user_manager.get_my_id();
+                                    user_manager.reload_user_full(
+                                        &mut user_env,
+                                        my_id,
+                                        promise,
+                                        "SetShareThemeQuery",
+                                    );
+                                }
+                                Ok(_)
+                                    if dialog_id.get_type()
+                                        == crate::dialog_id::DialogType::Channel =>
+                                {
+                                    let channel_id = dialog_id.get_channel_id();
+                                    chat_manager.reload_channel_full(
+                                        &mut user_env,
+                                        channel_id,
+                                        promise,
+                                        "SetShareThemeQuery",
+                                    );
+                                }
+                                Ok(_) => promise.set_value(()),
+                                Err(status) => promise.set_error(status),
+                            }
+                        } else {
+                            promise.set_error(parse_error());
+                        }
+                    }
                 }
             }
         }
@@ -26002,6 +26498,216 @@ impl Td {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// The shared in-place widget-data apply behind
+    /// `updateMessageWidgetData` and the `widgetPublicData` answer —
+    /// `MessagesManager::on_update_message_widget_data`
+    /// (MessagesManager.cpp:5222-5251) with the Td-level
+    /// `updateMessageContent` emission.
+    pub(crate) fn apply_message_widget_data(
+        &mut self,
+        message_full_id: crate::messages_manager::MessageFullId,
+        public_data: String,
+        public_data_hash: i64,
+        chat_data: String,
+        update_chat_data: bool,
+    ) {
+        let td_ptr = std::ptr::from_mut(self);
+        // SAFETY: the raw-pointer split-borrow convention of the apply
+        // walks (manager / ctx alias one Td, used strictly sequentially;
+        // the emission runs after the walk borrows end).
+        let global: &crate::global::Global = unsafe { &(*td_ptr).global };
+        let manager: &mut crate::messages_manager::MessagesManager =
+            unsafe { &mut (*td_ptr).messages_manager };
+        let ctx: &dyn crate::messages_manager::MessageObjectContext = unsafe { &*td_ptr };
+        let time = crate::user_manager::TimeCtx::from_global(global);
+        let new_content = crate::messages_manager::on_update_message_widget_data(
+            global,
+            manager,
+            ctx,
+            &time,
+            message_full_id,
+            public_data,
+            public_data_hash,
+            chat_data,
+            update_chat_data,
+        );
+        // `send_update_message_content_impl` (MessagesManager.cpp:5271-5283)
+        // — the emission runs after the walk borrows end.
+        if let Some(new_content) = new_content {
+            let td: &mut Td = unsafe { &mut *td_ptr };
+            td.send_update(td_api::Object::updateMessageContent(
+                td_api::updateMessageContent {
+                    chat_id: message_full_id.get_dialog_id().get(),
+                    message_id: message_full_id.get_message_id().get(),
+                    new_content: Some(new_content),
+                },
+            ));
+        }
+    }
+
+    /// Route one WidgetManager net answer by kind (the C++ query handler
+    /// halves of WidgetManager.cpp:125-313). The `on_get_message_error`
+    /// hop of the C++ `on_error` halves is the unported walking-lane
+    /// seam — the raw error settles the promise.
+    fn on_widget_net_answer(&mut self, kind: WidgetNetKind, query: NetQuery) {
+        fn pop_front<T>(lot: &mut Vec<T>) -> Option<T> {
+            if lot.is_empty() {
+                None
+            } else {
+                Some(lot.remove(0))
+            }
+        }
+        let error = if query.is_error() {
+            Some(query.error().clone())
+        } else {
+            None
+        };
+        match kind {
+            // `GetBotWidgetQueryAnswerQuery` (cpp:149-165) — the answer's
+            // result string answers the td_api widgetQueryAnswer; the
+            // BOT_RESPONSE_TIMEOUT remap is the query's 502 band.
+            WidgetNetKind::GetBotWidgetQueryAnswer => {
+                let Some(mut promise) = pop_front(&mut self.widget_manager.get_answer_promises)
+                else {
+                    return;
+                };
+                let Some(status) = error else {
+                    let answer =
+                        match telegram_api::messages_BotWidgetQueryAnswer::parse(query.ok()) {
+                            Ok(answer) => answer,
+                            Err(_) => {
+                                return promise
+                                    .set_error(Status::error(500, "Failed to parse the answer"));
+                            }
+                        };
+                    return promise.set_value(td_api::WidgetQueryAnswer {
+                        data: answer.result,
+                    });
+                };
+                let mut status = status;
+                if status.message() == "BOT_RESPONSE_TIMEOUT" {
+                    status = Status::error(502, "The bot is not responding");
+                }
+                promise.set_error(status);
+            }
+            // `SetBotWidgetQueryAnswerQuery` (cpp:180-195) — the Bool is
+            // logged when false, the promise settles either way.
+            WidgetNetKind::SetBotWidgetQueryAnswer => {
+                let Some(mut promise) = pop_front(&mut self.widget_manager.set_answer_promises)
+                else {
+                    return;
+                };
+                let Some(status) = error else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(true) => promise.set_value(()),
+                        Some(false) => {
+                            tdutils::log_info!("Sending answer to a widget query has failed");
+                            promise.set_value(());
+                        }
+                        None => {
+                            promise.set_error(Status::error(
+                                500,
+                                "Failed to parse the setBotWidgetQueryAnswer answer",
+                            ));
+                        }
+                    }
+                    return;
+                };
+                promise.set_error(status);
+            }
+            // `EditMessageWidgetDataQuery` (cpp:229-243) — the answer is
+            // an Updates umbrella routed through the updates pipe before
+            // the request settles (the C++ `on_get_updates` chain).
+            WidgetNetKind::EditMessageWidgetData => {
+                let Some(mut promise) =
+                    pop_front(&mut self.widget_manager.edit_message_data_promises)
+                else {
+                    return;
+                };
+                let Some(status) = error else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => {
+                            // the answer IS an Updates umbrella — the same
+                            // boxed serialization the session driver pushes
+                            let mut buffer = Vec::new();
+                            updates.store(&mut buffer);
+                            self.on_net_update(buffer);
+                            promise.set_value(());
+                        }
+                        Err(_) => {
+                            promise.set_error(Status::error(
+                                500,
+                                "Failed to parse the editMessageWidgetData answer",
+                            ));
+                        }
+                    }
+                    return;
+                };
+                promise.set_error(status);
+            }
+            // `EditWidgetDataQuery` (cpp:262-274) — the Bool is logged
+            // when false, the promise settles either way.
+            WidgetNetKind::EditWidgetData => {
+                let Some(mut promise) =
+                    pop_front(&mut self.widget_manager.edit_widget_data_promises)
+                else {
+                    return;
+                };
+                let Some(status) = error else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(true) => promise.set_value(()),
+                        Some(false) => {
+                            tdutils::log_error!("Receive false in result of editWidgetData");
+                            promise.set_value(());
+                        }
+                        None => {
+                            promise.set_error(Status::error(
+                                500,
+                                "Failed to parse the editWidgetData answer",
+                            ));
+                        }
+                    }
+                    return;
+                };
+                promise.set_error(status);
+            }
+            // `GetWidgetPublicDataQuery` (cpp:298-312) — the answer
+            // routes into `on_get_widget_public_data`.
+            WidgetNetKind::GetWidgetPublicData { message_full_id } => {
+                let Some(mut promise) =
+                    pop_front(&mut self.widget_manager.get_public_data_promises)
+                else {
+                    return;
+                };
+                let Some(status) = error else {
+                    let public_data =
+                        match telegram_api::messages_WidgetPublicData::parse(query.ok()) {
+                            Ok(public_data) => public_data,
+                            Err(_) => {
+                                return promise.set_error(Status::error(
+                                    500,
+                                    "Failed to parse the widgetPublicData answer",
+                                ));
+                            }
+                        };
+                    let mut manager = std::mem::take(&mut self.widget_manager);
+                    {
+                        let mut env = WidgetEnv { td: self };
+                        manager.on_get_widget_public_data(
+                            &mut env,
+                            message_full_id,
+                            public_data,
+                            promise,
+                        );
+                    }
+                    self.widget_manager = manager;
+                    return;
+                };
+                promise.set_error(status);
             }
         }
     }
@@ -31203,6 +31909,14 @@ impl Td {
         for event in saved_music_uploads {
             self.run_saved_music_upload_event(event);
         }
+        // the `AudiosManager::UploadAudioFileCallback` hops — the
+        // `send_closure_later` re-entries of the C++ story-music upload
+        // callback (AudiosManager.cpp:83-95) replay here
+        let audios_uploads =
+            std::mem::take(&mut *self.file_shared.lock().audios_upload_events.lock());
+        for event in audios_uploads {
+            self.run_audios_upload_event(event);
+        }
         // the `UploadAudioFileCallback` hops — the
         // `send_closure_later` re-entries of the C++ speech-recognition
         // upload callback (TranscriptionManager.cpp:500-515) replay here
@@ -31301,6 +32015,76 @@ impl Td {
             }
         }
         self.user_manager = user_manager;
+    }
+
+    /// One `AudiosManager::UploadAudioFileCallback` hop — the C++
+    /// `on_upload_audio_file[_error]` re-entries (AudiosManager.cpp
+    /// :427-457): the ok resolves the audios input media (the env locks
+    /// the file manager, so it runs before the story tail takes the
+    /// borrow) and continues in the `UploadStoryMusic` query send; the
+    /// close gate keeps the parked promises (the C++ early return).
+    fn run_audios_upload_event(&mut self, event: UserUploadEvent) {
+        if self.global.close_flag() {
+            return;
+        }
+        match event {
+            UserUploadEvent::Ok {
+                file_upload_id,
+                input_file,
+            } => {
+                tdutils::log_info!("Audio {file_upload_id:?} has been uploaded");
+                let promise = self
+                    .audios_manager
+                    .take_uploaded_audio_promise(file_upload_id);
+                let had_input_file = input_file.is_some();
+                let input_media = self
+                    .audios_manager
+                    .get_input_media(self, file_upload_id.file_id, input_file, None)
+                    .expect("CHECK(input_media != nullptr)");
+                let was_uploaded = crate::files::extract_was_uploaded(&input_media);
+                if had_input_file && !was_uploaded {
+                    // if we had InputFile, but has failed to use it for
+                    // input_media, then we need to immediately cancel file
+                    // upload so the next upload with the same file can
+                    // succeed
+                    let mut files = self.file_manager.lock();
+                    let mut fllm = self.file_load_manager.lock();
+                    files.cancel_upload(file_upload_id, &mut fllm);
+                }
+                self.with_story_manager(|_, manager| {
+                    manager.do_upload_story_music_query(
+                        file_upload_id,
+                        !had_input_file,
+                        was_uploaded,
+                        input_media,
+                        promise,
+                    );
+                });
+            }
+            UserUploadEvent::Error {
+                file_upload_id,
+                status,
+            } => {
+                tdutils::log_warning!("Audio {file_upload_id:?} has upload error {status}");
+                let mut promise = self
+                    .audios_manager
+                    .take_uploaded_audio_promise(file_upload_id);
+                // the C++ band: `status.code() > 0 ? status.code() : 500`
+                let status = if status.code() > 0 {
+                    status
+                } else {
+                    tdutils::status::Status::error(500, status.message())
+                };
+                promise.set_error(status.clone());
+                // the story lambda's error pass-through
+                if let Some((_, _, mut tail)) = self
+                    .story_manager
+                    .take_edit_story_music_upload_tail(file_upload_id)
+                {
+                    tail.set_error(status);
+                }
+            }
+        }
     }
 
     /// One `UploadSavedMusicCallback` hop — the C++
@@ -32605,6 +33389,94 @@ impl Td {
                 }
             }
         }
+        // The 1.8.70 widgets family (UpdatesManager.cpp:5233-5255 +
+        // MessagesManager.cpp:5822-5827) — the WidgetManager guards run
+        // for the query intakes, the in-place apply for the data edits.
+        for intake in sink.widget_intakes {
+            match intake {
+                WidgetIntake::Query(update) => {
+                    let mut manager = std::mem::take(&mut self.widget_manager);
+                    {
+                        let mut env = WidgetEnv { td: self };
+                        manager.on_new_widget_query(
+                            &mut env,
+                            update.query_id,
+                            update.query_type,
+                            crate::user_manager::UserId::new(update.user_id),
+                            update
+                                .peer
+                                .as_ref()
+                                .map(crate::messages_manager::DialogId::from_peer)
+                                .unwrap_or_default(),
+                            crate::messages_manager::MessageId::from_server_message_id(
+                                crate::messages_manager::ServerMessageId::new(update.msg_id),
+                            ),
+                            update.data,
+                            update.chat_instance,
+                            update.chat_type,
+                            update.widget_id,
+                            update.wallet_card,
+                        );
+                    }
+                    self.widget_manager = manager;
+                }
+                WidgetIntake::InlineQuery(update) => {
+                    let Some(inline_message_id) = update.inline_message_id else {
+                        tdutils::log_error!(
+                            "Receive updateInlineBotWidgetQuery without the inline message id"
+                        );
+                        continue;
+                    };
+                    let mut manager = std::mem::take(&mut self.widget_manager);
+                    {
+                        let mut env = WidgetEnv { td: self };
+                        manager.on_new_inline_widget_query(
+                            &mut env,
+                            update.query_id,
+                            update.query_type,
+                            crate::user_manager::UserId::new(update.user_id),
+                            inline_message_id,
+                            update.data,
+                            update.chat_instance,
+                            update.chat_type,
+                            update.widget_id,
+                            update.wallet_card,
+                        );
+                    }
+                    self.widget_manager = manager;
+                }
+                WidgetIntake::CopyQuery(update) => {
+                    let mut manager = std::mem::take(&mut self.widget_manager);
+                    {
+                        let mut env = WidgetEnv { td: self };
+                        manager.on_new_widget_copy_query(
+                            &mut env,
+                            update.query_id,
+                            update.query_type,
+                            crate::user_manager::UserId::new(update.user_id),
+                            update.data,
+                            update.widget_id,
+                            update.wallet_card,
+                        );
+                    }
+                    self.widget_manager = manager;
+                }
+                WidgetIntake::DataEdit {
+                    message_full_id,
+                    public_data,
+                    public_data_hash,
+                    chat_data,
+                } => {
+                    self.apply_message_widget_data(
+                        message_full_id,
+                        public_data,
+                        public_data_hash,
+                        chat_data,
+                        true,
+                    );
+                }
+            }
+        }
         // `MessagesManager::after_get_difference`'s 6a7cd24b6 tail: the
         // restore-missing timeout arm is the unported plane; the legacy
         // Archive unread recalc is gone — the marks load keeps the
@@ -33353,6 +34225,10 @@ pub(crate) struct TdFileShared {
     /// both completions re-enter
     /// `UserManager::on_upload_saved_music[_error]` at the drive end.
     pub(crate) saved_music_upload_events: Arc<parking_lot::Mutex<Vec<UserUploadEvent>>>,
+    /// The `AudiosManager::UploadAudioFileCallback` hops
+    /// (AudiosManager.cpp:83-95) — both completions re-enter the story
+    /// music upload's `on_upload_audio_file[_error]` at the drive end.
+    pub(crate) audios_upload_events: Arc<parking_lot::Mutex<Vec<UserUploadEvent>>>,
     /// The `UploadAudioFileCallback` hops (TranscriptionManager.cpp:
     /// 500-515) — both completions re-enter
     /// `TranscriptionManager::on_upload_audio_file[_error]` at the
@@ -33406,6 +34282,7 @@ impl TdFileShared {
             user_download_finished_events: Arc::new(Mutex::new(Vec::new())),
             profile_photo_upload_events: Arc::new(Mutex::new(Vec::new())),
             saved_music_upload_events: Arc::new(Mutex::new(Vec::new())),
+            audios_upload_events: Arc::new(Mutex::new(Vec::new())),
             audio_upload_events: Arc::new(Mutex::new(Vec::new())),
             files_dir: String::new(),
             secure_files_dir: String::new(),
@@ -34001,6 +34878,36 @@ struct TdAudioUploadCallback {
 }
 
 impl crate::files::UploadCallback for TdAudioUploadCallback {
+    fn on_upload_ok(
+        &mut self,
+        file_upload_id: crate::files::FileUploadId,
+        input_file: Option<telegram_api::InputFile>,
+    ) {
+        self.events.lock().push(UserUploadEvent::Ok {
+            file_upload_id,
+            input_file,
+        });
+    }
+
+    fn on_upload_error(
+        &mut self,
+        file_upload_id: crate::files::FileUploadId,
+        status: tdutils::status::Status,
+    ) {
+        self.events.lock().push(UserUploadEvent::Error {
+            file_upload_id,
+            status,
+        });
+    }
+}
+
+/// `AudiosManager::UploadAudioFileCallback` (AudiosManager.cpp:83-95)
+/// — the story-music upload twin of [`TdProfilePhotoUploadCallback`].
+struct TdAudiosUploadCallback {
+    events: Arc<parking_lot::Mutex<Vec<UserUploadEvent>>>,
+}
+
+impl crate::files::UploadCallback for TdAudiosUploadCallback {
     fn on_upload_ok(
         &mut self,
         file_upload_id: crate::files::FileUploadId,
@@ -42043,6 +42950,275 @@ impl crate::ton_wallet::TonWalletUpdateEnv for TonWalletEnv<'_> {
     }
 }
 
+/// The td-level [`crate::widget_manager::WidgetManagerEnv`] — the
+/// community env shape over `&mut Td` (the manager is `mem::take`n out
+/// of `Td` under the env).
+pub(crate) struct WidgetEnv<'a> {
+    pub(crate) td: &'a mut Td,
+}
+
+impl crate::widget_manager::WidgetManagerEnv for WidgetEnv<'_> {
+    fn auth_is_bot(&self) -> bool {
+        self.td.auth_manager.is_bot()
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.td.send_update(td_api::Object::from(update));
+    }
+
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: DialogId,
+    ) -> std::result::Result<(), tdutils::status::Status> {
+        // `DialogManager::check_dialog_access(dialog_id, false, Read,
+        // _)` — the full access-check plane is the M.6 continuation; the
+        // seam answers valid dialogs only.
+        if dialog_id.is_valid() {
+            Ok(())
+        } else {
+            Err(tdutils::status::Status::error(400, "Chat not found"))
+        }
+    }
+
+    fn force_create_dialog(&mut self, dialog_id: DialogId, source: &str) {
+        crate::dialog_manager::force_create_dialog(self.td, dialog_id, source);
+    }
+
+    fn have_min_user(&mut self, user_id: crate::user_manager::UserId) -> bool {
+        self.td.user_manager.have_min_user(user_id)
+    }
+
+    fn get_user_id_object(&mut self, user_id: crate::user_manager::UserId, source: &str) -> i64 {
+        let mut env = crate::user_manager::UserEnv {
+            global: &mut self.td.global,
+            options: self
+                .td
+                .option_manager
+                .as_mut()
+                .expect("the widget plane runs with the option manager"),
+            auth_is_bot: self.td.auth_manager.is_bot(),
+        };
+        self.td
+            .user_manager
+            .get_user_id_object(&mut env, user_id, source)
+    }
+
+    fn get_chat_id_object(&mut self, dialog_id: DialogId) -> i64 {
+        dialog_id.get()
+    }
+
+    fn have_message_force(
+        &mut self,
+        message_full_id: crate::messages_manager::MessageFullId,
+        source: &str,
+    ) -> bool {
+        crate::messages_manager::have_message_force_full(
+            &self.td.messages_manager,
+            message_full_id,
+            source,
+        )
+    }
+
+    fn get_message_widget_public_data(
+        &mut self,
+        message_full_id: crate::messages_manager::MessageFullId,
+    ) -> std::result::Result<(String, i64), tdutils::status::Status> {
+        crate::messages_manager::get_message_widget_public_data(
+            &self.td.messages_manager,
+            message_full_id,
+        )
+    }
+
+    fn on_update_message_widget_data(
+        &mut self,
+        message_full_id: crate::messages_manager::MessageFullId,
+        public_data: String,
+        public_data_hash: i64,
+        chat_data: String,
+        update_chat_data: bool,
+    ) {
+        self.td.apply_message_widget_data(
+            message_full_id,
+            public_data,
+            public_data_hash,
+            chat_data,
+            update_chat_data,
+        );
+    }
+
+    fn get_inline_message_id(
+        &mut self,
+        inline_message_id: telegram_api::InputBotInlineMessageID,
+    ) -> String {
+        crate::inline_queries_manager::get_inline_message_id(Some(inline_message_id))
+    }
+
+    // ---- The net query senders — the C++ ResultHandler send legs
+    // (WidgetManager.cpp:125-313). ----
+
+    /// `GetBotWidgetQueryAnswerQuery::send` (cpp:135-147) — the
+    /// read-access input peer of the message dialog (the C++ CHECK band
+    /// drops the query when the peer is missing).
+    fn send_get_bot_widget_query_answer_query(
+        &mut self,
+        message_full_id: crate::messages_manager::MessageFullId,
+        query_type: telegram_api::WidgetQueryType,
+        data: &[u8],
+    ) {
+        let Some(net) = self.td.widget_net() else {
+            return tdutils::log_info!("Send messages.getBotWidgetQueryAnswer — [net-inert]");
+        };
+        let dialog_id = message_full_id.get_dialog_id();
+        let Some(peer) = crate::dialog_manager::get_input_peer(
+            self.td,
+            dialog_id,
+            crate::user_manager::AccessRights::Read,
+        ) else {
+            tdutils::log_info!("GetBotWidgetQueryAnswerQuery — no input peer for {dialog_id:?}");
+            return;
+        };
+        let server_message_id = message_full_id.get_message_id().get_server_message_id();
+        net.dispatch(
+            crate::td::WidgetNetKind::GetBotWidgetQueryAnswer,
+            telegram_api::Function::messages_getBotWidgetQueryAnswer(
+                telegram_api::messages_getBotWidgetQueryAnswer {
+                    peer: Some(Box::new(peer)),
+                    msg_id: server_message_id.get(),
+                    query_type: Some(query_type),
+                    data: data.to_vec(),
+                },
+            ),
+        );
+    }
+
+    /// `SetBotWidgetQueryAnswerQuery::send` (cpp:175-178).
+    fn send_set_bot_widget_query_answer_query(&mut self, widget_query_id: i64, data: &str) {
+        let Some(net) = self.td.widget_net() else {
+            return tdutils::log_info!("Send messages.setBotWidgetQueryAnswer — [net-inert]");
+        };
+        net.dispatch(
+            crate::td::WidgetNetKind::SetBotWidgetQueryAnswer,
+            telegram_api::Function::messages_setBotWidgetQueryAnswer(
+                telegram_api::messages_setBotWidgetQueryAnswer {
+                    flags: 0,
+                    query_id: widget_query_id,
+                    result: data.to_owned(),
+                },
+            ),
+        );
+    }
+
+    /// `EditMessageWidgetDataQuery::send` (cpp:207-227) — the
+    /// read-access input peer of the message dialog.
+    fn send_edit_message_widget_data_query(
+        &mut self,
+        message_full_id: crate::messages_manager::MessageFullId,
+        edit_public_data: bool,
+        public_data: &str,
+        edit_chat_data: bool,
+        chat_data: &str,
+    ) {
+        let Some(net) = self.td.widget_net() else {
+            return tdutils::log_info!(
+                "Send messages.editMessageWidgetData for {message_full_id:?} — [net-inert]"
+            );
+        };
+        let dialog_id = message_full_id.get_dialog_id();
+        let Some(peer) = crate::dialog_manager::get_input_peer(
+            self.td,
+            dialog_id,
+            crate::user_manager::AccessRights::Read,
+        ) else {
+            tdutils::log_info!("EditMessageWidgetDataQuery — no input peer for {dialog_id:?}");
+            return;
+        };
+        let server_message_id = message_full_id.get_message_id().get_server_message_id();
+        let mut flags = 0;
+        if edit_public_data {
+            flags |= 1 << 0; // PUBLIC_DATA_MASK
+        }
+        if edit_chat_data {
+            flags |= 1 << 1; // CHAT_DATA_MASK
+        }
+        net.dispatch(
+            crate::td::WidgetNetKind::EditMessageWidgetData,
+            telegram_api::Function::messages_editMessageWidgetData(
+                telegram_api::messages_editMessageWidgetData {
+                    flags,
+                    peer: Some(Box::new(peer)),
+                    id: server_message_id.get(),
+                    public_data: if edit_public_data {
+                        public_data.to_owned()
+                    } else {
+                        String::new()
+                    },
+                    chat_data: if edit_chat_data {
+                        chat_data.to_owned()
+                    } else {
+                        String::new()
+                    },
+                },
+            ),
+        );
+    }
+
+    /// `EditWidgetDataQuery::send` (cpp:253-260).
+    fn send_edit_widget_data_query(&mut self, widget_id: i64, public_data: &str, cache_time: i32) {
+        let Some(net) = self.td.widget_net() else {
+            return tdutils::log_info!("Send messages.editWidgetData — [net-inert]");
+        };
+        let mut flags = 0;
+        if cache_time > 0 {
+            flags |= 1 << 0; // CACHE_TIME_MASK
+        }
+        net.dispatch(
+            crate::td::WidgetNetKind::EditWidgetData,
+            telegram_api::Function::messages_editWidgetData(
+                telegram_api::messages_editWidgetData {
+                    flags,
+                    widget_id,
+                    public_data: public_data.to_owned(),
+                    cache_time,
+                },
+            ),
+        );
+    }
+
+    /// `GetWidgetPublicDataQuery::send` (cpp:287-296) — the
+    /// read-access input peer of the message dialog.
+    fn send_get_widget_public_data_query(
+        &mut self,
+        message_full_id: crate::messages_manager::MessageFullId,
+        hash: i64,
+    ) {
+        let Some(net) = self.td.widget_net() else {
+            return tdutils::log_info!(
+                "Send messages.getWidgetPublicData for {message_full_id:?} — [net-inert]"
+            );
+        };
+        let dialog_id = message_full_id.get_dialog_id();
+        let Some(peer) = crate::dialog_manager::get_input_peer(
+            self.td,
+            dialog_id,
+            crate::user_manager::AccessRights::Read,
+        ) else {
+            tdutils::log_info!("GetWidgetPublicDataQuery — no input peer for {dialog_id:?}");
+            return;
+        };
+        let server_message_id = message_full_id.get_message_id().get_server_message_id();
+        net.dispatch(
+            crate::td::WidgetNetKind::GetWidgetPublicData { message_full_id },
+            telegram_api::Function::messages_getWidgetPublicData(
+                telegram_api::messages_getWidgetPublicData {
+                    peer: Some(Box::new(peer)),
+                    msg_id: server_message_id.get(),
+                    hash,
+                },
+            ),
+        );
+    }
+}
+
 impl crate::ton_wallet::TonWalletManagerEnv for TonWalletEnv<'_> {
     fn ton_nft_gift_object(
         &mut self,
@@ -46656,6 +47832,47 @@ impl crate::theme_manager::ThemeManagerEnv for ThemeEnv<'_> {
             ),
         }
     }
+
+    fn send_get_share_theme_backdrops_query(&mut self, hash: i32) {
+        match self.theme_net.clone() {
+            Some(net) => net.dispatch(
+                crate::theme_manager::ThemeNetKind::ShareThemeBackdrops,
+                telegram_api::Function::messages_getShareThemeBackdrops(
+                    telegram_api::messages_getShareThemeBackdrops { hash },
+                ),
+            ),
+            None => {
+                tdutils::log_info!(
+                    "Send messages.getShareThemeBackdrops(hash = {hash}) — [net-inert]"
+                );
+            }
+        }
+    }
+
+    fn send_set_share_theme_query(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        input_peer: telegram_api::InputPeer,
+        theme: telegram_api::ShareTheme,
+    ) {
+        // `SetShareThemeQuery::send` (ThemeManager.cpp:277-284); the
+        // Write peer is built at the request arm (the ThemeEnv carries
+        // no dialog manager).
+        match self.theme_net.clone() {
+            Some(net) => net.dispatch(
+                crate::theme_manager::ThemeNetKind::SetShareTheme { dialog_id },
+                telegram_api::Function::messages_setShareTheme(
+                    telegram_api::messages_setShareTheme {
+                        peer: Some(Box::new(input_peer)),
+                        theme: Some(theme),
+                    },
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send messages.setShareTheme — [net-inert]");
+            }
+        }
+    }
 }
 
 /// The `G()`/`td_` slice [`crate::star_gift_manager::StarGiftManager`]
@@ -49476,6 +50693,11 @@ pub(crate) struct StoryEnv<'a> {
     /// The story net dispatch surface — `None` keeps the net-inert
     /// posture (the §3.5 net-drain 20 families dispatch through it).
     pub net: Option<StoryNetHandle>,
+    /// The `AudiosManager::upload_audio_file_callback_` outbox bridge —
+    /// the story-music upload leg registers the file-plane uploads
+    /// through it.
+    pub audios_upload_callback:
+        std::sync::Arc<parking_lot::Mutex<dyn crate::files::UploadCallback>>,
 }
 
 impl<'a> StoryEnv<'a> {
@@ -50843,6 +52065,51 @@ impl<'a> crate::story_manager::StoryManagerEnv for StoryEnv<'a> {
             },
             None => tdutils::log_info!("Send stories.editStory (business) — [net-inert]"),
         }
+    }
+
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn get_story_music_input_document(
+        &mut self,
+        music_file_id: crate::files::FileId,
+    ) -> tdutils::status::Result<telegram_api::InputDocument> {
+        // `get_story_music_input_document` (StoryManager.cpp:6637-6648)
+        // — the empty/audio-type/main-remote gates, then the wire form.
+        const INVALID_AUDIO_FILE_ID: &str = "Invalid audio file identifier specified";
+        let files = self.file_manager.lock();
+        let Some(file_view) = files.get_file_view(music_file_id) else {
+            return tdutils::status::Result::Err(Status::error(400, INVALID_AUDIO_FILE_ID));
+        };
+        if file_view.get_type() != crate::files::FileType::Audio {
+            return tdutils::status::Result::Err(Status::error(400, INVALID_AUDIO_FILE_ID));
+        }
+        let Some(main_remote_location) = file_view.get_main_remote_location() else {
+            return tdutils::status::Result::Err(Status::error(400, INVALID_AUDIO_FILE_ID));
+        };
+        if main_remote_location.is_web() {
+            return tdutils::status::Result::Err(Status::error(400, INVALID_AUDIO_FILE_ID));
+        }
+        tdutils::status::Result::Ok(telegram_api::InputDocument::inputDocument(
+            main_remote_location.as_input_document(),
+        ))
+    }
+
+    fn upload_story_music_audio(
+        &mut self,
+        input_audio: td_api::InputAudio,
+        promise: tdutils::promise::Promise<()>,
+    ) -> tdutils::status::Result<crate::audios_manager::AudioUploadOutcome> {
+        let mut files = self.file_manager.lock();
+        let mut fllm = self.file_load_manager.lock();
+        self.audios.upload_audio(
+            &mut files,
+            &mut fllm,
+            &self.audios_upload_callback,
+            Some(input_audio),
+            promise,
+        )
     }
 }
 
@@ -52333,6 +53600,35 @@ impl crate::inline_message_manager::InlineMessageManagerEnv for TdInlineEnv<'_> 
             ),
             None => {
                 tdutils::log_info!("Send messages.editInlineBotMessage — [net-inert]");
+            }
+        }
+    }
+
+    /// `EditInlineMessageWidgetDataQuery::send`
+    /// (InlineMessageManager.cpp:144-161) — the 1.8.70 widgets family,
+    /// the same per-DC routing.
+    fn send_edit_inline_message_widget_data_query(
+        &mut self,
+        query: telegram_api::messages_editInlineBotMessageWidgetData,
+        promise: Promise<()>,
+    ) {
+        self.pending.widget_edits.push(promise);
+        let dc_id = tdnet::net_query::DcId::internal(
+            crate::inline_message_manager::get_inline_message_dc_id(
+                query
+                    .id
+                    .as_ref()
+                    .expect("the manager validation resolved the id"),
+            ),
+        );
+        match self.net.clone() {
+            Some(net) => net.dispatch_dc(
+                crate::inline_message_manager::InlineMessageNetKind::EditInlineMessageWidgetData,
+                telegram_api::Function::messages_editInlineBotMessageWidgetData(query),
+                dc_id,
+            ),
+            None => {
+                tdutils::log_info!("Send messages.editInlineBotMessageWidgetData — [net-inert]");
             }
         }
     }
@@ -86404,6 +87700,145 @@ mod tests {
         }
         .store_boxed(&mut answer);
         answer
+    }
+
+    #[test]
+    fn story_music_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(story_music_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn story_music_rides_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain19-story-music");
+        let my_dialog = seed_my_story_identity(&mut td);
+        let my_chat = my_dialog.get();
+
+        // seed my story 15 with photo content (the updates-engine
+        // storyItem intake)
+        td.with_story_manager(|env, manager| {
+            manager.on_get_story(
+                env,
+                my_dialog,
+                Some(wire_photo_story(15, false, 2_000_000_000)),
+            );
+        });
+
+        // 1. the gates — an unknown story answers 400 before any query
+        td.request(
+            1,
+            Function::editStoryMusic(td_api::editStoryMusic {
+                story_poster_chat_id: my_chat,
+                story_id: 99,
+                music: None,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 1);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Story not found")
+        );
+        assert_not_sent(&rec, telegram_api::stories_editStory::ID, "the gate");
+
+        // 2. the null-music band — the music-only editStory constructor
+        td.request(
+            2,
+            Function::editStoryMusic(td_api::editStoryMusic {
+                story_poster_chat_id: my_chat,
+                story_id: 15,
+                music: None,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_editStory::ID,
+        );
+        let body = telegram_api::stories_editStory::parse(sent.query()).expect("the body");
+        assert_eq!(body.flags, 1 << 4); // MUSIC_MASK only
+        assert_eq!(body.id, 15);
+        assert!(matches!(
+            body.music,
+            Some(telegram_api::InputDocument::inputDocumentEmpty(_))
+        ));
+        match body.peer.as_deref() {
+            // the owner dialog is the client's own user — the self peer
+            Some(telegram_api::InputPeer::inputPeerSelf(_)) => {}
+            other => panic!("the write peer: {other:?}"),
+        }
+        // the STORY_NOT_MODIFIED value band answers ok (non-bot)
+        net_fail(sent, 400, "STORY_NOT_MODIFIED");
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 3. the remote-audio fast path — the wire document rides the
+        //    registered audio's main remote
+        let audio_file_id = td.file_manager.lock().register_remote(
+            crate::files::FullRemoteFileLocation::from_document(
+                crate::files::FileType::Audio,
+                500,
+                42,
+                crate::chat_manager::DcId::main(),
+                "ref".to_owned(),
+            ),
+            crate::files::FileLocationSource::FromServer,
+            crate::messages_manager::DialogId::default(),
+            128,
+            128,
+            "song.mp3".to_owned(),
+        );
+        td.request(
+            3,
+            Function::editStoryMusic(td_api::editStoryMusic {
+                story_poster_chat_id: my_chat,
+                story_id: 15,
+                music: Some(td_api::InputAudio {
+                    audio: Some(td_api::InputFile::inputFileId(td_api::inputFileId {
+                        id: audio_file_id.get(),
+                    })),
+                    album_cover_thumbnail: None,
+                    duration: 180,
+                    title: "Song".to_owned(),
+                    performer: "Artist".to_owned(),
+                }),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_editStory::ID,
+        );
+        let body = telegram_api::stories_editStory::parse(sent.query()).expect("the body");
+        assert_eq!(body.flags, 1 << 4); // MUSIC_MASK only
+        match body.music {
+            Some(telegram_api::InputDocument::inputDocument(document)) => {
+                assert_eq!(document.id, 500);
+                assert_eq!(document.access_hash, 42);
+                assert_eq!(document.file_reference, b"ref");
+            }
+            other => panic!("the music document: {other:?}"),
+        }
+        // 4. the FILE_REFERENCE band — the reference delete + the
+        //    reupload chain park the caller promise (the repair seam is
+        //    [blocked: net]; the resumed upload idles in the outbox)
+        net_fail(sent, 400, "FILE_REFERENCE_EXPIRED");
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 3).is_empty(),
+            "the promise parks across the repair"
+        );
+        assert_eq!(
+            td.audios_manager.being_uploaded_audio_files.len(),
+            1,
+            "the reupload registered"
+        );
     }
 
     #[test]

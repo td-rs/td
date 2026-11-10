@@ -4864,6 +4864,12 @@ pub struct ChannelFull {
 
     pub main_profile_tab: ProfileTab,
 
+    /// `ChannelFull::share_theme` (ChatManager.h:633) — the supergroup
+    /// profile share theme (the #124 profile-themes family,
+    /// [`crate::profile_share_theme::ProfileShareTheme`]); `None` is
+    /// the C++ nullptr (the default theme).
+    pub share_theme: Option<crate::profile_share_theme::ProfileShareTheme>,
+
     pub stats_dc_id: DcId,
 
     pub slow_mode_delay: i32,
@@ -4935,6 +4941,7 @@ impl ChannelFull {
             linked_community_id: CommunityId::default(),
             location: DialogLocation::default(),
             main_profile_tab: ProfileTab::default(),
+            share_theme: None,
             stats_dc_id: DcId::default(),
             slow_mode_delay: 0,
             slow_mode_next_send_date: 0,
@@ -5002,6 +5009,7 @@ impl ChannelFull {
         let has_main_profile_tab = self.main_profile_tab != ProfileTab::Default;
         let has_guard_bot_user_id = self.guard_bot_user_id.is_valid();
         let has_linked_community_id = self.linked_community_id.is_valid();
+        let has_share_theme = self.share_theme.is_some();
         store_flags(
             out,
             [
@@ -5059,6 +5067,7 @@ impl ChannelFull {
                     has_main_profile_tab,
                     has_guard_bot_user_id,
                     has_linked_community_id,
+                    has_share_theme,
                 ],
             );
         }
@@ -5146,6 +5155,13 @@ impl ChannelFull {
         if has_linked_community_id {
             store_i64(out, self.linked_community_id.get());
         }
+        if has_share_theme {
+            // the C++ store(share_theme, storer) (ChatManager.cpp:2554-2556)
+            self.share_theme
+                .as_ref()
+                .expect("has_share_theme carries the theme")
+                .store(out);
+        }
     }
 
     /// `ChannelFull::parse` (ChatManager.cpp:2556-2741), including the
@@ -5209,10 +5225,12 @@ impl ChannelFull {
             has_main_profile_tab,
             has_guard_bot_user_id,
             has_linked_community_id,
+            // the 1.8.70 addition (ChatManager.cpp:2646)
+            has_share_theme,
         ] = if has_flags2 {
             parser.parse_flags()?
         } else {
-            [false; 18]
+            [false; 19]
         };
         if has_photo {
             return Err("ChannelFull photo needs the FileManager format (Files step)");
@@ -5342,6 +5360,11 @@ impl ChannelFull {
         }
         if has_linked_community_id {
             channel_full.linked_community_id = CommunityId::new(parser.i64_()?);
+        }
+        if has_share_theme {
+            channel_full.share_theme = Some(crate::profile_share_theme::ProfileShareTheme::parse(
+                parser,
+            )?);
         }
 
         if legacy_can_view_statistics {
@@ -8214,6 +8237,15 @@ impl ChatManager {
                     Self::get_channel_type(self.get_channel(channel_id).expect("checked above"));
                 let main_profile_tab =
                     get_profile_tab(std::mem::take(&mut channel.main_tab), channel_type);
+                // `ProfileShareTheme::get_profile_share_theme(td_,
+                // std::move(channel->share_theme_))` (ChatManager.cpp:6017)
+                // — the gift variant answers None through the recorded
+                // seam ([blocked: the StarGift-in-user-env seam]).
+                let share_theme =
+                    crate::profile_share_theme::ProfileShareTheme::get_profile_share_theme(
+                        env,
+                        channel.share_theme.take(),
+                    );
                 {
                     let Some(f) = self.get_channel_full_mut(channel_id) else {
                         return promise.set_value(());
@@ -8240,7 +8272,12 @@ impl ChatManager {
                         || f.has_stargifts_available != channel.stargifts_available
                         || f.has_paid_messages_available != channel.paid_messages_available
                         || f.send_paid_message_stars != channel.send_paid_messages_stars
-                        || f.main_profile_tab != main_profile_tab;
+                        || f.main_profile_tab != main_profile_tab
+                        // the C++ compares unique_ptr identities
+                        // (ChatManager.cpp:6043), so a freshly-parsed
+                        // theme always differs while one exists
+                        || f.share_theme.is_some()
+                        || share_theme.is_some();
                     if changed {
                         f.participant_count = participant_count;
                         f.administrator_count = administrator_count;
@@ -8263,6 +8300,7 @@ impl ChatManager {
                         f.has_paid_messages_available = channel.paid_messages_available;
                         f.send_paid_message_stars = channel.send_paid_messages_stars;
                         f.main_profile_tab = main_profile_tab;
+                        f.share_theme = share_theme;
                         f.is_changed = true;
                     }
                 }
@@ -15846,6 +15884,8 @@ impl ChatManager {
         if let Some(bot_verification) = &channel_full.bot_verification {
             user_dependencies.push(bot_verification.bot_user_id_);
         }
+        // the share-theme gift dependencies (ChatManager.cpp:5177-5179)
+        // arrive with the StarGift seam
         user_dependencies.push(channel_full.invite_link.get_creator_user_id());
         for user_id in user_dependencies {
             if user_id.is_valid() && !user_manager.have_user_force(env, user_id, source) {
@@ -17290,10 +17330,13 @@ impl ChatManager {
             bot_commands,
             bot_verification,
             main_profile_tab: Some(get_profile_tab_object(channel_full.main_profile_tab)),
-            // The ProfileShareTheme plane (channelFull share_theme,
-            // ChatManager.cpp:10014) rides the profile-themes family
-            // follow-up.
-            share_theme: None,
+            // `channel_full->share_theme == nullptr ? nullptr :
+            // ...->get_profile_share_theme_object(td_)`
+            // (ChatManager.cpp:10020); the gift emission is the recorded
+            // seam (the profile_share_theme module docs).
+            share_theme: channel_full.share_theme.as_ref().and_then(
+                crate::profile_share_theme::ProfileShareTheme::get_profile_share_theme_object,
+            ),
             upgraded_from_basic_group_id: migrated_from_basic_group_id,
             upgraded_from_max_message_id: channel_full.migrated_from_max_message_id.get(),
         }
@@ -21630,6 +21673,9 @@ mod tests {
         channel_full.monoforum_channel_id = ChannelId::new(1_002_147_483_651);
         channel_full.linked_community_id = CommunityId::new(77);
         channel_full.main_profile_tab = ProfileTab::Posts;
+        // the flags2 slot 19 (ChatManager.cpp:2471/2646) + the
+        // ProfileShareTheme body (cpp:2554-2556/2737-2740)
+        channel_full.share_theme = Some(crate::profile_share_theme::ProfileShareTheme::default());
         channel_full.stats_dc_id = DcId::create(2);
         channel_full.slow_mode_delay = 10;
         channel_full.slow_mode_next_send_date = 1_700_000_000;
@@ -21651,6 +21697,7 @@ mod tests {
         // the repair tail runs on parse; the source record had the flag off
         assert!(parsed.can_view_statistics);
         assert!(parsed.can_have_sponsored_messages);
+        assert!(parsed.share_theme.is_some(), "the share theme survives");
 
         // a blob without the flags2 block has no sponsored-messages flag at
         // all — the repair tail turns it back on, exactly like the C++

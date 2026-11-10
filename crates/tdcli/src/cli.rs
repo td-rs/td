@@ -6858,6 +6858,73 @@ impl CliClient {
                 },
             ));
             true
+        } else if op == "gpstb" {
+            self.send_request(Function::getProfileShareThemeBackdrops(
+                td_api::getProfileShareThemeBackdrops,
+            ));
+            true
+        } else if op == "spstd" {
+            self.send_request(Function::setProfileShareTheme(
+                td_api::setProfileShareTheme {
+                    chat_id: self.as_chat_id(args),
+                    theme: None,
+                },
+            ));
+            true
+        } else if op == "spste" || op == "spstb" {
+            let parts = autosplit(args);
+            let chat_id = self.as_chat_id(parts.first().map(String::as_str).unwrap_or_default());
+            let backdrop_id = if op == "spstb" {
+                tokenizer::to_integer_i32(parts.get(1).map(String::as_str).unwrap_or_default())
+            } else {
+                0
+            };
+            let emojis_arg = if op == "spstb" {
+                parts.get(2).cloned().unwrap_or_default()
+            } else {
+                parts.get(1).cloned().unwrap_or_default()
+            };
+            let emoji_types = autosplit(&emojis_arg)
+                .iter()
+                .map(|emoji| {
+                    if let Ok(custom_emoji_id) = emoji.parse::<i64>() {
+                        td_api::EmojiType::emojiTypeCustomEmoji(td_api::emojiTypeCustomEmoji {
+                            custom_emoji_id,
+                        })
+                    } else {
+                        td_api::EmojiType::emojiTypeRegular(td_api::emojiTypeRegular {
+                            emoji: emoji.clone(),
+                        })
+                    }
+                })
+                .collect();
+            self.send_request(Function::setProfileShareTheme(
+                td_api::setProfileShareTheme {
+                    chat_id,
+                    theme: Some(td_api::InputProfileShareTheme::inputProfileShareThemeEmoji(
+                        td_api::inputProfileShareThemeEmoji {
+                            emojis: emoji_types,
+                            use_default_background: op == "spste",
+                            background_backdrop_id: backdrop_id,
+                        },
+                    )),
+                },
+            ));
+            true
+        } else if op == "spstg" {
+            let parts = autosplit(args);
+            let received_gift_id = parts.get(1).cloned().unwrap_or_default();
+            self.send_request(Function::setProfileShareTheme(
+                td_api::setProfileShareTheme {
+                    chat_id: self.as_chat_id(parts.first().map(String::as_str).unwrap_or_default()),
+                    theme: Some(
+                        td_api::InputProfileShareTheme::inputProfileShareThemeUpgradedGift(
+                            td_api::inputProfileShareThemeUpgradedGift { received_gift_id },
+                        ),
+                    ),
+                },
+            ));
+            true
         } else if op == "gcos" {
             self.send_request(Function::getCountries(td_api::getCountries));
             true
@@ -11603,6 +11670,62 @@ impl CliClient {
                 }));
             }
             true
+        } else if op == "emwd" || op == "emwdp" || op == "emwdc" {
+            // cli.cpp:6857-6871 — the widget-data edit band
+            let (chat_id, rest0) = tokenizer::split(args, ' ');
+            let (message_id, rest1) = tokenizer::split(&rest0, ' ');
+            let (public_data, chat_data) = if op == "emwdp" {
+                let (public_data, _) = tokenizer::split(&rest1, ' ');
+                (public_data, String::new())
+            } else if op == "emwdc" {
+                let (chat_data, _) = tokenizer::split(&rest1, ' ');
+                (String::new(), chat_data)
+            } else {
+                tokenizer::split(&rest1, ' ')
+            };
+            self.send_request(Function::editMessageWidgetData(
+                td_api::editMessageWidgetData {
+                    chat_id: self.as_chat_id(&chat_id),
+                    message_id: as_message_id(&message_id),
+                    edit_public_data: op != "emwdc",
+                    public_data,
+                    edit_chat_data: op != "emwdp",
+                    chat_data,
+                },
+            ));
+            true
+        } else if op == "eimwd" || op == "eimwdp" || op == "eimwdc" {
+            // cli.cpp:6872-6883 — the inline widget-data edit band
+            let (inline_message_id, rest0) = tokenizer::split(args, ' ');
+            let (public_data, chat_data) = if op == "eimwdp" {
+                let (public_data, _) = tokenizer::split(&rest0, ' ');
+                (public_data, String::new())
+            } else if op == "eimwdc" {
+                let (chat_data, _) = tokenizer::split(&rest0, ' ');
+                (String::new(), chat_data)
+            } else {
+                tokenizer::split(&rest0, ' ')
+            };
+            self.send_request(Function::editInlineMessageWidgetData(
+                td_api::editInlineMessageWidgetData {
+                    inline_message_id,
+                    edit_public_data: op != "eimwdc",
+                    public_data,
+                    edit_chat_data: op != "eimwdp",
+                    chat_data,
+                },
+            ));
+            true
+        } else if op == "ewd" {
+            // cli.cpp:6884-6890
+            let (widget_id, rest0) = tokenizer::split(args, ' ');
+            let (public_data, cache_time) = tokenizer::split(&rest0, ' ');
+            self.send_request(Function::editWidgetData(td_api::editWidgetData {
+                widget_id: tokenizer::to_integer_i64(&widget_id),
+                public_data,
+                cache_time: tokenizer::to_integer_i32(&cache_time),
+            }));
+            true
         } else if op == "eqrmd" {
             let (shortcut_id, rest0) = tokenizer::split(args, ' ');
             let (message_id, document) = tokenizer::split(&rest0, ' ');
@@ -12182,6 +12305,68 @@ impl CliClient {
                 },
             ));
             true
+        } else if op == "gwqa" || op == "gwqaw" {
+            // cli.cpp:7201-7207 — the plain-data widget query
+            let (chat_id, rest0) = tokenizer::split(args, ' ');
+            let (message_id, data) = tokenizer::split(&rest0, ' ');
+            self.send_request(Function::getWidgetQueryAnswer(
+                td_api::getWidgetQueryAnswer {
+                    chat_id: self.as_chat_id(&chat_id),
+                    message_id: as_message_id(&message_id),
+                    query_type: Some(td_api::WidgetQueryType::widgetQueryTypeData(
+                        td_api::widgetQueryTypeData {
+                            with_wallet: op == "gwqaw",
+                        },
+                    )),
+                    data: data.into_bytes(),
+                },
+            ));
+            true
+        } else if op == "gwqas" || op == "gwqat" {
+            // cli.cpp:7208-7224 — the wallet-backed sign/transaction query
+            let (chat_id, rest0) = tokenizer::split(args, ' ');
+            let (message_id, rest1) = tokenizer::split(&rest0, ' ');
+            let (address, rest2) = tokenizer::split(&rest1, ' ');
+            let (gram_amount, rest3) = tokenizer::split(&rest2, ' ');
+            let (public_key, rest4) = tokenizer::split(&rest3, ' ');
+            let (state_init, rest5) = tokenizer::split(&rest4, ' ');
+            let (value, data) = tokenizer::split(&rest5, ' ');
+            let wallet = td_api::WidgetQueryWallet {
+                address,
+                gram_amount: tokenizer::to_integer_i64(&gram_amount),
+                public_key: public_key.into_bytes(),
+                state_init: state_init.into_bytes(),
+            };
+            let query_type = if op == "gwqas" {
+                td_api::WidgetQueryType::widgetQueryTypeSignData(td_api::widgetQueryTypeSignData {
+                    wallet: Some(wallet),
+                    sign_data: value,
+                })
+            } else {
+                td_api::WidgetQueryType::widgetQueryTypeSentTransaction(
+                    td_api::widgetQueryTypeSentTransaction {
+                        wallet: Some(wallet),
+                        msg_hash: value,
+                    },
+                )
+            };
+            self.send_request(Function::getWidgetQueryAnswer(
+                td_api::getWidgetQueryAnswer {
+                    chat_id: self.as_chat_id(&chat_id),
+                    message_id: as_message_id(&message_id),
+                    query_type: Some(query_type),
+                    data: data.into_bytes(),
+                },
+            ));
+            true
+        } else if op == "gwpd" {
+            // cli.cpp:7226-7230
+            let (chat_id, message_id) = tokenizer::split(args, ' ');
+            self.send_request(Function::getWidgetPublicData(td_api::getWidgetPublicData {
+                chat_id: self.as_chat_id(&chat_id),
+                message_id: as_message_id(&message_id),
+            }));
+            true
         } else if op == "acq" || op == "acqa" {
             let (callback_query_id, text) = tokenizer::split(args, ' ');
             self.send_request(Function::answerCallbackQuery(td_api::answerCallbackQuery {
@@ -12190,6 +12375,14 @@ impl CliClient {
                 show_alert: op == "acqa",
                 url: String::new(),
                 cache_time: 0,
+            }));
+            true
+        } else if op == "awq" {
+            // cli.cpp:7251-7255
+            let (widget_query_id, data) = tokenizer::split(args, ' ');
+            self.send_request(Function::answerWidgetQuery(td_api::answerWidgetQuery {
+                widget_query_id: tokenizer::to_integer_i64(&widget_query_id),
+                data,
             }));
             true
         } else {
@@ -15755,7 +15948,18 @@ pub fn run(client: &'static CliClient) {
             std::time::Duration::from_millis(100)
         };
         let queue = client.cmd_queue.lock().unwrap();
-        if queue.is_empty() && !client.close_flag.load(Ordering::SeqCst) {
+        // Park unless there is command work — including through the close
+        // window: every exit-relevant flip (add_cmd, the pump's
+        // stdin_reader_stopped, on_closed's ready_to_stop) notifies the
+        // condvar, so parking here is event-driven like the C++ actor.
+        // The former `!close_flag`-only guard skipped the wait exactly
+        // when on_closed's notify fires, busy-spinning receive(0.0) (a
+        // full core, and ~2 bookend log lines per iteration — the
+        // Client.cpp:281/294 flood) until the Closed update landed; the
+        // `queue.is_empty()` half of it re-spun whenever the dropped
+        // tail lines of a quit still sat in the queue.
+        let has_command_work = !queue.is_empty() && !client.close_flag.load(Ordering::SeqCst);
+        if !has_command_work {
             let _ = client.condvar.wait_timeout(queue, tick).unwrap();
         }
     }
@@ -16711,6 +16915,11 @@ mod tests {
             ("gatss", 4),
             ("gbf", 4),
             ("gbms", 4),
+            ("gpstb", 4),
+            ("spstb", 4),
+            ("spstd", 4),
+            ("spste", 4),
+            ("spstg", 4),
             ("gcapr", 4),
             ("gcaprs", 4),
             ("gcipn", 4),
@@ -16903,8 +17112,14 @@ mod tests {
             ("gcqa", 11),
             ("gcpqa", 11),
             ("gcgqa", 11),
+            ("gwqa", 11),
+            ("gwqaw", 11),
+            ("gwqas", 11),
+            ("gwqat", 11),
+            ("gwpd", 11),
             ("acq", 11),
             ("acqa", 11),
+            ("awq", 11),
             ("cc", 7),
             ("ac", 7),
             ("scsd", 7),
@@ -17056,6 +17271,13 @@ mod tests {
             ("eman", 10),
             ("emc", 10),
             ("emd", 10),
+            ("emwd", 10),
+            ("emwdp", 10),
+            ("emwdc", 10),
+            ("eimwd", 10),
+            ("eimwdp", 10),
+            ("eimwdc", 10),
+            ("ewd", 10),
             ("eqrmd", 10),
             ("emp", 10),
             ("eqrmp", 10),
@@ -17335,6 +17557,13 @@ mod tests {
             ("gjc", 6),
             // The community slice (#128) routes `tcacc` (chain 2).
             ("tcacc", 2),
+            ("gulf", 1),
+            ("gulfp", 1),
+            ("gulfr", 1),
+            ("gulfpr", 1),
+            ("cbun2", 17),
+            ("absun", 17),
+            ("dbsun", 17),
         ];
 
         let guard = TEST_LOCK.lock().unwrap();

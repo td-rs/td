@@ -173,7 +173,10 @@ fn is_emoji_element(str: &[u8]) -> bool {
 pub fn is_emoji(str: &str) -> bool {
     let bytes = str.as_bytes();
     // A 0xE2 byte can only be a UTF-8 lead byte, so the found position and
-    // every zero-width joiner position are char boundaries.
+    // every zero-width joiner position are char boundaries. The search runs
+    // over the C++ MAX_EMOJI_LENGTH + 4 window (emoji.cpp:142): an element
+    // longer than the window cannot pass is_emoji_element, so a first
+    // joiner beyond it is indistinguishable from none.
     let limit = (MAX_EMOJI_LENGTH + 4).min(bytes.len());
     let Some(mut i) = bytes[..limit].iter().position(|&b| b == 0xE2) else {
         return is_emoji_element(bytes);
@@ -272,6 +275,76 @@ pub fn remove_emoji_modifiers_in_place(emoji: &mut String, remove_selectors: boo
         // all-modifier string is left UNCHANGED instead of becoming empty.
         bytes.truncate(j);
     }
+}
+
+/// `skip_emoji_selector` (emoji.cpp:361-367) — one trailing variation
+/// selector U+FE0F is part of the match.
+fn skip_emoji_selector(str: &[u8], pos: usize) -> usize {
+    if pos + 3 <= str.len() && str[pos] == 0xEF && str[pos + 1] == 0xB8 && str[pos + 2] == 0x8F {
+        // skip \uFE0F
+        return pos + 3;
+    }
+    pos
+}
+
+/// The longest emoji-table entry starting at the byte position (the
+/// automaton's per-position length answer, emoji.cpp:283-300) — the
+/// entries are at most MAX_EMOJI_LENGTH bytes, so the scan tries the
+/// lengths high-to-low. The C++ reads the same answer out of the
+/// Aho-Corasick `process` circular buffer; the linear scan over the same
+/// table answers the identical longest match.
+fn longest_emoji_at(table: &HashSet<&'static [u8]>, str: &[u8], position: usize) -> usize {
+    let max_end = (position + MAX_EMOJI_LENGTH).min(str.len());
+    for end in (position + 1..=max_end).rev() {
+        if table.contains(&str[position..end]) {
+            return end - position;
+        }
+    }
+    0
+}
+
+/// `find_emojis` (emoji.h:16, emoji.cpp:369-413) — all non-overlapping
+/// emoji in the string in order of their appearance; the longest emoji is
+/// chosen at each position; every returned slice satisfies [`is_emoji`].
+/// The C++ drives the per-position lengths out of the Aho-Corasick
+/// automaton in 2048-byte batches; the collapsed scan reads the same
+/// lengths off the emoji table directly (the observable contract is the
+/// longest table match per position, one swallowed U+FE0F, then the
+/// zero-width-joiner chain).
+pub fn find_emojis(str: &str) -> Vec<&str> {
+    let table = emoji_table();
+    let bytes = str.as_bytes();
+    let mut result = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let length = longest_emoji_at(table, bytes, i);
+        if length == 0 {
+            // skip positions without emoji; the C++ skips ahead over the
+            // already-known zero lengths, the scan just steps one byte
+            // (a match start is always a UTF-8 lead byte, so table hits
+            // realign the scan)
+            i += 1;
+            continue;
+        }
+        let mut end = skip_emoji_selector(bytes, i + length);
+        while end + 3 < bytes.len()
+            && bytes[end] == 0xE2
+            && bytes[end + 1] == 0x80
+            && bytes[end + 2] == 0x8D
+        {
+            // zero-width joiner \u200D
+            let next_length = longest_emoji_at(table, bytes, end + 3);
+            if next_length == 0 {
+                break;
+            }
+            end = skip_emoji_selector(bytes, end + 3 + next_length);
+        }
+        // Every hop (a table entry, a 3-byte selector, a 3-byte joiner)
+        // is a run of complete characters, so i..end are char boundaries.
+        result.push(&str[i..end]);
+        i = end;
+    }
+    result
 }
 
 /// `remove_emoji_selectors` (emoji.h:28, emoji.cpp:217-232) — removes all
@@ -382,5 +455,65 @@ mod tests {
         assert_eq!(remove_emoji_selectors("⌚\u{FE0F}"), "⌚");
         // ...and returns a non-emoji untouched.
         assert_eq!(remove_emoji_selectors("a\u{FE0F}"), "a\u{FE0F}");
+    }
+
+    #[test]
+    fn find_emojis_matches_the_cpp_contract() {
+        // No emoji — the empty and plain-text bands.
+        assert!(find_emojis("").is_empty());
+        assert!(find_emojis("plain text, digits 123, no emoji").is_empty());
+        // A selector alone is not an emoji (emoji.cpp:375-381).
+        assert!(find_emojis("\u{FE0F}").is_empty());
+
+        // Single entries.
+        assert_eq!(find_emojis("⌚"), vec!["⌚"]);
+        assert_eq!(find_emojis("👍"), vec!["👍"]);
+        // Adjacent emoji are separate matches.
+        assert_eq!(find_emojis("⌚⌛"), vec!["⌚", "⌛"]);
+        // A regional-pair flag is one 8-byte entry.
+        assert_eq!(find_emojis("🇺🇸"), vec!["🇺🇸"]);
+        // The keycap is one entry over the digit + selector + combining key.
+        assert_eq!(find_emojis("1️⃣"), vec!["1️⃣"]);
+        // In running text the digit stays text unless the keycap follows:
+        // in "12️⃣" the keycap entry is "2️⃣" and the leading '1' stays text.
+        assert_eq!(find_emojis("abc12️⃣3"), vec!["2️⃣"]);
+
+        // The longest entry wins at each position: thumb + skin tone is its
+        // own table entry, so the pair is one match, not two.
+        assert_eq!(find_emojis("👍🏻"), vec!["👍🏻"]);
+
+        // A bare heart swallows one trailing variation selector...
+        assert_eq!(find_emojis("❤"), vec!["❤"]);
+        assert_eq!(find_emojis("❤\u{FE0F}"), vec!["❤\u{FE0F}"]);
+        // ...but only one (emoji.cpp:386-388 — the second selector is left
+        // unmatched and dropped).
+        assert_eq!(find_emojis("❤\u{FE0F}\u{FE0F}"), vec!["❤\u{FE0F}"]);
+
+        // Zero-width-joiner chains are one match while every joined element
+        // is an emoji (emoji.cpp:389-394).
+        assert_eq!(
+            find_emojis("👨\u{200D}👩\u{200D}👦"),
+            vec!["👨\u{200D}👩\u{200D}👦"]
+        );
+        // Chains compose over distinct entries.
+        assert_eq!(find_emojis("👍\u{200D}⌚"), vec!["👍\u{200D}⌚"]);
+        // A joiner without a following emoji breaks the chain: the match is
+        // the first element, the dangling joiner is dropped (the
+        // `end + 3 < str.size()` guard, emoji.cpp:391).
+        assert_eq!(find_emojis("👍\u{200D}"), vec!["👍"]);
+
+        // Mixed text.
+        assert_eq!(find_emojis("привет 👍 мир"), vec!["👍"]);
+        assert_eq!(find_emojis("a⌚b👍🏻c"), vec!["⌚", "👍🏻"]);
+
+        // Every returned slice satisfies is_emoji (the emoji.h contract).
+        for emoji in find_emojis("❤\u{FE0F}👍🏻x👨\u{200D}👩\u{200D}👦🇺🇸") {
+            assert!(is_emoji(emoji), "{emoji:?} must satisfy is_emoji");
+        }
+
+        // An input longer than the C++ 2048-byte automaton buffer — the
+        // batching is invisible in the answer.
+        let long = format!("{}👍{}", "word ".repeat(500), " tail");
+        assert_eq!(find_emojis(&long), vec!["👍"]);
     }
 }

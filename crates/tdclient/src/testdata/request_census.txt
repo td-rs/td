@@ -49,7 +49,7 @@ answerPreCheckoutQuery	dispatched
 answerShippingQuery	dispatched
 answerTonConnectRequest	dispatched
 answerWebAppQuery	dispatched
-answerWidgetQuery	interim
+answerWidgetQuery	dispatched
 applyPremiumGiftCode	dispatched
 applyUnpaidMessagesToken	dispatched
 approveSuggestedPost	dispatched
@@ -245,7 +245,7 @@ editInlineMessageLiveLocation	dispatched
 editInlineMessageMedia	dispatched
 editInlineMessageReplyMarkup	dispatched
 editInlineMessageText	dispatched
-editInlineMessageWidgetData	interim
+editInlineMessageWidgetData	dispatched
 editMessageCaption	dispatched
 editMessageChecklist	dispatched
 editMessageLiveLocation	dispatched
@@ -253,16 +253,16 @@ editMessageMedia	dispatched
 editMessageReplyMarkup	dispatched
 editMessageSchedulingState	dispatched
 editMessageText	dispatched
-editMessageWidgetData	interim
+editMessageWidgetData	dispatched
 editProxy	dispatched
 editQuickReplyMessage	dispatched
 editStarSubscription	dispatched
 editStory	dispatched
 editStoryCover	dispatched
-editStoryMusic	interim
+editStoryMusic	dispatched
 editTextCompositionStyle	dispatched
 editUserStarSubscription	dispatched
-editWidgetData	interim
+editWidgetData	dispatched
 enableProxy	dispatched
 enableTonWalletBackup	dispatched
 encryptGroupCallData	dispatched
@@ -520,7 +520,7 @@ getPremiumStickerExamples	dispatched
 getPremiumStickers	dispatched
 getPreparedInlineMessage	dispatched
 getPreparedKeyboardButton	dispatched
-getProfileShareThemeBackdrops	interim
+getProfileShareThemeBackdrops	dispatched
 getProxies	dispatched
 getPublicPostSearchLimits	dispatched
 getPushReceiverId	sync
@@ -586,7 +586,7 @@ getSupportName	dispatched
 getSupportUser	dispatched
 getTemporaryPasswordState	dispatched
 getTextCompositionStyleExample	dispatched
-getTextEmojiRanges	interim
+getTextEmojiRanges	sync
 getTextEntities	sync
 getThemeParametersJsonString	sync
 getThemedChatEmojiStatuses	dispatched
@@ -631,8 +631,8 @@ getWebAppLinkUrl	dispatched
 getWebAppPlaceholder	dispatched
 getWebAppUrl	dispatched
 getWebPageInstantView	dispatched
-getWidgetPublicData	interim
-getWidgetQueryAnswer	interim
+getWidgetPublicData	dispatched
+getWidgetQueryAnswer	dispatched
 giftPremiumWithStars	dispatched
 hideContactCloseBirthdays	dispatched
 hideSuggestedAction	dispatched
@@ -967,7 +967,7 @@ setPollAnswer	dispatched
 setProfileAccentColor	dispatched
 setProfileAudioPosition	dispatched
 setProfilePhoto	dispatched
-setProfileShareTheme	interim
+setProfileShareTheme	dispatched
 setQuickReplyShortcutName	dispatched
 setReactionNotificationSettings	dispatched
 setReadDatePrivacySettings	dispatched

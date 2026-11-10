@@ -41,7 +41,7 @@ on_update_message_forward_count	drop	[blocked: M.18 tail] the forward-count inte
 on_update_message_interaction_info	drop	[blocked: M.18 tail] the interaction-info plane is unported
 on_update_message_reactions	drop	[blocked: M.16 tail] the reactions intake (on_get_message_reactions) is unported; the M.16 value plane landed
 on_update_message_view_count	drop	[blocked: M.18 tail] the view-count plane is unported
-on_update_message_widget_data	drop	[blocked: Widgets] the widget-content apply walk (update_message_content_widget_data + the messageWidget content type) is unported and the process_pts_update sink collects nothing; the updateMessageWidgetData pts plane landed (ed8c44e17)
+on_update_message_widget_data	live	`widget_intakes` -> `apply_message_widget_data` -> the in-place `update_message_content_widget_data` walk with the updateMessageContent emission (MessagesManager.cpp:5222-5251; the get_dialog_force/get_message_force db legs are the message-db seam)
 on_update_notification_scope_is_muted	drop	[blocked: M.13 tail] the scope-mute flag plane is unported
 on_update_pinned_dialogs	drop	[blocked: M.10.12 tail] the pinned-dialogs order machine is unported
 on_update_poll_has_unread_votes	drop	[blocked: M.19 tail] the poll unread-votes plane is unported

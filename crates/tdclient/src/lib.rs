@@ -130,6 +130,7 @@ pub mod poll_manager;
 pub mod premium;
 pub mod premium_gift_option;
 pub mod privacy_manager;
+pub mod profile_share_theme;
 pub mod promo_data_manager;
 pub mod query_combiner;
 pub mod query_merger;
@@ -198,6 +199,7 @@ pub mod web_browser_settings;
 pub mod web_pages_manager;
 pub mod web_proxy_manager;
 pub mod webpage;
+pub mod widget_manager;
 
 // Generated code keeps C++-identical case-preserved names (`aiComposeTone`)
 // in types, fields and the JSON dispatch helpers alike.

@@ -2177,6 +2177,14 @@ mod tests {
             Some("I3")
         );
         assert_eq!(env.proxy_states, vec![true]);
+        // The `set_active_proxy` fan-out (cpp:463-464) — the enabled id
+        // with its proxy rides to the web-proxy manager.
+        assert_eq!(
+            env.web_proxy_calls
+                .last()
+                .map(|(id, proxy)| (*id, proxy.server.clone())),
+            Some((3, "b".to_string()))
+        );
         assert!(env.mtproto_updates.is_empty());
         assert!(creator.get_proxies().proxies[1].is_enabled);
 
@@ -2205,6 +2213,8 @@ mod tests {
         );
         assert!(env.sponsored_removals >= 1);
         assert!(env.promo_reloads >= 1);
+        // The disable fan-out carries the cleared pair (cpp:463-464).
+        assert_eq!(env.web_proxy_calls.last().map(|(id, _)| *id), Some(0));
 
         // Removing the active-proxy record erases the pmc keys.
         creator.enable_proxy(&mut env, 2).unwrap();
