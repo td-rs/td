@@ -15848,7 +15848,18 @@ pub fn run(client: &'static CliClient) {
             std::time::Duration::from_millis(100)
         };
         let queue = client.cmd_queue.lock().unwrap();
-        if queue.is_empty() && !client.close_flag.load(Ordering::SeqCst) {
+        // Park unless there is command work — including through the close
+        // window: every exit-relevant flip (add_cmd, the pump's
+        // stdin_reader_stopped, on_closed's ready_to_stop) notifies the
+        // condvar, so parking here is event-driven like the C++ actor.
+        // The former `!close_flag`-only guard skipped the wait exactly
+        // when on_closed's notify fires, busy-spinning receive(0.0) (a
+        // full core, and ~2 bookend log lines per iteration — the
+        // Client.cpp:281/294 flood) until the Closed update landed; the
+        // `queue.is_empty()` half of it re-spun whenever the dropped
+        // tail lines of a quit still sat in the queue.
+        let has_command_work = !queue.is_empty() && !client.close_flag.load(Ordering::SeqCst);
+        if !has_command_work {
             let _ = client.condvar.wait_timeout(queue, tick).unwrap();
         }
     }
