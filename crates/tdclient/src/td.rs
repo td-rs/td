@@ -61675,6 +61675,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn community_add_chat_requests_ride_the_dispatcher() {
         std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
