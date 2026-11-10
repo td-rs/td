@@ -867,6 +867,76 @@ impl CommunityManager {
         });
     }
 
+    /// `process_community_add_dialog_request` (2b80bf533,
+    /// CommunityManager.cpp:2072-2084) — the
+    /// `processCommunityAddChatRequest` request half: the get_community
+    /// gate, the admin-only linked-peer right, the read access on the
+    /// requested chat, then the `ProcessCommunityPeerLinkRequestQuery`
+    /// send (the requested chat's input peer resolves at the seam).
+    pub fn process_community_add_dialog_request(
+        &mut self,
+        env: &mut impl CommunityManagerEnv,
+        community_id: CommunityId,
+        dialog_id: DialogId,
+        approve: bool,
+        mut promise: Promise<()>,
+    ) {
+        let Some(community) = self.get_community(community_id) else {
+            return promise.set_error(Status::error(400, "Community not found"));
+        };
+        if !community
+            .status
+            .can_manage_linked_peers_as_administrator()
+        {
+            return promise.set_error(Status::error(400, "Have not enough rights"));
+        }
+        if let Err(status) = env.check_dialog_access(dialog_id) {
+            return promise.set_error(status);
+        }
+        // `ProcessCommunityPeerLinkRequestQuery::send` resolves
+        // `get_input_community` (the C++ CHECK band is the cached
+        // community invariant).
+        let Some(input_community) = self.get_input_community(env, community_id) else {
+            return promise.set_error(Status::error(500, "Community not found"));
+        };
+        env.send_process_community_peer_link_request_query(
+            community_id,
+            dialog_id,
+            input_community,
+            approve,
+        );
+        self.pending_process_request.push((community_id.get(), promise));
+    }
+
+    /// `process_community_add_dialog_requests` (79a943019,
+    /// CommunityManager.cpp:2086-2096) — the
+    /// `processCommunityAddChatRequests` request half: the same community
+    /// gates with no per-chat access check, then the
+    /// `ProcessCommunityPeerLinkRequestsQuery` send.
+    pub fn process_community_add_dialog_requests(
+        &mut self,
+        env: &mut impl CommunityManagerEnv,
+        community_id: CommunityId,
+        approve: bool,
+        mut promise: Promise<()>,
+    ) {
+        let Some(community) = self.get_community(community_id) else {
+            return promise.set_error(Status::error(400, "Community not found"));
+        };
+        if !community
+            .status
+            .can_manage_linked_peers_as_administrator()
+        {
+            return promise.set_error(Status::error(400, "Have not enough rights"));
+        }
+        let Some(input_community) = self.get_input_community(env, community_id) else {
+            return promise.set_error(Status::error(500, "Community not found"));
+        };
+        env.send_process_community_peer_link_requests_query(community_id, input_community, approve);
+        self.pending_process_all_requests
+            .push((community_id.get(), promise));
+    }
+
     /// `do_update_community_notification_settings` (c9ed2c390,
     /// 0063421d6, 09634ee46) — the committed write + the community-chat
     /// fan-out. `need_save_to_database` collapses into `is_changed` (no
@@ -2923,6 +2993,152 @@ mod tests {
                 "GetCommunityPeerLinkRequestsQuery".to_owned()
             )],
             "only the valid entry's dialog force-creates"
+        );
+    }
+
+    #[test]
+    fn process_add_chat_request_gates() {
+        // CommunityManager.cpp:2072-2084 (2b80bf533) — the get_community
+        // gate, the admin-only linked-peer right, the read access on the
+        // requested chat, then the single-approval toggle send with
+        // reject = !approve.
+        let mut env = TestEnv::new();
+        let mut manager = CommunityManager::new();
+        manager.on_get_community(&mut env, &wire_community(7, "c"), "test");
+        manager.on_get_community(&mut env, &wire_member_community(9), "test");
+
+        let (promise, recorded) = record();
+        manager.process_community_add_dialog_request(
+            &mut env,
+            CommunityId::new(8),
+            DialogId::new(1),
+            true,
+            promise,
+        );
+        assert_eq!(
+            recorded
+                .0
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .unwrap_err()
+                .message(),
+            "Community not found"
+        );
+
+        let (promise, recorded) = record();
+        manager.process_community_add_dialog_request(
+            &mut env,
+            CommunityId::new(9),
+            DialogId::new(1),
+            true,
+            promise,
+        );
+        assert_eq!(
+            recorded
+                .0
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .unwrap_err()
+                .message(),
+            "Have not enough rights"
+        );
+
+        env.dialog_access_error = Some(Status::error(400, "Chat not found"));
+        let (promise, recorded) = record();
+        manager.process_community_add_dialog_request(
+            &mut env,
+            CommunityId::new(7),
+            DialogId::new(1),
+            true,
+            promise,
+        );
+        assert_eq!(
+            recorded
+                .0
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .unwrap_err()
+                .message(),
+            "Chat not found"
+        );
+        env.dialog_access_error = None;
+
+        let (promise, recorded) = record();
+        manager.process_community_add_dialog_request(
+            &mut env,
+            CommunityId::new(7),
+            DialogId::new(1),
+            false,
+            promise,
+        );
+        assert!(
+            env.queries.iter().any(|q| q
+                == "togglePeerLinkRequestApproval 7 DialogId(1) reject=true"),
+            "the reject band inverts approve"
+        );
+        assert_eq!(manager.pending_process_request.len(), 1);
+        assert!(
+            !recorded.0.lock().unwrap().is_some(),
+            "the approval promise parks at the query"
+        );
+    }
+
+    #[test]
+    fn process_add_chat_requests_gates() {
+        // CommunityManager.cpp:2086-2096 (79a943019) — the same community
+        // gates with no per-chat access check, then the all-approvals
+        // toggle send with reject = !approve.
+        let mut env = TestEnv::new();
+        let mut manager = CommunityManager::new();
+        manager.on_get_community(&mut env, &wire_community(7, "c"), "test");
+        manager.on_get_community(&mut env, &wire_member_community(9), "test");
+
+        let (promise, recorded) = record();
+        manager.process_community_add_dialog_requests(&mut env, CommunityId::new(8), true, promise);
+        assert_eq!(
+            recorded
+                .0
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .unwrap_err()
+                .message(),
+            "Community not found"
+        );
+
+        let (promise, recorded) = record();
+        manager.process_community_add_dialog_requests(&mut env, CommunityId::new(9), true, promise);
+        assert_eq!(
+            recorded
+                .0
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .unwrap_err()
+                .message(),
+            "Have not enough rights"
+        );
+
+        let (promise, recorded) = record();
+        manager.process_community_add_dialog_requests(&mut env, CommunityId::new(7), true, promise);
+        assert!(
+            env.queries
+                .iter()
+                .any(|q| q == "toggleAllPeerLinkRequestApproval 7 reject=false"),
+            "the reject band inverts approve"
+        );
+        assert_eq!(manager.pending_process_all_requests.len(), 1);
+        assert!(
+            !recorded.0.lock().unwrap().is_some(),
+            "the approval promise parks at the query"
         );
     }
 }
