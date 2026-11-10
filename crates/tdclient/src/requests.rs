@@ -20472,6 +20472,25 @@ mod request_census_tests {
         // the #127 change-settle): 1,058 + 2 = 1,060 dispatched /
         // 15 - 2 = 13 interim, sync unmoved 26 (the #131-over-#128/#133
         // merge pin).
+        // The community family close-out (#134): the six function
+        // slices composed flip all ten family functions
+        // interim -> dispatched — getJoinedCommunities (#129),
+        // getSuitableCommunityChats (#130), the member pair
+        // toggleCommunityMemberIsBanned / getCommunityMemberChats
+        // (#133), toggleCommunityAreChatsCollapsed (#128), the
+        // add-chat-requests trio getCommunityAddChatRequests /
+        // processCommunityAddChatRequest /
+        // processCommunityAddChatRequests (#132) and the link-mutator
+        // pair addCommunityChat / removeCommunityChat (#131) —
+        // composed over the post-#125 landing base: 1,053 + 10 = 1,063
+        // dispatched / 20 - 10 = 10 interim, sync unmoved 26 of 1,099
+        // — the family close-out pin. The spec's projected 1,050/23 is
+        // stale base arithmetic: authored over the post-#113 1,040/33
+        // base, it predates the #123 TON-cards and #125 web-proxy
+        // landings that (with the #121/#122 flips recorded above)
+        // moved the landing-time base 1,040/33 -> 1,053/20; the
+        // family's own delta arithmetic — ten flips, -10 interim — is
+        // exactly as specced.
         assert_eq!(*counts.get("interim").unwrap_or(&0), 10, "interim count");
     }
 }
