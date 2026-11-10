@@ -270,8 +270,8 @@ endGroupCall	dispatched
 endGroupCallRecording	dispatched
 endGroupCallScreenSharing	dispatched
 finishFileGeneration	dispatched
-fixRecognizedRichMessageWithAi	interim
-fixRecognizedTextWithAi	interim
+fixRecognizedRichMessageWithAi	dispatched
+fixRecognizedTextWithAi	dispatched
 fixRichMessageWithAi	dispatched
 fixTextWithAi	dispatched
 forwardMessages	dispatched
@@ -548,7 +548,7 @@ getScopeNotificationSettings	dispatched
 getSearchSponsoredChats	dispatched
 getSearchedForTags	dispatched
 getSecretChat	dispatched
-getSpeechRecognitionLanguages	interim
+getSpeechRecognitionLanguages	dispatched
 getStakeDiceState	dispatched
 getStarAdAccountUrl	dispatched
 getStarGiftPaymentOptions	dispatched
@@ -702,7 +702,7 @@ readChatList	dispatched
 readFilePart	dispatched
 readdQuickReplyShortcutMessages	dispatched
 recognizeSpeech	dispatched
-recognizeSpeechInFile	interim
+recognizeSpeechInFile	dispatched
 recoverAuthenticationPassword	dispatched
 recoverPassword	dispatched
 refundStarPayment	dispatched

@@ -13163,6 +13163,46 @@ fn run_referral_requests(td: &mut Td, id: u64, function: Function) {
             );
             td.transcription_manager = manager;
         }
+        Function::recognizeSpeechInFile(request) => {
+            // `Requests.cpp:2976-2981`: CHECK_IS_USER, then the
+            // transcription manager's file flow (the upload-callback hop
+            // rides the Td audio outbox bridge; the
+            // `TranscribeAudioFileQuery` tail rides the
+            // `TranscriptionNetKind` plane with the request promise
+            // parked in the manager's per-upload map).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Text, _>(id, Object::text);
+            let (mut manager, mut env) = crate::td::transcription_env_split(td);
+            manager.recognize_speech_in_file(
+                &mut env,
+                request.audio_file,
+                request.recognition_id,
+                promise,
+            );
+            td.transcription_manager = manager;
+        }
+        Function::getSpeechRecognitionLanguages(request) => {
+            // `Requests.cpp:2983-2987`: CHECK_IS_USER, then the
+            // transcription manager (the optional dialog-access head and
+            // the `GetTranscriptionLangsQuery` tail with the request
+            // promise parked in the manager's FIFO lot).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::SpeechRecognitionLanguages, _>(
+                id,
+                Object::speechRecognitionLanguages,
+            );
+            let (mut manager, mut env) = crate::td::transcription_env_split(td);
+            manager.get_speech_recognition_languages(
+                &mut env,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                promise,
+            );
+            td.transcription_manager = manager;
+        }
         Function::translateText(request) => {
             // `Requests.cpp:2847-2853`: CHECK_IS_USER, clean the two
             // strings, then the translation manager. The query tail is
@@ -13311,6 +13351,34 @@ fn run_referral_requests(td: &mut Td, id: u64, function: Function) {
             let promise = td.deferred_promise::<td_api::RichMessage, _>(id, Object::richMessage);
             let (manager, mut env) = translation_env_split(td);
             manager.proofread_rich_message_with_ai(
+                &mut env,
+                request.message.map(|message| *message),
+                promise,
+            );
+            td.translation_manager = manager;
+        }
+        Function::fixRecognizedTextWithAi(request) => {
+            // `Requests.cpp:2950-2954`: CHECK_IS_USER, then the manager's
+            // recognized-text fix (the composeMessageWithAI tail with
+            // the "voice" tone).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::FormattedText, _>(id, Object::formattedText);
+            let (manager, mut env) = translation_env_split(td);
+            manager.fix_recognized_text_with_ai(&mut env, request.text, promise);
+            td.translation_manager = manager;
+        }
+        Function::fixRecognizedRichMessageWithAi(request) => {
+            // `Requests.cpp:2956-2960`: CHECK_IS_USER, then the manager's
+            // recognized-rich fix ([blocked: RichMessage]).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::RichMessage, _>(id, Object::richMessage);
+            let (manager, mut env) = translation_env_split(td);
+            manager.fix_recognized_rich_message_with_ai(
                 &mut env,
                 request.message.map(|message| *message),
                 promise,
@@ -20055,7 +20123,7 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 26, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            1045,
+            1049,
             "dispatched count"
         );
         // the 23383aef sync base (1.8.70): the 34 new scheme functions
@@ -20076,6 +20144,11 @@ mod request_census_tests {
         // applyUnpaidMessagesToken (the AccountManager
         // ImportNoPaidMessagesTokenQuery seam): 1,040 + 5 = 1,045
         // dispatched / 33 - 5 = 28 interim, sync unmoved 26.
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 28, "interim count");
+        // The speech-recognition family slice (#122) flipped the four
+        // speech arms (recognizeSpeechInFile,
+        // getSpeechRecognitionLanguages, fixRecognizedTextWithAi,
+        // fixRecognizedRichMessageWithAi): 1,045 + 4 = 1,049
+        // dispatched / 28 - 4 = 24 interim, sync unmoved 26.
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 24, "interim count");
     }
 }
