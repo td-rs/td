@@ -7114,6 +7114,19 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             manager.delete_community(&mut env, CommunityId::new(request.community_id), promise);
             td.community_manager = manager;
         }
+        Function::getJoinedCommunities(_) => {
+            // Requests.cpp:3456-3459 — CHECK_IS_USER, then
+            // CommunityManager::get_joined_communities (the
+            // communities.getJoinedCommunities send rides the net step;
+            // the answer intakes its chats then resolves the cached ids).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Communities, _>(id, Object::communities);
+            let (mut manager, mut env) = community_split(td);
+            manager.get_joined_communities(&mut env, promise);
+            td.community_manager = manager;
+        }
         Function::getCommunityAddChatRequests(request) => {
             // Requests.cpp:3511-3517 (ffc06ec75) — CHECK_IS_USER,
             // CLEAN_INPUT_STRING(offset), CREATE_REQUEST_PROMISE, then
@@ -20263,7 +20276,7 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 26, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            1057,
+            1058,
             "dispatched count"
         );
         // the 23383aef sync base (1.8.70): the 34 new scheme functions
@@ -20289,28 +20302,28 @@ mod request_census_tests {
         // getSpeechRecognitionLanguages, fixRecognizedTextWithAi,
         // fixRecognizedRichMessageWithAi): 1,045 + 4 = 1,049
         // dispatched / 28 - 4 = 24 interim, sync unmoved 26.
-        // The TON wallet cards family slice (#123) flipped the pair:
-        // getTonWalletCardBackgroundGiftCollectionNames (the
-        // `\xFF`-separated option answer) and setTonWalletCardStickers
-        // (the validation ladder over the SetWalletCardStickersQuery net
-        // tail): 1,049 + 2 = 1,051 dispatched / 24 - 2 = 22 interim, sync
-        // unmoved 26.
         // The web-proxy-carrier family slice (#125) flipped the pair
         // (processWebProxyCarrierMessage, reportWebProxyCarrierError —
         // the WebProxyManager carrier plane over the #114-band
         // Proxy::web records): 1,051 + 2 = 1,053 dispatched / 22 - 2 =
         // 20 interim, sync unmoved 26.
+        // The community joined-communities slice (#129) flipped
+        // getJoinedCommunities (the GetJoinedCommunitiesQuery kind over
+        // the communities.getJoinedCommunities wire query, the chats
+        // intaken before the cached-id resolution): 1,053 + 1 = 1,054
+        // dispatched / 20 - 1 = 19 interim, sync unmoved 26.
         // The community family slice (#130) flipped
         // getSuitableCommunityChats (the ForCommunityDialog plane of the
-        // created-public-dialogs cache): 1,053 + 1 = 1,054 dispatched /
-        // 20 - 1 = 19 interim, sync unmoved 26.
+        // created-public-dialogs cache): 1,054 + 1 = 1,055 dispatched /
+        // 19 - 1 = 18 interim, sync unmoved 26 (the composed #129 + #130
+        // merge pin: 1,053 + 2 = 1,055 / 20 - 2 = 18).
         // The community family slice (#132) flipped the add-chat
         // requests trio (getCommunityAddChatRequests — the page query
         // over communities.getPeerLinkRequests, and the two approval
         // toggles processCommunityAddChatRequest /
         // processCommunityAddChatRequests whose Bool answers settle
-        // through the change-settle): 1,054 + 3 = 1,057 dispatched /
-        // 19 - 3 = 16 interim, sync unmoved 26.
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 16, "interim count");
+        // through the change-settle): 1,055 + 3 = 1,058 dispatched /
+        // 18 - 3 = 15 interim, sync unmoved 26.
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 15, "interim count");
     }
 }

@@ -8019,6 +8019,9 @@ impl CliClient {
                 },
             ));
             true
+        } else if op == "gjc" {
+            self.send_request(Function::getJoinedCommunities(td_api::getJoinedCommunities));
+            true
         } else if op == "open" {
             let chat_id = self.as_chat_id(args);
             self.send_request(Function::openChat(td_api::openChat { chat_id }));
@@ -17269,6 +17272,7 @@ mod tests {
             ("gtpjs", 8),
             ("gac", 8),
             ("sale", 8),
+            ("gjc", 6),
         ];
 
         let guard = TEST_LOCK.lock().unwrap();

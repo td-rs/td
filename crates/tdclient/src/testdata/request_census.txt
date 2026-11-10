@@ -437,7 +437,7 @@ getInstalledBackgrounds	dispatched
 getInstalledStickerSets	dispatched
 getInternalLink	dispatched
 getInternalLinkType	dispatched
-getJoinedCommunities	interim
+getJoinedCommunities	dispatched
 getJsonString	sync
 getJsonValue	sync
 getKeywordEmojis	dispatched
