@@ -5391,6 +5391,32 @@ impl CliClient {
                 name,
             }));
             true
+        } else if op == "tcmib" {
+            // cli.cpp:3942-3947 — the member ban toggle over the
+            // message-sender form of the member id.
+            let (community_id, member_id, is_banned) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::toggleCommunityMemberIsBanned(
+                td_api::toggleCommunityMemberIsBanned {
+                    community_id: tokenizer::to_integer_i64(trim_td(&community_id)),
+                    member_id: self.as_message_sender(&member_id),
+                    is_banned: as_bool(&is_banned),
+                },
+            ));
+            true
+        } else if op == "gcomc" {
+            // cli.cpp:3949-3953 — the member's owned/joined chats.
+            let (community_id, member_id) = tokenizer::split(args, ' ');
+            self.send_request(Function::getCommunityMemberChats(
+                td_api::getCommunityMemberChats {
+                    community_id: tokenizer::to_integer_i64(trim_td(&community_id)),
+                    member_id: self.as_message_sender(&member_id),
+                },
+            ));
+            true
         } else if op == "gcc" {
             let (user_id, offset_chat_id, limit) = {
                 let (w0, rest0) = tokenizer::split(args, ' ');
@@ -16119,6 +16145,7 @@ mod tests {
             ("gcmc", 2),
             ("gcmca", 2),
             ("gcmp", 2),
+            ("gcomc", 2),
             ("gcsa", 2),
             ("gcsm", 2),
             ("gcsmp", 2),
@@ -16210,6 +16237,7 @@ mod tests {
             ("ssms", 2),
             ("ssmtl", 2),
             ("synclp", 2),
+            ("tcmib", 2),
             ("tdmctcsum", 2),
             ("tsmtip", 2),
             ("uadmctm", 2),

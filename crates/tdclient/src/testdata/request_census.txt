@@ -367,7 +367,7 @@ getCollectibleItemInfo	dispatched
 getCommands	dispatched
 getCommunityAddChatRequests	interim
 getCommunityFullInfo	dispatched
-getCommunityMemberChats	interim
+getCommunityMemberChats	dispatched
 getConnectedAffiliateProgram	dispatched
 getConnectedAffiliatePrograms	dispatched
 getConnectedWebsites	dispatched
@@ -1043,7 +1043,7 @@ toggleChatIsPinned	dispatched
 toggleChatIsTranslatable	dispatched
 toggleChatViewAsTopics	dispatched
 toggleCommunityAreChatsCollapsed	interim
-toggleCommunityMemberIsBanned	interim
+toggleCommunityMemberIsBanned	dispatched
 toggleDirectMessagesChatTopicCanSendUnpaidMessages	dispatched
 toggleDownloadIsPaused	dispatched
 toggleForumTopicIsClosed	dispatched

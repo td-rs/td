@@ -3151,6 +3151,18 @@ enum CommunityNetKind {
     /// `UpdateCommunityNotifySettingsQuery` (99302f0e2, cpp:140-168) —
     /// the set flow's server write.
     UpdateNotifySettings { community_id: CommunityId },
+    /// `ToggleCommunityParticipantBannedQuery` (20fc28e23, cpp:541-568)
+    /// — the participant-ban toggle; the Bool answer's value is ignored
+    /// and the popped promise settles through the change-settle
+    /// (`on_change_community_dialogs`) with the query's own community.
+    /// The invoke-after chain `{{community_id}}` collapses with the
+    /// port's no-dependency-set NetQuery.
+    ToggleParticipantBanned { community_id: CommunityId },
+    /// `GetCommunityParticipantJoinedChatsQuery` (4cd0dae69,
+    /// cpp:570-620) — the member-chats query; the answer builds the
+    /// `communityMemberChats` object (the owned/joined split over the
+    /// per-channel known gate).
+    GetParticipantJoinedChats { community_id: CommunityId },
     /// `GetJoinedCommunitiesQuery` (cpp:197-237) — the joined-communities
     /// list; the answer intakes its chats then resolves the cached ids.
     GetJoinedCommunities,
@@ -25670,6 +25682,93 @@ impl Td {
                     None => promise.set_error(parse_error("account_updateNotifySettings")),
                 }
             }
+            // `ToggleCommunityParticipantBannedQuery` (20fc28e23,
+            // cpp:541-568) — the Bool answer's value is ignored
+            // (LOG(INFO) only); the promise settles through the
+            // change-settle (`on_change_community_dialogs`) with the
+            // query's own community. The error arm fails the request.
+            CommunityNetKind::ToggleParticipantBanned { community_id } => {
+                let promise = self
+                    .community_manager
+                    .pending_ban_toggles
+                    .iter()
+                    .position(|(id, _)| *id == community_id.get())
+                    .map(|index| self.community_manager.pending_ban_toggles.remove(index).1);
+                let Some(mut promise) = promise else {
+                    return;
+                };
+                if query.is_error() {
+                    return promise.set_error(query.error().clone());
+                }
+                if parse_wire_bool_value(query.ok()).is_none() {
+                    // The C++ `fetch_result` failure routes on_error.
+                    return promise.set_error(parse_error("communities_toggleParticipantBanned"));
+                }
+                let mut manager = std::mem::take(&mut self.community_manager);
+                let mut env = CommunityEnv { td: &mut *self };
+                manager.on_change_community_dialogs(&mut env, community_id, promise);
+                self.community_manager = manager;
+            }
+            // `GetCommunityParticipantJoinedChatsQuery` (4cd0dae69,
+            // cpp:570-620) — the users/chats intakes, then the
+            // `get_chat_ids` lambda: the per-channel known gate (an
+            // unknown channel logs and drops), the forced dialog
+            // creation, and the chat-id objects; the owned (creator) and
+            // joined vectors split into the communityMemberChats answer.
+            CommunityNetKind::GetParticipantJoinedChats { community_id } => {
+                let promise = self
+                    .community_manager
+                    .pending_member_chats
+                    .iter()
+                    .position(|(id, _)| *id == community_id.get())
+                    .map(|index| self.community_manager.pending_member_chats.remove(index).1);
+                let Some(mut promise) = promise else {
+                    return;
+                };
+                if query.is_error() {
+                    return promise.set_error(query.error().clone());
+                }
+                let Ok(joined_chats) =
+                    telegram_api::communities_ParticipantJoinedChats::parse(query.ok())
+                else {
+                    return promise.set_error(parse_error("communities_getParticipantJoinedChats"));
+                };
+                self.intake_users(
+                    joined_chats.users,
+                    "GetCommunityParticipantJoinedChatsQuery",
+                );
+                self.intake_chats(
+                    joined_chats.chats,
+                    "GetCommunityParticipantJoinedChatsQuery",
+                );
+                let get_chat_ids = |td: &mut Self, channel_ids: &[i64]| -> Vec<i64> {
+                    let mut chat_ids = Vec::new();
+                    for &channel_id_int in channel_ids {
+                        let channel_id = crate::chat_manager::ChannelId::new(channel_id_int);
+                        if !td.chat_manager.have_channel(channel_id) {
+                            tdutils::log_error!("Receive unknown {channel_id:?}");
+                            continue;
+                        }
+                        let dialog_id = crate::dialog_id::DialogId::from_channel_id(channel_id);
+                        crate::dialog_manager::force_create_dialog(
+                            td,
+                            dialog_id,
+                            "GetCommunityParticipantJoinedChatsQuery",
+                        );
+                        chat_ids.push(crate::dialog_manager::get_chat_id_object(
+                            dialog_id,
+                            "communityMemberChats",
+                        ));
+                    }
+                    chat_ids
+                };
+                let owned_chat_ids = get_chat_ids(self, &joined_chats.creator_chat_ids);
+                let joined_chat_ids = get_chat_ids(self, &joined_chats.joined_chat_ids);
+                promise.set_value(td_api::CommunityMemberChats {
+                    owned_chat_ids,
+                    joined_chat_ids,
+                });
+            }
             // `GetJoinedCommunitiesQuery` (cpp:197-237) — the chats
             // intaken then the cached-id resolution ride the manager
             // method; the slice-shaped answer logs the C++ error and
@@ -41225,6 +41324,20 @@ impl CommunityManagerEnv for CommunityEnv<'_> {
         self.td.auth_manager.is_bot()
     }
 
+    /// `DialogManager::get_input_peer(dialog_id, AccessRights::Know)`
+    /// (CommunityManager.cpp:2116) — the member peer lookup of the
+    /// member pair; the null answer is the "Member not found" band.
+    fn get_input_peer_know(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+    ) -> Option<tdmtproto::telegram_api::InputPeer> {
+        crate::dialog_manager::get_input_peer(
+            self.td,
+            dialog_id,
+            crate::user_manager::AccessRights::Know,
+        )
+    }
+
     // ---- The net query senders — the C++ ResultHandler send legs
     // (CommunityManager.cpp:120-260). ----
 
@@ -41399,6 +41512,59 @@ impl CommunityManagerEnv for CommunityEnv<'_> {
         }
     }
 
+    /// `ToggleCommunityParticipantBannedQuery::send` (20fc28e23,
+    /// cpp:549-560) — `communities.toggleParticipantBanned(0,
+    /// unban = !is_banned, input_community, participant)`; the kind
+    /// carries the community the change-settle runs over.
+    fn send_toggle_participant_banned_query(
+        &mut self,
+        community_id: CommunityId,
+        input_community: telegram_api::InputChannel,
+        participant: telegram_api::InputPeer,
+        is_banned: bool,
+    ) {
+        let Some(net) = self.td.community_net() else {
+            return tdutils::log_info!(
+                "Send communities.toggleParticipantBanned for {community_id:?} — [net-inert]"
+            );
+        };
+        net.dispatch(
+            CommunityNetKind::ToggleParticipantBanned { community_id },
+            telegram_api::Function::communities_toggleParticipantBanned(
+                telegram_api::communities_toggleParticipantBanned {
+                    flags: 0,
+                    unban: !is_banned,
+                    community: Some(input_community),
+                    participant: Some(Box::new(participant)),
+                },
+            ),
+        );
+    }
+
+    /// `GetCommunityParticipantJoinedChatsQuery::send` (4cd0dae69,
+    /// cpp:583-589) — `communities.getParticipantJoinedChats(
+    /// input_community, participant)`.
+    fn send_get_participant_joined_chats_query(
+        &mut self,
+        community_id: CommunityId,
+        input_community: telegram_api::InputChannel,
+        participant: telegram_api::InputPeer,
+    ) {
+        let Some(net) = self.td.community_net() else {
+            return tdutils::log_info!(
+                "Send communities.getParticipantJoinedChats for {community_id:?} — [net-inert]"
+            );
+        };
+        net.dispatch(
+            CommunityNetKind::GetParticipantJoinedChats { community_id },
+            telegram_api::Function::communities_getParticipantJoinedChats(
+                telegram_api::communities_getParticipantJoinedChats {
+                    community: Some(input_community),
+                    participant: Some(Box::new(participant)),
+                },
+            ),
+        );
+    }
     /// `GetJoinedCommunitiesQuery::send` (cpp:205-207).
     fn send_get_joined_communities_query(&mut self) {
         match self.td.community_net() {
@@ -60348,6 +60514,16 @@ mod tests {
     }
 
     #[test]
+    fn community_member_ban_toggle_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(community_member_ban_toggle_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
     fn community_joined_communities_ride_the_dispatcher() {
         std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
@@ -60355,6 +60531,403 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    /// The `toggleCommunityMemberIsBanned` walk (20fc28e23,
+    /// Requests.cpp:3540-3546 + CommunityManager.cpp:2107-2122/541-568):
+    /// the sender→dialog resolution bands answer their 400s before any
+    /// query, the gates send the participant-banned toggle with the
+    /// unban inversion band, and the ignored Bool answer settles through
+    /// the change-settle — ok now without a cached full, ok after the
+    /// reload once one is cached. The error arm fails the request.
+    fn community_member_ban_toggle_rides_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-cm-member-ban");
+        const BOOL_TRUE: i32 = 0x9972_75b5u32 as i32;
+
+        // seed the creator community + the member user (the Know peer
+        // lookup needs the user cached)
+        with_community_manager(&mut td, |manager, env| {
+            manager.on_get_community(
+                env,
+                &telegram_api::community {
+                    flags: 1,
+                    creator: true,
+                    left: false,
+                    min: false,
+                    flags2: 0,
+                    collapsed_in_dialogs: false,
+                    id: 7,
+                    access_hash: 11,
+                    title: "My community".to_owned(),
+                    photo: None,
+                    date: 10,
+                    admin_rights: None,
+                    default_banned_rights: None,
+                },
+                "test",
+            );
+        });
+        td.intake_users(vec![wire_user(5, "Member")], "test");
+
+        // 1. the sender→dialog resolution bands (MessageSender.cpp:180,
+        //    189) answer before any query
+        td.request(
+            1,
+            Function::toggleCommunityMemberIsBanned(td_api::toggleCommunityMemberIsBanned {
+                community_id: 7,
+                member_id: None,
+                is_banned: true,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 1);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Message sender must be non-empty")
+        );
+        td.request(
+            2,
+            Function::toggleCommunityMemberIsBanned(td_api::toggleCommunityMemberIsBanned {
+                community_id: 7,
+                member_id: Some(td_api::MessageSender::messageSenderUser(
+                    td_api::messageSenderUser { user_id: 0 },
+                )),
+                is_banned: true,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 2);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Invalid user identifier specified")
+        );
+        assert!(rec.sent.lock().is_empty(), "the bands send no query");
+
+        // 2. the gates pass: the wire toggle carries the unban inversion
+        //    band + the resolved input forms
+        td.request(
+            3,
+            Function::toggleCommunityMemberIsBanned(td_api::toggleCommunityMemberIsBanned {
+                community_id: 7,
+                member_id: Some(td_api::MessageSender::messageSenderUser(
+                    td_api::messageSenderUser { user_id: 5 },
+                )),
+                is_banned: true,
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent_query(&rec, telegram_api::communities_toggleParticipantBanned::ID);
+        let body = telegram_api::communities_toggleParticipantBanned::parse(sent.query())
+            .expect("the sent body");
+        assert!(!body.unban, "unban = !is_banned");
+        match body.community {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!((channel.channel_id, channel.access_hash), (7, 11));
+            }
+            other => panic!("the input community: {other:?}"),
+        }
+        match body.participant {
+            Some(participant) => match *participant {
+                telegram_api::InputPeer::inputPeerUser(user) => {
+                    assert_eq!((user.user_id, user.access_hash), (5, 42));
+                }
+                other => panic!("the participant peer: {other:?}"),
+            },
+            None => panic!("the participant peer rides the query"),
+        }
+
+        // the ignored Bool settles through the change-settle — no cached
+        // full, so the request settles ok now
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_community_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 3).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 3. the error arm fails the request
+        td.request(
+            4,
+            Function::toggleCommunityMemberIsBanned(td_api::toggleCommunityMemberIsBanned {
+                community_id: 7,
+                member_id: Some(td_api::MessageSender::messageSenderUser(
+                    td_api::messageSenderUser { user_id: 5 },
+                )),
+                is_banned: false,
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent_query(&rec, telegram_api::communities_toggleParticipantBanned::ID);
+        let body = telegram_api::communities_toggleParticipantBanned::parse(sent.query())
+            .expect("the unban body");
+        assert!(body.unban, "unban = !is_banned lifts on the unban arm");
+        net_fail(sent, 400, "USER_NOT_PARTICIPANT");
+        td.dispatch_completed_community_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 4);
+        assert_eq!(error.message, "USER_NOT_PARTICIPANT");
+
+        // 4. with a cached full the same Bool answer settles through the
+        //    change-settle's reload: the full reloads first, then the
+        //    request settles ok
+        let wire_full = telegram_api::communityFull {
+            flags: 0,
+            id: 7,
+            about: "about".to_owned(),
+            chat_photo: None,
+            linked_peers: vec![],
+            admins_count: 2,
+            kicked_count: 1,
+            peer_link_requests_pending: 0,
+        };
+        with_community_manager(&mut td, |manager, env| {
+            manager.on_get_community_full(env, &wire_full);
+        });
+        // the unsynchronized settings query the full intake fires
+        let notify = take_sent_query(&rec, telegram_api::account_getNotifySettings::ID);
+        net_complete(notify, {
+            let mut out = Vec::new();
+            telegram_api::PeerNotifySettings {
+                flags: 0,
+                show_previews: true,
+                silent: false,
+                mute_until: 0,
+                ios_sound: None,
+                android_sound: None,
+                other_sound: None,
+                stories_muted: false,
+                stories_hide_sender: false,
+                stories_ios_sound: None,
+                stories_android_sound: None,
+                stories_other_sound: None,
+            }
+            .store_boxed(&mut out);
+            out
+        });
+        td.dispatch_completed_community_net();
+
+        td.request(
+            5,
+            Function::toggleCommunityMemberIsBanned(td_api::toggleCommunityMemberIsBanned {
+                community_id: 7,
+                member_id: Some(td_api::MessageSender::messageSenderUser(
+                    td_api::messageSenderUser { user_id: 5 },
+                )),
+                is_banned: true,
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent_query(&rec, telegram_api::communities_toggleParticipantBanned::ID);
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_community_net();
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 5).is_empty(),
+            "the settle parks on the reload"
+        );
+        // the change-settle's full reload settles the request ok at its
+        // answer
+        let reload = take_sent_query(&rec, telegram_api::channels_getFullChannel::ID);
+        match telegram_api::channels_getFullChannel::parse(reload.query()) {
+            Ok(body) => match body.channel {
+                Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                    assert_eq!(channel.channel_id, 7);
+                }
+                other => panic!("the reload community: {other:?}"),
+            },
+            Err(what) => panic!("the reload body: {what}"),
+        }
+        net_complete(
+            reload,
+            messages_chat_full_answer(
+                telegram_api::ChatFull::communityFull(wire_full),
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        td.dispatch_completed_community_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 5).first(),
+            Some(Object::ok(_))
+        ));
+        assert!(td.community_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn community_member_chats_walk_the_split() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(community_member_chats_walk_the_split_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The `getCommunityMemberChats` walk (4cd0dae69,
+    /// Requests.cpp:3549-3556 + CommunityManager.cpp:2124-2140/570-620):
+    /// the same gates over the joined-chats query, then the answer's
+    /// users/chats intake, the per-channel known gate (an id whose
+    /// channel never arrived logs and drops), the forced dialogs, and
+    /// the owned (creator) vs joined split of the communityMemberChats
+    /// answer.
+    fn community_member_chats_walk_the_split_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-cm-member-chats");
+
+        // seed the creator community + the member user
+        with_community_manager(&mut td, |manager, env| {
+            manager.on_get_community(
+                env,
+                &telegram_api::community {
+                    flags: 1,
+                    creator: true,
+                    left: false,
+                    min: false,
+                    flags2: 0,
+                    collapsed_in_dialogs: false,
+                    id: 7,
+                    access_hash: 11,
+                    title: "My community".to_owned(),
+                    photo: None,
+                    date: 10,
+                    admin_rights: None,
+                    default_banned_rights: None,
+                },
+                "test",
+            );
+        });
+        td.intake_users(vec![wire_user(5, "Member")], "test");
+
+        // 1. the Know band answers before any query — the member user is
+        //    not cached
+        td.request(
+            1,
+            Function::getCommunityMemberChats(td_api::getCommunityMemberChats {
+                community_id: 7,
+                member_id: Some(td_api::MessageSender::messageSenderUser(
+                    td_api::messageSenderUser { user_id: 55 },
+                )),
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 1);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Member not found")
+        );
+        assert!(rec.sent.lock().is_empty(), "the band sends no query");
+
+        // 2. the gates pass: the joined-chats query carries the resolved
+        //    input forms
+        td.request(
+            2,
+            Function::getCommunityMemberChats(td_api::getCommunityMemberChats {
+                community_id: 7,
+                member_id: Some(td_api::MessageSender::messageSenderUser(
+                    td_api::messageSenderUser { user_id: 5 },
+                )),
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent_query(
+            &rec,
+            telegram_api::communities_getParticipantJoinedChats::ID,
+        );
+        let body = telegram_api::communities_getParticipantJoinedChats::parse(sent.query())
+            .expect("the sent body");
+        match body.community {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!((channel.channel_id, channel.access_hash), (7, 11));
+            }
+            other => panic!("the input community: {other:?}"),
+        }
+        match body.participant {
+            Some(participant) => match *participant {
+                telegram_api::InputPeer::inputPeerUser(user) => {
+                    assert_eq!((user.user_id, user.access_hash), (5, 42));
+                }
+                other => panic!("the participant peer: {other:?}"),
+            },
+            None => panic!("the participant peer rides the query"),
+        }
+
+        // 3. the answer walk: channels 50/51 arrive as the member's owned
+        //    chats, 52 as joined — the chats intake creates them so the
+        //    known gate passes; 53 never arrives, so its id drops with
+        //    the LOG ERROR band
+        let answer = telegram_api::communities_ParticipantJoinedChats {
+            creator_chat_ids: vec![50, 51],
+            joined_chat_ids: vec![52, 53],
+            chats: vec![
+                telegram_api::Chat::channel(wire_channel(50, "owned one")),
+                telegram_api::Chat::channel(wire_channel(51, "owned two")),
+                telegram_api::Chat::channel(wire_channel(52, "joined one")),
+            ],
+            users: vec![wire_user(5, "Member")],
+        };
+        let mut out = Vec::new();
+        answer.store_boxed(&mut out);
+        net_complete(sent, out);
+        td.dispatch_completed_community_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 2).first() {
+            Some(Object::communityMemberChats(member_chats)) => {
+                let channel_dialog_id = |channel_id: i64| {
+                    crate::dialog_id::DialogId::from_channel_id(
+                        crate::chat_manager::ChannelId::new(channel_id),
+                    )
+                    .get()
+                };
+                assert_eq!(
+                    member_chats.owned_chat_ids,
+                    vec![channel_dialog_id(50), channel_dialog_id(51)]
+                );
+                assert_eq!(member_chats.joined_chat_ids, vec![channel_dialog_id(52)]);
+            }
+            other => panic!("the member chats answer: {other:?}"),
+        }
+        assert!(
+            td.chat_manager
+                .have_channel(crate::chat_manager::ChannelId::new(50)),
+            "the answer's chats intake created the channels"
+        );
+
+        // 4. the error arm fails the request
+        td.request(
+            3,
+            Function::getCommunityMemberChats(td_api::getCommunityMemberChats {
+                community_id: 7,
+                member_id: Some(td_api::MessageSender::messageSenderUser(
+                    td_api::messageSenderUser { user_id: 5 },
+                )),
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent_query(
+            &rec,
+            telegram_api::communities_getParticipantJoinedChats::ID,
+        );
+        net_fail(sent, 400, "CHAT_ADMIN_REQUIRED");
+        td.dispatch_completed_community_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 3);
+        assert_eq!(error.message, "CHAT_ADMIN_REQUIRED");
+        assert!(td.community_net_completed.lock().is_empty(), "drained");
+    }
+
+    /// One wire broadcast channel record with a full access hash (the
+    /// member-chats answer's chats intake accepts it as received).
+    fn wire_channel(id: i64, title: &str) -> telegram_api::channel {
+        telegram_api::channel {
+            flags: (1 << 13) | (1 << 17),
+            creator: false,
+            broadcast: true,
+            id,
+            access_hash: 40,
+            title: title.to_owned(),
+            ..telegram_api::channel::default()
+        }
     }
 
     fn community_joined_communities_ride_the_dispatcher_impl() {
