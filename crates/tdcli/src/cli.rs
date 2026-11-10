@@ -2601,7 +2601,7 @@ impl CliClient {
         let mut op_not_found_count = 0;
 
         // The 19 blocks, in cli.cpp order; the census fixture
-        // (`testdata/cli_census.txt`, 1299 arms) pins the per-block command
+        // (`testdata/cli_census.txt`, 1382 arms) pins the per-block command
         // inventory, and the slices fill them in: M.14.3 auth, M.14.4
         // messages/dialogs, M.14.5 files, M.14.6 misc/dev.
         if !self.op_block_auth(&op, &args) {
@@ -15897,7 +15897,7 @@ mod tests {
         drop(guard);
     }
 
-    /// The M.14.2 census gate: the fixture pins all 1299 command arms of the
+    /// The M.14.2 census gate: the fixture pins all 1382 command arms of the
     /// C++ `on_cmd` (regenerate with
     /// `conformance/cli_gate/extract_cli_census.sh`); every arm whose slice
     /// has landed must be routed by the dispatcher, every not-yet-ported arm
@@ -15908,7 +15908,7 @@ mod tests {
         const CENSUS: &str = include_str!("../testdata/cli_census.txt");
         assert_eq!(
             CENSUS.lines().count(),
-            1299,
+            1382,
             "the C++ tree changed — regenerate the census with \
              conformance/cli_gate/extract_cli_census.sh"
         );
@@ -16015,6 +16015,10 @@ mod tests {
             ("gugvu", 1),
             ("gugwu", 1),
             ("gul", 1),
+            ("gulf", 1),
+            ("gulfp", 1),
+            ("gulfr", 1),
+            ("gulfpr", 1),
             ("ic", 1),
             ("igab", 1),
             ("oga", 1),
@@ -17043,6 +17047,9 @@ mod tests {
             ("rbmp", 17),
             ("dbmp", 17),
             ("cbun", 17),
+            ("cbun2", 17),
+            ("absun", 17),
+            ("dbsun", 17),
             ("cb", 17),
             ("cbl", 17),
             ("gbi", 17),
