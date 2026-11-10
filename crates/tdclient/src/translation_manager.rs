@@ -1132,6 +1132,63 @@ impl TranslationManager {
         );
     }
 
+    /// `TranslationManager::get_recognized_speech_input_ai_compose_tone`
+    /// (TranslationManager.cpp:798-802) — the shared tone of the
+    /// fix-recognized pair: the default tone with the "voice" prompt.
+    fn get_recognized_speech_input_ai_compose_tone() -> Option<telegram_api::InputAiComposeTone> {
+        Some(telegram_api::InputAiComposeTone::inputAiComposeToneDefault(
+            telegram_api::inputAiComposeToneDefault {
+                tone: "voice".to_string(),
+            },
+        ))
+    }
+
+    /// `TranslationManager::fix_recognized_text_with_ai`
+    /// (TranslationManager.cpp:804-810) — the recognized-text fix rides
+    /// the same `messages.composeMessageWithAI` query as the compose
+    /// family, with no language code, the "voice" tone and no emojify.
+    pub fn fix_recognized_text_with_ai(
+        &self,
+        env: &mut (impl TranslationManagerEnv + crate::message_entity::UserManagerLike),
+        text: Option<td_api::FormattedText>,
+        mut promise: Promise<td_api::FormattedText>,
+    ) {
+        let input_text = match self.get_input_text(env, text) {
+            Result::Ok(input_text) => input_text,
+            Result::Err(status) => {
+                promise.set_error(status);
+                return;
+            }
+        };
+        env.send_compose_message_with_ai_query(
+            input_text,
+            String::new(),
+            Self::get_recognized_speech_input_ai_compose_tone(),
+            false,
+            promise,
+        );
+    }
+
+    /// `TranslationManager::fix_recognized_rich_message_with_ai`
+    /// (TranslationManager.cpp:811-816) — [blocked: RichMessage], like
+    /// the rest of the rich family.
+    pub fn fix_recognized_rich_message_with_ai(
+        &self,
+        env: &mut impl TranslationManagerEnv,
+        message: Option<td_api::InputRichMessage>,
+        promise: Promise<td_api::RichMessage>,
+    ) {
+        env.send_compose_rich_message_with_ai_query(
+            true,
+            message,
+            String::new(),
+            Self::get_recognized_speech_input_ai_compose_tone(),
+            false,
+            false,
+            promise,
+        );
+    }
+
     /// `TranslationManager::reload_ai_compose_tones`
     /// (TranslationManager.cpp:831-835).
     pub fn reload_ai_compose_tones(
@@ -1424,6 +1481,10 @@ mod tests {
         queries: Vec<&'static str>,
         last_skip_bot_commands: bool,
         last_max_media_timestamp: i32,
+        /// the recorded `send_compose_message_with_ai_query` arguments
+        last_compose_lang: String,
+        last_compose_tone: Option<String>,
+        last_compose_emojify: bool,
         updates: Vec<td_api::Update>,
     }
 
@@ -1439,6 +1500,9 @@ mod tests {
                 queries: Vec::new(),
                 last_skip_bot_commands: true,
                 last_max_media_timestamp: -1,
+                last_compose_lang: String::new(),
+                last_compose_tone: None,
+                last_compose_emojify: false,
                 updates: Vec::new(),
             }
         }
@@ -1503,12 +1567,24 @@ mod tests {
         fn send_compose_message_with_ai_query(
             &mut self,
             _text: InputText,
-            _translate_to_language_code: String,
-            _input_tone: Option<telegram_api::InputAiComposeTone>,
-            _emojify: bool,
+            translate_to_language_code: String,
+            input_tone: Option<telegram_api::InputAiComposeTone>,
+            emojify: bool,
             _promise: Promise<td_api::FormattedText>,
         ) {
             self.queries.push("compose");
+            self.last_compose_lang = translate_to_language_code;
+            self.last_compose_tone = match input_tone {
+                Some(telegram_api::InputAiComposeTone::inputAiComposeToneDefault(tone)) => {
+                    Some(tone.tone)
+                }
+                Some(telegram_api::InputAiComposeTone::inputAiComposeToneSingleUse(tone)) => {
+                    Some(tone.custom_prompt)
+                }
+                Some(_) => Some(String::new()),
+                None => None,
+            };
+            self.last_compose_emojify = emojify;
         }
 
         fn send_proofread_message_with_ai_query(
@@ -1838,6 +1914,41 @@ mod tests {
         manager.translate_text(&mut env, text, "es".to_owned(), String::new(), promise);
         assert_eq!(env.queries, vec!["translate"]);
         assert_eq!(env.last_max_media_timestamp, 42);
+    }
+
+    #[test]
+    fn fix_recognized_text_with_ai_rides_the_compose_query() {
+        let mut env = TestTranslationEnv::new();
+        let manager = TranslationManager::default();
+        let ((_value_flag, _error_flag), promise) = FlagPromise::<td_api::FormattedText>::create();
+        manager.fix_recognized_text_with_ai(&mut env, api_text("recog nized"), promise);
+        assert_eq!(env.queries, vec!["compose"]);
+        // no language code, the "voice" default tone, no emojify — the
+        // recognized-speech form of the shared compose query
+        // (TranslationManager.cpp:804-810).
+        assert_eq!(env.last_compose_lang, "");
+        assert_eq!(env.last_compose_tone.as_deref(), Some("voice"));
+        assert!(!env.last_compose_emojify);
+
+        // the empty-text band answers before the query (the
+        // get_input_text null band).
+        let mut env = TestTranslationEnv::new();
+        let manager = TranslationManager::default();
+        let ((_value_flag, error_flag), promise) = FlagPromise::<td_api::FormattedText>::create();
+        manager.fix_recognized_text_with_ai(&mut env, None, promise);
+        assert!(env.queries.is_empty());
+        assert!(flag(&error_flag));
+    }
+
+    #[test]
+    fn fix_recognized_rich_message_with_ai_parks_at_the_seam() {
+        // [blocked: RichMessage] — the promise drops unanswered, like
+        // the rest of the rich family.
+        let mut env = TestTranslationEnv::new();
+        let manager = TranslationManager::default();
+        let ((_value_flag, _error_flag), promise) = FlagPromise::<td_api::RichMessage>::create();
+        manager.fix_recognized_rich_message_with_ai(&mut env, None, promise);
+        assert_eq!(env.queries, vec!["compose_rich"]);
     }
 
     #[test]

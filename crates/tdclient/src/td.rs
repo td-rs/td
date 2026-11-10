@@ -6247,6 +6247,10 @@ pub struct Td {
     /// twin.
     pub(crate) saved_music_upload_callback:
         Arc<parking_lot::Mutex<dyn crate::files::UploadCallback>>,
+    /// `TranscriptionManager`'s `UploadAudioFileCallback`
+    /// (TranscriptionManager.cpp:500-515) — the
+    /// `recognizeSpeechInFile` upload outbox bridge.
+    pub(crate) audio_upload_callback: Arc<parking_lot::Mutex<dyn crate::files::UploadCallback>>,
     /// `Td::download_manager_` (Td.cpp:1219, the `init_managers` block).
     pub(crate) download_manager: Arc<parking_lot::Mutex<DownloadManager>>,
     /// The `Td *td_`/`G()` plane cell behind the stored file context/worker
@@ -6917,6 +6921,10 @@ impl Td {
             Arc::new(Mutex::new(TdSavedMusicUploadCallback {
                 events: Arc::clone(&file_shared.lock().saved_music_upload_events),
             }));
+        let audio_upload_callback: Arc<parking_lot::Mutex<dyn crate::files::UploadCallback>> =
+            Arc::new(Mutex::new(TdAudioUploadCallback {
+                events: Arc::clone(&file_shared.lock().audio_upload_events),
+            }));
         {
             let mut download_manager = download_manager.lock();
             download_manager.set_callback(Box::new(TdFilePlane(Arc::clone(&file_shared))));
@@ -7074,6 +7082,7 @@ impl Td {
             file_load_manager,
             profile_photo_upload_callback,
             saved_music_upload_callback,
+            audio_upload_callback,
             download_manager,
             file_shared,
             use_message_database: false,
@@ -20896,6 +20905,75 @@ impl Td {
                     (_, None) => {}
                 }
             }
+            // `TranscribeAudioFileQuery::on_result`/`on_error`
+            // (TranscriptionManager.cpp:86-99) — the same
+            // `messages_transcribedAudio` answer shape; no dialog error
+            // head (the query carries no dialog).
+            K::TranscribeAudioFile { file_upload_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::messages_TranscribedAudio::parse(query.ok()) {
+                        Ok(audio) => Ok(audio),
+                        Err(error) => {
+                            tdutils::log_error!(
+                                "Can't parse messages.transcribeAudioFile: {error}"
+                            );
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the messages_transcribeAudio answer",
+                            ))
+                        }
+                    }
+                };
+                let (mut manager, mut env) = crate::td::transcription_env_split(self);
+                manager.on_transcribed_audio_file(&mut env, file_upload_id, result.into());
+                self.transcription_manager = manager;
+            }
+            // `GetTranscriptionLangsQuery::on_result`/`on_error`
+            // (TranscriptionManager.cpp:51-68) — the `Vector<string>`
+            // answer drops its empty codes before the object build; the
+            // error head runs the dialog band for nonzero dialogs only.
+            K::GetTranscriptionLangs { dialog_id } => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match parse_string_vector(query.ok()) {
+                        Some(mut language_codes) => {
+                            tdutils::log_info!(
+                                "Receive result for GetTranscriptionLangsQuery: {language_codes:?}"
+                            );
+                            language_codes.retain(|language_code| !language_code.is_empty());
+                            Ok(td_api::SpeechRecognitionLanguages { language_codes })
+                        }
+                        None => {
+                            tdutils::log_error!("Can't parse messages.getTranscriptionLangs");
+                            Err(Status::error(
+                                500,
+                                "Failed to parse the messages_getTranscriptionLangs answer",
+                            ))
+                        }
+                    }
+                };
+                if let Err(status) = &result
+                    && dialog_id != crate::dialog_id::DialogId::default()
+                {
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        status,
+                        "GetTranscriptionLangsQuery",
+                    );
+                }
+                let promise = self.transcription_manager.pop_langs_promise();
+                match (result, promise) {
+                    (Ok(languages), Some(mut promise)) => promise.set_value(languages),
+                    (Err(status), Some(mut promise)) => promise.set_error(status),
+                    // no parked promise: the send leg parked none (the
+                    // net-inert posture or a dropped request)
+                    (_, None) => {}
+                }
+            }
         }
     }
 
@@ -30649,6 +30727,14 @@ impl Td {
         for event in saved_music_uploads {
             self.run_saved_music_upload_event(event);
         }
+        // the `UploadAudioFileCallback` hops — the
+        // `send_closure_later` re-entries of the C++ speech-recognition
+        // upload callback (TranscriptionManager.cpp:500-515) replay here
+        let audio_uploads =
+            std::mem::take(&mut *self.file_shared.lock().audio_upload_events.lock());
+        for event in audio_uploads {
+            self.run_audio_upload_event(event);
+        }
         let worker_events = std::mem::take(&mut self.file_shared.lock().worker_events);
         let mut merge_events = Vec::new();
         if !worker_events.is_empty() {
@@ -30784,6 +30870,30 @@ impl Td {
             }
         }
         self.user_manager = user_manager;
+    }
+
+    /// One `UploadAudioFileCallback` hop — the C++
+    /// `TranscriptionManager::on_upload_audio_file[_error]` re-entry
+    /// (TranscriptionManager.cpp:521-544): unlike the saved-music twin,
+    /// the close gate lives in the manager method (the C++ answers the
+    /// `close_status()` error at the finish).
+    fn run_audio_upload_event(&mut self, event: UserUploadEvent) {
+        let (mut manager, mut env) = crate::td::transcription_env_split(self);
+        match event {
+            UserUploadEvent::Ok {
+                file_upload_id,
+                input_file,
+            } => {
+                manager.on_upload_audio_file(&mut env, file_upload_id, input_file);
+            }
+            UserUploadEvent::Error {
+                file_upload_id,
+                status,
+            } => {
+                manager.on_upload_audio_file_error(&mut env, file_upload_id, status);
+            }
+        }
+        self.transcription_manager = manager;
     }
 
     /// The file-db replay: build the node's `FileData` (the C++
@@ -32763,6 +32873,11 @@ pub(crate) struct TdFileShared {
     /// both completions re-enter
     /// `UserManager::on_upload_saved_music[_error]` at the drive end.
     pub(crate) saved_music_upload_events: Arc<parking_lot::Mutex<Vec<UserUploadEvent>>>,
+    /// The `UploadAudioFileCallback` hops (TranscriptionManager.cpp:
+    /// 500-515) — both completions re-enter
+    /// `TranscriptionManager::on_upload_audio_file[_error]` at the
+    /// drive end.
+    pub(crate) audio_upload_events: Arc<parking_lot::Mutex<Vec<UserUploadEvent>>>,
     // ── the snapshot (refreshed per drive) ──
     files_dir: String,
     secure_files_dir: String,
@@ -32811,6 +32926,7 @@ impl TdFileShared {
             user_download_finished_events: Arc::new(Mutex::new(Vec::new())),
             profile_photo_upload_events: Arc::new(Mutex::new(Vec::new())),
             saved_music_upload_events: Arc::new(Mutex::new(Vec::new())),
+            audio_upload_events: Arc::new(Mutex::new(Vec::new())),
             files_dir: String::new(),
             secure_files_dir: String::new(),
             is_bot: false,
@@ -33374,6 +33490,37 @@ struct TdSavedMusicUploadCallback {
 }
 
 impl crate::files::UploadCallback for TdSavedMusicUploadCallback {
+    fn on_upload_ok(
+        &mut self,
+        file_upload_id: crate::files::FileUploadId,
+        input_file: Option<telegram_api::InputFile>,
+    ) {
+        self.events.lock().push(UserUploadEvent::Ok {
+            file_upload_id,
+            input_file,
+        });
+    }
+
+    fn on_upload_error(
+        &mut self,
+        file_upload_id: crate::files::FileUploadId,
+        status: tdutils::status::Status,
+    ) {
+        self.events.lock().push(UserUploadEvent::Error {
+            file_upload_id,
+            status,
+        });
+    }
+}
+
+/// `TranscriptionManager::UploadAudioFileCallback`
+/// (TranscriptionManager.cpp:500-515) — the recognizeSpeechInFile twin
+/// of [`TdProfilePhotoUploadCallback`].
+struct TdAudioUploadCallback {
+    events: Arc<parking_lot::Mutex<Vec<UserUploadEvent>>>,
+}
+
+impl crate::files::UploadCallback for TdAudioUploadCallback {
     fn on_upload_ok(
         &mut self,
         file_upload_id: crate::files::FileUploadId,
@@ -36729,6 +36876,189 @@ impl crate::transcription_manager::TranscriptionManagerEnv for TdTranscriptionEn
             ),
             None => net.complete_error(kind, 400, "Can't access the chat"),
         }
+    }
+
+    fn close_status(&self) -> tdutils::status::Status {
+        if self.td.global.close_flag() {
+            tdutils::status::Status::error(500, "Request aborted")
+        } else {
+            tdutils::status::Status::ok()
+        }
+    }
+
+    /// `FileManager::get_input_file_id(SpeechRecognitionAudio, ...)`
+    /// (TranscriptionManager.cpp:482-484) — the C++ five-argument
+    /// overload (is_encrypted defaulted off; the
+    /// get_by_hash/is_secure/force_reuse/never_reuse tail keeps the
+    /// C++ defaults).
+    fn fm_get_input_file_id(
+        &mut self,
+        audio_file: Option<td_api::InputFile>,
+    ) -> tdutils::status::Result<crate::files::FileId> {
+        let mut files = self.td.file_manager.lock();
+        files
+            .get_input_file_id(
+                crate::files::FileType::SpeechRecognitionAudio,
+                audio_file.as_ref(),
+                crate::dialog_id::DialogId::default(),
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+            )
+            .into()
+    }
+
+    fn fm_get_internal_upload_id(&mut self) -> i64 {
+        let mut files = self.td.file_manager.lock();
+        files.get_internal_upload_id()
+    }
+
+    fn fm_view_is_encrypted(&mut self, file_id: crate::files::FileId) -> bool {
+        let files = self.td.file_manager.lock();
+        files
+            .get_file_view(file_id)
+            .is_some_and(|view| view.is_encrypted())
+    }
+
+    /// `has_full_local_location() || has_generate_location()`
+    /// (TranscriptionManager.cpp:495-497); the empty view answers false.
+    fn fm_view_has_upload_location(&mut self, file_id: crate::files::FileId) -> bool {
+        let files = self.td.file_manager.lock();
+        files
+            .get_file_view(file_id)
+            .is_some_and(|view| view.has_full_local_location() || view.has_generate_location())
+    }
+
+    /// `file_view.get_type()` (TranscriptionManager.cpp:605); the empty
+    /// view answers `FileType::None` (the C++ view's null-node band).
+    fn fm_view_file_type(&mut self, file_id: crate::files::FileId) -> crate::files::FileType {
+        let files = self.td.file_manager.lock();
+        match files.get_file_view(file_id) {
+            Some(view) => view.get_type(),
+            None => crate::files::FileType::None,
+        }
+    }
+
+    /// `FileManager::upload(file_upload_id, callback, 1, 0)`
+    /// (TranscriptionManager.cpp:518) — the Td-held audio callback
+    /// records the completions for the [`Td::run_audio_upload_event`]
+    /// drain (the C++ callback hops through the actor id).
+    fn fm_upload_audio_file(&mut self, file_upload_id: crate::files::FileUploadId) {
+        let mut files = self.td.file_manager.lock();
+        let mut fllm = self.td.file_load_manager.lock();
+        files.upload(
+            file_upload_id,
+            std::sync::Arc::clone(&self.td.audio_upload_callback),
+            1,
+            0,
+            &mut fllm,
+        );
+    }
+
+    fn fm_delete_partial_remote_location(&mut self, file_upload_id: crate::files::FileUploadId) {
+        let mut files = self.td.file_manager.lock();
+        let mut fllm = self.td.file_load_manager.lock();
+        files.delete_partial_remote_location(file_upload_id, &mut fllm);
+    }
+
+    /// `delete_file(file_id, Promise<Unit>(),
+    /// "finish_audio_file_transcription")`
+    /// (TranscriptionManager.cpp:606) — the empty promise is the
+    /// default.
+    fn fm_delete_file(&mut self, file_id: crate::files::FileId) {
+        let mut files = self.td.file_manager.lock();
+        let mut fllm = self.td.file_load_manager.lock();
+        files.delete_file(
+            file_id,
+            tdutils::promise::Promise::default(),
+            "finish_audio_file_transcription",
+            &mut fllm,
+        );
+    }
+
+    /// `check_dialog_access(dialog_id, false, AccessRights::Read, ...)`
+    /// (TranscriptionManager.cpp:617-619).
+    fn check_dialog_access_read(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        source: &str,
+    ) -> tdutils::status::Result<()> {
+        crate::dialog_manager::check_dialog_access(
+            self.td,
+            dialog_id,
+            false,
+            crate::user_manager::AccessRights::Read,
+            source,
+        )
+    }
+
+    /// `TranscribeAudioFileQuery::send`
+    /// (TranscriptionManager.cpp:80-84) — the uploaded `InputFile`
+    /// rides the query; no dialog peer. The C++
+    /// `query->total_timeout_limit_ = 8` rides the handle's 24-hour
+    /// budget like every landed per-kind send (the walking-skeleton
+    /// default; documented divergence).
+    fn send_transcribe_audio_file_query(
+        &mut self,
+        file_upload_id: crate::files::FileUploadId,
+        input_file: telegram_api::InputFile,
+    ) {
+        use crate::transcription_manager::TranscriptionNetKind;
+        let Some(net) = self.td.transcription_net() else {
+            tdutils::log_info!("Transcribe audio file {file_upload_id:?} — [net-inert]");
+            return;
+        };
+        net.dispatch(
+            TranscriptionNetKind::TranscribeAudioFile { file_upload_id },
+            telegram_api::Function::messages_transcribeAudioFile(
+                telegram_api::messages_transcribeAudioFile {
+                    file: Some(input_file),
+                },
+            ),
+        );
+    }
+
+    /// `GetTranscriptionLangsQuery::send`
+    /// (TranscriptionManager.cpp:41-49) — the optional read peer
+    /// resolves at the send leg; the C++ `CHECK(input_peer != nullptr)`
+    /// rides the just-passed access check, so the unresolvable band
+    /// files through the completed queue as the standard 400 (the
+    /// answer half runs the full `on_error` tail). The promise has
+    /// already parked in the family lot by the caller.
+    fn send_get_transcription_langs_query(&mut self, dialog_id: crate::dialog_id::DialogId) {
+        use crate::transcription_manager::TranscriptionNetKind;
+        let Some(net) = self.td.transcription_net() else {
+            tdutils::log_info!("Get speech recognition languages {dialog_id:?} — [net-inert]");
+            return;
+        };
+        let kind = TranscriptionNetKind::GetTranscriptionLangs { dialog_id };
+        let peer = if dialog_id == crate::dialog_id::DialogId::default() {
+            None
+        } else {
+            match crate::dialog_manager::get_input_peer(
+                self.td,
+                dialog_id,
+                crate::user_manager::AccessRights::Read,
+            ) {
+                Some(peer) => Some(Box::new(peer)),
+                None => {
+                    net.complete_error(kind, 400, "Can't access the chat");
+                    return;
+                }
+            }
+        };
+        net.dispatch(
+            kind,
+            telegram_api::Function::messages_getTranscriptionLangs(
+                telegram_api::messages_getTranscriptionLangs {
+                    flags: i32::from(peer.is_some()),
+                    peer,
+                },
+            ),
+        );
     }
 }
 

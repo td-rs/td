@@ -2601,7 +2601,7 @@ impl CliClient {
         let mut op_not_found_count = 0;
 
         // The 19 blocks, in cli.cpp order; the census fixture
-        // (`testdata/cli_census.txt`, 1295 arms) pins the per-block command
+        // (`testdata/cli_census.txt`, 1299 arms) pins the per-block command
         // inventory, and the slices fill them in: M.14.3 auth, M.14.4
         // messages/dialogs, M.14.5 files, M.14.6 misc/dev.
         if !self.op_block_auth(&op, &args) {
@@ -8433,6 +8433,22 @@ impl CliClient {
                 },
             ));
             true
+        } else if op == "frtwa" {
+            // cli.cpp:5473-5476 (f18704166) — the recognized-text fix.
+            self.send_request(Function::fixRecognizedTextWithAi(
+                td_api::fixRecognizedTextWithAi {
+                    text: Some(self.as_formatted_text(args)),
+                },
+            ));
+            true
+        } else if op == "frrmwa" {
+            // cli.cpp:5477-5480 (f18704166) — the recognized-rich fix.
+            self.send_request(Function::fixRecognizedRichMessageWithAi(
+                td_api::fixRecognizedRichMessageWithAi {
+                    message: Some(Box::new(self.as_input_rich_message(args))),
+                },
+            ));
+            true
         } else if op == "rs" {
             let (chat_id, message_id) = tokenizer::split(args, ' ');
             self.send_request(Function::recognizeSpeech(td_api::recognizeSpeech {
@@ -8451,6 +8467,25 @@ impl CliClient {
                     chat_id: self.as_chat_id(&chat_id),
                     message_id: as_message_id(&message_id),
                     is_good: as_bool(&is_good),
+                },
+            ));
+            true
+        } else if op == "rsif" {
+            // cli.cpp:5492-5496 (fb273279e + 3745d89c7) — the file
+            // transcription, with the partial-update recognition id.
+            let (audio_file, recognition_id) = tokenizer::split(args, ' ');
+            self.send_request(Function::recognizeSpeechInFile(
+                td_api::recognizeSpeechInFile {
+                    audio_file: as_input_file(&audio_file),
+                    recognition_id: tokenizer::to_integer_i64(&recognition_id),
+                },
+            ));
+            true
+        } else if op == "gsrl" {
+            // cli.cpp:5497-5500 (6484a38a3) — the recognition languages.
+            self.send_request(Function::getSpeechRecognitionLanguages(
+                td_api::getSpeechRecognitionLanguages {
+                    chat_id: self.as_chat_id(args),
                 },
             ));
             true
@@ -15862,7 +15897,7 @@ mod tests {
         drop(guard);
     }
 
-    /// The M.14.2 census gate: the fixture pins all 1295 command arms of the
+    /// The M.14.2 census gate: the fixture pins all 1299 command arms of the
     /// C++ `on_cmd` (regenerate with
     /// `conformance/cli_gate/extract_cli_census.sh`); every arm whose slice
     /// has landed must be routed by the dispatcher, every not-yet-ported arm
@@ -15873,7 +15908,7 @@ mod tests {
         const CENSUS: &str = include_str!("../testdata/cli_census.txt");
         assert_eq!(
             CENSUS.lines().count(),
-            1295,
+            1299,
             "the C++ tree changed — regenerate the census with \
              conformance/cli_gate/extract_cli_census.sh"
         );
@@ -16199,6 +16234,8 @@ mod tests {
             ("etcsp", 6),
             ("fm", 6),
             ("frmwa", 6),
+            ("frtwa", 6),
+            ("frrmwa", 6),
             ("ftwa", 6),
             ("gbg", 6),
             ("gbgf", 6),
@@ -16247,6 +16284,8 @@ mod tests {
             ("rfp", 6),
             ("rs", 6),
             ("rsc", 6),
+            ("rsif", 6),
+            ("gsrl", 6),
             ("rsr", 6),
             ("rtcs", 6),
             ("rvma", 6),

@@ -34,7 +34,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::dialog_id::{DialogId, DialogType, MessageFullId};
-use crate::files::FileId;
+use crate::files::{FileId, FileType, FileUploadId};
 use crate::td_api;
 use tdmtproto::telegram_api;
 use tdutils::promise::Promise;
@@ -87,6 +87,46 @@ pub(crate) enum TranscriptionNetKind {
     /// manager's `pending_rate_promises` FIFO lot (the C++ promise rides
     /// the query's `promise_` member; §5's FIFO-per-family shape).
     RateTranscribedAudio { dialog_id: DialogId },
+    /// `TranscribeAudioFileQuery` (TranscriptionManager.cpp:71-100) —
+    /// `messages.transcribeAudioFile`; the request promise parks in the
+    /// manager's `audio_file_transcriptions` map keyed by the upload
+    /// pair, so the kind carries the pair the C++ handler lambda closes
+    /// over (cpp:532-535) and the answer re-enters
+    /// `on_transcribed_audio_file`.
+    TranscribeAudioFile { file_upload_id: FileUploadId },
+    /// `GetTranscriptionLangsQuery` (TranscriptionManager.cpp:32-69) —
+    /// `messages.getTranscriptionLangs`; the request promise parks in
+    /// the manager's `pending_langs_promises` FIFO lot (the C++ promise
+    /// rides the query's `promise_` member; §5). The kind carries the
+    /// request's `dialog_id` for the `on_get_dialog_error` head the C++
+    /// `on_error` runs (cpp:63-68).
+    GetTranscriptionLangs { dialog_id: DialogId },
+}
+
+/// `TranscriptionManager::AudioFileTranscription`
+/// (TranscriptionManager.h:162-165) — the in-flight
+/// `recognizeSpeechInFile` park, keyed by the upload pair.
+struct AudioFileTranscription {
+    /// The request's `recognition_id` — nonzero requests get the
+    /// partial-text `updateSpeechRecognitionInFile` stream.
+    recognition_id: i64,
+    /// The request promise; the final text arrives as the answer.
+    promise: Promise<td_api::Text>,
+}
+
+/// The transcription-id subscription entries — the C++ handler closures'
+/// only free variable, tagged by which continuation the answer drives
+/// (the message-content machine vs the file-transcription finish).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingTranscription {
+    /// The message-content continuation — the `FileInfo` the
+    /// `on_transcribed_audio_update` lambda captures
+    /// (TranscriptionManager.cpp:433-439).
+    Message(FileInfo),
+    /// The file-transcription continuation — the `FileUploadId` the
+    /// `on_transcribed_audio_file_update` lambda captures
+    /// (TranscriptionManager.cpp:564-569).
+    File(FileUploadId),
 }
 
 /// `TranscriptionInfo` (TranscriptionInfo.h:23-31) — the per-message-
@@ -475,6 +515,68 @@ pub trait TranscriptionManagerEnv {
         transcription_id: i64,
         is_good: bool,
     );
+
+    // -- the file-manager slice (the recognizeSpeechInFile flow, the
+    // -- 1.8.70 family; each op is the one C++ line over the held
+    // -- FileManager)
+    /// `G()->close_status()` — the finish error while closing.
+    fn close_status(&self) -> Status;
+    /// `td_->file_manager_->get_input_file_id(FileType::
+    /// SpeechRecognitionAudio, audio_file, DialogId(), false, false)`
+    /// (TranscriptionManager.cpp:482-484) — the C++ five-argument
+    /// overload (`is_encrypted` defaulted off; the
+    /// `get_by_hash`/`is_secure`/`force_reuse`/`never_reuse` tail keeps
+    /// the C++ defaults).
+    fn fm_get_input_file_id(
+        &mut self,
+        audio_file: Option<td_api::InputFile>,
+    ) -> tdutils::status::Result<FileId>;
+    /// `FileManager::get_internal_upload_id()`
+    /// (TranscriptionManager.cpp:485).
+    fn fm_get_internal_upload_id(&mut self) -> i64;
+    /// `file_view.is_encrypted()` (TranscriptionManager.cpp:492).
+    fn fm_view_is_encrypted(&mut self, file_id: FileId) -> bool;
+    /// `file_view.has_full_local_location() ||
+    /// file_view.has_generate_location()`
+    /// (TranscriptionManager.cpp:495); the empty view answers false.
+    fn fm_view_has_upload_location(&mut self, file_id: FileId) -> bool;
+    /// `file_view.get_type()` (TranscriptionManager.cpp:605); the empty
+    /// view answers `FileType::None`.
+    fn fm_view_file_type(&mut self, file_id: FileId) -> FileType;
+    /// `td_->file_manager_->upload(file_upload_id, callback, 1, 0)`
+    /// (TranscriptionManager.cpp:518) — the callback records the
+    /// completions for the Td drain (the C++ callback hops through the
+    /// actor id).
+    fn fm_upload_audio_file(&mut self, file_upload_id: FileUploadId);
+    /// `td_->file_manager_->delete_partial_remote_location(file_upload_id)`
+    /// (TranscriptionManager.cpp:603).
+    fn fm_delete_partial_remote_location(&mut self, file_upload_id: FileUploadId);
+    /// `td_->file_manager_->delete_file(file_id, Promise<Unit>(),
+    /// "finish_audio_file_transcription")`
+    /// (TranscriptionManager.cpp:606).
+    fn fm_delete_file(&mut self, file_id: FileId);
+    /// `td_->dialog_manager_->check_dialog_access(dialog_id, false,
+    /// AccessRights::Read, source)`
+    /// (TranscriptionManager.cpp:617-619) — the optional head of
+    /// `getSpeechRecognitionLanguages`.
+    fn check_dialog_access_read(
+        &mut self,
+        dialog_id: DialogId,
+        source: &str,
+    ) -> tdutils::status::Result<()>;
+    /// `TranscribeAudioFileQuery::send`
+    /// (TranscriptionManager.cpp:80-84) — the uploaded `InputFile`
+    /// rides the query; no dialog peer.
+    fn send_transcribe_audio_file_query(
+        &mut self,
+        file_upload_id: FileUploadId,
+        input_file: telegram_api::InputFile,
+    );
+    /// `GetTranscriptionLangsQuery::send`
+    /// (TranscriptionManager.cpp:41-49) — the optional read peer
+    /// resolves at the send leg; the promise has already parked in the
+    /// family lot by the caller.
+    fn send_get_transcription_langs_query(&mut self, dialog_id: DialogId);
 }
 
 /// The side effects `TranscriptionManager::on_transcribed_audio_update`
@@ -504,10 +606,10 @@ pub struct TranscriptionManager {
     trial_parameters_timeout: Option<f64>,
 
     /// `pending_audio_transcriptions_` — the handler map collapsed to
-    /// the file info it closes over (the closure's only free variable;
-    /// the wire answer (`on_transcribed_audio`) and the updates intake
-    /// both route back to `on_transcribed_audio_update`).
-    pending_audio_transcriptions: HashMap<i64, FileInfo>,
+    /// the closures' free variable (the message `FileInfo` or the file
+    /// `FileUploadId`; the wire answer (`on_transcribed_audio`) and the
+    /// updates intake both route back through the entry's continuation).
+    pending_audio_transcriptions: HashMap<i64, PendingTranscription>,
     /// The C++ `MultiTimeout pending_audio_transcription_timeout_` — the
     /// per-transcription-id deadlines.
     pending_audio_transcription_timeouts: BTreeMap<i64, f64>,
@@ -523,12 +625,20 @@ pub struct TranscriptionManager {
     /// (`promise_`, TranscriptionInfo.cpp:57-62); the collapse parks it
     /// here and the answer pops the head (FIFO-paired per family, §5).
     pending_rate_promises: Vec<Promise<()>>,
+    /// `audio_file_transcriptions_` — the in-flight
+    /// `recognizeSpeechInFile` parks keyed by the upload pair.
+    audio_file_transcriptions: HashMap<FileUploadId, AudioFileTranscription>,
+    /// The `getSpeechRecognitionLanguages` request promises — the C++
+    /// `GetTranscriptionLangsQuery` carries the promise on the query
+    /// (`promise_`, TranscriptionManager.cpp:33-39); the collapse parks
+    /// it here and the answer pops the head (FIFO-paired per family, §5).
+    pending_langs_promises: Vec<Promise<td_api::SpeechRecognitionLanguages>>,
 }
 
 /// Pop the oldest parked entry — the §5 FIFO-per-family convention (the
 /// C++ promise rides its own ResultHandler; the net completes the
 /// same-family queries in dispatch order, so the head pairs).
-fn pop_head(queue: &mut Vec<Promise<()>>) -> Option<Promise<()>> {
+fn pop_head<T: Send + 'static>(queue: &mut Vec<Promise<T>>) -> Option<Promise<T>> {
     if queue.is_empty() {
         None
     } else {
@@ -815,19 +925,13 @@ impl TranscriptionManager {
         }
         match r_audio {
             tdutils::status::Result::Err(error) => {
-                let retry_after = get_retry_after(error.code(), error.message());
                 self.on_transcribed_audio_update(
                     env,
                     file_info,
                     true,
-                    tdutils::status::Result::Err(error),
+                    tdutils::status::Result::Err(error.clone()),
                 );
-                if retry_after > 0 && self.trial_parameters.left_tries > 0 {
-                    let mut new_trial_parameters = self.trial_parameters;
-                    new_trial_parameters.next_reset_date = env.unix_time() + retry_after;
-                    new_trial_parameters.left_tries = 0;
-                    self.set_trial_parameters(env, new_trial_parameters);
-                }
+                self.on_transcription_error(env, &error);
             }
             tdutils::status::Result::Ok(audio) => {
                 if audio.transcription_id == 0 {
@@ -854,17 +958,317 @@ impl TranscriptionManager {
                     tdutils::status::Result::Ok(update),
                 );
 
-                // `messages_transcribedAudio::TRIAL_REMAINS_NUM_MASK` —
-                // the `flags.1` pair (trial_remains_num +
-                // trial_remains_until_date).
-                if audio.flags & (1 << 1) != 0 {
-                    let mut new_trial_parameters = self.trial_parameters;
-                    new_trial_parameters.next_reset_date = audio.trial_remains_until_date.max(0);
-                    new_trial_parameters.left_tries = audio.trial_remains_num;
-                    self.set_trial_parameters(env, new_trial_parameters);
-                }
+                self.on_transcription_trial_parameters(env, &audio);
             }
         }
+    }
+
+    /// `TranscriptionManager::on_transcription_error`
+    /// (TranscriptionManager.cpp:386-394) — the 429 retry-after band of
+    /// the trial table, shared by the message and file intakes.
+    fn on_transcription_error(&mut self, env: &mut impl TranscriptionManagerEnv, error: &Status) {
+        let retry_after = get_retry_after(error.code(), error.message());
+        if retry_after > 0 && self.trial_parameters.left_tries > 0 {
+            let mut new_trial_parameters = self.trial_parameters;
+            new_trial_parameters.next_reset_date = env.unix_time() + retry_after;
+            new_trial_parameters.left_tries = 0;
+            self.set_trial_parameters(env, new_trial_parameters);
+        }
+    }
+
+    /// `TranscriptionManager::on_transcription_trial_parameters`
+    /// (TranscriptionManager.cpp:396-403) — the
+    /// `messages_transcribedAudio::TRIAL_REMAINS_NUM_MASK` band (the
+    /// `flags.1` pair, trial_remains_num + trial_remains_until_date),
+    /// shared by the message and file intakes.
+    fn on_transcription_trial_parameters(
+        &mut self,
+        env: &mut impl TranscriptionManagerEnv,
+        audio: &telegram_api::messages_TranscribedAudio,
+    ) {
+        if audio.flags & (1 << 1) != 0 {
+            let mut new_trial_parameters = self.trial_parameters;
+            new_trial_parameters.next_reset_date = audio.trial_remains_until_date.max(0);
+            new_trial_parameters.left_tries = audio.trial_remains_num;
+            self.set_trial_parameters(env, new_trial_parameters);
+        }
+    }
+
+    /// `TranscriptionManager::recognize_speech_in_file`
+    /// (TranscriptionManager.cpp:479-519) — the 1.8.70 file flow: the
+    /// input file resolves under the never-exposed
+    /// `SpeechRecognitionAudio` type, the request parks by the upload
+    /// pair, and the encrypted/location bands answer synchronously
+    /// through the finish.
+    pub fn recognize_speech_in_file(
+        &mut self,
+        env: &mut impl TranscriptionManagerEnv,
+        audio_file: Option<td_api::InputFile>,
+        recognition_id: i64,
+        promise: Promise<td_api::Text>,
+    ) {
+        let file_id = match env.fm_get_input_file_id(audio_file) {
+            tdutils::status::Result::Ok(file_id) => file_id,
+            tdutils::status::Result::Err(status) => {
+                let mut promise = promise;
+                promise.set_error(status);
+                return;
+            }
+        };
+        let file_upload_id = FileUploadId::new(file_id, env.fm_get_internal_upload_id());
+        assert!(
+            self.audio_file_transcriptions
+                .insert(
+                    file_upload_id,
+                    AudioFileTranscription {
+                        recognition_id,
+                        promise,
+                    },
+                )
+                .is_none(),
+            "CHECK(!transcription.promise_)"
+        );
+
+        if env.fm_view_is_encrypted(file_id) {
+            return self.finish_audio_file_transcription(
+                env,
+                file_upload_id,
+                tdutils::status::Result::Err(Status::error(400, "Can't use encrypted file")),
+            );
+        }
+        if !env.fm_view_has_upload_location(file_id) {
+            return self.finish_audio_file_transcription(
+                env,
+                file_upload_id,
+                tdutils::status::Result::Err(Status::error(
+                    400,
+                    "Need local or generate location to upload the file",
+                )),
+            );
+        }
+
+        tdutils::log_info!("Upload audio {file_upload_id:?} for speech recognition");
+        env.fm_upload_audio_file(file_upload_id);
+    }
+
+    /// `TranscriptionManager::on_upload_audio_file`
+    /// (TranscriptionManager.cpp:521-537) — the upload-callback ok hop.
+    pub fn on_upload_audio_file(
+        &mut self,
+        env: &mut impl TranscriptionManagerEnv,
+        file_upload_id: FileUploadId,
+        input_file: Option<telegram_api::InputFile>,
+    ) {
+        tdutils::log_info!("Audio {file_upload_id:?} has been uploaded");
+        if env.close_flag() {
+            return self.finish_audio_file_transcription(
+                env,
+                file_upload_id,
+                tdutils::status::Result::Err(env.close_status()),
+            );
+        }
+        let Some(input_file) = input_file else {
+            return self.finish_audio_file_transcription(
+                env,
+                file_upload_id,
+                tdutils::status::Result::Err(Status::error(500, "Failed to reupload the file")),
+            );
+        };
+        env.send_transcribe_audio_file_query(file_upload_id, input_file);
+    }
+
+    /// `TranscriptionManager::on_upload_audio_file_error`
+    /// (TranscriptionManager.cpp:539-544) — the upload-callback error
+    /// hop; non-positive codes clamp at 500.
+    pub fn on_upload_audio_file_error(
+        &mut self,
+        env: &mut impl TranscriptionManagerEnv,
+        file_upload_id: FileUploadId,
+        status: Status,
+    ) {
+        tdutils::log_info!("Audio {file_upload_id:?} has upload error {status}");
+        assert!(status.is_error(), "CHECK(status.is_error())");
+        let code = if status.code() > 0 {
+            status.code()
+        } else {
+            500
+        };
+        self.finish_audio_file_transcription(
+            env,
+            file_upload_id,
+            tdutils::status::Result::Err(Status::error(code, status.message())),
+        );
+    }
+
+    /// `TranscriptionManager::on_transcribed_audio_file`
+    /// (TranscriptionManager.cpp:546-570) — the
+    /// `TranscribeAudioFileQuery` answer intake.
+    pub fn on_transcribed_audio_file(
+        &mut self,
+        env: &mut impl TranscriptionManagerEnv,
+        file_upload_id: FileUploadId,
+        r_audio: tdutils::status::Result<telegram_api::messages_TranscribedAudio>,
+    ) {
+        if env.close_flag() {
+            return self.finish_audio_file_transcription(
+                env,
+                file_upload_id,
+                tdutils::status::Result::Err(env.close_status()),
+            );
+        }
+        let audio = match r_audio {
+            tdutils::status::Result::Err(error) => {
+                self.on_transcription_error(env, &error);
+                return self.finish_audio_file_transcription(
+                    env,
+                    file_upload_id,
+                    tdutils::status::Result::Err(error),
+                );
+            }
+            tdutils::status::Result::Ok(audio) => audio,
+        };
+        self.on_transcription_trial_parameters(env, &audio);
+        if audio.transcription_id == 0 {
+            return self.finish_audio_file_transcription(
+                env,
+                file_upload_id,
+                tdutils::status::Result::Err(Status::error(
+                    500,
+                    "Receive no transcription identifier",
+                )),
+            );
+        }
+        if !audio.pending {
+            return self.finish_audio_file_transcription(
+                env,
+                file_upload_id,
+                tdutils::status::Result::Ok(audio.text),
+            );
+        }
+        self.on_partial_audio_file_transcription(env, file_upload_id, audio.text);
+        self.subscribe_to_transcribed_audio_updates(
+            env,
+            audio.transcription_id,
+            PendingTranscription::File(file_upload_id),
+        );
+    }
+
+    /// `TranscriptionManager::on_transcribed_audio_file_update`
+    /// (TranscriptionManager.cpp:572-583) — the subscription
+    /// continuation of the file flow.
+    pub fn on_transcribed_audio_file_update(
+        &mut self,
+        env: &mut impl TranscriptionManagerEnv,
+        file_upload_id: FileUploadId,
+        r_update: tdutils::status::Result<telegram_api::updateTranscribedAudio>,
+    ) {
+        let update = match r_update {
+            tdutils::status::Result::Err(error) => {
+                return self.finish_audio_file_transcription(
+                    env,
+                    file_upload_id,
+                    tdutils::status::Result::Err(error),
+                );
+            }
+            tdutils::status::Result::Ok(update) => update,
+        };
+        if !update.pending {
+            self.finish_audio_file_transcription(
+                env,
+                file_upload_id,
+                tdutils::status::Result::Ok(update.text),
+            );
+        } else {
+            self.on_partial_audio_file_transcription(env, file_upload_id, update.text);
+        }
+    }
+
+    /// `TranscriptionManager::on_partial_audio_file_transcription`
+    /// (TranscriptionManager.cpp:585-595) — the partial-text update for
+    /// the requests that passed a nonzero `recognition_id`.
+    fn on_partial_audio_file_transcription(
+        &self,
+        env: &mut impl TranscriptionManagerEnv,
+        file_upload_id: FileUploadId,
+        partial_text: String,
+    ) {
+        let recognition_id = self
+            .audio_file_transcriptions
+            .get(&file_upload_id)
+            .expect("CHECK(it != audio_file_transcriptions_.end())")
+            .recognition_id;
+        if recognition_id == 0 {
+            return;
+        }
+        env.send_update(td_api::Update::updateSpeechRecognitionInFile(
+            td_api::updateSpeechRecognitionInFile {
+                recognition_id,
+                partial_text,
+            },
+        ));
+    }
+
+    /// `TranscriptionManager::finish_audio_file_transcription`
+    /// (TranscriptionManager.cpp:597-613) — the file flow's single
+    /// completion: the partial remote location drops, the
+    /// speech-recognition file deletes, the request answers.
+    fn finish_audio_file_transcription(
+        &mut self,
+        env: &mut impl TranscriptionManagerEnv,
+        file_upload_id: FileUploadId,
+        r_text: tdutils::status::Result<String>,
+    ) {
+        let transcription = self
+            .audio_file_transcriptions
+            .remove(&file_upload_id)
+            .expect("CHECK(it != audio_file_transcriptions_.end())");
+
+        env.fm_delete_partial_remote_location(file_upload_id);
+        let file_id = file_upload_id.file_id;
+        if env.fm_view_file_type(file_id) == FileType::SpeechRecognitionAudio {
+            env.fm_delete_file(file_id);
+        }
+
+        match r_text {
+            tdutils::status::Result::Err(status) => {
+                let mut promise = transcription.promise;
+                promise.set_error(status);
+            }
+            tdutils::status::Result::Ok(text) => {
+                let mut promise = transcription.promise;
+                promise.set_value(td_api::Text { text });
+            }
+        }
+    }
+
+    /// `TranscriptionManager::get_speech_recognition_languages`
+    /// (TranscriptionManager.cpp:615-622) — the optional dialog-access
+    /// head, then the langs query (the promise parks in the family lot).
+    pub fn get_speech_recognition_languages(
+        &mut self,
+        env: &mut impl TranscriptionManagerEnv,
+        dialog_id: DialogId,
+        promise: Promise<td_api::SpeechRecognitionLanguages>,
+    ) {
+        if dialog_id != DialogId::default()
+            && let tdutils::status::Result::Err(status) =
+                env.check_dialog_access_read(dialog_id, "get_speech_recognition_languages")
+        {
+            let mut promise = promise;
+            promise.set_error(status);
+            return;
+        }
+        self.pending_langs_promises.push(promise);
+        env.send_get_transcription_langs_query(dialog_id);
+    }
+
+    /// The langs-family promise pop for the
+    /// `Td::on_transcription_net_answer` drain — the FIFO head the
+    /// answer pairs with (the C++ promise rides the query).
+    pub(crate) fn pop_langs_promise(
+        &mut self,
+    ) -> Option<Promise<td_api::SpeechRecognitionLanguages>> {
+        pop_head(&mut self.pending_langs_promises)
     }
 
     /// The side effects `on_transcribed_audio_update` runs after the
@@ -926,7 +1330,11 @@ impl TranscriptionManager {
                 }
 
                 if is_initial {
-                    self.subscribe_to_transcribed_audio_updates(env, transcription_id, file_info);
+                    self.subscribe_to_transcribed_audio_updates(
+                        env,
+                        transcription_id,
+                        PendingTranscription::Message(file_info),
+                    );
                 }
             }
         }
@@ -1009,12 +1417,14 @@ impl TranscriptionManager {
     }
 
     /// `TranscriptionManager::subscribe_to_transcribed_audio_updates`
-    /// (TranscriptionManager.cpp:392-402).
+    /// (TranscriptionManager.cpp:392-402) — the handler collapses to
+    /// its free variable (the message `FileInfo` or the file
+    /// `FileUploadId`).
     fn subscribe_to_transcribed_audio_updates(
         &mut self,
         env: &mut impl TranscriptionManagerEnv,
         transcription_id: i64,
-        file_info: FileInfo,
+        handler: PendingTranscription,
     ) {
         assert!(transcription_id != 0, "CHECK(transcription_id != 0)");
         if self
@@ -1029,7 +1439,7 @@ impl TranscriptionManager {
         }
         assert!(
             self.pending_audio_transcriptions
-                .insert(transcription_id, file_info)
+                .insert(transcription_id, handler)
                 .is_none(),
             "CHECK(is_inserted)"
         );
@@ -1039,13 +1449,14 @@ impl TranscriptionManager {
 
     /// `TranscriptionManager::on_update_transcribed_audio`
     /// (TranscriptionManager.cpp:404-419) — the UpdatesManager intake;
-    /// `flags_`, `peer_` and `msg_id_` must not be used.
+    /// `flags_`, `peer_` and `msg_id_` must not be used. The entry kind
+    /// picks the continuation (the message machine vs the file finish).
     pub fn on_update_transcribed_audio(
         &mut self,
         env: &mut impl TranscriptionManagerEnv,
         update: telegram_api::updateTranscribedAudio,
     ) {
-        let Some(file_info) = self
+        let Some(handler) = self
             .pending_audio_transcriptions
             .get(&update.transcription_id)
             .copied()
@@ -1057,20 +1468,8 @@ impl TranscriptionManager {
                 .remove(&update.transcription_id);
             self.pending_audio_transcription_timeouts
                 .remove(&update.transcription_id);
-            self.on_transcribed_audio_update(
-                env,
-                file_info,
-                false,
-                tdutils::status::Result::Ok(update),
-            );
-        } else {
-            self.on_transcribed_audio_update(
-                env,
-                file_info,
-                false,
-                tdutils::status::Result::Ok(update),
-            );
         }
+        self.dispatch_pending_transcription(env, handler, tdutils::status::Result::Ok(update));
     }
 
     /// `TranscriptionManager::on_pending_audio_transcription_failed`
@@ -1084,18 +1483,32 @@ impl TranscriptionManager {
         if env.close_flag() {
             return;
         }
-        let Some(file_info) = self.pending_audio_transcriptions.remove(&transcription_id) else {
+        let Some(handler) = self.pending_audio_transcriptions.remove(&transcription_id) else {
             return;
         };
         self.pending_audio_transcription_timeouts
             .remove(&transcription_id);
 
-        self.on_transcribed_audio_update(
-            env,
-            file_info,
-            false,
-            tdutils::status::Result::Err(error),
-        );
+        self.dispatch_pending_transcription(env, handler, tdutils::status::Result::Err(error));
+    }
+
+    /// The stored handler's call — the C++ invokes the popped closure
+    /// with the result (TranscriptionManager.cpp:433-439/565-569/647/:674);
+    /// the closure's free variable rides the enum.
+    fn dispatch_pending_transcription(
+        &mut self,
+        env: &mut impl TranscriptionManagerEnv,
+        handler: PendingTranscription,
+        r_update: tdutils::status::Result<telegram_api::updateTranscribedAudio>,
+    ) {
+        match handler {
+            PendingTranscription::Message(file_info) => {
+                self.on_transcribed_audio_update(env, file_info, false, r_update);
+            }
+            PendingTranscription::File(file_upload_id) => {
+                self.on_transcribed_audio_file_update(env, file_upload_id, r_update);
+            }
+        }
     }
 
     /// The C++ `on_pending_audio_transcription_timeout_callback`
@@ -1264,6 +1677,19 @@ mod tests {
         /// net plane)
         queries: Vec<&'static str>,
         updates: Vec<td_api::Update>,
+        // -- the file-manager slice stand-ins
+        /// the canned `get_input_file_id` result
+        input_file_id_result: tdutils::status::Result<FileId>,
+        internal_upload_id: i64,
+        view_is_encrypted: bool,
+        view_has_upload_location: bool,
+        /// the canned view types by raw file id (the default is `None`)
+        view_file_types: HashMap<i32, FileType>,
+        uploads: Vec<FileUploadId>,
+        deleted_partial: Vec<FileUploadId>,
+        deleted_files: Vec<FileId>,
+        /// the canned `check_dialog_access` failure (`None` is access)
+        dialog_access_error: Option<Status>,
     }
 
     impl TestTranscriptionEnv {
@@ -1279,6 +1705,15 @@ mod tests {
                 infos: HashMap::new(),
                 queries: Vec::new(),
                 updates: Vec::new(),
+                input_file_id_result: tdutils::status::Result::Ok(FileId::new(3, 0)),
+                internal_upload_id: 0,
+                view_is_encrypted: false,
+                view_has_upload_location: true,
+                view_file_types: HashMap::new(),
+                uploads: Vec::new(),
+                deleted_partial: Vec::new(),
+                deleted_files: Vec::new(),
+                dialog_access_error: None,
             }
         }
 
@@ -1360,6 +1795,77 @@ mod tests {
             _is_good: bool,
         ) {
             self.queries.push("rateTranscribedAudio");
+        }
+
+        fn close_status(&self) -> Status {
+            if self.close_flag {
+                Status::error(500, "Request aborted")
+            } else {
+                Status::ok()
+            }
+        }
+
+        fn fm_get_input_file_id(
+            &mut self,
+            _audio_file: Option<td_api::InputFile>,
+        ) -> tdutils::status::Result<FileId> {
+            self.input_file_id_result.clone()
+        }
+
+        fn fm_get_internal_upload_id(&mut self) -> i64 {
+            self.internal_upload_id += 1;
+            self.internal_upload_id
+        }
+
+        fn fm_view_is_encrypted(&mut self, _file_id: FileId) -> bool {
+            self.view_is_encrypted
+        }
+
+        fn fm_view_has_upload_location(&mut self, _file_id: FileId) -> bool {
+            self.view_has_upload_location
+        }
+
+        fn fm_view_file_type(&mut self, file_id: FileId) -> FileType {
+            self.view_file_types
+                .get(&file_id.get())
+                .copied()
+                .unwrap_or(FileType::None)
+        }
+
+        fn fm_upload_audio_file(&mut self, file_upload_id: FileUploadId) {
+            self.uploads.push(file_upload_id);
+            self.queries.push("uploadAudio");
+        }
+
+        fn fm_delete_partial_remote_location(&mut self, file_upload_id: FileUploadId) {
+            self.deleted_partial.push(file_upload_id);
+        }
+
+        fn fm_delete_file(&mut self, file_id: FileId) {
+            self.deleted_files.push(file_id);
+        }
+
+        fn check_dialog_access_read(
+            &mut self,
+            _dialog_id: DialogId,
+            _source: &str,
+        ) -> tdutils::status::Result<()> {
+            match self.dialog_access_error.clone() {
+                Some(status) => tdutils::status::Result::Err(status),
+                None => tdutils::status::Result::Ok(()),
+            }
+        }
+
+        fn send_transcribe_audio_file_query(
+            &mut self,
+            _file_upload_id: FileUploadId,
+            _input_file: telegram_api::InputFile,
+        ) {
+            self.queries.push("transcribeAudioFile");
+        }
+
+        fn send_get_transcription_langs_query(&mut self, _dialog_id: DialogId) {
+            self.queries.push("getTranscriptionLangs");
         }
     }
 
@@ -1984,6 +2490,288 @@ mod tests {
         assert!(second_error.load(std::sync::atomic::Ordering::SeqCst));
 
         assert!(manager.pop_rate_promise().is_none(), "the lot drained");
+    }
+
+    #[test]
+    fn test_recognize_speech_in_file_bands() {
+        // The input-file resolution failure answers its error before any
+        // park (TranscriptionManager.cpp:482-484).
+        let mut env = TestTranscriptionEnv::new();
+        let mut manager = TranscriptionManager::default();
+        env.input_file_id_result =
+            tdutils::status::Result::Err(Status::error(400, "File not found"));
+        let ((ok_flag, error_flag), promise) = FlagPromise::<td_api::Text>::create();
+        manager.recognize_speech_in_file(&mut env, None, 7, promise);
+        assert!(!ok_flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(error_flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(manager.audio_file_transcriptions.is_empty());
+        assert!(env.uploads.is_empty());
+        assert!(env.deleted_partial.is_empty());
+
+        // The encrypted band finishes through the shared completion: the
+        // partial remote location drops even on the early exit (the
+        // canned view type is not a speech file, so no file delete).
+        let mut env = TestTranscriptionEnv::new();
+        let mut manager = TranscriptionManager::default();
+        env.view_is_encrypted = true;
+        let ((ok_flag, error_flag), promise) = FlagPromise::<td_api::Text>::create();
+        manager.recognize_speech_in_file(&mut env, None, 7, promise);
+        assert!(!ok_flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(error_flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(manager.audio_file_transcriptions.is_empty());
+        assert_eq!(env.deleted_partial.len(), 1);
+        assert!(env.deleted_files.is_empty());
+        assert!(env.uploads.is_empty());
+
+        // The missing-upload-location band.
+        let mut env = TestTranscriptionEnv::new();
+        let mut manager = TranscriptionManager::default();
+        env.view_has_upload_location = false;
+        let ((ok_flag, error_flag), promise) = FlagPromise::<td_api::Text>::create();
+        manager.recognize_speech_in_file(&mut env, None, 0, promise);
+        assert!(!ok_flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(error_flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(env.deleted_partial.len(), 1);
+        assert!(env.uploads.is_empty());
+    }
+
+    #[test]
+    fn test_recognize_speech_in_file_happy_path() {
+        let mut env = TestTranscriptionEnv::new();
+        let mut manager = TranscriptionManager::default();
+        env.view_file_types
+            .insert(3, FileType::SpeechRecognitionAudio);
+        let file_upload_id = FileUploadId::new(FileId::new(3, 0), 1);
+        let ((_, error_flag), promise) = FlagPromise::<td_api::Text>::create();
+        manager.recognize_speech_in_file(&mut env, None, 7, promise);
+        assert!(
+            manager
+                .audio_file_transcriptions
+                .contains_key(&file_upload_id)
+        );
+        assert_eq!(env.uploads, vec![file_upload_id]);
+
+        // The upload ok hop without an InputFile: the reupload band
+        // fails the request (TranscriptionManager.cpp:527-529).
+        manager.on_upload_audio_file(&mut env, file_upload_id, None);
+        assert!(error_flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(manager.audio_file_transcriptions.is_empty());
+        assert_eq!(env.deleted_partial, vec![file_upload_id]);
+        // the speech file deletes at the finish
+        assert_eq!(env.deleted_files, vec![FileId::new(3, 0)]);
+
+        // A full pass: the upload ok, the final answer, the text object.
+        let mut env = TestTranscriptionEnv::new();
+        let mut manager = TranscriptionManager::default();
+        env.view_file_types
+            .insert(3, FileType::SpeechRecognitionAudio);
+        let ((ok_flag, error_flag), promise) = FlagPromise::<td_api::Text>::create();
+        manager.recognize_speech_in_file(&mut env, None, 7, promise);
+        manager.on_upload_audio_file(
+            &mut env,
+            file_upload_id,
+            Some(telegram_api::InputFile::inputFile(
+                telegram_api::inputFile {
+                    id: 1,
+                    parts: 1,
+                    name: String::new(),
+                    md5_checksum: String::new(),
+                },
+            )),
+        );
+        assert_eq!(env.queries, vec!["uploadAudio", "transcribeAudioFile"]);
+        manager.on_transcribed_audio_file(
+            &mut env,
+            file_upload_id,
+            tdutils::status::Result::Ok(telegram_api::messages_TranscribedAudio {
+                flags: 0,
+                pending: false,
+                transcription_id: 9,
+                text: "hello".to_string(),
+                trial_remains_num: 0,
+                trial_remains_until_date: 0,
+            }),
+        );
+        assert!(ok_flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!error_flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(manager.audio_file_transcriptions.is_empty());
+        assert_eq!(env.deleted_partial, vec![file_upload_id]);
+        assert_eq!(env.deleted_files, vec![FileId::new(3, 0)]);
+
+        // A non-speech view type skips the file delete.
+        let mut env = TestTranscriptionEnv::new();
+        let mut manager = TranscriptionManager::default();
+        let ((ok_flag, _), promise) = FlagPromise::<td_api::Text>::create();
+        manager.recognize_speech_in_file(&mut env, None, 0, promise);
+        manager.on_transcribed_audio_file(
+            &mut env,
+            file_upload_id,
+            tdutils::status::Result::Ok(telegram_api::messages_TranscribedAudio {
+                flags: 0,
+                pending: false,
+                transcription_id: 9,
+                text: String::new(),
+                trial_remains_num: 0,
+                trial_remains_until_date: 0,
+            }),
+        );
+        assert!(ok_flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(env.deleted_partial, vec![file_upload_id]);
+        assert!(env.deleted_files.is_empty());
+    }
+
+    #[test]
+    fn test_recognize_speech_in_file_partial_flow() {
+        let mut env = TestTranscriptionEnv::new();
+        let mut manager = TranscriptionManager::default();
+        let file_upload_id = FileUploadId::new(FileId::new(3, 0), 1);
+        let ((ok_flag, error_flag), promise) = FlagPromise::<td_api::Text>::create();
+        manager.recognize_speech_in_file(&mut env, None, 7, promise);
+        manager.on_upload_audio_file(
+            &mut env,
+            file_upload_id,
+            Some(telegram_api::InputFile::inputFile(
+                telegram_api::inputFile {
+                    id: 1,
+                    parts: 1,
+                    name: String::new(),
+                    md5_checksum: String::new(),
+                },
+            )),
+        );
+
+        // The pending answer arms the subscription and emits the partial
+        // update for the nonzero recognition id.
+        manager.on_transcribed_audio_file(
+            &mut env,
+            file_upload_id,
+            tdutils::status::Result::Ok(telegram_api::messages_TranscribedAudio {
+                flags: 1,
+                pending: true,
+                transcription_id: 9,
+                text: "par".to_string(),
+                trial_remains_num: 0,
+                trial_remains_until_date: 0,
+            }),
+        );
+        assert!(manager.pending_audio_transcriptions.contains_key(&9));
+        assert_eq!(
+            manager.pending_audio_transcription_timeouts.get(&9),
+            Some(&(env.now + AUDIO_TRANSCRIPTION_TIMEOUT))
+        );
+        assert_eq!(env.updates.len(), 1);
+        let td_api::Update::updateSpeechRecognitionInFile(update) = &env.updates[0] else {
+            panic!("speech recognition in file update");
+        };
+        assert_eq!(update.recognition_id, 7);
+        assert_eq!(update.partial_text, "par");
+
+        // The follow-up pending update rides the subscription.
+        manager.on_update_transcribed_audio(
+            &mut env,
+            telegram_api::updateTranscribedAudio {
+                flags: 1,
+                pending: true,
+                transcription_id: 9,
+                text: "partial".to_string(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(env.updates.len(), 2);
+
+        // The final update finishes through the subscription: the
+        // request answers the text, the cleanup runs.
+        manager.on_update_transcribed_audio(
+            &mut env,
+            telegram_api::updateTranscribedAudio {
+                flags: 0,
+                pending: false,
+                transcription_id: 9,
+                text: "done".to_string(),
+                ..Default::default()
+            },
+        );
+        assert!(!manager.pending_audio_transcriptions.contains_key(&9));
+        assert!(ok_flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!error_flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(manager.audio_file_transcriptions.is_empty());
+        assert_eq!(env.deleted_partial, vec![file_upload_id]);
+        assert_eq!(env.updates.len(), 2);
+
+        // recognition_id 0 suppresses the partial updates (the request
+        // only wants the final text).
+        let mut env = TestTranscriptionEnv::new();
+        let mut manager = TranscriptionManager::default();
+        let ((ok_flag, error_flag), promise) = FlagPromise::<td_api::Text>::create();
+        manager.recognize_speech_in_file(&mut env, None, 0, promise);
+        manager.on_transcribed_audio_file(
+            &mut env,
+            file_upload_id,
+            tdutils::status::Result::Ok(telegram_api::messages_TranscribedAudio {
+                flags: 1,
+                pending: true,
+                transcription_id: 9,
+                text: "par".to_string(),
+                trial_remains_num: 0,
+                trial_remains_until_date: 0,
+            }),
+        );
+        assert!(manager.pending_audio_transcriptions.contains_key(&9));
+        assert!(env.updates.is_empty());
+
+        // The subscription timeout fails the request through the file
+        // continuation (the shared failed intake).
+        env.now += AUDIO_TRANSCRIPTION_TIMEOUT + 1.0;
+        manager.tick_timeouts(&mut env);
+        assert!(!manager.pending_audio_transcriptions.contains_key(&9));
+        assert!(!ok_flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(error_flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(manager.audio_file_transcriptions.is_empty());
+        assert_eq!(env.deleted_partial.len(), 1);
+    }
+
+    #[test]
+    fn test_get_speech_recognition_languages() {
+        let mut env = TestTranscriptionEnv::new();
+        let mut manager = TranscriptionManager::default();
+
+        // The dialog-access failure answers before the park (the C++
+        // TRY_STATUS_PROMISE head).
+        env.dialog_access_error = Some(Status::error(400, "Chat not found"));
+        let ((ok_flag, error_flag), promise) =
+            FlagPromise::<td_api::SpeechRecognitionLanguages>::create();
+        manager.get_speech_recognition_languages(&mut env, DialogId::new(1), promise);
+        assert!(error_flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!ok_flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(env.queries.is_empty());
+        assert!(manager.pop_langs_promise().is_none());
+
+        // dialog_id 0 skips the access check and parks the promise.
+        let ((ok_flag, error_flag), promise) =
+            FlagPromise::<td_api::SpeechRecognitionLanguages>::create();
+        manager.get_speech_recognition_languages(&mut env, DialogId::default(), promise);
+        assert_eq!(env.queries, vec!["getTranscriptionLangs"]);
+
+        // A second request parks behind the first (the FIFO family lot).
+        env.dialog_access_error = None;
+        let ((second_ok, second_error), promise) =
+            FlagPromise::<td_api::SpeechRecognitionLanguages>::create();
+        manager.get_speech_recognition_languages(&mut env, DialogId::new(2), promise);
+        assert_eq!(env.queries, vec!["getTranscriptionLangs"; 2]);
+
+        let mut head = manager.pop_langs_promise().expect("the first park");
+        head.set_value(td_api::SpeechRecognitionLanguages {
+            language_codes: vec!["en".to_string()],
+        });
+        assert!(ok_flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!error_flag.load(std::sync::atomic::Ordering::SeqCst));
+
+        let mut head = manager.pop_langs_promise().expect("the second park");
+        head.set_error(Status::error(500, "Timeout expired"));
+        assert!(!second_ok.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(second_error.load(std::sync::atomic::Ordering::SeqCst));
+
+        assert!(manager.pop_langs_promise().is_none(), "the lot drained");
     }
 
     #[test]

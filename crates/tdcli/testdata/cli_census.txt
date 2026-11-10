@@ -554,8 +554,12 @@ crmwac 6
 cnrmwa 6
 ftwa 6
 frmwa 6
+frtwa 6
+frrmwa 6
 rs 6
 rsr 6
+rsif 6
+gsrl 6
 gf 6
 gfdps 6
 rfp 6
