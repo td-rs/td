@@ -7114,6 +7114,19 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             manager.delete_community(&mut env, CommunityId::new(request.community_id), promise);
             td.community_manager = manager;
         }
+        Function::getJoinedCommunities(_) => {
+            // Requests.cpp:3456-3459 — CHECK_IS_USER, then
+            // CommunityManager::get_joined_communities (the
+            // communities.getJoinedCommunities send rides the net step;
+            // the answer intakes its chats then resolves the cached ids).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Communities, _>(id, Object::communities);
+            let (mut manager, mut env) = community_split(td);
+            manager.get_joined_communities(&mut env, promise);
+            td.community_manager = manager;
+        }
         Function::toggleCommunityAreChatsCollapsed(request) => {
             // Requests.cpp:3533-3538 — CHECK_IS_USER, then
             // CommunityManager::toggle_community_are_dialogs_collapsed
@@ -20224,7 +20237,7 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 26, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            1055,
+            1056,
             "dispatched count"
         );
         // the 23383aef sync base (1.8.70): the 34 new scheme functions
@@ -20255,16 +20268,22 @@ mod request_census_tests {
         // the WebProxyManager carrier plane over the #114-band
         // Proxy::web records): 1,051 + 2 = 1,053 dispatched / 22 - 2 =
         // 20 interim, sync unmoved 26.
+        // The community joined-communities slice (#129) flipped
+        // getJoinedCommunities (the GetJoinedCommunitiesQuery kind over
+        // the communities.getJoinedCommunities wire query, the chats
+        // intaken before the cached-id resolution): 1,053 + 1 = 1,054
+        // dispatched / 20 - 1 = 19 interim, sync unmoved 26.
         // The community family slice (#130) flipped
         // getSuitableCommunityChats (the ForCommunityDialog plane of the
-        // created-public-dialogs cache): 1,053 + 1 = 1,054 dispatched /
-        // 20 - 1 = 19 interim, sync unmoved 26.
+        // created-public-dialogs cache): 1,054 + 1 = 1,055 dispatched /
+        // 19 - 1 = 18 interim, sync unmoved 26 (the composed #129 + #130
+        // merge pin: 1,053 + 2 = 1,055 / 20 - 2 = 18).
         // The community collapse slice (#128) flipped
         // toggleCommunityAreChatsCollapsed (the
         // communities.toggleCommunityCollapsedInDialogs send whose
         // Updates answer re-enters the updates intake; the collapse
-        // state comes back through on_get_community): 1,054 + 1 = 1,055
-        // dispatched / 19 - 1 = 18 interim, sync unmoved 26.
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 18, "interim count");
+        // state comes back through on_get_community): 1,055 + 1 = 1,056
+        // dispatched / 18 - 1 = 17 interim, sync unmoved 26.
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 17, "interim count");
     }
 }
