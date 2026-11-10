@@ -171,6 +171,49 @@ pub trait CommunityManagerEnv {
         _new_settings: &DialogNotificationSettings,
     ) {
     }
+
+    /// `UserManager::get_bot_data(user_id)` as the `is_dialog_owner`
+    /// user-dialog arm reads it (CommunityManager.cpp:2021-2024) — the
+    /// dialog is its owner's iff the bot is known and can be edited.
+    fn get_bot_can_be_edited(&self, _user_id: crate::user_manager::UserId) -> bool {
+        false
+    }
+
+    /// `ChatManager::get_chat_status(chat_id)` — the basic-group arm of
+    /// `is_dialog_owner` (CommunityManager.cpp:2025-2026).
+    fn get_chat_status(&self, _chat_id: crate::chat_manager::ChatId) -> DialogParticipantStatus {
+        DialogParticipantStatus::banned(0, String::new())
+    }
+
+    /// `ChatManager::get_channel_status(channel_id)` — the channel arm
+    /// of `is_dialog_owner` (CommunityManager.cpp:2027-2028).
+    fn get_channel_status(
+        &self,
+        _channel_id: crate::chat_manager::ChannelId,
+    ) -> DialogParticipantStatus {
+        DialogParticipantStatus::banned(0, String::new())
+    }
+
+    /// `ToggleCommunityPeerLinkQuery::send` (1747ecde1,
+    /// CommunityManager.cpp:350-386) — `communities.togglePeerLink` over
+    /// the input community and the dialog's read-access input peer; the
+    /// wire flag band is `visible = !is_deleted && !is_hidden`,
+    /// `hidden = !is_deleted && is_hidden`, `deleted = is_deleted`. The
+    /// answer is a `Bool` whose value is ignored — the request settles
+    /// through the change-settle (`on_change_community_dialogs`); the
+    /// error arm runs the dialog-error convention first. The
+    /// invoke-after chain `{{community_id}}` collapses (the port's
+    /// NetQuery carries no dependency set).
+    fn send_toggle_community_peer_link_query(
+        &mut self,
+        community_id: CommunityId,
+        _input_community: telegram_api::InputChannel,
+        _dialog_id: DialogId,
+        _is_deleted: bool,
+        _is_hidden: bool,
+    ) {
+        tdutils::log_info!("Send communities.togglePeerLink for {community_id:?} — [net-inert]");
+    }
 }
 
 /// `CommunityManager::Community` — the cached community record. The
@@ -273,6 +316,11 @@ pub struct CommunityManager {
     /// concurrent reloads and settles every added promise at the single
     /// answer, so the whole keyed entry drains at once.
     pub pending_change_dialogs: Vec<(i64, Promise<()>)>,
+    /// The `ToggleCommunityPeerLinkQuery` promises keyed by community —
+    /// the C++ handler carries its own promise, and the answer kind's
+    /// community_id pairs the toggle with its settle (the change-settle
+    /// either resolves it now or moves it onto `pending_change_dialogs`).
+    pub pending_toggle_peer_link: Vec<(i64, Promise<()>)>,
     /// `get_community_notification_settings_queries_` (ea8219749,
     /// 09634ee46) — the communities with an in-flight
     /// `GetCommunityNotifySettingsQuery`.
@@ -680,6 +728,106 @@ impl CommunityManager {
         };
         env.reload_community_full(community_id, input_community);
         self.pending_change_dialogs
+            .push((community_id.get(), promise));
+    }
+
+    /// `is_dialog_owner` (f027a2d06, CommunityManager.cpp:2019-2034) — the
+    /// add/remove owner test over the dialog type: a user dialog is its
+    /// owner's iff the bot is known and can be edited, a basic group or a
+    /// channel iff the user created it; secret chats and the empty dialog
+    /// answer false. The cross-manager lookups ride the env seams.
+    pub fn is_dialog_owner(&self, env: &impl CommunityManagerEnv, dialog_id: DialogId) -> bool {
+        match dialog_id.get_type() {
+            crate::dialog_id::DialogType::User => {
+                env.get_bot_can_be_edited(dialog_id.get_user_id())
+            }
+            crate::dialog_id::DialogType::Chat => {
+                env.get_chat_status(dialog_id.get_chat_id()).is_creator()
+            }
+            crate::dialog_id::DialogType::Channel => env
+                .get_channel_status(dialog_id.get_channel_id())
+                .is_creator(),
+            crate::dialog_id::DialogType::SecretChat | crate::dialog_id::DialogType::None => false,
+        }
+    }
+
+    /// `add_community_dialog` (1747ecde1 + the da0e19cf3 owner gate,
+    /// CommunityManager.cpp:2005-2017) — the known-community gate, the
+    /// Read access check, the owner test, then the visible/hidden-band
+    /// `communities.togglePeerLink` send.
+    pub fn add_community_dialog(
+        &mut self,
+        env: &mut impl CommunityManagerEnv,
+        community_id: CommunityId,
+        dialog_id: DialogId,
+        is_hidden: bool,
+        mut promise: Promise<()>,
+    ) {
+        if !self.have_community(community_id) {
+            return promise.set_error(Status::error(400, "Community not found"));
+        }
+        if let Err(status) = env.check_dialog_access(dialog_id) {
+            return promise.set_error(status);
+        }
+        if !self.is_dialog_owner(env, dialog_id) {
+            return promise.set_error(Status::error(400, "Have not enough rights"));
+        }
+        // `ToggleCommunityPeerLinkQuery::send` resolves
+        // `get_input_community` (the C++ CHECK band is the
+        // have_community invariant above).
+        let Some(input_community) = self.get_input_community(env, community_id) else {
+            return promise.set_error(Status::error(500, "Community not found"));
+        };
+        env.send_toggle_community_peer_link_query(
+            community_id,
+            input_community,
+            dialog_id,
+            /* is_deleted = */ false,
+            is_hidden,
+        );
+        self.pending_toggle_peer_link
+            .push((community_id.get(), promise));
+    }
+
+    /// `remove_community_dialog` (f027a2d06, CommunityManager.cpp:2036-2047)
+    /// — the get_community gate, the Read access check, the
+    /// linked-peer-administrator OR dialog-owner rights gate, then the
+    /// deleted-band `communities.togglePeerLink` send.
+    pub fn remove_community_dialog(
+        &mut self,
+        env: &mut impl CommunityManagerEnv,
+        community_id: CommunityId,
+        dialog_id: DialogId,
+        mut promise: Promise<()>,
+    ) {
+        let Some(community) = self.get_community(community_id) else {
+            return promise.set_error(Status::error(400, "Community not found"));
+        };
+        if let Err(status) = env.check_dialog_access(dialog_id) {
+            return promise.set_error(status);
+        }
+        // `get_community_status(c)` reads the stored status (the C++
+        // `update_restrictions` tail collapses — the port's community
+        // status reads are direct, as every sibling gate).
+        if !community.status.can_manage_linked_peers_as_administrator()
+            && !self.is_dialog_owner(env, dialog_id)
+        {
+            return promise.set_error(Status::error(400, "Have not enough rights"));
+        }
+        // `ToggleCommunityPeerLinkQuery::send` resolves
+        // `get_input_community` (the C++ CHECK band is the cached-community
+        // invariant above).
+        let Some(input_community) = self.get_input_community(env, community_id) else {
+            return promise.set_error(Status::error(500, "Community not found"));
+        };
+        env.send_toggle_community_peer_link_query(
+            community_id,
+            input_community,
+            dialog_id,
+            /* is_deleted = */ true,
+            /* is_hidden = */ false,
+        );
+        self.pending_toggle_peer_link
             .push((community_id.get(), promise));
     }
 
@@ -1312,6 +1460,15 @@ mod tests {
         /// The fan-out seam records (dialog ids, old mute_until, new
         /// mute_until).
         fanouts: Vec<(Vec<DialogId>, i32, i32)>,
+        /// The dialogs the access seam refuses (the Read-check error
+        /// band of the add/remove gate walks).
+        failing_access: Vec<DialogId>,
+        /// The dialogs the status lookups answer a creator for (the
+        /// `is_dialog_owner` group/channel bands).
+        creator_dialogs: Vec<DialogId>,
+        /// The users the bot lookup knows as editable (the
+        /// `is_dialog_owner` user band).
+        editable_bots: Vec<i64>,
     }
 
     impl TestEnv {
@@ -1323,6 +1480,9 @@ mod tests {
                 now: 100.0,
                 reloaded_fulls: Vec::new(),
                 fanouts: Vec::new(),
+                failing_access: Vec::new(),
+                creator_dialogs: Vec::new(),
+                editable_bots: Vec::new(),
             }
         }
     }
@@ -1336,8 +1496,12 @@ mod tests {
             self.updates.push(update);
         }
 
-        fn check_dialog_access(&mut self, _dialog_id: DialogId) -> std::result::Result<(), Status> {
-            Ok(())
+        fn check_dialog_access(&mut self, dialog_id: DialogId) -> std::result::Result<(), Status> {
+            if self.failing_access.contains(&dialog_id) {
+                Err(Status::error(400, "Can't access the chat"))
+            } else {
+                Ok(())
+            }
         }
 
         fn get_chat_id_object(&mut self, _dialog_id: DialogId) -> i64 {
@@ -1433,6 +1597,50 @@ mod tests {
                 dialog_ids.to_vec(),
                 old_settings.mute_until,
                 new_settings.mute_until,
+            ));
+        }
+
+        fn get_bot_can_be_edited(&self, user_id: crate::user_manager::UserId) -> bool {
+            self.editable_bots.contains(&user_id.get())
+        }
+
+        fn get_chat_status(&self, chat_id: crate::chat_manager::ChatId) -> DialogParticipantStatus {
+            if self
+                .creator_dialogs
+                .contains(&DialogId::from_chat_id(chat_id))
+            {
+                DialogParticipantStatus::creator(true, false, String::new())
+            } else {
+                DialogParticipantStatus::banned(0, String::new())
+            }
+        }
+
+        fn get_channel_status(
+            &self,
+            channel_id: crate::chat_manager::ChannelId,
+        ) -> DialogParticipantStatus {
+            if self
+                .creator_dialogs
+                .contains(&DialogId::from_channel_id(channel_id))
+            {
+                DialogParticipantStatus::creator(true, false, String::new())
+            } else {
+                DialogParticipantStatus::banned(0, String::new())
+            }
+        }
+
+        fn send_toggle_community_peer_link_query(
+            &mut self,
+            community_id: CommunityId,
+            _input_community: telegram_api::InputChannel,
+            dialog_id: DialogId,
+            is_deleted: bool,
+            is_hidden: bool,
+        ) {
+            self.queries.push(format!(
+                "togglePeerLink {} {:?} deleted={is_deleted} hidden={is_hidden}",
+                community_id.get(),
+                dialog_id
             ));
         }
     }
@@ -2475,5 +2683,273 @@ mod tests {
             "the reload error never propagates to the request"
         );
         assert!(manager.pending_change_dialogs.is_empty());
+    }
+
+    // ---- the add/remove community dialog link toggles (#131) ----
+
+    fn channel_dialog(id: i64) -> DialogId {
+        DialogId::from_channel_id(crate::chat_manager::ChannelId::new(id))
+    }
+
+    fn group_dialog(id: i64) -> DialogId {
+        DialogId::from_chat_id(crate::chat_manager::ChatId::new(id))
+    }
+
+    fn user_dialog(id: i64) -> DialogId {
+        DialogId::from_user_id(crate::user_manager::UserId::new(id))
+    }
+
+    fn secret_dialog(id: i64) -> DialogId {
+        DialogId::from_secret_chat_id(crate::user_manager::SecretChatId::new(
+            id.try_into().unwrap(),
+        ))
+    }
+
+    #[test]
+    fn add_community_dialog_gate_bands() {
+        // CommunityManager.cpp:2005-2017 (1747ecde1 + the da0e19cf3
+        // owner gate): the known-community gate, the Read access check,
+        // the owner test, then the visible-band toggle send with the
+        // promise parked at the toggle lot.
+        let mut env = TestEnv::new();
+        let mut manager = CommunityManager::new();
+        manager.on_get_community(&mut env, &wire_community(7, "c"), "test");
+
+        // the known-community gate (have_community)
+        let (promise, recorded) = record();
+        manager.add_community_dialog(
+            &mut env,
+            CommunityId::new(8),
+            channel_dialog(3),
+            false,
+            promise,
+        );
+        assert_eq!(
+            recorded
+                .0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap_err()
+                .message(),
+            "Community not found"
+        );
+
+        // the Read access check surfaces its error
+        env.failing_access = vec![channel_dialog(3)];
+        let (promise, recorded) = record();
+        manager.add_community_dialog(
+            &mut env,
+            CommunityId::new(7),
+            channel_dialog(3),
+            false,
+            promise,
+        );
+        assert_eq!(
+            recorded
+                .0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap_err()
+                .message(),
+            "Can't access the chat"
+        );
+        env.failing_access.clear();
+
+        // the owner test: a non-creator channel is not the owner's
+        let (promise, recorded) = record();
+        manager.add_community_dialog(
+            &mut env,
+            CommunityId::new(7),
+            channel_dialog(3),
+            false,
+            promise,
+        );
+        assert_eq!(
+            recorded
+                .0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap_err()
+                .message(),
+            "Have not enough rights"
+        );
+        assert!(env.queries.is_empty(), "no toggle leaves the gate band");
+
+        // the owner's channel sends the visible band and parks the
+        // promise at the toggle lot
+        env.creator_dialogs = vec![channel_dialog(3)];
+        let (promise, recorded) = record();
+        manager.add_community_dialog(
+            &mut env,
+            CommunityId::new(7),
+            channel_dialog(3),
+            false,
+            promise,
+        );
+        assert_eq!(
+            env.queries,
+            vec!["togglePeerLink 7 DialogId(-1000000000003) deleted=false hidden=false"]
+        );
+        assert_eq!(manager.pending_toggle_peer_link.len(), 1);
+        assert!(
+            !recorded.0.lock().unwrap().is_some(),
+            "the promise parks at the toggle query"
+        );
+    }
+
+    #[test]
+    fn is_dialog_owner_bands() {
+        // CommunityManager.cpp:2019-2034 (f027a2d06): a user dialog is
+        // the owner's iff the bot is known and can be edited, a basic
+        // group or a channel iff the user created it, a secret chat or
+        // the empty dialog never.
+        let mut env = TestEnv::new();
+        let manager = CommunityManager::new();
+
+        assert!(!manager.is_dialog_owner(&env, user_dialog(5)));
+        env.editable_bots = vec![5];
+        assert!(manager.is_dialog_owner(&env, user_dialog(5)));
+
+        assert!(!manager.is_dialog_owner(&env, group_dialog(9)));
+        assert!(!manager.is_dialog_owner(&env, channel_dialog(3)));
+        env.creator_dialogs = vec![group_dialog(9), channel_dialog(3)];
+        assert!(manager.is_dialog_owner(&env, group_dialog(9)));
+        assert!(manager.is_dialog_owner(&env, channel_dialog(3)));
+
+        assert!(!manager.is_dialog_owner(&env, secret_dialog(4)));
+        assert!(!manager.is_dialog_owner(&env, DialogId::new(0)));
+    }
+
+    #[test]
+    fn add_community_dialog_hidden_band() {
+        // CommunityManager.cpp:366-368 — the hidden add rides the seam
+        // with its own band (the wire flags are the env sender's).
+        let mut env = TestEnv::new();
+        let mut manager = CommunityManager::new();
+        manager.on_get_community(&mut env, &wire_community(7, "c"), "test");
+        env.editable_bots = vec![5];
+
+        let (promise, _recorded) = record();
+        manager.add_community_dialog(&mut env, CommunityId::new(7), user_dialog(5), true, promise);
+        assert_eq!(
+            env.queries,
+            vec!["togglePeerLink 7 DialogId(5) deleted=false hidden=true"]
+        );
+        assert_eq!(manager.pending_toggle_peer_link.len(), 1);
+    }
+
+    /// A linked-peer administrator community (admin_rights bit 19) — the
+    /// remove gate's administrator band (DialogParticipant.h:524-526).
+    fn wire_linked_peer_admin_community(id: i64) -> telegram_api::community {
+        telegram_api::community {
+            creator: false,
+            admin_rights: Some(telegram_api::ChatAdminRights {
+                manage_linked_peers: true,
+                ..telegram_api::ChatAdminRights::default()
+            }),
+            ..wire_community(id, "My community")
+        }
+    }
+
+    #[test]
+    fn remove_community_dialog_gate_bands() {
+        // CommunityManager.cpp:2036-2047 (f027a2d06): the get_community
+        // gate, the Read access check, the linked-peer-administrator OR
+        // owner rights gate, then the deleted-band toggle send.
+        let mut env = TestEnv::new();
+        let mut manager = CommunityManager::new();
+        manager.on_get_community(&mut env, &wire_member_community(7), "test");
+
+        // the get_community gate
+        let (promise, recorded) = record();
+        manager.remove_community_dialog(&mut env, CommunityId::new(8), channel_dialog(3), promise);
+        assert_eq!(
+            recorded
+                .0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap_err()
+                .message(),
+            "Community not found"
+        );
+
+        // the Read access check surfaces its error
+        env.failing_access = vec![channel_dialog(3)];
+        let (promise, recorded) = record();
+        manager.remove_community_dialog(&mut env, CommunityId::new(7), channel_dialog(3), promise);
+        assert_eq!(
+            recorded
+                .0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap_err()
+                .message(),
+            "Can't access the chat"
+        );
+        env.failing_access.clear();
+
+        // neither a linked-peer administrator nor the dialog owner
+        let (promise, recorded) = record();
+        manager.remove_community_dialog(&mut env, CommunityId::new(7), channel_dialog(3), promise);
+        assert_eq!(
+            recorded
+                .0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap_err()
+                .message(),
+            "Have not enough rights"
+        );
+        assert!(env.queries.is_empty(), "no toggle leaves the gate band");
+
+        // the dialog owner removes its own chat (the community status is
+        // a plain member's) — the deleted band
+        env.creator_dialogs = vec![channel_dialog(3)];
+        let (promise, recorded) = record();
+        manager.remove_community_dialog(&mut env, CommunityId::new(7), channel_dialog(3), promise);
+        assert_eq!(
+            env.queries,
+            vec!["togglePeerLink 7 DialogId(-1000000000003) deleted=true hidden=false"]
+        );
+        assert_eq!(manager.pending_toggle_peer_link.len(), 1);
+        assert!(!recorded.0.lock().unwrap().is_some(), "the promise parks");
+
+        // a linked-peer administrator removes a chat it does not own
+        manager.on_get_community(&mut env, &wire_linked_peer_admin_community(9), "test");
+        let (promise, _recorded) = record();
+        manager.remove_community_dialog(&mut env, CommunityId::new(9), channel_dialog(4), promise);
+        assert_eq!(
+            env.queries.last().unwrap(),
+            "togglePeerLink 9 DialogId(-1000000000004) deleted=true hidden=false"
+        );
+        assert_eq!(manager.pending_toggle_peer_link.len(), 2);
+
+        // a creator community carries every administrator right — the
+        // gate passes without the dialog ownership
+        manager.on_get_community(&mut env, &wire_community(10, "c"), "test");
+        let (promise, _recorded) = record();
+        manager.remove_community_dialog(&mut env, CommunityId::new(10), channel_dialog(4), promise);
+        assert_eq!(
+            env.queries.last().unwrap(),
+            "togglePeerLink 10 DialogId(-1000000000004) deleted=true hidden=false"
+        );
     }
 }
