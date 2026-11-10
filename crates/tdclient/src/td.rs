@@ -6000,6 +6000,14 @@ pub struct Td {
     /// The transcription manager's `send_update` outbox — drained by
     /// [`Td::flush_user_updates`].
     pub(crate) transcription_updates: Vec<td_api::Update>,
+    /// `Td::web_proxy_manager_` (Td.cpp:462, #125) — the web-proxy-carrier
+    /// manager; available before `setTdlibParameters` like the C++
+    /// `start_up` actor (the two carrier arms are preinitialization
+    /// requests).
+    pub(crate) web_proxy_manager: crate::web_proxy_manager::WebProxyManager,
+    /// The web-proxy manager's `send_update` outbox — drained by
+    /// [`Td::flush_user_updates`].
+    pub(crate) web_proxy_updates: Vec<td_api::Update>,
     /// `Td::translation_manager_` (`Td.cpp:1316`, M.25) — the
     /// AI-compose/translation query manager; created with Td like the
     /// C++ `init_managers`.
@@ -7015,6 +7023,8 @@ impl Td {
                 crate::notification_settings_manager::NotificationSettingsManager::new(),
             transcription_manager: crate::transcription_manager::TranscriptionManager::default(),
             transcription_updates: Vec::new(),
+            web_proxy_manager: crate::web_proxy_manager::WebProxyManager::default(),
+            web_proxy_updates: Vec::new(),
             translation_manager: crate::translation_manager::TranslationManager::default(),
             translation_updates: Vec::new(),
             account_manager: AccountManager::new(),
@@ -8438,6 +8448,16 @@ impl Td {
             self.close_flag = 4;
             self.global.set_close_flag();
             self.clear_requests();
+            // `web_proxy_manager_.reset()` (Td.cpp:804) — the reset fires the
+            // manager's `hangup`, so the carrier-closed updates precede the
+            // Closing announcement; the `clear()` half (Td.cpp:699) is
+            // idempotent over the emptied registry.
+            {
+                let (mut web_proxy_manager, mut web_proxy_env) = web_proxy_env_split(self);
+                web_proxy_manager.hangup(&mut web_proxy_env);
+                self.web_proxy_manager = web_proxy_manager;
+            }
+            self.flush_user_updates();
             self.send_update(Object::updateAuthorizationState(
                 td_api::updateAuthorizationState {
                     authorization_state: Some(
@@ -8586,6 +8606,16 @@ impl Td {
         self.link_manager = None;
         // Td.cpp:691.
         tdutils::log_debug!(at "Td.cpp", 691, "ConnectionCreator was cleared{timer}");
+        // `reset_actor(ActorOwn<Actor>(std::move(web_proxy_manager_)))`
+        // (Td.cpp:699, #125): the manager's `hangup` (cpp:253-264) closes
+        // every open carrier — the `updateWebProxyCarrierClosed` fan-out
+        // flushes like the C++ `send_web_proxy_update` hop.
+        {
+            let (mut web_proxy_manager, mut web_proxy_env) = web_proxy_env_split(self);
+            web_proxy_manager.hangup(&mut web_proxy_env);
+            self.web_proxy_manager = web_proxy_manager;
+        }
+        self.flush_user_updates();
         // `reset_manager(bot_info_manager_, "BotInfoManager")`
         // (Td.cpp:520): the manager's `hangup` fails the pending bot-info
         // fan-ins and the parked query promises with
@@ -8758,6 +8788,29 @@ impl Td {
             // this arm the match would fall to the pretty default and a
             // bot's option sends would all be logged.
             Object::updateOption(_) => {}
+            // The carrier redactions (Td.cpp:1415-1423, #125): the URL
+            // carries the proxy capability and the data is relay traffic —
+            // only the carrier id logs.
+            Object::updateWebProxyCarrierOpened(update) => {
+                tdutils::vlog!(
+                    tdutils::logging::verbosity::TD_REQUESTS,
+                    "td_requests",
+                    at "Td.cpp",
+                    1417,
+                    "Sending update: updateWebProxyCarrierOpened {}",
+                    update.carrier.as_ref().map(|carrier| carrier.id).unwrap_or(0)
+                );
+            }
+            Object::updateWebProxyCarrierData(update) => {
+                tdutils::vlog!(
+                    tdutils::logging::verbosity::TD_REQUESTS,
+                    "td_requests",
+                    at "Td.cpp",
+                    1421,
+                    "Sending update: updateWebProxyCarrierData {}",
+                    update.carrier_id
+                );
+            }
             _ => {
                 tdutils::vlog!(
                     tdutils::logging::verbosity::TD_REQUESTS,
@@ -9072,6 +9125,14 @@ impl Td {
             && (expire_time == 0.0 || self.state_manager.flush_at < expire_time)
         {
             expire_time = self.state_manager.flush_at;
+        }
+        // The web-proxy-carrier deadlines join the same slot (#125): the
+        // fired timeout runs the manager's `timeout_expired` (the C++
+        // actor's own `update_timeout` arm, WebProxyManager.cpp:1051).
+        if let Some(web_proxy_deadline) = self.web_proxy_manager.next_deadline()
+            && (expire_time == 0.0 || web_proxy_deadline < expire_time)
+        {
+            expire_time = web_proxy_deadline;
         }
         if expire_time == 0.0 {
             self.cancel_timeout();
@@ -31198,6 +31259,10 @@ impl Td {
         for update in translation_updates {
             self.send_update(update.into());
         }
+        let web_proxy_updates = std::mem::take(&mut self.web_proxy_updates);
+        for update in web_proxy_updates {
+            self.send_update(update.into());
+        }
     }
 
     /// `td_->notification_manager_->init()` +
@@ -35588,6 +35653,14 @@ impl Actor for Td {
             promo_data_manager.tick_timeouts(&mut promo_env);
             self.promo_data_manager = promo_data_manager;
         }
+        // The web-proxy-carrier sweep (#125): the endpoint/carrier
+        // handshake, response, window-flush and retry timeouts (the C++
+        // actor's `timeout_expired`, WebProxyManager.cpp:1005).
+        {
+            let (mut web_proxy_manager, mut web_proxy_env) = web_proxy_env_split(self);
+            web_proxy_manager.timeout_expired(&mut web_proxy_env);
+            self.web_proxy_manager = web_proxy_manager;
+        }
 
         // The TopDialogManager timeout sweep (M.27).
         {
@@ -37138,6 +37211,69 @@ impl crate::transcription_manager::TranscriptionManagerEnv for TdTranscriptionEn
                 },
             ),
         );
+    }
+}
+
+/// The whole-`Td` [`crate::web_proxy_manager::WebProxyManagerEnv`] (the
+/// [`TdTranscriptionEnv`] convention) — the request arms split the manager
+/// out of `Td` and hand the remainder to the env.
+pub(crate) struct TdWebProxyEnv<'a> {
+    pub(crate) td: &'a mut Td,
+}
+
+/// The disjoint manager/env take-out (the `transcription_env_split`
+/// convention).
+pub(crate) fn web_proxy_env_split(
+    td: &mut Td,
+) -> (crate::web_proxy_manager::WebProxyManager, TdWebProxyEnv<'_>) {
+    let manager = std::mem::take(&mut td.web_proxy_manager);
+    (manager, TdWebProxyEnv { td })
+}
+
+impl crate::web_proxy_manager::WebProxyManagerEnv for TdWebProxyEnv<'_> {
+    fn now(&self) -> f64 {
+        tdutils::time::now()
+    }
+
+    fn send_web_proxy_update(&mut self, update: td_api::Update) {
+        self.td.web_proxy_updates.push(update);
+    }
+
+    fn open_web_proxy_listener(&mut self, _endpoint_id: i64) {
+        // `WebProxyListener::start_up` (cpp:93-113) — the
+        // `ServerSocketFd::open(0, "127.0.0.1")` + `on_listener_started`
+        // half; the `[blocked: net]` listener seam parks, so the endpoint
+        // address promises resolve with the C++ LambdaPromise drop until
+        // the net step binds the loopback listener.
+    }
+
+    fn stream_created(&mut self, _stream_key: u64) {
+        // `create_actor<WebProxyStream>` + `start_up` (cpp:484-486) — the
+        // accepted-socket actor half; `[blocked: net]`.
+    }
+
+    fn stream_open(&mut self, _stream_key: u64) {
+        // `WebProxyStream::open` (cpp:150-154) — the read loop opens;
+        // `[blocked: net]`.
+    }
+
+    fn stream_add_send_window(&mut self, _stream_key: u64, _amount: u32) {
+        // `WebProxyStream::add_send_window` (cpp:155-159); `[blocked: net]`.
+    }
+
+    fn stream_write(&mut self, _stream_key: u64, _data: &[u8]) {
+        // `WebProxyStream::write` (cpp:160-164); `[blocked: net]`.
+    }
+
+    fn stream_close(&mut self, _stream_key: u64) {
+        // `WebProxyStream::close` (cpp:165-171) — the released-actor drain
+        // tail with the CLOSING_STREAM_TIMEOUT timeout; `[blocked: net]`.
+    }
+
+    fn on_web_proxy_address_closed(&mut self, _ip_address: &str) {
+        // `ConnectionCreator::on_web_proxy_address_closed` (cpp:1319-1330) —
+        // the resolve-plane consumer; the collapsed `ConnectionCreator` has
+        // no resolve state to drop, so the seam parks (`[blocked: net]`).
     }
 }
 
@@ -40271,6 +40407,12 @@ pub(crate) fn is_preinitialization_request(function: &Function) -> bool {
             | Function::testCallVectorString(_)
             | Function::testCallVectorStringObject(_)
             | Function::testProxy(_)
+            // the carrier arms ride before authorization like testProxy
+            // (Td.cpp:205-206) — testProxy can be used before
+            // setTdlibParameters, so web proxies must be available from
+            // the start
+            | Function::processWebProxyCarrierMessage(_)
+            | Function::reportWebProxyCarrierError(_)
     )
 }
 
@@ -44216,8 +44358,23 @@ impl crate::connection_creator::ConnectionCreatorEnv for ConnectionEnv<'_> {
         promise: Promise<()>,
     ) {
         // `ProxyChecker::test_proxy` — the `[blocked: net]` handshake
-        // seam; the promise resolves with the C++ LambdaPromise drop.
+        // seam; the promise resolves with the C++ LambdaPromise drop. The
+        // C++ web band (ProxyChecker.cpp:33-56) opens a temporary carrier
+        // first — the carrier machinery rides the same net step.
         drop(promise);
+    }
+
+    fn web_proxy_set_active_proxy(
+        &mut self,
+        proxy_id: i32,
+        proxy: crate::connection_creator::Proxy,
+    ) {
+        // `send_closure(G()->web_proxy_manager(), &WebProxyManager::
+        // set_active_proxy, ...)` (cpp:463-465) — the creator rides the
+        // env borrow, so the manager field is free.
+        let (mut manager, mut env) = crate::td::web_proxy_env_split(self.td);
+        manager.set_active_proxy(&mut env, proxy_id, proxy);
+        self.td.web_proxy_manager = manager;
     }
 }
 

@@ -688,7 +688,7 @@ processCommunityAddChatRequest	interim
 processCommunityAddChatRequests	interim
 processGiftPurchaseOffer	dispatched
 processPushNotification	dispatched
-processWebProxyCarrierMessage	interim
+processWebProxyCarrierMessage	dispatched
 rateSpeechRecognition	dispatched
 readAllChatMentions	dispatched
 readAllChatPollVotes	dispatched
@@ -766,7 +766,7 @@ reportStory	dispatched
 reportSupergroupAntiSpamFalsePositive	dispatched
 reportSupergroupSpam	dispatched
 reportVideoMessageAdvertisement	dispatched
-reportWebProxyCarrierError	interim
+reportWebProxyCarrierError	dispatched
 requestAuthenticationPasswordRecovery	dispatched
 requestPasswordRecovery	dispatched
 requestQrCodeAuthentication	dispatched

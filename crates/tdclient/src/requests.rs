@@ -17271,6 +17271,25 @@ fn run_proxy_network_requests(td: &mut Td, id: u64, function: Function) {
             let mut env = crate::td::ConnectionEnv { td };
             env.test_proxy_via_net(&proxy, request.dc_id, request.timeout, promise);
         }
+        Function::processWebProxyCarrierMessage(request) => {
+            // Requests.cpp:9908-9913 — CREATE_OK_REQUEST_PROMISE, then the
+            // web-proxy manager's carrier-message intake. The C++ answers
+            // ok before the intake and redacts the receive log (the page
+            // messages carry relay traffic); the collapsed world has no
+            // receive log, and the manager settles the promise first.
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut manager, mut env) = crate::td::web_proxy_env_split(td);
+            manager.process_carrier_message(&mut env, request.carrier_id, request.message, promise);
+            td.web_proxy_manager = manager;
+        }
+        Function::reportWebProxyCarrierError(request) => {
+            // Requests.cpp:9914-9919 — CREATE_OK_REQUEST_PROMISE, then the
+            // manager's error report (the close/retry ladder).
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut manager, mut env) = crate::td::web_proxy_env_split(td);
+            manager.report_carrier_error(&mut env, request.carrier_id, request.error, promise);
+            td.web_proxy_manager = manager;
+        }
         Function::addNetworkStatistics(_) => {
             // Requests.cpp:3059-3076 — the C++ checks the entry pointer
             // first (the flattened model makes it non-nullable, the band
@@ -20168,7 +20187,7 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 26, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            1051,
+            1053,
             "dispatched count"
         );
         // the 23383aef sync base (1.8.70): the 34 new scheme functions
@@ -20200,6 +20219,11 @@ mod request_census_tests {
         // (the validation ladder over the SetWalletCardStickersQuery net
         // tail): 1,049 + 2 = 1,051 dispatched / 24 - 2 = 22 interim, sync
         // unmoved 26.
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 22, "interim count");
+        // The web-proxy-carrier family slice (#125) flipped the pair
+        // (processWebProxyCarrierMessage, reportWebProxyCarrierError —
+        // the WebProxyManager carrier plane over the #114-band
+        // Proxy::web records): 1,051 + 2 = 1,053 dispatched / 22 - 2 =
+        // 20 interim, sync unmoved 26.
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 20, "interim count");
     }
 }

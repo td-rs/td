@@ -196,6 +196,7 @@ pub mod web_app_manager;
 pub mod web_browser_manager;
 pub mod web_browser_settings;
 pub mod web_pages_manager;
+pub mod web_proxy_manager;
 pub mod webpage;
 
 // Generated code keeps C++-identical case-preserved names (`aiComposeTone`)

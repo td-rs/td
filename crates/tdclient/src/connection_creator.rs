@@ -424,10 +424,10 @@ impl ConnectionCreator {
         self.on_proxy_changed(env, false);
     }
 
-    /// `ConnectionCreator::on_proxy_changed` (cpp:437-458) — the state
+    /// `ConnectionCreator::on_proxy_changed` (cpp:457-484) — the state
     /// flag and the resolve/children resets are the net step's consumers
-    /// (the `[blocked: net]` seams); the promo fan-outs and the flag
-    /// itself are real.
+    /// (the `[blocked: net]` seams); the promo fan-outs, the flag itself
+    /// and the web-proxy-carrier fan-out are real.
     fn on_proxy_changed(&mut self, env: &mut impl ConnectionCreatorEnv, from_db: bool) {
         let use_proxy = self.active_proxy_id != 0
             && self
@@ -437,6 +437,17 @@ impl ConnectionCreator {
                     proxy.type_ != ProxyType::Mtproto && proxy.type_ != ProxyType::HttpCaching
                 });
         env.on_proxy_state(use_proxy);
+
+        // the manager opens a carrier as soon as a web proxy is enabled,
+        // and closes it when the proxy changes (cpp:463-465); the manager
+        // filters `use_web_proxy` itself
+        let (send_proxy_id, send_proxy) = if self.active_proxy_id == 0 {
+            (0, Proxy::default())
+        } else {
+            let proxy = &self.proxies[&self.active_proxy_id].0;
+            (self.active_proxy_id, proxy.clone())
+        };
+        env.web_proxy_set_active_proxy(send_proxy_id, send_proxy);
 
         if !from_db {
             // the children `send_closure` resets — the net step's
@@ -584,6 +595,11 @@ pub(crate) trait ConnectionCreatorEnv {
 
     /// `ProxyChecker::test_proxy` — the `[blocked: net]` handshake seam.
     fn test_proxy_via_net(&mut self, proxy: &Proxy, dc_id: i32, timeout: f64, promise: Promise<()>);
+
+    /// `send_closure(G()->web_proxy_manager(), &WebProxyManager::
+    /// set_active_proxy, ...)` (cpp:463-465) — the carrier open/close
+    /// fan-out; the manager filters `use_web_proxy` itself.
+    fn web_proxy_set_active_proxy(&mut self, proxy_id: i32, proxy: Proxy);
 }
 
 /// `ConnectionCreator::set_proxy_comment` (cpp:143-156).
@@ -763,7 +779,7 @@ impl Proxy {
     pub(crate) const WEB_PROXY_PORT: i32 = 443;
 
     /// `Proxy::web` (net/Proxy.h:89-97) — the port is forced to 443.
-    fn web(server: String, path: String, secret: ProxySecret) -> Proxy {
+    pub(crate) fn web(server: String, path: String, secret: ProxySecret) -> Proxy {
         Proxy {
             type_: ProxyType::Web,
             server,
@@ -774,7 +790,30 @@ impl Proxy {
         }
     }
 
-    /// `Proxy::use_mtproto_transport_proxy` (net/Proxy.h:145-147) — an
+    /// `Proxy::use_web_proxy` (net/Proxy.h:147-149).
+    pub(crate) fn use_web_proxy(&self) -> bool {
+        self.type_ == ProxyType::Web
+    }
+
+    /// `Proxy::get_web_proxy_bridge_capability` (net/Proxy.cpp:165-177) —
+    /// the HMAC capability the relay page checks; the "tdesktop-" prefix is
+    /// part of the contract (the deployed relay checks these exact bytes),
+    /// so it must not depend on the OS.
+    pub(crate) fn get_web_proxy_bridge_capability(&self) -> String {
+        debug_assert!(self.type_ == ProxyType::Web);
+        let context = if self.path.is_empty() {
+            format!("tdesktop-web-proxy-bridge-v1\n{}", self.server)
+        } else {
+            format!(
+                "tdesktop-web-proxy-bridge-v2\n{}\n{}",
+                self.server, self.path
+            )
+        };
+        let hash = tdutils::crypto::hmac_sha256(self.secret.get_raw_secret(), context.as_bytes());
+        String::from_utf8_lossy(&tdmtproto::utils::base64url_encode(&hash)).into_owned()
+    }
+
+    /// `Proxy::use_mtproto_transport_proxy` (net/Proxy.h:151-153) — an
     /// MTProto proxy, which is reached directly or through a web proxy
     /// relay.
     fn use_mtproto_transport_proxy(&self) -> bool {
@@ -1592,6 +1631,8 @@ mod tests {
         sponsored_removals: usize,
         proxy_states: Vec<bool>,
         mtproto_updates: Vec<Option<ProxyType>>,
+        /// the recorded `set_active_proxy` fan-outs (#125)
+        web_proxy_calls: Vec<(i32, Proxy)>,
     }
 
     impl TestProxyEnv {
@@ -1603,6 +1644,7 @@ mod tests {
                 sponsored_removals: 0,
                 proxy_states: Vec::new(),
                 mtproto_updates: Vec::new(),
+                web_proxy_calls: Vec::new(),
             }
         }
 
@@ -1684,6 +1726,10 @@ mod tests {
             promise: Promise<()>,
         ) {
             drop(promise);
+        }
+
+        fn web_proxy_set_active_proxy(&mut self, proxy_id: i32, proxy: Proxy) {
+            self.web_proxy_calls.push((proxy_id, proxy));
         }
     }
 
