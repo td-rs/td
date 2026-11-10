@@ -16459,6 +16459,23 @@ fn run_chat_and_group_requests(td: &mut Td, id: u64, function: Function) {
             }
             let _promise = td.deferred_promise::<td_api::Chats, _>(id, Object::chats);
         }
+        Function::getSuitableCommunityChats(_) => {
+            // Requests.cpp:3636-3640 — the ForCommunityDialog plane of the
+            // created-public-dialogs cache; the C++ third argument `false`
+            // is `from_binlog` (the check_limit=false reload path).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Chats, _>(id, Object::chats);
+            let (mut env, user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.get_created_public_dialogs(
+                user_manager,
+                &mut env,
+                crate::chat_manager::PublicDialogType::ForCommunityDialog,
+                promise,
+                false,
+            );
+        }
         Function::getSupergroup(request) => {
             if let Some(supergroup) = td
                 .chat_manager
@@ -20200,7 +20217,7 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 26, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            1054,
+            1055,
             "dispatched count"
         );
         // the 23383aef sync base (1.8.70): the 34 new scheme functions
@@ -20236,6 +20253,11 @@ mod request_census_tests {
         // the communities.getJoinedCommunities wire query, the chats
         // intaken before the cached-id resolution): 1,053 + 1 = 1,054
         // dispatched / 20 - 1 = 19 interim, sync unmoved 26.
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 19, "interim count");
+        // The community family slice (#130) flipped
+        // getSuitableCommunityChats (the ForCommunityDialog plane of the
+        // created-public-dialogs cache): 1,054 + 1 = 1,055 dispatched /
+        // 19 - 1 = 18 interim, sync unmoved 26 (the composed #129 + #130
+        // merge pin: 1,053 + 2 = 1,055 / 20 - 2 = 18).
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 18, "interim count");
     }
 }
