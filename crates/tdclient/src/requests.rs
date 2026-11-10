@@ -20429,3 +20429,212 @@ mod request_census_tests {
         assert_eq!(*counts.get("interim").unwrap_or(&0), 18, "interim count");
     }
 }
+
+/// The `get_input_share_theme` validation ladder
+/// (ThemeManager.cpp:206-265) — the ton-cards
+/// `set_card_stickers_validation_ladder` convention: every error band
+/// and the two happy wire forms over a bare `Td` (the gift band's
+/// ForUser conversion is env-free, StarGiftId.cpp's `get_input_saved_star_gift`).
+#[cfg(test)]
+mod get_input_share_theme_tests {
+    use super::get_input_share_theme;
+    use crate::td::Td;
+    use crate::td::TdCallback;
+    use crate::td_api;
+
+    /// A drop-everything callback (the dialog_manager tests' convention).
+    #[derive(Default)]
+    struct DropCallback;
+
+    impl TdCallback for DropCallback {
+        fn on_result(&mut self, _id: u64, _result: crate::td_api::Object) {}
+        fn on_error(&mut self, _id: u64, _error: crate::td_api::Error) {}
+    }
+
+    fn test_td() -> Td {
+        Td::new(Box::new(DropCallback))
+    }
+
+    fn regular(emoji: &str) -> td_api::EmojiType {
+        td_api::EmojiType::emojiTypeRegular(td_api::emojiTypeRegular {
+            emoji: emoji.to_owned(),
+        })
+    }
+
+    fn custom_emoji(id: i64) -> td_api::EmojiType {
+        td_api::EmojiType::emojiTypeCustomEmoji(td_api::emojiTypeCustomEmoji {
+            custom_emoji_id: id,
+        })
+    }
+
+    fn emoji_theme(
+        emojis: Vec<td_api::EmojiType>,
+        use_default_background: bool,
+        backdrop_id: i32,
+    ) -> td_api::InputProfileShareTheme {
+        td_api::InputProfileShareTheme::inputProfileShareThemeEmoji(
+            td_api::inputProfileShareThemeEmoji {
+                emojis,
+                use_default_background,
+                background_backdrop_id: backdrop_id,
+            },
+        )
+    }
+
+    fn error_message(
+        result: tdutils::status::Result<tdmtproto::telegram_api::ShareTheme>,
+    ) -> String {
+        match result {
+            tdutils::status::Result::Err(status) => status.message().to_owned(),
+            tdutils::status::Result::Ok(_) => panic!("expected an error"),
+        }
+    }
+
+    fn ok_value(
+        result: tdutils::status::Result<tdmtproto::telegram_api::ShareTheme>,
+    ) -> tdmtproto::telegram_api::ShareTheme {
+        match result {
+            tdutils::status::Result::Ok(theme) => theme,
+            tdutils::status::Result::Err(status) => panic!("expected a theme, got {status}"),
+        }
+    }
+
+    /// The null theme rides shareThemeDefault (cpp:208-210).
+    #[test]
+    fn null_theme_answers_share_theme_default() {
+        let mut td = test_td();
+        let theme = ok_value(get_input_share_theme(&mut td, None));
+        assert!(matches!(
+            theme,
+            tdmtproto::telegram_api::ShareTheme::shareThemeDefault(_)
+        ));
+    }
+
+    /// More than MAX_EMOJI_COUNT emojis (cpp:215-217).
+    #[test]
+    fn too_many_emoji_is_rejected() {
+        let mut td = test_td();
+        let emojis: Vec<_> = (0..crate::profile_share_theme::MAX_EMOJI_COUNT + 1)
+            .map(|_| regular("\u{1f525}"))
+            .collect();
+        let message = error_message(get_input_share_theme(
+            &mut td,
+            Some(emoji_theme(emojis, false, 1)),
+        ));
+        assert_eq!(message, "Too many emoji specified");
+    }
+
+    /// No emoji with the default background (cpp:218-220).
+    #[test]
+    fn empty_emoji_with_default_background_is_rejected() {
+        let mut td = test_td();
+        let message = error_message(get_input_share_theme(
+            &mut td,
+            Some(emoji_theme(vec![], true, 0)),
+        ));
+        assert_eq!(message, "Emoji or a backdrop must be specified");
+    }
+
+    /// A non-emoji regular emoji fails clean_input_string/is_emoji
+    /// (cpp:226-229).
+    #[test]
+    fn non_emoji_regular_emoji_is_rejected() {
+        let mut td = test_td();
+        let message = error_message(get_input_share_theme(
+            &mut td,
+            Some(emoji_theme(vec![regular("not an emoji")], false, 1)),
+        ));
+        assert_eq!(message, "Invalid emoji specified");
+    }
+
+    /// The zero custom-emoji id band (cpp:233-236).
+    #[test]
+    fn invalid_custom_emoji_id_is_rejected() {
+        let mut td = test_td();
+        let message = error_message(get_input_share_theme(
+            &mut td,
+            Some(emoji_theme(vec![custom_emoji(0)], false, 1)),
+        ));
+        assert_eq!(message, "Invalid custom emoji identifier specified");
+    }
+
+    /// The happy emoji form: the reaction order is kept, the
+    /// use_default_background band maps the BACKDROP_ID_MASK flag
+    /// (cpp:239-244), the backdrop id rides through.
+    #[test]
+    fn emoji_theme_carries_the_flag_backdrop_and_reactions() {
+        let mut td = test_td();
+        let custom_id = 1 << 21;
+        let theme = ok_value(get_input_share_theme(
+            &mut td,
+            Some(emoji_theme(
+                vec![regular("\u{1f525}"), custom_emoji(custom_id)],
+                false,
+                9,
+            )),
+        ));
+        let tdmtproto::telegram_api::ShareTheme::shareThemeEmojiBackdrop(theme) = &theme else {
+            panic!("expected the emoji backdrop form");
+        };
+        assert_eq!(theme.flags, 1, "the BACKDROP_ID_MASK is set");
+        assert_eq!(theme.backdrop_id, 9);
+        assert_eq!(theme.emojis.len(), 2);
+        assert!(matches!(
+            theme.emojis[0],
+            tdmtproto::telegram_api::Reaction::reactionEmoji(_)
+        ));
+        assert!(matches!(
+            theme.emojis[1],
+            tdmtproto::telegram_api::Reaction::reactionCustomEmoji(_)
+        ));
+
+        // use_default_background keeps the flag down
+        let theme = ok_value(get_input_share_theme(
+            &mut td,
+            Some(emoji_theme(vec![regular("\u{1f525}")], true, 0)),
+        ));
+        let tdmtproto::telegram_api::ShareTheme::shareThemeEmojiBackdrop(theme) = &theme else {
+            panic!("expected the emoji backdrop form");
+        };
+        assert_eq!(theme.flags, 0, "the default background keeps the mask down");
+    }
+
+    /// The gift band (cpp:246-255): the invalid/empty id answers the
+    /// 400; the ForUser id converts env-free through
+    /// inputSavedStarGiftUser.
+    #[test]
+    fn gift_band_answers_the_invalid_id_error_or_the_user_form() {
+        let mut td = test_td();
+        let message = error_message(get_input_share_theme(
+            &mut td,
+            Some(
+                td_api::InputProfileShareTheme::inputProfileShareThemeUpgradedGift(
+                    td_api::inputProfileShareThemeUpgradedGift {
+                        received_gift_id: String::new(),
+                    },
+                ),
+            ),
+        ));
+        assert_eq!(message, "Invalid gift identifier specified");
+
+        let theme = ok_value(get_input_share_theme(
+            &mut td,
+            Some(
+                td_api::InputProfileShareTheme::inputProfileShareThemeUpgradedGift(
+                    td_api::inputProfileShareThemeUpgradedGift {
+                        received_gift_id: "12345".to_owned(),
+                    },
+                ),
+            ),
+        ));
+        let tdmtproto::telegram_api::ShareTheme::inputShareThemeGift(theme) = &theme else {
+            panic!("expected the gift form");
+        };
+        let gift = theme.stargift.as_ref().expect("the saved gift rides");
+        assert!(matches!(
+            gift,
+            tdmtproto::telegram_api::InputSavedStarGift::inputSavedStarGiftUser(user)
+                if user.msg_id == 12345
+        ));
+    }
+}
