@@ -171,6 +171,55 @@ pub trait CommunityManagerEnv {
         _new_settings: &DialogNotificationSettings,
     ) {
     }
+
+    /// `DialogManager::get_input_peer(dialog_id, AccessRights::Know)`
+    /// (20fc28e23, CommunityManager.cpp:2116) — the member peer lookup
+    /// whose null answer is the 400 "Member not found" band of the
+    /// member pair (the lookup runs after the sender→dialog resolution
+    /// the request half performs).
+    fn get_input_peer_know(&mut self, dialog_id: DialogId) -> Option<telegram_api::InputPeer> {
+        tdutils::log_info!("Look up the member peer for {dialog_id:?} — [dialog seam]");
+        None
+    }
+
+    /// `ToggleCommunityParticipantBannedQuery::send` (20fc28e23,
+    /// CommunityManager.cpp:541-568) —
+    /// `communities.toggleParticipantBanned(flags, unban = !is_banned,
+    /// input_community, participant)`; the Bool answer's value is
+    /// ignored and the promise settles through the change-settle
+    /// (`on_change_community_dialogs`). The invoke-after chain
+    /// `{{community_id}}` (ChainId.h:43-45) collapses with the port's
+    /// no-dependency-set NetQuery.
+    fn send_toggle_participant_banned_query(
+        &mut self,
+        community_id: CommunityId,
+        input_community: telegram_api::InputChannel,
+        participant: telegram_api::InputPeer,
+        is_banned: bool,
+    ) {
+        tdutils::log_info!(
+            "Send communities.toggleParticipantBanned for {community_id:?}, \
+             is_banned = {is_banned} — [net-inert]"
+        );
+        let _ = (input_community, participant);
+    }
+
+    /// `GetCommunityParticipantJoinedChatsQuery::send` (4cd0dae69,
+    /// CommunityManager.cpp:570-620) —
+    /// `communities.getParticipantJoinedChats(input_community,
+    /// participant)`; the answer builds the `communityMemberChats`
+    /// object over the owned (creator) vs joined split.
+    fn send_get_participant_joined_chats_query(
+        &mut self,
+        community_id: CommunityId,
+        input_community: telegram_api::InputChannel,
+        participant: telegram_api::InputPeer,
+    ) {
+        tdutils::log_info!(
+            "Send communities.getParticipantJoinedChats for {community_id:?} — [net-inert]"
+        );
+        let _ = (input_community, participant);
+    }
 }
 
 /// `CommunityManager::Community` — the cached community record. The
@@ -273,6 +322,17 @@ pub struct CommunityManager {
     /// concurrent reloads and settles every added promise at the single
     /// answer, so the whole keyed entry drains at once.
     pub pending_change_dialogs: Vec<(i64, Promise<()>)>,
+    /// The `ToggleCommunityParticipantBannedQuery` promises keyed by
+    /// community (`toggleCommunityMemberIsBanned`) — the Bool answer's
+    /// value is ignored and the promise settles through the
+    /// change-settle with the query's own community, so the lot pairs
+    /// the answer with its community's promise.
+    pub pending_ban_toggles: Vec<(i64, Promise<()>)>,
+    /// The `GetCommunityParticipantJoinedChatsQuery` promises keyed by
+    /// community (`getCommunityMemberChats`) — the answer builds the
+    /// per-community object, so concurrent settles pair with their own
+    /// answer.
+    pub pending_member_chats: Vec<(i64, Promise<td_api::CommunityMemberChats>)>,
     /// `get_community_notification_settings_queries_` (ea8219749,
     /// 09634ee46) — the communities with an in-flight
     /// `GetCommunityNotifySettingsQuery`.
@@ -1143,6 +1203,73 @@ impl CommunityManager {
         self.pending_delete.push(promise);
     }
 
+    /// `toggle_community_participant_is_banned` (20fc28e23,
+    /// CommunityManager.cpp:2107-2122) — the shared member gate ladder
+    /// (the community gate, the restrict-members right, then the
+    /// Know-peer "Member not found" band) over the participant-banned
+    /// wire toggle. The C++ `get_community_status` updates the
+    /// restriction deadlines first; the port reads the cached status
+    /// raw (the recorded simplification the other rights gates share).
+    pub fn toggle_community_participant_is_banned(
+        &mut self,
+        env: &mut impl CommunityManagerEnv,
+        community_id: CommunityId,
+        participant_dialog_id: DialogId,
+        is_banned: bool,
+        mut promise: Promise<()>,
+    ) {
+        let Some(community) = self.get_community(community_id) else {
+            return promise.set_error(Status::error(400, "Community not found"));
+        };
+        if !community.status.can_restrict_members() {
+            return promise.set_error(Status::error(400, "Have not enough rights"));
+        }
+        let Some(participant) = env.get_input_peer_know(participant_dialog_id) else {
+            return promise.set_error(Status::error(400, "Member not found"));
+        };
+        // `ToggleCommunityParticipantBannedQuery::send` resolves
+        // `get_input_community` (the C++ CHECK band is the gate above).
+        let Some(input_community) = self.get_input_community(env, community_id) else {
+            return promise.set_error(Status::error(500, "Community not found"));
+        };
+        env.send_toggle_participant_banned_query(
+            community_id,
+            input_community,
+            participant,
+            is_banned,
+        );
+        self.pending_ban_toggles.push((community_id.get(), promise));
+    }
+
+    /// `get_community_participant_dialogs` (4cd0dae69,
+    /// CommunityManager.cpp:2124-2140) — the same member gate ladder
+    /// over the participant-joined-chats query.
+    pub fn get_community_participant_dialogs(
+        &mut self,
+        env: &mut impl CommunityManagerEnv,
+        community_id: CommunityId,
+        participant_dialog_id: DialogId,
+        mut promise: Promise<td_api::CommunityMemberChats>,
+    ) {
+        let Some(community) = self.get_community(community_id) else {
+            return promise.set_error(Status::error(400, "Community not found"));
+        };
+        if !community.status.can_restrict_members() {
+            return promise.set_error(Status::error(400, "Have not enough rights"));
+        }
+        let Some(participant) = env.get_input_peer_know(participant_dialog_id) else {
+            return promise.set_error(Status::error(400, "Member not found"));
+        };
+        // `GetCommunityParticipantJoinedChatsQuery::send` resolves
+        // `get_input_community` (the same CHECK band).
+        let Some(input_community) = self.get_input_community(env, community_id) else {
+            return promise.set_error(Status::error(500, "Community not found"));
+        };
+        env.send_get_participant_joined_chats_query(community_id, input_community, participant);
+        self.pending_member_chats
+            .push((community_id.get(), promise));
+    }
+
     /// `get_input_community` (1118a50df, CommunityManager.cpp:1373-1385).
     pub fn get_input_community(
         &self,
@@ -1312,6 +1439,9 @@ mod tests {
         /// The fan-out seam records (dialog ids, old mute_until, new
         /// mute_until).
         fanouts: Vec<(Vec<DialogId>, i32, i32)>,
+        /// The dialog ids whose `get_input_peer(Know)` resolves — the
+        /// member band of the member pair.
+        known_members: Vec<i64>,
     }
 
     impl TestEnv {
@@ -1323,6 +1453,7 @@ mod tests {
                 now: 100.0,
                 reloaded_fulls: Vec::new(),
                 fanouts: Vec::new(),
+                known_members: Vec::new(),
             }
         }
     }
@@ -1434,6 +1565,61 @@ mod tests {
                 old_settings.mute_until,
                 new_settings.mute_until,
             ));
+        }
+
+        fn get_input_peer_know(&mut self, dialog_id: DialogId) -> Option<telegram_api::InputPeer> {
+            if self.known_members.contains(&dialog_id.get()) {
+                Some(telegram_api::InputPeer::inputPeerUser(
+                    telegram_api::inputPeerUser {
+                        user_id: dialog_id.get(),
+                        access_hash: 7,
+                    },
+                ))
+            } else {
+                None
+            }
+        }
+
+        fn send_toggle_participant_banned_query(
+            &mut self,
+            community_id: CommunityId,
+            input_community: telegram_api::InputChannel,
+            participant: telegram_api::InputPeer,
+            is_banned: bool,
+        ) {
+            let member = input_peer_tag(&participant);
+            let band = if is_banned { "ban" } else { "unban" };
+            self.queries.push(format!(
+                "toggleParticipantBanned {} {member} {band}",
+                community_id.get()
+            ));
+            let _ = input_community;
+        }
+
+        fn send_get_participant_joined_chats_query(
+            &mut self,
+            community_id: CommunityId,
+            input_community: telegram_api::InputChannel,
+            participant: telegram_api::InputPeer,
+        ) {
+            let member = input_peer_tag(&participant);
+            self.queries.push(format!(
+                "getParticipantJoinedChats {} {member}",
+                community_id.get()
+            ));
+            let _ = input_community;
+        }
+    }
+
+    /// The member-peer tag the member-pair query records share.
+    fn input_peer_tag(peer: &telegram_api::InputPeer) -> String {
+        match peer {
+            telegram_api::InputPeer::inputPeerUser(user) => format!("user {}", user.user_id),
+            telegram_api::InputPeer::inputPeerChannel(channel) => {
+                format!("channel {}", channel.channel_id)
+            }
+            telegram_api::InputPeer::inputPeerChat(chat) => format!("chat {}", chat.chat_id),
+            _ => "other".to_owned(),
         }
     }
 
@@ -1599,6 +1785,65 @@ mod tests {
             Promise::from_interface(RecordingId(recorded.clone())),
             RecordedId(recorded),
         )
+    }
+
+    struct RecordedMemberChats(
+        std::sync::Arc<
+            std::sync::Mutex<Option<std::result::Result<td_api::CommunityMemberChats, Status>>>,
+        >,
+    );
+
+    struct RecordingMemberChats(
+        std::sync::Arc<
+            std::sync::Mutex<Option<std::result::Result<td_api::CommunityMemberChats, Status>>>,
+        >,
+    );
+
+    impl tdutils::promise::PromiseInterface<td_api::CommunityMemberChats> for RecordingMemberChats {
+        fn set_value(&mut self, value: td_api::CommunityMemberChats) {
+            *self.0.lock().unwrap() = Some(Ok(value));
+        }
+
+        fn set_error(&mut self, error: Status) {
+            *self.0.lock().unwrap() = Some(Err(error));
+        }
+    }
+
+    fn record_member_chats() -> (Promise<td_api::CommunityMemberChats>, RecordedMemberChats) {
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (
+            Promise::from_interface(RecordingMemberChats(recorded.clone())),
+            RecordedMemberChats(recorded),
+        )
+    }
+
+    /// The settled-error message of a recorded promise (the band asserts
+    /// share).
+    fn recorded_error_message(recorded: &Recorded) -> String {
+        recorded
+            .0
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap_err()
+            .message()
+            .to_owned()
+    }
+
+    /// The [`recorded_error_message`] form over the member-chats recorder.
+    fn recorded_member_chats_error_message(recorded: &RecordedMemberChats) -> String {
+        recorded
+            .0
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap_err()
+            .message()
+            .to_owned()
     }
 
     /// A non-creator member wire community (on_get_community derives the
@@ -2475,5 +2720,147 @@ mod tests {
             "the reload error never propagates to the request"
         );
         assert!(manager.pending_change_dialogs.is_empty());
+    }
+
+    // ---- the member pair (toggleCommunityMemberIsBanned +
+    // getCommunityMemberChats) ----
+
+    #[test]
+    fn member_pair_gates_and_wire_bands() {
+        // CommunityManager.cpp:2107-2122 (20fc28e23) and 2124-2140
+        // (4cd0dae69): the shared gate ladder — the community gate, the
+        // restrict-members right, then the Know-peer "Member not found"
+        // band (the 400 comes from the input-peer lookup, after the
+        // sender→dialog conversion the request half runs) — and the two
+        // wire query sends park their promises.
+        let mut env = TestEnv::new();
+        let mut manager = CommunityManager::new();
+        manager.on_get_community(&mut env, &wire_community(7, "c"), "test");
+        let member_dialog_id = DialogId::new(5);
+        env.known_members = vec![5];
+
+        // the unknown community answers its 400 on both
+        let (promise, recorded) = record();
+        manager.toggle_community_participant_is_banned(
+            &mut env,
+            CommunityId::new(8),
+            member_dialog_id,
+            true,
+            promise,
+        );
+        assert_eq!(recorded_error_message(&recorded), "Community not found");
+        let (promise, recorded) = record_member_chats();
+        manager.get_community_participant_dialogs(
+            &mut env,
+            CommunityId::new(8),
+            member_dialog_id,
+            promise,
+        );
+        assert_eq!(
+            recorded_member_chats_error_message(&recorded),
+            "Community not found"
+        );
+
+        // a plain member lacks the restrict-members right
+        manager.on_get_community(&mut env, &wire_member_community(9), "test");
+        let (promise, recorded) = record();
+        manager.toggle_community_participant_is_banned(
+            &mut env,
+            CommunityId::new(9),
+            member_dialog_id,
+            true,
+            promise,
+        );
+        assert_eq!(recorded_error_message(&recorded), "Have not enough rights");
+        let (promise, recorded) = record_member_chats();
+        manager.get_community_participant_dialogs(
+            &mut env,
+            CommunityId::new(9),
+            member_dialog_id,
+            promise,
+        );
+        assert_eq!(
+            recorded_member_chats_error_message(&recorded),
+            "Have not enough rights"
+        );
+
+        // the unknown member answers the Know band on both
+        env.known_members = Vec::new();
+        let (promise, recorded) = record();
+        manager.toggle_community_participant_is_banned(
+            &mut env,
+            CommunityId::new(7),
+            member_dialog_id,
+            true,
+            promise,
+        );
+        assert_eq!(recorded_error_message(&recorded), "Member not found");
+        let (promise, recorded) = record_member_chats();
+        manager.get_community_participant_dialogs(
+            &mut env,
+            CommunityId::new(7),
+            member_dialog_id,
+            promise,
+        );
+        assert_eq!(
+            recorded_member_chats_error_message(&recorded),
+            "Member not found"
+        );
+        assert!(env.queries.is_empty(), "the bands send nothing");
+
+        // the ban walk: the creator community sends the participant
+        // toggle with the unban inversion band and parks the promise
+        env.known_members = vec![5];
+        let (promise, recorded) = record();
+        manager.toggle_community_participant_is_banned(
+            &mut env,
+            CommunityId::new(7),
+            member_dialog_id,
+            true,
+            promise,
+        );
+        assert!(
+            env.queries
+                .iter()
+                .any(|q| q == "toggleParticipantBanned 7 user 5 ban")
+        );
+        let (promise, unban_recorded) = record();
+        manager.toggle_community_participant_is_banned(
+            &mut env,
+            CommunityId::new(7),
+            member_dialog_id,
+            false,
+            promise,
+        );
+        assert!(
+            env.queries
+                .iter()
+                .any(|q| q == "toggleParticipantBanned 7 user 5 unban")
+        );
+        assert_eq!(manager.pending_ban_toggles.len(), 2);
+        assert!(
+            !recorded.0.lock().unwrap().is_some(),
+            "the ban promise parks at the query"
+        );
+        assert!(!unban_recorded.0.lock().unwrap().is_some());
+
+        // the member-chats walk sends the joined-chats query
+        let (promise, recorded) = record_member_chats();
+        manager.get_community_participant_dialogs(
+            &mut env,
+            CommunityId::new(7),
+            member_dialog_id,
+            promise,
+        );
+        assert!(
+            env.queries
+                .iter()
+                .any(|q| q == "getParticipantJoinedChats 7 user 5")
+        );
+        assert_eq!(manager.pending_member_chats.len(), 1);
+        assert!(
+            recorded.0.lock().unwrap().is_none(),
+            "the member-chats promise parks at the query"
+        );
     }
 }
