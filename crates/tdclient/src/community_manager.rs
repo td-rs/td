@@ -165,6 +165,85 @@ pub trait CommunityManagerEnv {
         tdutils::log_info!("Reload community full {community_id:?} — [net-inert]");
     }
 
+    /// `GetCommunityPeerLinkRequestsQuery::send` (ffc06ec75,
+    /// CommunityManager.cpp:388-410) — `communities_getPeerLinkRequests`
+    /// over `get_input_community`; the answer routes through the
+    /// community net-answer drain and the manager's page builder
+    /// (`on_get_community_peer_link_requests`). The input is resolved
+    /// manager-side.
+    fn send_get_community_peer_link_requests_query(
+        &mut self,
+        community_id: CommunityId,
+        _input_community: telegram_api::InputChannel,
+        _offset: &str,
+        _limit: i32,
+    ) {
+        tdutils::log_info!(
+            "Send communities_getPeerLinkRequests for {community_id:?} — [net-inert]"
+        );
+    }
+
+    /// `UserManager::on_get_users` (CommunityManager.cpp:411 is the first
+    /// community-family caller) — the shared wire-users intake: the
+    /// requesting users must exist before the page resolves.
+    fn on_get_users(&mut self, _users: Vec<telegram_api::User>, _source: &str) {}
+
+    /// `ChatManager::on_get_chats` (CommunityManager.cpp:1867 is the
+    /// first community-family caller) — the shared wire-chats intake:
+    /// the community dialogs must exist before an answer resolves. The
+    /// community-family entries route through the manager's own
+    /// `on_get_community`/`on_get_community_forbidden` intakes (the
+    /// port's `ChatManager::on_get_chat` consume-drops them — the C++
+    /// ChatManager.cpp:5767-5773 hop lives with the community slice),
+    /// so callers hand this seam the non-community remainder.
+    fn on_get_chats(&mut self, _chats: Vec<telegram_api::Chat>, _source: &str) {}
+
+    /// `DialogManager::force_create_dialog` — the documented no-op stub;
+    /// the seam keeps the C++ call sites (the forced dialog creation
+    /// collapses until the messages plane lands).
+    fn force_create_dialog(&mut self, _dialog_id: DialogId, _source: &str) {}
+
+    /// `UserManager::get_user_id_object` (UserManager.cpp:10278-10291) —
+    /// the collapsed sync form.
+    fn get_user_id_object(&mut self, user_id: crate::user_manager::UserId, _source: &str) -> i64 {
+        user_id.get()
+    }
+
+    /// `ProcessCommunityPeerLinkRequestQuery::send` (2b80bf533,
+    /// CommunityManager.cpp:442-475) —
+    /// `communities_togglePeerLinkRequestApproval` with
+    /// `reject = !approve`; the requested chat's read-access input peer
+    /// resolves at the seam (the manager is taken out under the env).
+    /// The answer's `Bool` is ignored — the request settles through the
+    /// change-settle.
+    fn send_process_community_peer_link_request_query(
+        &mut self,
+        community_id: CommunityId,
+        _dialog_id: DialogId,
+        _input_community: telegram_api::InputChannel,
+        _approve: bool,
+    ) {
+        tdutils::log_info!(
+            "Send communities_togglePeerLinkRequestApproval for {community_id:?} — [net-inert]"
+        );
+    }
+
+    /// `ProcessCommunityPeerLinkRequestsQuery::send` (79a943019,
+    /// CommunityManager.cpp:477-505) —
+    /// `communities_toggleAllPeerLinkRequestApproval` with
+    /// `reject = !approve`; the `Bool` answer is ignored — the request
+    /// settles through the change-settle.
+    fn send_process_community_peer_link_requests_query(
+        &mut self,
+        community_id: CommunityId,
+        _input_community: telegram_api::InputChannel,
+        _approve: bool,
+    ) {
+        tdutils::log_info!(
+            "Send communities_toggleAllPeerLinkRequestApproval for {community_id:?} — [net-inert]"
+        );
+    }
+
     /// The `MessagesManager::on_update_dialog_community_notification_settings`
     /// fan-out (0063421d6) — seam until the messages notification plane;
     /// the C++ body walks the community chats re-evaluating muted unread
@@ -232,16 +311,6 @@ pub trait CommunityManagerEnv {
     fn send_get_joined_communities_query(&mut self) {
         tdutils::log_info!("Send communities.getJoinedCommunities — [net-inert]");
     }
-
-    /// `ChatManager::on_get_chats` (CommunityManager.cpp:1867 is the
-    /// first community-family caller) — the shared wire-chats intake:
-    /// the community dialogs must exist before an answer resolves. The
-    /// community-family entries route through the manager's own
-    /// `on_get_community`/`on_get_community_forbidden` intakes (the
-    /// port's `ChatManager::on_get_chat` consume-drops them — the C++
-    /// ChatManager.cpp:5767-5773 hop lives with the community slice),
-    /// so callers hand this seam the non-community remainder.
-    fn on_get_chats(&mut self, _chats: Vec<telegram_api::Chat>, _source: &str) {}
 
     /// `ToggleCommunityCollapsedInDialogsQuery::send`
     /// (CommunityManager.cpp:511-540) —
@@ -379,6 +448,19 @@ pub struct CommunityManager {
     /// collapse toggle's promise settles on the Updates answer, parked
     /// until the update lands).
     pub pending_collapse: Vec<Promise<()>>,
+    /// The `GetCommunityPeerLinkRequestsQuery` promises keyed by
+    /// community (`getCommunityAddChatRequests`) — the answer kind's
+    /// community_id pairs the page with its own query, exactly like the
+    /// settings lot above.
+    pub pending_peer_link_requests: Vec<(i64, Promise<td_api::CommunityAddChatRequests>)>,
+    /// The `ProcessCommunityPeerLinkRequestQuery` promises keyed by
+    /// community (`processCommunityAddChatRequest`) — the answer pops
+    /// one and settles it through the change-settle.
+    pub pending_process_request: Vec<(i64, Promise<()>)>,
+    /// The `ProcessCommunityPeerLinkRequestsQuery` promises keyed by
+    /// community (`processCommunityAddChatRequests`) — the answer pops
+    /// one and settles it through the change-settle.
+    pub pending_process_all_requests: Vec<(i64, Promise<()>)>,
     /// `get_community_notification_settings_queries_` (ea8219749,
     /// 09634ee46) — the communities with an in-flight
     /// `GetCommunityNotifySettingsQuery`.
@@ -790,6 +872,163 @@ impl CommunityManager {
         };
         env.reload_community_full(community_id, input_community);
         self.pending_change_dialogs
+            .push((community_id.get(), promise));
+    }
+
+    /// `get_community_add_dialog_requests` (ffc06ec75,
+    /// CommunityManager.cpp:2060-2070) — the `getCommunityAddChatRequests`
+    /// request half: the have_community gate, the positive-limit band,
+    /// then the `GetCommunityPeerLinkRequestsQuery` send.
+    pub fn get_community_add_dialog_requests(
+        &mut self,
+        env: &mut impl CommunityManagerEnv,
+        community_id: CommunityId,
+        offset: &str,
+        limit: i32,
+        mut promise: Promise<td_api::CommunityAddChatRequests>,
+    ) {
+        if !self.have_community(community_id) {
+            return promise.set_error(Status::error(400, "Community not found"));
+        }
+        if limit <= 0 {
+            return promise.set_error(Status::error(400, "Parameter limit must be positive"));
+        }
+        // `GetCommunityPeerLinkRequestsQuery::send` resolves
+        // `get_input_community` (the C++ CHECK band is the
+        // have_community invariant).
+        let Some(input_community) = self.get_input_community(env, community_id) else {
+            return promise.set_error(Status::error(500, "Community not found"));
+        };
+        env.send_get_community_peer_link_requests_query(
+            community_id,
+            input_community,
+            offset,
+            limit,
+        );
+        self.pending_peer_link_requests
+            .push((community_id.get(), promise));
+    }
+
+    /// `GetCommunityPeerLinkRequestsQuery::on_result` (ffc06ec75,
+    /// CommunityManager.cpp:411-434) — the page builder: the users +
+    /// chats intakes run first, the total clamps up to the page size,
+    /// invalid entries drop with the count decremented, the valid
+    /// entries' dialogs force-create, and each page entry carries the
+    /// hidden inversion (`is_hidden = !visible`) with the next offset
+    /// passed through (an empty next offset means no more results).
+    pub fn on_get_community_peer_link_requests(
+        &mut self,
+        env: &mut impl CommunityManagerEnv,
+        mut ptr: telegram_api::communities_PeerLinkRequests,
+        mut promise: Promise<td_api::CommunityAddChatRequests>,
+    ) {
+        env.on_get_users(
+            std::mem::take(&mut ptr.users),
+            "GetCommunityPeerLinkRequestsQuery",
+        );
+        env.on_get_chats(
+            std::mem::take(&mut ptr.chats),
+            "GetCommunityPeerLinkRequestsQuery",
+        );
+
+        let mut total_count = ptr.total_count;
+        if total_count < ptr.requests.len() as i32 {
+            tdutils::log_error!(
+                "Receive wrong total count {} of {} requests",
+                total_count,
+                ptr.requests.len()
+            );
+            total_count = ptr.requests.len() as i32;
+        }
+        let mut requests = Vec::new();
+        for request in &ptr.requests {
+            let dialog_id = request
+                .peer
+                .as_ref()
+                .map_or(DialogId::default(), DialogId::from_peer);
+            let sender_user_id = crate::user_manager::UserId::new(request.requested_by);
+            if !dialog_id.is_valid() || !sender_user_id.is_valid() {
+                tdutils::log_error!("Receive invalid {request:?}");
+                total_count -= 1;
+                continue;
+            }
+            env.force_create_dialog(dialog_id, "GetCommunityPeerLinkRequestsQuery");
+            requests.push(td_api::CommunityAddChatRequest {
+                chat_id: env.get_chat_id_object(dialog_id),
+                is_hidden: !request.visible,
+                sender_user_id: env.get_user_id_object(sender_user_id, "communityAddChatRequest"),
+                date: request.date,
+            });
+        }
+        promise.set_value(td_api::CommunityAddChatRequests {
+            total_count,
+            requests,
+            next_offset: ptr.next_offset,
+        });
+    }
+
+    /// `process_community_add_dialog_request` (2b80bf533,
+    /// CommunityManager.cpp:2072-2084) — the
+    /// `processCommunityAddChatRequest` request half: the get_community
+    /// gate, the admin-only linked-peer right, the read access on the
+    /// requested chat, then the `ProcessCommunityPeerLinkRequestQuery`
+    /// send (the requested chat's input peer resolves at the seam).
+    pub fn process_community_add_dialog_request(
+        &mut self,
+        env: &mut impl CommunityManagerEnv,
+        community_id: CommunityId,
+        dialog_id: DialogId,
+        approve: bool,
+        mut promise: Promise<()>,
+    ) {
+        let Some(community) = self.get_community(community_id) else {
+            return promise.set_error(Status::error(400, "Community not found"));
+        };
+        if !community.status.can_manage_linked_peers_as_administrator() {
+            return promise.set_error(Status::error(400, "Have not enough rights"));
+        }
+        if let Err(status) = env.check_dialog_access(dialog_id) {
+            return promise.set_error(status);
+        }
+        // `ProcessCommunityPeerLinkRequestQuery::send` resolves
+        // `get_input_community` (the C++ CHECK band is the cached
+        // community invariant).
+        let Some(input_community) = self.get_input_community(env, community_id) else {
+            return promise.set_error(Status::error(500, "Community not found"));
+        };
+        env.send_process_community_peer_link_request_query(
+            community_id,
+            dialog_id,
+            input_community,
+            approve,
+        );
+        self.pending_process_request
+            .push((community_id.get(), promise));
+    }
+
+    /// `process_community_add_dialog_requests` (79a943019,
+    /// CommunityManager.cpp:2086-2096) — the
+    /// `processCommunityAddChatRequests` request half: the same community
+    /// gates with no per-chat access check, then the
+    /// `ProcessCommunityPeerLinkRequestsQuery` send.
+    pub fn process_community_add_dialog_requests(
+        &mut self,
+        env: &mut impl CommunityManagerEnv,
+        community_id: CommunityId,
+        approve: bool,
+        mut promise: Promise<()>,
+    ) {
+        let Some(community) = self.get_community(community_id) else {
+            return promise.set_error(Status::error(400, "Community not found"));
+        };
+        if !community.status.can_manage_linked_peers_as_administrator() {
+            return promise.set_error(Status::error(400, "Have not enough rights"));
+        }
+        let Some(input_community) = self.get_input_community(env, community_id) else {
+            return promise.set_error(Status::error(500, "Community not found"));
+        };
+        env.send_process_community_peer_link_requests_query(community_id, input_community, approve);
+        self.pending_process_all_requests
             .push((community_id.get(), promise));
     }
 
@@ -1608,6 +1847,12 @@ mod tests {
         /// (the community ids whose expansion removed them from the
         /// chat folders).
         filter_removals: Vec<i64>,
+        /// The users-intake seam records (user count, source).
+        intaken_users: Vec<(usize, String)>,
+        /// The force-create records (dialog id, source).
+        forced_dialogs: Vec<(DialogId, String)>,
+        /// The `check_dialog_access` failure knob (defaults to Ok).
+        dialog_access_error: Option<Status>,
     }
 
     impl TestEnv {
@@ -1622,6 +1867,9 @@ mod tests {
                 known_members: Vec::new(),
                 intaken_chats: Vec::new(),
                 filter_removals: Vec::new(),
+                intaken_users: Vec::new(),
+                forced_dialogs: Vec::new(),
+                dialog_access_error: None,
             }
         }
     }
@@ -1636,7 +1884,10 @@ mod tests {
         }
 
         fn check_dialog_access(&mut self, _dialog_id: DialogId) -> std::result::Result<(), Status> {
-            Ok(())
+            match &self.dialog_access_error {
+                Some(status) => Err(status.clone()),
+                None => Ok(()),
+            }
         }
 
         fn get_chat_id_object(&mut self, _dialog_id: DialogId) -> i64 {
@@ -1722,6 +1973,59 @@ mod tests {
             self.reloaded_fulls.push(community_id.get());
         }
 
+        fn send_get_community_peer_link_requests_query(
+            &mut self,
+            community_id: CommunityId,
+            _input_community: telegram_api::InputChannel,
+            offset: &str,
+            limit: i32,
+        ) {
+            self.queries.push(format!(
+                "getPeerLinkRequests {} {offset} {limit}",
+                community_id.get()
+            ));
+        }
+
+        fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &str) {
+            self.intaken_users.push((users.len(), source.to_owned()));
+        }
+
+        fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &str) {
+            self.intaken_chats.push((chats.len(), source.to_owned()));
+        }
+
+        fn force_create_dialog(&mut self, dialog_id: DialogId, source: &str) {
+            self.forced_dialogs.push((dialog_id, source.to_owned()));
+        }
+
+        fn send_process_community_peer_link_request_query(
+            &mut self,
+            community_id: CommunityId,
+            dialog_id: DialogId,
+            _input_community: telegram_api::InputChannel,
+            approve: bool,
+        ) {
+            self.queries.push(format!(
+                "togglePeerLinkRequestApproval {} {:?} reject={}",
+                community_id.get(),
+                dialog_id,
+                !approve
+            ));
+        }
+
+        fn send_process_community_peer_link_requests_query(
+            &mut self,
+            community_id: CommunityId,
+            _input_community: telegram_api::InputChannel,
+            approve: bool,
+        ) {
+            self.queries.push(format!(
+                "toggleAllPeerLinkRequestApproval {} reject={}",
+                community_id.get(),
+                !approve
+            ));
+        }
+
         fn send_get_joined_communities_query(&mut self) {
             self.queries.push("getJoinedCommunities".to_owned());
         }
@@ -1780,10 +2084,6 @@ mod tests {
                 community_id.get()
             ));
             let _ = input_community;
-        }
-
-        fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &str) {
-            self.intaken_chats.push((chats.len(), source.to_owned()));
         }
 
         fn remove_community_from_dialog_filters(&mut self, community_id: CommunityId) {
@@ -2053,6 +2353,36 @@ mod tests {
         fn set_error(&mut self, error: Status) {
             *self.0.lock().unwrap() = Some(Err(error));
         }
+    }
+
+    struct RecordedPage(
+        std::sync::Arc<
+            std::sync::Mutex<Option<std::result::Result<td_api::CommunityAddChatRequests, Status>>>,
+        >,
+    );
+
+    struct RecordingPage(
+        std::sync::Arc<
+            std::sync::Mutex<Option<std::result::Result<td_api::CommunityAddChatRequests, Status>>>,
+        >,
+    );
+
+    impl tdutils::promise::PromiseInterface<td_api::CommunityAddChatRequests> for RecordingPage {
+        fn set_value(&mut self, value: td_api::CommunityAddChatRequests) {
+            *self.0.lock().unwrap() = Some(Ok(value));
+        }
+
+        fn set_error(&mut self, error: Status) {
+            *self.0.lock().unwrap() = Some(Err(error));
+        }
+    }
+
+    fn record_page() -> (Promise<td_api::CommunityAddChatRequests>, RecordedPage) {
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (
+            Promise::from_interface(RecordingPage(recorded.clone())),
+            RecordedPage(recorded),
+        )
     }
 
     struct RecordedCommunities(
@@ -3230,5 +3560,324 @@ mod tests {
         ));
         assert_eq!(env.filter_removals, vec![7], "the expansion fans out");
         assert_eq!(env.filter_removals.len(), 1, "exactly one fan-out");
+    }
+
+    // ---- the add-chat requests queue (#132) ----
+
+    #[test]
+    fn add_chat_requests_validation_bands() {
+        // CommunityManager.cpp:2060-2070 — the have_community gate first,
+        // then the positive-limit band, then the
+        // GetCommunityPeerLinkRequestsQuery send over the input community.
+        let mut env = TestEnv::new();
+        let mut manager = CommunityManager::new();
+        manager.on_get_community(&mut env, &wire_community(7, "c"), "test");
+
+        let (promise, recorded) = record_page();
+        manager.get_community_add_dialog_requests(&mut env, CommunityId::new(8), "", 10, promise);
+        assert_eq!(
+            recorded
+                .0
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .unwrap_err()
+                .message(),
+            "Community not found"
+        );
+
+        let (promise, recorded) = record_page();
+        manager.get_community_add_dialog_requests(&mut env, CommunityId::new(7), "", 0, promise);
+        assert_eq!(
+            recorded
+                .0
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .unwrap_err()
+                .message(),
+            "Parameter limit must be positive"
+        );
+
+        let (promise, recorded) = record_page();
+        manager.get_community_add_dialog_requests(&mut env, CommunityId::new(7), "", -1, promise);
+        assert_eq!(
+            recorded
+                .0
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .unwrap_err()
+                .message(),
+            "Parameter limit must be positive"
+        );
+
+        let (promise, recorded) = record_page();
+        manager.get_community_add_dialog_requests(
+            &mut env,
+            CommunityId::new(7),
+            "off",
+            10,
+            promise,
+        );
+        assert!(
+            env.queries
+                .iter()
+                .any(|q| q == "getPeerLinkRequests 7 off 10")
+        );
+        assert_eq!(manager.pending_peer_link_requests.len(), 1);
+        assert!(
+            !recorded.0.lock().unwrap().is_some(),
+            "the page promise parks at the query"
+        );
+    }
+
+    #[test]
+    fn add_chat_requests_page_building() {
+        // `GetCommunityPeerLinkRequestsQuery::on_result`
+        // (CommunityManager.cpp:411-434): the users + chats intakes run
+        // first, the total clamps up to the page size, invalid entries
+        // drop with the count decremented, the dialogs force-create, and
+        // each page entry carries the hidden inversion
+        // (`is_hidden = !visible`) with the next offset passed through.
+        let mut env = TestEnv::new();
+        let mut manager = CommunityManager::new();
+        let (promise, recorded) = record_page();
+        manager.on_get_community_peer_link_requests(
+            &mut env,
+            telegram_api::communities_PeerLinkRequests {
+                flags: 1,
+                // smaller than the page — clamps up to 3, then the two
+                // invalid entries decrement it to 1
+                total_count: 0,
+                requests: vec![
+                    telegram_api::CommunityPeerRequest {
+                        flags: 0,
+                        visible: false,
+                        peer: Some(telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                            channel_id: 3,
+                        })),
+                        requested_by: 42,
+                        date: 77,
+                    },
+                    telegram_api::CommunityPeerRequest {
+                        flags: 0,
+                        visible: true,
+                        // an invalid dialog id (channel 0) drops the entry
+                        peer: Some(telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                            channel_id: 0,
+                        })),
+                        requested_by: 42,
+                        date: 78,
+                    },
+                    telegram_api::CommunityPeerRequest {
+                        flags: 0,
+                        visible: true,
+                        peer: Some(telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                            channel_id: 4,
+                        })),
+                        // an invalid user id drops the entry
+                        requested_by: 0,
+                        date: 79,
+                    },
+                ],
+                next_offset: "next".to_owned(),
+                chats: vec![telegram_api::Chat::chatEmpty(telegram_api::chatEmpty {
+                    id: 3,
+                })],
+                users: vec![telegram_api::User::userEmpty(telegram_api::userEmpty {
+                    id: 42,
+                })],
+            },
+            promise,
+        );
+        let page = recorded
+            .0
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .expect("the page resolves");
+        assert_eq!(
+            page.total_count, 1,
+            "0 clamps up to 3, the two drops decrement"
+        );
+        assert_eq!(page.next_offset, "next");
+        assert_eq!(page.requests.len(), 1);
+        let request = &page.requests[0];
+        assert!(request.is_hidden, "the hidden inversion");
+        assert_eq!(request.sender_user_id, 42);
+        assert_eq!(request.date, 77);
+        assert_eq!(request.chat_id, 3, "get_chat_id_object");
+
+        assert_eq!(
+            env.intaken_users,
+            vec![(1, "GetCommunityPeerLinkRequestsQuery".to_owned())],
+            "the users intake runs first"
+        );
+        assert_eq!(
+            env.intaken_chats,
+            vec![(1, "GetCommunityPeerLinkRequestsQuery".to_owned())]
+        );
+        assert_eq!(
+            env.forced_dialogs,
+            vec![(
+                DialogId::from_peer(&telegram_api::Peer::peerChannel(
+                    telegram_api::peerChannel { channel_id: 3 }
+                )),
+                "GetCommunityPeerLinkRequestsQuery".to_owned()
+            )],
+            "only the valid entry's dialog force-creates"
+        );
+    }
+
+    #[test]
+    fn process_add_chat_request_gates() {
+        // CommunityManager.cpp:2072-2084 (2b80bf533) — the get_community
+        // gate, the admin-only linked-peer right, the read access on the
+        // requested chat, then the single-approval toggle send with
+        // reject = !approve.
+        let mut env = TestEnv::new();
+        let mut manager = CommunityManager::new();
+        manager.on_get_community(&mut env, &wire_community(7, "c"), "test");
+        manager.on_get_community(&mut env, &wire_member_community(9), "test");
+
+        let (promise, recorded) = record();
+        manager.process_community_add_dialog_request(
+            &mut env,
+            CommunityId::new(8),
+            DialogId::new(1),
+            true,
+            promise,
+        );
+        assert_eq!(
+            recorded
+                .0
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .unwrap_err()
+                .message(),
+            "Community not found"
+        );
+
+        let (promise, recorded) = record();
+        manager.process_community_add_dialog_request(
+            &mut env,
+            CommunityId::new(9),
+            DialogId::new(1),
+            true,
+            promise,
+        );
+        assert_eq!(
+            recorded
+                .0
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .unwrap_err()
+                .message(),
+            "Have not enough rights"
+        );
+
+        env.dialog_access_error = Some(Status::error(400, "Chat not found"));
+        let (promise, recorded) = record();
+        manager.process_community_add_dialog_request(
+            &mut env,
+            CommunityId::new(7),
+            DialogId::new(1),
+            true,
+            promise,
+        );
+        assert_eq!(
+            recorded
+                .0
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .unwrap_err()
+                .message(),
+            "Chat not found"
+        );
+        env.dialog_access_error = None;
+
+        let (promise, recorded) = record();
+        manager.process_community_add_dialog_request(
+            &mut env,
+            CommunityId::new(7),
+            DialogId::new(1),
+            false,
+            promise,
+        );
+        assert!(
+            env.queries
+                .iter()
+                .any(|q| q == "togglePeerLinkRequestApproval 7 DialogId(1) reject=true"),
+            "the reject band inverts approve"
+        );
+        assert_eq!(manager.pending_process_request.len(), 1);
+        assert!(
+            !recorded.0.lock().unwrap().is_some(),
+            "the approval promise parks at the query"
+        );
+    }
+
+    #[test]
+    fn process_add_chat_requests_gates() {
+        // CommunityManager.cpp:2086-2096 (79a943019) — the same community
+        // gates with no per-chat access check, then the all-approvals
+        // toggle send with reject = !approve.
+        let mut env = TestEnv::new();
+        let mut manager = CommunityManager::new();
+        manager.on_get_community(&mut env, &wire_community(7, "c"), "test");
+        manager.on_get_community(&mut env, &wire_member_community(9), "test");
+
+        let (promise, recorded) = record();
+        manager.process_community_add_dialog_requests(&mut env, CommunityId::new(8), true, promise);
+        assert_eq!(
+            recorded
+                .0
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .unwrap_err()
+                .message(),
+            "Community not found"
+        );
+
+        let (promise, recorded) = record();
+        manager.process_community_add_dialog_requests(&mut env, CommunityId::new(9), true, promise);
+        assert_eq!(
+            recorded
+                .0
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .unwrap_err()
+                .message(),
+            "Have not enough rights"
+        );
+
+        let (promise, recorded) = record();
+        manager.process_community_add_dialog_requests(&mut env, CommunityId::new(7), true, promise);
+        assert!(
+            env.queries
+                .iter()
+                .any(|q| q == "toggleAllPeerLinkRequestApproval 7 reject=false"),
+            "the reject band inverts approve"
+        );
+        assert_eq!(manager.pending_process_all_requests.len(), 1);
+        assert!(
+            !recorded.0.lock().unwrap().is_some(),
+            "the approval promise parks at the query"
+        );
     }
 }

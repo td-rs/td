@@ -5428,6 +5428,43 @@ impl CliClient {
                 },
             ));
             true
+        } else if op == "gcacr" {
+            // cli.cpp:3920-3924 — CommunityId, offset, as_limit(limit)
+            let (w0, rest0) = tokenizer::split(args, ' ');
+            let (offset, limit) = tokenizer::split(&rest0, ' ');
+            self.send_request(Function::getCommunityAddChatRequests(
+                td_api::getCommunityAddChatRequests {
+                    community_id: tokenizer::to_integer_i64(trim_td(&w0)),
+                    offset,
+                    limit: as_limit(&limit, 10),
+                },
+            ));
+            true
+        } else if op == "pcacr" {
+            // cli.cpp:3926-3930 — CommunityId, ChatId, approve
+            let (w0, w1, w2) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::processCommunityAddChatRequest(
+                td_api::processCommunityAddChatRequest {
+                    community_id: tokenizer::to_integer_i64(trim_td(&w0)),
+                    chat_id: tokenizer::to_integer_i64(trim_td(&w1)),
+                    approve: as_bool(&w2),
+                },
+            ));
+            true
+        } else if op == "pcacrs" {
+            // cli.cpp:3932-3936 — CommunityId, approve
+            let (w0, w1) = tokenizer::split(args, ' ');
+            self.send_request(Function::processCommunityAddChatRequests(
+                td_api::processCommunityAddChatRequests {
+                    community_id: tokenizer::to_integer_i64(trim_td(&w0)),
+                    approve: as_bool(&w1),
+                },
+            ));
+            true
         } else if op == "gcc" {
             let (user_id, offset_chat_id, limit) = {
                 let (w0, rest0) = tokenizer::split(args, ' ');
@@ -16150,6 +16187,7 @@ mod tests {
             ("gc", 2),
             ("gca", 2),
             ("gcapmrs", 2),
+            ("gcacr", 2),
             ("gcc", 2),
             ("gcera", 2),
             ("gcmbd", 2),
@@ -16197,6 +16235,8 @@ mod tests {
             ("lca", 2),
             ("ldmct", 2),
             ("lsmt", 2),
+            ("pcacr", 2),
+            ("pcacrs", 2),
             ("radmctr", 2),
             ("react", 2),
             ("reactbot", 2),

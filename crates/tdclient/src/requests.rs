@@ -7203,6 +7203,65 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             );
             td.community_manager = manager;
         }
+        Function::getCommunityAddChatRequests(request) => {
+            // Requests.cpp:3511-3517 (ffc06ec75) — CHECK_IS_USER,
+            // CLEAN_INPUT_STRING(offset), CREATE_REQUEST_PROMISE, then
+            // CommunityManager::get_community_add_dialog_requests.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(offset) = clean_or_utf8_error(td, id, &request.offset) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::CommunityAddChatRequests, _>(
+                id,
+                Object::communityAddChatRequests,
+            );
+            let (mut manager, mut env) = community_split(td);
+            manager.get_community_add_dialog_requests(
+                &mut env,
+                CommunityId::new(request.community_id),
+                &offset,
+                request.limit,
+                promise,
+            );
+            td.community_manager = manager;
+        }
+        Function::processCommunityAddChatRequest(request) => {
+            // Requests.cpp:3519-3524 (2b80bf533) — CHECK_IS_USER,
+            // CREATE_OK_REQUEST_PROMISE, then
+            // CommunityManager::process_community_add_dialog_request.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut manager, mut env) = community_split(td);
+            manager.process_community_add_dialog_request(
+                &mut env,
+                CommunityId::new(request.community_id),
+                crate::dialog_id::DialogId::new(request.chat_id),
+                request.approve,
+                promise,
+            );
+            td.community_manager = manager;
+        }
+        Function::processCommunityAddChatRequests(request) => {
+            // Requests.cpp:3526-3530 (79a943019) — CHECK_IS_USER,
+            // CREATE_OK_REQUEST_PROMISE, then
+            // CommunityManager::process_community_add_dialog_requests.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut manager, mut env) = community_split(td);
+            manager.process_community_add_dialog_requests(
+                &mut env,
+                CommunityId::new(request.community_id),
+                request.approve,
+                promise,
+            );
+            td.community_manager = manager;
+        }
 
         // -- the payments set (M.43): Requests.cpp:8372-8436, 8757-8771,
         //    9247-9251; the CHECK_IS_USER/CHECK_IS_BOT gates match the
@@ -20307,7 +20366,7 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 26, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            1058,
+            1061,
             "dispatched count"
         );
         // the 23383aef sync base (1.8.70): the 34 new scheme functions
@@ -20362,6 +20421,13 @@ mod request_census_tests {
         // Updates answer re-enters the updates intake; the collapse
         // state comes back through on_get_community): 1,055 + 1 = 1,056
         // dispatched / 18 - 1 = 17 interim, sync unmoved 26.
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 15, "interim count");
+        // The community family slice (#132) flipped the add-chat
+        // requests trio (getCommunityAddChatRequests — the page query
+        // over communities.getPeerLinkRequests, and the two approval
+        // toggles processCommunityAddChatRequest /
+        // processCommunityAddChatRequests whose Bool answers settle
+        // through the change-settle): 1,055 + 3 = 1,058 dispatched /
+        // 18 - 3 = 15 interim, sync unmoved 26.
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 12, "interim count");
     }
 }
