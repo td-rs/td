@@ -18707,6 +18707,51 @@ fn run_misc_glue_requests(td: &mut Td, id: u64, function: Function) {
             manager.get_nfts(&mut env, &offset, request.limit, promise);
             td.ton_wallet_manager = manager;
         }
+        Function::getTonWalletCardBackgroundGiftCollectionNames(_) => {
+            // Requests.cpp:8234-8238.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::UpgradedGiftCollectionNames, _>(
+                id,
+                Object::upgradedGiftCollectionNames,
+            );
+            let (manager, env) = ton_wallet_split(td);
+            manager.get_ton_wallet_card_background_gift_collection_names(&env, promise);
+            td.ton_wallet_manager = manager;
+        }
+        Function::setTonWalletCardStickers(request) => {
+            // Requests.cpp:8240-8248.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let mut stickers = Vec::with_capacity(request.stickers.len());
+            for sticker in request.stickers {
+                let Some(nft_address) = crate::misc::clean_input_string(&sticker.nft_address)
+                else {
+                    return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+                };
+                stickers.push(Some(td_api::InputTonWalletCardSticker {
+                    position: sticker.position,
+                    nft_address,
+                }));
+            }
+            let Some(background_nft_address) =
+                crate::misc::clean_input_string(&request.background_nft_address)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise =
+                td.deferred_promise::<td_api::TonWalletCard, _>(id, Object::tonWalletCard);
+            let (mut manager, mut env) = ton_wallet_split(td);
+            manager.set_ton_wallet_card_stickers(
+                &mut env,
+                stickers,
+                &background_nft_address,
+                promise,
+            );
+            td.ton_wallet_manager = manager;
+        }
         Function::getTonConnectSessions(_) => {
             // Requests.cpp:8074-8079.
             if !check_is_user(td, id) {
@@ -20123,7 +20168,7 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 26, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            1049,
+            1051,
             "dispatched count"
         );
         // the 23383aef sync base (1.8.70): the 34 new scheme functions
@@ -20149,6 +20194,12 @@ mod request_census_tests {
         // getSpeechRecognitionLanguages, fixRecognizedTextWithAi,
         // fixRecognizedRichMessageWithAi): 1,045 + 4 = 1,049
         // dispatched / 28 - 4 = 24 interim, sync unmoved 26.
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 24, "interim count");
+        // The TON wallet cards family slice (#123) flipped the pair:
+        // getTonWalletCardBackgroundGiftCollectionNames (the
+        // `\xFF`-separated option answer) and setTonWalletCardStickers
+        // (the validation ladder over the SetWalletCardStickersQuery net
+        // tail): 1,049 + 2 = 1,051 dispatched / 24 - 2 = 22 interim, sync
+        // unmoved 26.
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 22, "interim count");
     }
 }

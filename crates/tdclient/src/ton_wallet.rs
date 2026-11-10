@@ -16,8 +16,9 @@
 //! `GetWalletGaslessInfoQuery`, `GetWalletProofChallengeQuery`,
 //! `ReplaceWalletQuery`, `GetTonWalletTransactionsQuery` (the
 //! transactions/by-ids/by-msg-hash forms), `SendWalletTransferQuery`,
-//! `GetCurrencyRatesQuery`, `GetTonNftsQuery`, the TonConnect query set,
-//! the on-ramp query set, `PerformTonCenterApiRequestQuery`,
+//! `GetCurrencyRatesQuery`, `GetTonNftsQuery`,
+//! `SetWalletCardStickersQuery` (the #123 card family), the TonConnect
+//! query set, the on-ramp query set, `PerformTonCenterApiRequestQuery`,
 //! `GetTonCenterStreamingApiUrlQuery`, `GetWalletBackupHolderDcsQuery`.
 //! The NFT/manifest web-document legs are `[blocked: files]` (the photo
 //! and document objects answer `None`); the `timeout_expired` gasless
@@ -25,6 +26,14 @@
 //! offline — no wire update can arrive); `PasswordManager::
 //! get_input_check_password_srp` is the `[blocked: PasswordManager]`
 //! seam.
+//!
+//! The card plane (`TonWalletCard`/`TonWalletCardSticker`, the
+//! `wallet.setCardStickers` answer and the user-full carrier) converts
+//! with the full StarGift value plane at the query tails; the
+//! user-full intake's gift leg parks at the `[blocked: user-intake env
+//! seam]` band (`get_ton_wallet_card_for_user_full`), and the card
+//! stays session-only (the store keeps the C++ `has_ton_wallet_card`
+//! flag down until the Files/Gift store planes land).
 //!
 //! The value plane seeded earlier stays: `check_ton_address`, shared by
 //! the TON-address entity detector and the wallet request gates.
@@ -377,10 +386,14 @@ pub(crate) fn get_on_ramp_payment_session_object(
 /// `TonWalletManager::get_ton_wallet_transaction_object`
 /// (TonWalletManager.cpp:2311-2365) — the static conversion over the wire
 /// transaction; the NFT web-document legs are [blocked: files] and the
-/// peer user id rides the user id-object mapping.
+/// peer user id rides the user id-object mapping. The `gift_of`
+/// closure is the C++ `TonNft` gift field's StarGift conversion
+/// (TonWalletManager.cpp:2368); the net-inert callers pass the
+/// always-None park.
 pub fn get_ton_wallet_transaction_object(
     my_user_id: i64,
     transaction: telegram_api::WalletTransaction,
+    gift_of: TonNftGiftOf,
 ) -> td_api::TonWalletTransaction {
     let telegram_api::WalletTransaction {
         incoming,
@@ -447,7 +460,7 @@ pub fn get_ton_wallet_transaction_object(
         )
     };
     let transaction_type = if let Some(nft) = nft {
-        let nft_object = get_ton_nft_object(&nft);
+        let nft_object = get_ton_nft_object(&nft, gift_of(&nft));
         if is_telegram_gift {
             td_api::TonWalletTransactionType::tonWalletTransactionTypeTelegramGiftTransfer(
                 td_api::tonWalletTransactionTypeTelegramGiftTransfer {
@@ -509,8 +522,13 @@ pub fn get_ton_wallet_transaction_object(
 /// (TonWalletManager.cpp:1425-1445) — the photo/document legs are the
 /// [blocked: files] seams (`get_web_document_photo_size`,
 /// `documents_manager_->on_get_document`); the extra JSON rides the
-/// value-or-null parse.
-pub(crate) fn get_ton_nft_object(item: &telegram_api::wallet_NftItem) -> td_api::TonNft {
+/// value-or-null parse. The `gift` leg is the C++ `TonNft` gift field
+/// (TonNft.cpp:69-76) — the caller pre-converts the wire gift through
+/// the StarGift value plane (`td::ton_nft_gift_object`).
+pub(crate) fn get_ton_nft_object(
+    item: &telegram_api::wallet_NftItem,
+    gift: Option<td_api::UpgradedGift>,
+) -> td_api::TonNft {
     let extra = item
         .extra
         .as_ref()
@@ -539,11 +557,196 @@ pub(crate) fn get_ton_nft_object(item: &telegram_api::wallet_NftItem) -> td_api:
             tdutils::status::Result::Ok(value) => Some(Box::new(value)),
             tdutils::status::Result::Err(_) => None,
         },
-        // The wire gift (TonNft.cpp:69-76 StarGift parse → upgradedGift)
-        // needs the StarGiftEnv conversion plane — the TON-wallet-cards
-        // family follow-up.
-        gift: None,
+        gift,
     }
+}
+
+// ======================= the TON wallet card plane =======================
+// `td/telegram/TonWalletCard.{h,cpp}` + `TonWalletCardSticker.{h,cpp}`
+// (the 1.8.70 sync family, #123): the card rides userFull
+// (`wallet_card`) and the wallet.setCardStickers answer; the value
+// plane carries the emitted td_api forms so the user-full diff and
+// emission stay env-free.
+
+/// The C++ `TonNft` gift leg's StarGift conversion closure — the
+/// per-NFT `(wire gift, nft address)` pair the callers pre-convert
+/// through the StarGift value plane (`td::ton_nft_gift_object`); the
+/// net-inert contexts pass the always-None park.
+pub type TonNftGiftOf<'a> =
+    &'a mut dyn FnMut(&telegram_api::wallet_NftItem) -> Option<td_api::UpgradedGift>;
+
+/// `td::TonWalletCardSticker` (TonWalletCardSticker.h:21-46) — the
+/// wire card sticker over its converted value form.
+#[derive(Clone, Debug)]
+pub struct TonWalletCardSticker {
+    coordinates: crate::media_area_coordinates::MediaAreaCoordinates,
+    nft: td_api::TonNft,
+}
+
+impl TonWalletCardSticker {
+    /// `TonWalletCardSticker(Td *, sticker)` (TonWalletCardSticker.cpp:12-15)
+    /// — the wire intake over the gift conversion closure.
+    fn from_telegram(
+        sticker: telegram_api::wallet_CardSticker,
+        gift_of: TonNftGiftOf,
+    ) -> TonWalletCardSticker {
+        let coordinates = crate::media_area_coordinates::MediaAreaCoordinates::from_telegram(
+            sticker.coordinates.as_ref(),
+        );
+        let nft = match sticker.nft {
+            Some(nft) => get_ton_nft_object(&nft, gift_of(&nft)),
+            // the C++ would dereference the null item — the malformed
+            // wire form parks as the invalid (empty-address) sticker.
+            None => get_ton_nft_object(&telegram_api::wallet_NftItem::default(), None),
+        };
+        TonWalletCardSticker { coordinates, nft }
+    }
+
+    /// `is_valid` (TonWalletCardSticker.h:31-33).
+    fn is_valid(&self) -> bool {
+        self.coordinates.is_valid() && !self.nft.address.is_empty()
+    }
+
+    /// `get_nft_address` (TonWalletCardSticker.h:35-37).
+    fn get_nft_address(&self) -> &str {
+        &self.nft.address
+    }
+
+    /// `get_ton_wallet_card_sticker_object` (TonWalletCardSticker.cpp:17-20).
+    fn get_object(&self) -> td_api::TonWalletCardSticker {
+        td_api::TonWalletCardSticker {
+            position: Some(self.coordinates.get_area_position_object()),
+            nft: Some(self.nft.clone()),
+        }
+    }
+}
+
+/// The C++ field-wise `operator==` (TonWalletCardSticker.cpp:23-25) —
+/// the coordinates compare through their epsilon equality.
+impl PartialEq for TonWalletCardSticker {
+    fn eq(&self, other: &Self) -> bool {
+        self.coordinates == other.coordinates && self.nft == other.nft
+    }
+}
+
+/// `td::TonWalletCard` (TonWalletCard.h:20-51) — the value form the
+/// user-full plane stores.
+#[derive(Clone, Debug)]
+pub struct TonWalletCard {
+    address: String,
+    balance: i64,
+    stickers: Vec<TonWalletCardSticker>,
+    background_nft_address: String,
+}
+
+impl TonWalletCard {
+    /// `TonWalletCard::get_ton_wallet_card` (TonWalletCard.cpp:41-53) —
+    /// the null card is the caller's `Option`; the empty address is the
+    /// invalid bail.
+    pub(crate) fn get_ton_wallet_card(
+        card: telegram_api::wallet_Card,
+        gift_of: TonNftGiftOf,
+    ) -> Option<TonWalletCard> {
+        if card.address.is_empty() {
+            tdutils::log_error!("Receive TON wallet card without address");
+            return None;
+        }
+        Some(Self::new(card, gift_of))
+    }
+
+    /// `TonWalletCard(Td *, card)` (TonWalletCard.cpp:17-39) — the
+    /// balance clamp, the invalid-sticker skips and the
+    /// background-in-stickers band.
+    fn new(card: telegram_api::wallet_Card, gift_of: TonNftGiftOf) -> TonWalletCard {
+        let mut balance = card.balance;
+        if balance < 0 {
+            tdutils::log_error!("Receive TON wallet balance {balance}");
+            balance = 0;
+        }
+        let mut stickers = Vec::with_capacity(card.stickers.len());
+        for sticker in card.stickers {
+            let sticker = TonWalletCardSticker::from_telegram(sticker, gift_of);
+            if !sticker.is_valid() {
+                tdutils::log_error!(
+                    "Receive invalid sticker on TON wallet card {}",
+                    card.address
+                );
+                continue;
+            }
+            stickers.push(sticker);
+        }
+        let mut background_nft_address = String::new();
+        if let Some(bg_nft_item) = card.bg_nft_item {
+            let background = bg_nft_item.address;
+            if stickers
+                .iter()
+                .any(|sticker| sticker.get_nft_address() == background)
+            {
+                background_nft_address = background;
+            } else {
+                tdutils::log_error!(
+                    "Receive background NFT {} not from stickers on TON wallet card {}",
+                    background,
+                    card.address
+                );
+            }
+        }
+        TonWalletCard {
+            address: card.address,
+            balance,
+            stickers,
+            background_nft_address,
+        }
+    }
+
+    /// `get_ton_wallet_card_object` (TonWalletCard.cpp:55-65).
+    pub(crate) fn get_ton_wallet_card_object(&self) -> td_api::TonWalletCard {
+        td_api::TonWalletCard {
+            address: self.address.clone(),
+            gram_amount: self.balance,
+            stickers: self
+                .stickers
+                .iter()
+                .map(TonWalletCardSticker::get_object)
+                .collect(),
+            background_nft_address: self.background_nft_address.clone(),
+        }
+    }
+}
+
+/// The C++ field-wise `operator==` (TonWalletCard.cpp:67-71).
+impl PartialEq for TonWalletCard {
+    fn eq(&self, other: &Self) -> bool {
+        self.address == other.address
+            && self.balance == other.balance
+            && self.stickers == other.stickers
+            && self.background_nft_address == other.background_nft_address
+    }
+}
+
+/// `full_split` (tdutils misc.h:36-53) — the empty input is the empty
+/// vector, the separator keeps the empty parts.
+fn full_split(s: &str, delimiter: char) -> Vec<String> {
+    if s.is_empty() {
+        return Vec::new();
+    }
+    s.split(delimiter).map(str::to_owned).collect()
+}
+
+/// The user-full intake conversion (UserManager.cpp:9049-9050) — the
+/// C++ parses through `TonWalletCard::get_ton_wallet_card(td_, ...)`
+/// with the gift leg included; the intake's `UserEnv` cannot reach the
+/// StarGift value plane (the chat-dialog seeding and the sticker
+/// registration of the gift parse), so the gift parks as `None` — the
+/// recorded [blocked: user-intake env seam] band (the shape of the
+/// theme plane's `star_gift_object_for_theme` park). The
+/// wallet.setCardStickers answer converts with the full plane.
+pub(crate) fn get_ton_wallet_card_for_user_full(
+    card: Option<telegram_api::wallet_Card>,
+) -> Option<TonWalletCard> {
+    let card = card?;
+    let mut gift_of = |_nft: &telegram_api::wallet_NftItem| None;
+    TonWalletCard::get_ton_wallet_card(card, &mut gift_of)
 }
 
 /// `TonWalletManager::WalletOwnershipProof::get_wallet_ownership_proof`
@@ -666,6 +869,12 @@ pub trait TonWalletUpdateEnv {
         0
     }
 
+    /// `G()->get_option_string` — the empty default of the C++ Global
+    /// read (the card-background gift slugs).
+    fn get_option_string(&self, _name: &str) -> String {
+        String::new()
+    }
+
     /// `Td::send_update`.
     fn send_update(&mut self, _update: td_api::Update) {}
 }
@@ -675,6 +884,19 @@ pub trait TonWalletManagerEnv: TonWalletUpdateEnv {
     /// `G()->close_status()`.
     fn close_status(&self) -> Status {
         Status::ok()
+    }
+
+    /// `TonNft(Td *, item)`'s gift leg (TonNft.cpp:69-76) — the
+    /// `StarGift(td, gift, true)` parse + `is_valid`/`is_unique` gate +
+    /// `get_upgraded_gift_object`; the invalid forms are the `None`
+    /// bail with the C++ "Receive invalid gift for NFT" error. The
+    /// net-inert default parks the conversion.
+    fn ton_nft_gift_object(
+        &mut self,
+        _wire_gift: Option<telegram_api::StarGift>,
+        _nft_address: &str,
+    ) -> Option<td_api::UpgradedGift> {
+        None
     }
 
     /// `UserManager::get_my_id` — the key-change transaction peer.
@@ -846,6 +1068,16 @@ pub trait TonWalletManagerEnv: TonWalletUpdateEnv {
     /// `GetTonNftsQuery::send` — the net-inert default (the Td env dispatches).
     fn send_wallet_get_nfts_query(&mut self, _offset: &str, _limit: i32) {
         tdutils::log_info!("Send wallet_getNfts — [net-inert]");
+    }
+
+    /// `SetWalletCardStickersQuery::send` (TonWalletManager.cpp:449-453) —
+    /// the net-inert default (the Td env dispatches).
+    fn send_wallet_set_card_stickers_query(
+        &mut self,
+        _stickers: Vec<telegram_api::InputWalletCardSticker>,
+        _background_nft_address: &str,
+    ) {
+        tdutils::log_info!("Send wallet_setCardStickers — [net-inert]");
     }
 
     /// `GetTonConnectSessionsQuery::send` — the net-inert default (the Td env dispatches).
@@ -1124,6 +1356,8 @@ pub struct TonWalletManager {
     pub(crate) pending_transaction: Vec<Promise<Option<td_api::TonWalletTransaction>>>,
     /// `GetTonNftsQuery`.
     pub(crate) pending_nfts: Vec<Promise<td_api::TonNfts>>,
+    /// `SetWalletCardStickersQuery`.
+    pub(crate) pending_card_stickers: Vec<Promise<td_api::TonWalletCard>>,
     /// `GetTonConnectSessionsQuery`.
     pub(crate) pending_ton_connect_sessions: Vec<Promise<td_api::TonConnectSessions>>,
     /// `CreateTonConnectSessionQuery`.
@@ -1988,6 +2222,83 @@ impl TonWalletManager {
         env.send_wallet_get_nfts_query(offset, limit);
     }
 
+    /// `get_ton_wallet_card_background_gift_collection_names`
+    /// (getTonWalletCardBackgroundGiftCollectionNames,
+    /// TonWalletManager.cpp:2032-2036) — the `\xFF`-separated option
+    /// answers synchronously.
+    pub fn get_ton_wallet_card_background_gift_collection_names(
+        &self,
+        env: &impl TonWalletManagerEnv,
+        mut promise: Promise<td_api::UpgradedGiftCollectionNames>,
+    ) {
+        let option = env.get_option_string("ton_wallet_card_background_gifts");
+        // The C++ walks the option BYTES on 0xFF; the Rust option is the
+        // config join's '\u{ff}' char form (config_manager.rs implode),
+        // so the split mirrors the join and the names round-trip the
+        // same (the C++ byte 0xFF never survives the UTF-8 option store).
+        promise.set_value(td_api::UpgradedGiftCollectionNames {
+            names: full_split(&option, '\u{FF}'),
+        });
+    }
+
+    /// `set_ton_wallet_card_stickers` (TonWalletManager.cpp:2038-2063) —
+    /// the validation ladder and the
+    /// `SetWalletCardStickersQuery` net tail.
+    pub fn set_ton_wallet_card_stickers(
+        &mut self,
+        env: &mut impl TonWalletManagerEnv,
+        stickers: Vec<Option<td_api::InputTonWalletCardSticker>>,
+        background_nft_address: &str,
+        mut promise: Promise<td_api::TonWalletCard>,
+    ) {
+        let mut nft_addresses: Vec<String> = Vec::new();
+        let mut input_stickers = Vec::with_capacity(stickers.len());
+        for sticker in stickers {
+            // The C++ null-sticker band (cpp:2043-2045): the generated
+            // td_api layer flattens the object vector to `Vec<...>`, so
+            // a JSON `null` element dies at the decode step; the band
+            // stays for the exactness of the ported ladder.
+            let Some(sticker) = sticker else {
+                promise.set_error(Status::error(400, "Sticker must be non-empty"));
+                return;
+            };
+            let coordinates =
+                crate::media_area_coordinates::MediaAreaCoordinates::from_area_position(
+                    sticker.position.as_ref(),
+                );
+            if !coordinates.is_valid() {
+                promise.set_error(Status::error(400, "Invalid sticker position specified"));
+                return;
+            }
+            if let Result::Err(error) = check_ton_address_allow_raw(&sticker.nft_address) {
+                promise.set_error(error);
+                return;
+            }
+            if nft_addresses.contains(&sticker.nft_address) {
+                promise.set_error(Status::error(400, "The same NFT can't be used twice"));
+                return;
+            }
+            nft_addresses.push(sticker.nft_address.clone());
+            input_stickers.push(telegram_api::InputWalletCardSticker {
+                coordinates: Some(coordinates.get_input_media_area_coordinates()),
+                nft_address: sticker.nft_address,
+            });
+        }
+        if !background_nft_address.is_empty()
+            && !nft_addresses
+                .iter()
+                .any(|address| address == background_nft_address)
+        {
+            promise.set_error(Status::error(
+                400,
+                "Background NFT must be one of the stickers",
+            ));
+            return;
+        }
+        self.pending_card_stickers.push(promise);
+        env.send_wallet_set_card_stickers_query(input_stickers, background_nft_address);
+    }
+
     /// `get_ton_connect_sessions`.
     pub fn get_ton_connect_sessions(
         &mut self,
@@ -2457,12 +2768,19 @@ impl TonWalletManager {
         env: &mut impl TonWalletManagerEnv,
         transaction: telegram_api::WalletTransaction,
     ) -> td_api::TonWalletTransaction {
-        let mut object = get_ton_wallet_transaction_object(env.get_my_id(), transaction);
+        // The StarGift conversion closure (TonWalletManager.cpp:2368) —
+        // the env serves the wire-gift parse per NFT.
+        let my_user_id = env.get_my_id();
+        let env_ref = env;
+        let mut gift_of = |nft: &telegram_api::wallet_NftItem| {
+            env_ref.ton_nft_gift_object(nft.gift.clone(), &nft.address)
+        };
+        let mut object = get_ton_wallet_transaction_object(my_user_id, transaction, &mut gift_of);
         // The peer user id rides the id-object mapping after the
         // key-change my-id substitution folded in the static.
         if object.peer_user_id != 0 {
             object.peer_user_id =
-                env.get_user_id_object(object.peer_user_id, "tonWalletTransaction");
+                env_ref.get_user_id_object(object.peer_user_id, "tonWalletTransaction");
         }
         object
     }
@@ -2622,6 +2940,7 @@ mod tests {
         queries: Vec<&'static str>,
         close: bool,
         options: Vec<(&'static str, i64)>,
+        option_strings: Vec<(&'static str, String)>,
     }
 
     impl Default for TestEnv {
@@ -2632,6 +2951,7 @@ mod tests {
                 queries: Vec::new(),
                 close: false,
                 options: vec![("ton_wallet_gasless_transfer_daily_count_max", 100)],
+                option_strings: Vec::new(),
             }
         }
     }
@@ -2660,6 +2980,13 @@ mod tests {
                 .map_or(0, |(_, value)| *value)
         }
 
+        fn get_option_string(&self, name: &str) -> String {
+            self.option_strings
+                .iter()
+                .find(|(option, _)| *option == name)
+                .map_or_else(String::new, |(_, value)| value.clone())
+        }
+
         fn send_update(&mut self, update: td_api::Update) {
             self.updates.push(update);
         }
@@ -2672,6 +2999,14 @@ mod tests {
             } else {
                 Status::ok()
             }
+        }
+
+        fn send_wallet_set_card_stickers_query(
+            &mut self,
+            _stickers: Vec<telegram_api::InputWalletCardSticker>,
+            _background_nft_address: &str,
+        ) {
+            self.queries.push("setCardStickers");
         }
 
         fn send_wallet_get_state_query(&mut self) {
@@ -3022,7 +3357,8 @@ mod tests {
             nft: None,
         };
         // Outgoing transfer negates the amount.
-        let object = get_ton_wallet_transaction_object(5, base.clone());
+        let mut no_gift = |_nft: &telegram_api::wallet_NftItem| None;
+        let object = get_ton_wallet_transaction_object(5, base.clone(), &mut no_gift);
         match object.r#type.as_ref().unwrap() {
             td_api::TonWalletTransactionType::tonWalletTransactionTypeTransfer(transfer) => {
                 assert_eq!(transfer.amount, -42);
@@ -3042,7 +3378,7 @@ mod tests {
                 },
             ),
         );
-        match get_ton_wallet_transaction_object(5, onramp)
+        match get_ton_wallet_transaction_object(5, onramp, &mut no_gift)
             .r#type
             .as_ref()
             .unwrap()
@@ -3056,7 +3392,7 @@ mod tests {
         // The key-change arm substitutes the my-id peer.
         let mut key_change = base.clone();
         key_change.key_change = true;
-        let object = get_ton_wallet_transaction_object(5, key_change);
+        let object = get_ton_wallet_transaction_object(5, key_change, &mut no_gift);
         assert_eq!(object.peer_user_id, 5);
         assert!(matches!(
             object.r#type.as_ref().unwrap(),
@@ -3075,7 +3411,7 @@ mod tests {
             ),
         );
         assert_eq!(
-            get_ton_wallet_transaction_object(5, user_peer).peer_user_id,
+            get_ton_wallet_transaction_object(5, user_peer, &mut no_gift).peer_user_id,
             0
         );
     }
@@ -3463,5 +3799,323 @@ mod tests {
             slot.lock().unwrap().as_ref(),
             Some(tdutils::status::Result::Err(status)) if status.message() == "Item type must be non-empty"
         ));
+    }
+
+    // ===================== the #123 card family =====================
+
+    fn record_names() -> (
+        Promise<td_api::UpgradedGiftCollectionNames>,
+        RecordedSlot<td_api::UpgradedGiftCollectionNames>,
+    ) {
+        struct Rec(RecordedSlot<td_api::UpgradedGiftCollectionNames>);
+        impl tdutils::promise::PromiseInterface<td_api::UpgradedGiftCollectionNames> for Rec {
+            fn set_value(&mut self, value: td_api::UpgradedGiftCollectionNames) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    fn record_card() -> (
+        Promise<td_api::TonWalletCard>,
+        RecordedSlot<td_api::TonWalletCard>,
+    ) {
+        struct Rec(RecordedSlot<td_api::TonWalletCard>);
+        impl tdutils::promise::PromiseInterface<td_api::TonWalletCard> for Rec {
+            fn set_value(&mut self, value: td_api::TonWalletCard) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (Promise::from_interface(Rec(slot.clone())), slot)
+    }
+
+    fn area_position(width_percentage: f64, height_percentage: f64) -> td_api::AreaPosition {
+        td_api::AreaPosition {
+            x_percentage: 10.0,
+            y_percentage: 20.0,
+            width_percentage,
+            height_percentage,
+            rotation_angle: 0.0,
+            corner_radius_percentage: 0.0,
+        }
+    }
+
+    fn input_sticker(
+        width_percentage: f64,
+        nft_address: &str,
+    ) -> td_api::InputTonWalletCardSticker {
+        td_api::InputTonWalletCardSticker {
+            position: Some(area_position(width_percentage, 30.0)),
+            nft_address: nft_address.to_owned(),
+        }
+    }
+
+    const STICKER_ADDRESS_A: &str =
+        "0:8002F3AB9BE0AC5D76E6E0A73E33C33E0E6F9EDF1CBC3A71D24A0AF1D6C1D70B";
+    const STICKER_ADDRESS_B: &str =
+        "-1:8002f3ab9be0ac5d76e6e0a73e33c33e0e6f9edf1cbc3a71d24a0af1d6c1d70b";
+
+    /// `getTonWalletCardBackgroundGiftCollectionNames` — the
+    /// `\xFF`-separated option split keeps the empty parts; the empty
+    /// option is the empty vector (`full_split`, misc.h:36-53).
+    #[test]
+    fn card_background_gift_collection_names_split() {
+        let mut env = TestEnv::default();
+        let manager = TonWalletManager::new();
+        env.option_strings.push((
+            "ton_wallet_card_background_gifts",
+            "slug-one\u{FF}slug-two\u{FF}\u{FF}slug-three".to_owned(),
+        ));
+        let (promise, slot) = record_names();
+        manager.get_ton_wallet_card_background_gift_collection_names(&env, promise);
+        let tdutils::status::Result::Ok(names) = slot.lock().unwrap().take().unwrap() else {
+            panic!("expected the option split answer");
+        };
+        assert_eq!(names.names, ["slug-one", "slug-two", "", "slug-three"]);
+
+        // The empty option answers the empty vector.
+        let empty_env = TestEnv::default();
+        let (promise, slot) = record_names();
+        manager.get_ton_wallet_card_background_gift_collection_names(&empty_env, promise);
+        let tdutils::status::Result::Ok(names) = slot.lock().unwrap().take().unwrap() else {
+            panic!("expected the option split answer");
+        };
+        assert!(names.names.is_empty());
+    }
+
+    /// `set_ton_wallet_card_stickers` — the validation ladder
+    /// (TonWalletManager.cpp:2038-2063) and the valid form's net park.
+    #[test]
+    fn set_card_stickers_validation_ladder() {
+        let mut env = TestEnv::default();
+        let mut manager = TonWalletManager::new();
+
+        // The null sticker band.
+        let (promise, slot) = record_card();
+        manager.set_ton_wallet_card_stickers(&mut env, vec![None], "", promise);
+        assert!(matches!(
+            slot.lock().unwrap().as_ref(),
+            Some(tdutils::status::Result::Err(status)) if status.message() == "Sticker must be non-empty"
+        ));
+
+        // The invalid-position band (the zero dimensions).
+        let (promise, slot) = record_card();
+        manager.set_ton_wallet_card_stickers(
+            &mut env,
+            vec![Some(input_sticker(0.0, STICKER_ADDRESS_A))],
+            "",
+            promise,
+        );
+        assert!(matches!(
+            slot.lock().unwrap().as_ref(),
+            Some(tdutils::status::Result::Err(status)) if status.message() == "Invalid sticker position specified"
+        ));
+
+        // The strict-address band: the raw form passes only with the
+        // allow_raw walk, and this ladder uses it (cpp:2049).
+        let (promise, slot) = record_card();
+        manager.set_ton_wallet_card_stickers(
+            &mut env,
+            vec![Some(input_sticker(10.0, "EQD-not-an-address"))],
+            "",
+            promise,
+        );
+        assert!(matches!(
+            slot.lock().unwrap().as_ref(),
+            Some(tdutils::status::Result::Err(status)) if status.code() == 400
+        ));
+
+        // The duplicate band.
+        let (promise, slot) = record_card();
+        manager.set_ton_wallet_card_stickers(
+            &mut env,
+            vec![
+                Some(input_sticker(10.0, STICKER_ADDRESS_A)),
+                Some(input_sticker(20.0, STICKER_ADDRESS_A)),
+            ],
+            "",
+            promise,
+        );
+        assert!(matches!(
+            slot.lock().unwrap().as_ref(),
+            Some(tdutils::status::Result::Err(status)) if status.message() == "The same NFT can't be used twice"
+        ));
+
+        // The background-must-be-a-sticker band.
+        let (promise, slot) = record_card();
+        manager.set_ton_wallet_card_stickers(
+            &mut env,
+            vec![Some(input_sticker(10.0, STICKER_ADDRESS_A))],
+            STICKER_ADDRESS_B,
+            promise,
+        );
+        assert!(matches!(
+            slot.lock().unwrap().as_ref(),
+            Some(tdutils::status::Result::Err(status)) if status.message() == "Background NFT must be one of the stickers"
+        ));
+
+        // The valid form parks at the net seam with the converted wire
+        // stickers.
+        let (promise, slot) = record_card();
+        manager.set_ton_wallet_card_stickers(
+            &mut env,
+            vec![
+                Some(input_sticker(10.0, STICKER_ADDRESS_A)),
+                Some(input_sticker(20.0, STICKER_ADDRESS_B)),
+            ],
+            STICKER_ADDRESS_B,
+            promise,
+        );
+        assert!(slot.lock().unwrap().is_none(), "the promise parks");
+        assert_eq!(manager.pending_card_stickers.len(), 1);
+        assert_eq!(env.queries, ["setCardStickers"]);
+    }
+
+    fn wire_nft(address: &str) -> telegram_api::wallet_NftItem {
+        telegram_api::wallet_NftItem {
+            flags: 0,
+            collection_address: String::new(),
+            address: address.to_owned(),
+            owner_address: String::new(),
+            index: "0".to_owned(),
+            name: String::new(),
+            description: String::new(),
+            image: None,
+            image_small: None,
+            content_url: None,
+            lottie: None,
+            attributes: Vec::new(),
+            extra: None,
+            gift: None,
+        }
+    }
+
+    fn wire_sticker(width_percentage: f64, address: &str) -> telegram_api::wallet_CardSticker {
+        let position = area_position(width_percentage, 30.0);
+        let coordinates = crate::media_area_coordinates::MediaAreaCoordinates::from_area_position(
+            Some(&position),
+        );
+        let wire_coordinates = if coordinates.is_valid() {
+            Some(coordinates.get_input_media_area_coordinates())
+        } else {
+            // the C++ null wire object is the default (invalid) record
+            Some(telegram_api::MediaAreaCoordinates {
+                flags: 0,
+                x: 0.0,
+                y: 0.0,
+                w: 0.0,
+                h: 0.0,
+                rotation: 0.0,
+                radius: 0.0,
+            })
+        };
+        telegram_api::wallet_CardSticker {
+            coordinates: wire_coordinates,
+            nft: Some(wire_nft(address)),
+        }
+    }
+
+    /// `TonWalletCard` parse bands (TonWalletCard.cpp:17-53): the empty
+    /// address bail, the balance clamp, the invalid-sticker skip and the
+    /// background-in-stickers band; the emitted object round-trips.
+    #[test]
+    fn ton_wallet_card_parse_bands() {
+        let mut no_gift = |_nft: &telegram_api::wallet_NftItem| None;
+
+        // The empty-address bail is the 500 "Receive invalid" band.
+        let empty = telegram_api::wallet_Card {
+            flags: 0,
+            stickers: Vec::new(),
+            bg_nft_item: None,
+            address: String::new(),
+            balance: 42,
+        };
+        assert!(TonWalletCard::get_ton_wallet_card(empty, &mut no_gift).is_none());
+
+        // The negative balance clamps to zero with the C++ error.
+        let negative = telegram_api::wallet_Card {
+            flags: 0,
+            stickers: Vec::new(),
+            bg_nft_item: None,
+            address: "EQD123".to_owned(),
+            balance: -7,
+        };
+        let card = TonWalletCard::get_ton_wallet_card(negative, &mut no_gift).unwrap();
+        let object = card.get_ton_wallet_card_object();
+        assert_eq!(object.address, "EQD123");
+        assert_eq!(object.gram_amount, 0);
+        assert!(object.stickers.is_empty());
+        assert_eq!(object.background_nft_address, "");
+
+        // The invalid sticker (zero dimensions) skips; the valid one
+        // stays; the background rides only when it is one of them.
+        let mixed = telegram_api::wallet_Card {
+            flags: 3,
+            stickers: vec![
+                wire_sticker(0.0, STICKER_ADDRESS_A),
+                wire_sticker(40.0, STICKER_ADDRESS_B),
+            ],
+            bg_nft_item: Some(wire_nft(STICKER_ADDRESS_B)),
+            address: "EQD123".to_owned(),
+            balance: 42,
+        };
+        let card = TonWalletCard::get_ton_wallet_card(mixed, &mut no_gift).unwrap();
+        let object = card.get_ton_wallet_card_object();
+        assert_eq!(object.stickers.len(), 1);
+        let emitted_sticker = object.stickers[0].clone();
+        assert_eq!(
+            emitted_sticker.nft.as_ref().unwrap().address,
+            STICKER_ADDRESS_B
+        );
+        assert_eq!(
+            object.background_nft_address, STICKER_ADDRESS_B,
+            "the background is one of the valid stickers"
+        );
+
+        // A background outside the stickers drops (the C++ error band).
+        let stray = telegram_api::wallet_Card {
+            flags: 3,
+            stickers: vec![wire_sticker(40.0, STICKER_ADDRESS_B)],
+            bg_nft_item: Some(wire_nft(STICKER_ADDRESS_A)),
+            address: "EQD123".to_owned(),
+            balance: 42,
+        };
+        let card = TonWalletCard::get_ton_wallet_card(stray, &mut no_gift).unwrap();
+        let object = card.get_ton_wallet_card_object();
+        assert_eq!(object.background_nft_address, "");
+
+        // The value-form diff: the same card compares equal (the
+        // user-full update's band), a different one does not.
+        let twin = card.clone();
+        assert_eq!(card, twin);
+        let other = {
+            let wire = telegram_api::wallet_Card {
+                flags: 3,
+                stickers: vec![wire_sticker(40.0, STICKER_ADDRESS_A)],
+                bg_nft_item: None,
+                address: "EQD123".to_owned(),
+                balance: 42,
+            };
+            TonWalletCard::get_ton_wallet_card(wire, &mut no_gift).unwrap()
+        };
+        assert_ne!(card, other);
+    }
+
+    /// `full_split` keeps the empty parts and answers the empty vector
+    /// on the empty input (misc.h:36-53).
+    #[test]
+    fn full_split_matches_the_cpp_form() {
+        assert!(full_split("", '\u{FF}').is_empty());
+        assert_eq!(full_split("a\u{FF}\u{FF}b", '\u{FF}'), ["a", "", "b"]);
+        assert_eq!(full_split("solo", '\u{FF}'), ["solo"]);
+        assert_eq!(full_split("\u{FF}", '\u{FF}'), ["", ""]);
     }
 }

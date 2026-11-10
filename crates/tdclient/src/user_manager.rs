@@ -1286,6 +1286,15 @@ pub struct UserFull {
     /// chosen main profile tab ([`crate::chat_manager::ProfileTab`]).
     pub main_profile_tab: crate::chat_manager::ProfileTab,
 
+    /// `UserFull::ton_wallet_card` (UserManager.h:773) — the parsed
+    /// TON wallet card in its value form (the C++ holds the
+    /// `TonWalletCard` class and re-emits on demand; the parked media
+    /// legs and the value-plane conversion make the emitted form the
+    /// faithful carrier). Session-only: the store keeps the C++
+    /// `has_ton_wallet_card` flag down (the card bytes ride the
+    /// Files/Gift store planes, UserManager.cpp:2415).
+    pub ton_wallet_card: Option<crate::ton_wallet::TonWalletCard>,
+
     /// `UserFull::first_saved_music_file_id` (UserManager.h:787) — the
     /// id is a placeholder until the Files step and the store keeps the
     /// flag forced off (the C++ persists it through
@@ -1343,6 +1352,7 @@ impl Default for UserFull {
             send_paid_message_stars: 0,
             gift_settings: crate::star_gift_settings::StarGiftSettings::default(),
             main_profile_tab: crate::chat_manager::ProfileTab::default(),
+            ton_wallet_card: None,
             first_saved_music_file_id: FileId::default(),
             is_first_saved_music_file_id_changed: false,
             is_blocked: false,
@@ -1618,10 +1628,15 @@ impl UserFull {
             has_manager_bot_user_id,
             unofficial_security_risk,
             has_linked_community_id,
+            // 1.8.70 (UserManager.cpp PARSE_FLAG order): the TON wallet
+            // card; a stored card carries the Files/Gift store-plane
+            // bytes the port cannot parse yet, so the flag rejects the
+            // record instead of desyncing the tail.
+            has_ton_wallet_card,
         ] = if has_flags2 {
             parser.parse_flags()?
         } else {
-            [false; 26]
+            [false; 27]
         };
         if has_privacy_policy_url
             || has_placeholder_path
@@ -1637,8 +1652,9 @@ impl UserFull {
             || has_first_saved_music_file_id
             || has_note
             || has_manager_bot_user_id
+            || has_ton_wallet_card
         {
-            return Err("UserFull bot/gift/note fields need their subsystems");
+            return Err("UserFull bot/gift/note/card fields need their subsystems");
         }
 
         let mut result = UserFull::new();
@@ -6066,6 +6082,15 @@ impl UserManager {
                 drop_user_saved_music_map(&mut self.user_saved_music, user_id, false);
             }
         }
+        // `on_update_user_full_ton_wallet_card` (cpp:9049-9050) — the
+        // card intake over the [blocked: user-intake env seam] gift park
+        // (`get_ton_wallet_card_for_user_full`).
+        let ton_wallet_card =
+            crate::ton_wallet::get_ton_wallet_card_for_user_full(user_full.wallet_card.take());
+        Self::on_update_user_full_ton_wallet_card(
+            self.users_full.get_mut(&user_id.get()).unwrap(),
+            ton_wallet_card,
+        );
         // on_get_peer_settings (cpp:9330-9331) — with MessagesManager
         self.users_full
             .get_mut(&user_id.get())
@@ -6958,10 +6983,14 @@ impl UserManager {
                 text: String::new(),
                 entities: Vec::new(),
             }),
-            // The TON wallet card / profile share theme plane (userFull
-            // wallet_card / share_theme, UserManager.cpp:9049-9052)
+            // The TON wallet card (userFull wallet_card,
+            // UserManager.cpp:9049-9050, the #123 slice) emits from the
+            // stored value form; the profile share theme plane (cpp:9051)
             // rides the profile-themes family follow-up.
-            ton_wallet_card: None,
+            ton_wallet_card: user_full
+                .ton_wallet_card
+                .as_ref()
+                .map(crate::ton_wallet::TonWalletCard::get_ton_wallet_card_object),
             share_theme: None,
             business_info: Some(td_api::BusinessInfo::default()),
             bot_info: Some(td_api::BotInfo::default()),
@@ -12281,6 +12310,37 @@ impl UserManager {
         }
     }
 
+    /// `UserManager::on_update_user_full_ton_wallet_card`
+    /// (UserManager.cpp:4728-4735) — the card diff.
+    fn on_update_user_full_ton_wallet_card(
+        user_full: &mut UserFull,
+        ton_wallet_card: Option<crate::ton_wallet::TonWalletCard>,
+    ) {
+        if user_full.ton_wallet_card != ton_wallet_card {
+            user_full.ton_wallet_card = ton_wallet_card;
+            user_full.is_changed = true;
+        }
+    }
+
+    /// `UserManager::on_update_my_ton_wallet_card`
+    /// (UserManager.cpp:4745-4753) — the wallet.setCardStickers
+    /// answer's self-full update.
+    pub fn on_update_my_ton_wallet_card(
+        &mut self,
+        env: &mut UserEnv,
+        ton_wallet_card: Option<crate::ton_wallet::TonWalletCard>,
+    ) {
+        let my_id = self.my_id;
+        if !self.get_user_full_force(env, my_id, "on_update_my_ton_wallet_card") {
+            return;
+        }
+        let Some(user_full) = self.users_full.get_mut(&my_id.get()) else {
+            return;
+        };
+        Self::on_update_user_full_ton_wallet_card(user_full, ton_wallet_card);
+        self.update_user_full(env, my_id, "on_update_my_ton_wallet_card", false);
+    }
+
     /// `UserManager::reload_my_saved_music_list`
     /// (UserManager.cpp:7683-7699): the promise queue is local; the
     /// first queued caller sends `account.getSavedMusicIds` over the
@@ -15980,10 +16040,30 @@ mod tests {
         user_full.send_paid_message_stars = 15;
         user_full.linked_community_id = CommunityId::new(8);
         user_full.expires_at = ctx.now + 100.0;
-
+        // The #123 card: the store keeps the C++ `has_ton_wallet_card`
+        // flag down (UserManager.cpp:2415 rides the Files/Gift store
+        // planes), so the card-carrying full stores byte-identically to
+        // the card-less one and the card stays session-only.
+        user_full.ton_wallet_card =
+            crate::ton_wallet::get_ton_wallet_card_for_user_full(Some(telegram_api::wallet_Card {
+                flags: 1,
+                stickers: Vec::new(),
+                bg_nft_item: None,
+                address: "0:8002f3ab9be0ac5d76e6e0a73e33c33e0e6f9edf1cbc3a71d24a0af1d6c1d70b"
+                    .to_owned(),
+                balance: 42,
+            }));
         let mut bytes = Vec::new();
         user_full.store_value(&mut bytes, &ctx);
+        user_full.ton_wallet_card = None;
+        let mut card_less_bytes = Vec::new();
+        user_full.store_value(&mut card_less_bytes, &ctx);
+        assert_eq!(bytes, card_less_bytes, "the card store stays flag-down");
         let parsed = UserFull::parse_value(&bytes, &ctx).unwrap();
+        assert!(
+            parsed.ton_wallet_card.is_none(),
+            "the card stays session-only"
+        );
         assert_eq!(parsed.about, "bio text");
         assert_eq!(parsed.common_chat_count, 3);
         assert_eq!(parsed.birthdate.get_year(), 1990);
@@ -15998,6 +16078,56 @@ mod tests {
         assert!(parsed.is_changed);
         assert!(parsed.need_send_update);
         assert!(parsed.need_save_to_database);
+    }
+
+    /// The #123 card diff (UserManager.cpp:4728-4735) and the emission
+    /// (cpp:10496): the first card flips `is_changed`, the identical one
+    /// keeps quiet, the null card flips back, and the userFullInfo
+    /// object carries the card.
+    #[test]
+    fn user_full_ton_wallet_card_diff_and_emission() {
+        let (mut temp, mut um) = test_env();
+        let env = temp.env(false);
+        let my_id = um.my_id;
+        let wire_card = || telegram_api::wallet_Card {
+            flags: 0,
+            stickers: Vec::new(),
+            bg_nft_item: None,
+            address: "EQD123".to_owned(),
+            balance: 42,
+        };
+        let card = crate::ton_wallet::get_ton_wallet_card_for_user_full(Some(wire_card()));
+        let card = card.expect("the well-formed wire card parses");
+
+        um.users_full.insert(my_id.get(), UserFull::new());
+
+        UserManager::on_update_user_full_ton_wallet_card(
+            um.users_full.get_mut(&my_id.get()).unwrap(),
+            Some(card.clone()),
+        );
+        assert!(um.users_full.get(&my_id.get()).unwrap().is_changed);
+        um.users_full.get_mut(&my_id.get()).unwrap().is_changed = false;
+        UserManager::on_update_user_full_ton_wallet_card(
+            um.users_full.get_mut(&my_id.get()).unwrap(),
+            Some(card.clone()),
+        );
+        assert!(
+            !um.users_full.get(&my_id.get()).unwrap().is_changed,
+            "the identical card keeps the diff quiet"
+        );
+
+        let full_info = um.get_user_full_info_object_of(&env, my_id);
+        let emitted = full_info.ton_wallet_card.expect("the card emits");
+        assert_eq!(emitted.address, "EQD123");
+        assert_eq!(emitted.gram_amount, 42);
+
+        UserManager::on_update_user_full_ton_wallet_card(
+            um.users_full.get_mut(&my_id.get()).unwrap(),
+            None,
+        );
+        assert!(um.users_full.get(&my_id.get()).unwrap().is_changed);
+        let full_info = um.get_user_full_info_object_of(&env, my_id);
+        assert!(full_info.ton_wallet_card.is_none());
     }
 
     #[test]

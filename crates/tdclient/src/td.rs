@@ -3077,6 +3077,8 @@ enum TonWalletNetKind {
     GetCurrencyRates,
     /// `TonWalletManager::GetTonNftsQuery` (cpp:628).
     GetTonNfts,
+    /// `TonWalletManager::SetWalletCardStickersQuery` (cpp:438).
+    SetCardStickers,
     /// `GetTonConnectSessionsQuery` (cpp:657).
     TonConnectGetSessions,
     /// `CreateTonConnectSessionQuery` (cpp:681).
@@ -4466,6 +4468,27 @@ fn upgraded_star_gift_object(
     gift: &crate::star_gift_manager::StarGift,
 ) -> td_api::UpgradedGift {
     td.with_star_gift_manager(|env, _| gift.get_upgraded_gift_object(env))
+}
+
+/// `TonNft(Td *, item)`'s gift leg (TonNft.cpp:69-76) — the
+/// `StarGift(td, gift, true)` parse over the `is_valid`/`is_unique`
+/// gate ("Receive invalid gift for NFT"); the emitted upgradedGift is
+/// the value-plane form the NFT carriers hold. The absent wire gift is
+/// the C++ null `gift_` (the null object emission).
+fn ton_nft_gift_object(
+    td: &mut Td,
+    wire_gift: Option<telegram_api::StarGift>,
+    nft_address: &str,
+) -> Option<td_api::UpgradedGift> {
+    let wire_gift = wire_gift?;
+    let gift = td.with_star_gift_manager(|env, _| {
+        crate::star_gift_manager::StarGift::from_telegram(env, wire_gift, true)
+    });
+    if !gift.is_valid() || !gift.is_unique() {
+        tdutils::log_error!("Receive invalid gift for NFT {nft_address}");
+        return None;
+    }
+    Some(upgraded_star_gift_object(td, &gift))
 }
 
 /// `StarManager::get_star_transaction_file_source_id`
@@ -11071,15 +11094,71 @@ impl Td {
                         promise.set_error(query.error().clone());
                     } else {
                         match telegram_api::wallet_NftItems::parse(query.ok()) {
-                            Ok(items) => promise.set_value(td_api::TonNfts {
-                                nfts: items
-                                    .items
-                                    .iter()
-                                    .map(crate::ton_wallet::get_ton_nft_object)
-                                    .collect(),
-                                next_offset: items.next_offset,
-                            }),
+                            Ok(items) => {
+                                // `GetTonNftsQuery::on_result` (cpp:669-671) —
+                                // the full TonNft class, the gift leg included.
+                                let mut nfts = Vec::with_capacity(items.items.len());
+                                for item in &items.items {
+                                    let gift =
+                                        ton_nft_gift_object(self, item.gift.clone(), &item.address);
+                                    nfts.push(crate::ton_wallet::get_ton_nft_object(item, gift));
+                                }
+                                promise.set_value(td_api::TonNfts {
+                                    nfts,
+                                    next_offset: items.next_offset,
+                                })
+                            }
                             Err(_) => promise.set_error(parse_error("wallet_getNfts")),
+                        }
+                    }
+                }
+            }
+            // `SetWalletCardStickersQuery::on_result` (cpp:455-470): the
+            // wire card converts through the value plane, feeds the
+            // my-user-full update, then the promise.
+            TonWalletNetKind::SetCardStickers => {
+                if let Some(mut promise) = self
+                    .ton_wallet_manager
+                    .take_promise(|m| &mut m.pending_card_stickers)
+                {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::wallet_Card::parse(query.ok()) {
+                            Ok(card) => {
+                                let mut gift_of = |nft: &telegram_api::wallet_NftItem| {
+                                    ton_nft_gift_object(self, nft.gift.clone(), &nft.address)
+                                };
+                                let converted =
+                                    crate::ton_wallet::TonWalletCard::get_ton_wallet_card(
+                                        card,
+                                        &mut gift_of,
+                                    );
+                                let Some(card) = converted else {
+                                    promise.set_error(Status::error(
+                                        500,
+                                        "Receive invalid TON wallet card",
+                                    ));
+                                    return;
+                                };
+                                let card_object = card.get_ton_wallet_card_object();
+                                // `on_update_my_ton_wallet_card` (cpp:465) —
+                                // the UserEnv rides the request-plane shape;
+                                // the options gate is the answer-arm
+                                // close-state convention (the
+                                // on_user_net_answer head).
+                                if let Some(options) = self.option_manager.as_mut() {
+                                    let mut env = crate::user_manager::UserEnv {
+                                        global: &mut self.global,
+                                        options,
+                                        auth_is_bot: self.auth_manager.is_bot(),
+                                    };
+                                    self.user_manager
+                                        .on_update_my_ton_wallet_card(&mut env, Some(card));
+                                }
+                                promise.set_value(card_object);
+                            }
+                            Err(_) => promise.set_error(parse_error("wallet_setCardStickers")),
                         }
                     }
                 }
@@ -41174,12 +41253,26 @@ impl crate::ton_wallet::TonWalletUpdateEnv for TonWalletEnv<'_> {
             .map_or(0, |options| options.get_option_integer(name, 0))
     }
 
+    fn get_option_string(&self, name: &str) -> String {
+        self.td
+            .option_manager
+            .as_ref()
+            .map_or_else(String::new, |options| options.get_option_string(name, ""))
+    }
+
     fn send_update(&mut self, update: td_api::Update) {
         self.td.send_update(td_api::Object::from(update));
     }
 }
 
 impl crate::ton_wallet::TonWalletManagerEnv for TonWalletEnv<'_> {
+    fn ton_nft_gift_object(
+        &mut self,
+        wire_gift: Option<telegram_api::StarGift>,
+        nft_address: &str,
+    ) -> Option<td_api::UpgradedGift> {
+        ton_nft_gift_object(self.td, wire_gift, nft_address)
+    }
     fn close_status(&self) -> tdutils::status::Status {
         if self.td.close_flag != 0 {
             tdutils::status::Status::error(500, "Request aborted")
@@ -41582,6 +41675,27 @@ impl crate::ton_wallet::TonWalletManagerEnv for TonWalletEnv<'_> {
                 }),
             ),
             None => tdutils::log_info!("Send wallet_getNfts — [net-inert]"),
+        }
+    }
+
+    /// `SetWalletCardStickersQuery::send` (cpp:449-453).
+    fn send_wallet_set_card_stickers_query(
+        &mut self,
+        stickers: Vec<telegram_api::InputWalletCardSticker>,
+        background_nft_address: &str,
+    ) {
+        match self.td.ton_wallet_net() {
+            Some(net) => net.dispatch(
+                TonWalletNetKind::SetCardStickers,
+                telegram_api::Function::wallet_setCardStickers(
+                    telegram_api::wallet_setCardStickers {
+                        flags: 0,
+                        stickers,
+                        bg_nft_address: background_nft_address.to_owned(),
+                    },
+                ),
+            ),
+            None => tdutils::log_info!("Send wallet_setCardStickers — [net-inert]"),
         }
     }
 
