@@ -23897,40 +23897,45 @@ impl Td {
                             "SetShareThemeQuery",
                         );
                     }
-                    let promise = manager.pop_pending_set_share_theme();
-                    let Some(mut promise) = promise else {
-                        return;
-                    };
-                    let Some(options) = options else {
-                        promise.set_error(parse_error());
-                        return;
-                    };
-                    let mut user_env = crate::user_manager::UserEnv {
-                        global,
-                        options,
-                        auth_is_bot,
-                    };
-                    match result {
-                        Ok(_) if dialog_id == my_dialog_id => {
-                            let my_id = user_manager.get_my_id();
-                            user_manager.reload_user_full(
-                                &mut user_env,
-                                my_id,
-                                promise,
-                                "SetShareThemeQuery",
-                            );
+                    // no early returns here — the taken manager must
+                    // always reach the restore at the fn tail (the
+                    // defensive no-promise / no-options bands fall
+                    // through with the promise error-set)
+                    if let Some(mut promise) = manager.pop_pending_set_share_theme() {
+                        if let Some(options) = options {
+                            let mut user_env = crate::user_manager::UserEnv {
+                                global,
+                                options,
+                                auth_is_bot,
+                            };
+                            match result {
+                                Ok(_) if dialog_id == my_dialog_id => {
+                                    let my_id = user_manager.get_my_id();
+                                    user_manager.reload_user_full(
+                                        &mut user_env,
+                                        my_id,
+                                        promise,
+                                        "SetShareThemeQuery",
+                                    );
+                                }
+                                Ok(_)
+                                    if dialog_id.get_type()
+                                        == crate::dialog_id::DialogType::Channel =>
+                                {
+                                    let channel_id = dialog_id.get_channel_id();
+                                    chat_manager.reload_channel_full(
+                                        &mut user_env,
+                                        channel_id,
+                                        promise,
+                                        "SetShareThemeQuery",
+                                    );
+                                }
+                                Ok(_) => promise.set_value(()),
+                                Err(status) => promise.set_error(status),
+                            }
+                        } else {
+                            promise.set_error(parse_error());
                         }
-                        Ok(_) if dialog_id.get_type() == crate::dialog_id::DialogType::Channel => {
-                            let channel_id = dialog_id.get_channel_id();
-                            chat_manager.reload_channel_full(
-                                &mut user_env,
-                                channel_id,
-                                promise,
-                                "SetShareThemeQuery",
-                            );
-                        }
-                        Ok(_) => promise.set_value(()),
-                        Err(status) => promise.set_error(status),
                     }
                 }
             }
