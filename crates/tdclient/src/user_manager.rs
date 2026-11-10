@@ -1295,6 +1295,12 @@ pub struct UserFull {
     /// Files/Gift store planes, UserManager.cpp:2415).
     pub ton_wallet_card: Option<crate::ton_wallet::TonWalletCard>,
 
+    /// `UserFull::share_theme` (UserManager.h:775) — the profile share
+    /// theme (the #124 profile-themes family,
+    /// [`crate::profile_share_theme::ProfileShareTheme`]); `None` is
+    /// the C++ nullptr (the default theme).
+    pub share_theme: Option<crate::profile_share_theme::ProfileShareTheme>,
+
     /// `UserFull::first_saved_music_file_id` (UserManager.h:787) — the
     /// id is a placeholder until the Files step and the store keeps the
     /// flag forced off (the C++ persists it through
@@ -1353,6 +1359,7 @@ impl Default for UserFull {
             gift_settings: crate::star_gift_settings::StarGiftSettings::default(),
             main_profile_tab: crate::chat_manager::ProfileTab::default(),
             ton_wallet_card: None,
+            share_theme: None,
             first_saved_music_file_id: FileId::default(),
             is_first_saved_music_file_id_changed: false,
             is_blocked: false,
@@ -1434,6 +1441,11 @@ impl UserFull {
         let has_note = false; // FormattedText subsystem
         let has_manager_bot_user_id = false;
         let has_linked_community_id = self.linked_community_id.is_valid();
+        // `has_ton_wallet_card` (UserManager.cpp:2240, the 1.8.70 bit
+        // 26): the #123 card is session-only — the store keeps the C++
+        // bit down (the card bytes ride the Files/Gift store planes).
+        let has_ton_wallet_card = false;
+        let has_share_theme = self.share_theme.is_some();
         store_flags(
             out,
             [
@@ -1499,6 +1511,8 @@ impl UserFull {
                     has_manager_bot_user_id,
                     self.unofficial_security_risk,
                     has_linked_community_id,
+                    has_ton_wallet_card,
+                    has_share_theme,
                 ],
             );
         }
@@ -1533,6 +1547,13 @@ impl UserFull {
         }
         if has_linked_community_id {
             store_i64(out, self.linked_community_id.get());
+        }
+        if has_share_theme {
+            // the C++ store(share_theme, storer) (UserManager.cpp:2417-2419)
+            self.share_theme
+                .as_ref()
+                .expect("has_share_theme carries the theme")
+                .store(out);
         }
     }
 
@@ -1633,10 +1654,12 @@ impl UserFull {
             // bytes the port cannot parse yet, so the flag rejects the
             // record instead of desyncing the tail.
             has_ton_wallet_card,
+            // the 1.8.70 addition (UserManager.cpp:2527-2529)
+            has_share_theme,
         ] = if has_flags2 {
             parser.parse_flags()?
         } else {
-            [false; 27]
+            [false; 28]
         };
         if has_privacy_policy_url
             || has_placeholder_path
@@ -1709,6 +1732,11 @@ impl UserFull {
         }
         if has_linked_community_id {
             result.linked_community_id = CommunityId::new(parser.i64_()?);
+        }
+        if has_share_theme {
+            result.share_theme = Some(crate::profile_share_theme::ProfileShareTheme::parse(
+                parser,
+            )?);
         }
         Ok(result)
     }
@@ -1892,6 +1920,11 @@ impl<'a> UserEnv<'a> {
         }
     }
 }
+
+/// The share-theme intake seam over the user-plane env — the default
+/// blocked body (the profile_share_theme module docs); flips real
+/// with the StarGift-in-user-env seam.
+impl crate::profile_share_theme::ShareThemeEnv for UserEnv<'_> {}
 
 /// The user-plane in-flight query kinds — the C++ ResultHandler classes
 /// of the landed families (the users core cpp:1432-1803, the emoji-status
@@ -5813,6 +5846,14 @@ impl UserManager {
         };
         let private_forward_name = std::mem::take(&mut user_full.private_forward_name);
         let linked_community_id = user_linked_community_id;
+        // `ProfileShareTheme::get_profile_share_theme(td_,
+        // std::move(user->share_theme_))` (cpp:9051-9052) — the gift
+        // variant answers None through the recorded seam
+        // ([blocked: the StarGift-in-user-env seam]).
+        let share_theme = crate::profile_share_theme::ProfileShareTheme::get_profile_share_theme(
+            env,
+            user_full.share_theme.take(),
+        );
         // `get_profile_tab(user->main_tab_, ChannelType::Unknown)`
         // (cpp:9059-9060) — the disallowed band logs and answers Default
         // (ProfileTab.cpp:47-50).
@@ -5948,6 +5989,14 @@ impl UserManager {
             // the main_tab apply of the cpp:9060-9082 block
             if stored.main_profile_tab != main_profile_tab {
                 stored.main_profile_tab = main_profile_tab;
+                stored.is_changed = true;
+            }
+            // on_update_user_full_share_theme (cpp:4737-4745) — the C++
+            // compares unique_ptr identities, so a freshly-parsed theme
+            // always differs and is_changed re-fires on every refresh
+            // while a theme exists (changed ⇔ either side non-null).
+            if stored.share_theme.is_some() || share_theme.is_some() {
+                stored.share_theme = share_theme;
                 stored.is_changed = true;
             }
             if stored.birthdate != birthdate {
@@ -6152,6 +6201,7 @@ impl UserManager {
             user_full.personal_channel_id = 0;
             // main_profile_tab — with the ProfileTab step
             user_full.linked_community_id = CommunityId::default();
+            user_full.share_theme = None;
             // business_info / bot_verification / star_rating /
             // pending_star_rating — with their subsystems
             user_full.private_forward_name = String::new();
@@ -6275,8 +6325,10 @@ impl UserManager {
         // Dependencies (cpp:9403-9413): the user itself is guaranteed by
         // the have_user_force gate; the linked-community /
         // personal-channel / bot-info / note loads arrive with
-        // ChatManager and the subsystems. The pending_star_rating
-        // promotion (cpp:9415-9418) — with StarRating.
+        // ChatManager and the subsystems; the share-theme gift
+        // dependencies (cpp:9415-9417) arrive with the StarGift seam.
+        // The pending_star_rating promotion (cpp:9415-9418) — with
+        // StarRating.
         if self
             .users_full
             .get(&user_id.get())
@@ -6985,13 +7037,18 @@ impl UserManager {
             }),
             // The TON wallet card (userFull wallet_card,
             // UserManager.cpp:9049-9050, the #123 slice) emits from the
-            // stored value form; the profile share theme plane (cpp:9051)
-            // rides the profile-themes family follow-up.
+            // stored value form.
             ton_wallet_card: user_full
                 .ton_wallet_card
                 .as_ref()
                 .map(crate::ton_wallet::TonWalletCard::get_ton_wallet_card_object),
-            share_theme: None,
+            // `user_full->share_theme ==
+            // nullptr ? nullptr : ...->get_profile_share_theme_object(td_)`
+            // (UserManager.cpp:10497); the gift emission is the recorded
+            // seam (the profile_share_theme module docs).
+            share_theme: user_full.share_theme.as_ref().and_then(
+                crate::profile_share_theme::ProfileShareTheme::get_profile_share_theme_object,
+            ),
             business_info: Some(td_api::BusinessInfo::default()),
             bot_info: Some(td_api::BotInfo::default()),
         }
@@ -20667,6 +20724,90 @@ mod tests {
         let mut bytes2 = Vec::new();
         parsed.store_value(&mut bytes2, &ctx);
         assert_eq!(bytes, bytes2, "the re-store is byte-identical");
+    }
+
+    #[test]
+    fn user_full_store_round_trips_the_share_theme() {
+        // the flags2 slot 27 (UserManager.cpp:2303/2529 — bit 26 is the
+        // parked ton-wallet band) + the ProfileShareTheme body
+        // (cpp:2417-2419/2646-2649)
+        let ctx = TimeCtx {
+            now: 1.0,
+            server_time: 0.0,
+        };
+        let mut user_full = UserFull::new();
+        let mut bytes = Vec::new();
+        user_full.store_value(&mut bytes, &ctx);
+        let parsed = UserFull::parse_value(&bytes, &ctx).unwrap();
+        assert!(parsed.share_theme.is_none());
+
+        user_full.share_theme = Some(crate::profile_share_theme::ProfileShareTheme::default());
+        let mut bytes = Vec::new();
+        user_full.store_value(&mut bytes, &ctx);
+        let parsed = UserFull::parse_value(&bytes, &ctx).unwrap();
+        assert!(parsed.share_theme.is_some());
+        let mut bytes2 = Vec::new();
+        parsed.store_value(&mut bytes2, &ctx);
+        assert_eq!(bytes, bytes2, "the re-store is byte-identical");
+    }
+
+    #[test]
+    fn on_get_user_full_applies_the_wire_share_theme() {
+        let (mut temp, mut um) = test_env();
+        let full_flags = USER_ACCESS_HASH_MASK | (1 << 1);
+        um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(telegram_user(5, "A", full_flags)),
+            "t",
+        );
+        um.take_updates();
+        um.on_get_user_full(
+            &mut temp.env(false),
+            telegram_api::UserFull {
+                id: 5,
+                share_theme: Some(telegram_api::ShareTheme::shareThemeEmojiBackdrop(
+                    telegram_api::shareThemeEmojiBackdrop {
+                        flags: 1,
+                        backdrop_id: 4,
+                        emojis: vec![telegram_api::Reaction::reactionEmoji(
+                            telegram_api::reactionEmoji {
+                                emoticon: "\u{1f600}".to_owned(),
+                            },
+                        )],
+                    },
+                )),
+                ..telegram_api::UserFull::default()
+            },
+        );
+        let stored = um.users_full.get(&5).expect("the full record");
+        let theme = stored.share_theme.as_ref().expect("the theme");
+        let object = theme
+            .get_profile_share_theme_object()
+            .expect("the emoji theme");
+        let td_api::ProfileShareTheme::profileShareThemeEmoji(emoji) = &object else {
+            panic!("expected the emoji variant");
+        };
+        assert!(!emoji.use_default_background);
+        assert_eq!(emoji.background_backdrop_id, 4);
+        assert_eq!(emoji.emojis.len(), 1);
+
+        // a follow-up Default wire theme maps to the null unique_ptr
+        // (ProfileShareTheme.cpp:94-96), which differs from the stored
+        // non-null one and replaces it (cpp:4739-4742)
+        um.on_get_user_full(
+            &mut temp.env(false),
+            telegram_api::UserFull {
+                id: 5,
+                share_theme: Some(telegram_api::ShareTheme::shareThemeDefault(
+                    telegram_api::shareThemeDefault,
+                )),
+                ..telegram_api::UserFull::default()
+            },
+        );
+        assert!(
+            um.users_full.get(&5).unwrap().share_theme.is_none(),
+            "the Default wire theme clears the stored one"
+        );
     }
 
     #[test]

@@ -2601,7 +2601,7 @@ impl CliClient {
         let mut op_not_found_count = 0;
 
         // The 19 blocks, in cli.cpp order; the census fixture
-        // (`testdata/cli_census.txt`, 1299 arms) pins the per-block command
+        // (`testdata/cli_census.txt`, 1382 arms) pins the per-block command
         // inventory, and the slices fill them in: M.14.3 auth, M.14.4
         // messages/dialogs, M.14.5 files, M.14.6 misc/dev.
         if !self.op_block_auth(&op, &args) {
@@ -6763,6 +6763,73 @@ impl CliClient {
                 td_api::deleteChatBackground {
                     chat_id: self.as_chat_id(args),
                     restore_previous: op == "dcbr",
+                },
+            ));
+            true
+        } else if op == "gpstb" {
+            self.send_request(Function::getProfileShareThemeBackdrops(
+                td_api::getProfileShareThemeBackdrops,
+            ));
+            true
+        } else if op == "spstd" {
+            self.send_request(Function::setProfileShareTheme(
+                td_api::setProfileShareTheme {
+                    chat_id: self.as_chat_id(args),
+                    theme: None,
+                },
+            ));
+            true
+        } else if op == "spste" || op == "spstb" {
+            let parts = autosplit(args);
+            let chat_id = self.as_chat_id(parts.first().map(String::as_str).unwrap_or_default());
+            let backdrop_id = if op == "spstb" {
+                tokenizer::to_integer_i32(parts.get(1).map(String::as_str).unwrap_or_default())
+            } else {
+                0
+            };
+            let emojis_arg = if op == "spstb" {
+                parts.get(2).cloned().unwrap_or_default()
+            } else {
+                parts.get(1).cloned().unwrap_or_default()
+            };
+            let emoji_types = autosplit(&emojis_arg)
+                .iter()
+                .map(|emoji| {
+                    if let Ok(custom_emoji_id) = emoji.parse::<i64>() {
+                        td_api::EmojiType::emojiTypeCustomEmoji(td_api::emojiTypeCustomEmoji {
+                            custom_emoji_id,
+                        })
+                    } else {
+                        td_api::EmojiType::emojiTypeRegular(td_api::emojiTypeRegular {
+                            emoji: emoji.clone(),
+                        })
+                    }
+                })
+                .collect();
+            self.send_request(Function::setProfileShareTheme(
+                td_api::setProfileShareTheme {
+                    chat_id,
+                    theme: Some(td_api::InputProfileShareTheme::inputProfileShareThemeEmoji(
+                        td_api::inputProfileShareThemeEmoji {
+                            emojis: emoji_types,
+                            use_default_background: op == "spste",
+                            background_backdrop_id: backdrop_id,
+                        },
+                    )),
+                },
+            ));
+            true
+        } else if op == "spstg" {
+            let parts = autosplit(args);
+            let received_gift_id = parts.get(1).cloned().unwrap_or_default();
+            self.send_request(Function::setProfileShareTheme(
+                td_api::setProfileShareTheme {
+                    chat_id: self.as_chat_id(parts.first().map(String::as_str).unwrap_or_default()),
+                    theme: Some(
+                        td_api::InputProfileShareTheme::inputProfileShareThemeUpgradedGift(
+                            td_api::inputProfileShareThemeUpgradedGift { received_gift_id },
+                        ),
+                    ),
                 },
             ));
             true
@@ -15897,7 +15964,7 @@ mod tests {
         drop(guard);
     }
 
-    /// The M.14.2 census gate: the fixture pins all 1299 command arms of the
+    /// The M.14.2 census gate: the fixture pins all 1382 command arms of the
     /// C++ `on_cmd` (regenerate with
     /// `conformance/cli_gate/extract_cli_census.sh`); every arm whose slice
     /// has landed must be routed by the dispatcher, every not-yet-ported arm
@@ -15908,7 +15975,7 @@ mod tests {
         const CENSUS: &str = include_str!("../testdata/cli_census.txt");
         assert_eq!(
             CENSUS.lines().count(),
-            1299,
+            1382,
             "the C++ tree changed — regenerate the census with \
              conformance/cli_gate/extract_cli_census.sh"
         );
@@ -16015,6 +16082,10 @@ mod tests {
             ("gugvu", 1),
             ("gugwu", 1),
             ("gul", 1),
+            ("gulf", 1),
+            ("gulfp", 1),
+            ("gulfr", 1),
+            ("gulfpr", 1),
             ("ic", 1),
             ("igab", 1),
             ("oga", 1),
@@ -16598,6 +16669,11 @@ mod tests {
             ("gatss", 4),
             ("gbf", 4),
             ("gbms", 4),
+            ("gpstb", 4),
+            ("spstb", 4),
+            ("spstd", 4),
+            ("spste", 4),
+            ("spstg", 4),
             ("gcapr", 4),
             ("gcaprs", 4),
             ("gcipn", 4),
@@ -17043,6 +17119,9 @@ mod tests {
             ("rbmp", 17),
             ("dbmp", 17),
             ("cbun", 17),
+            ("cbun2", 17),
+            ("absun", 17),
+            ("dbsun", 17),
             ("cb", 17),
             ("cbl", 17),
             ("gbi", 17),
