@@ -466,6 +466,18 @@ pub struct CommunityManager {
     /// community (`setCommunityNotificationSettings`; the C++ promise
     /// rides its own query — the answer kind's community_id pairs it
     /// exactly, unlike the single-community FIFO lots above).
+    ///
+    /// Lot-pairing divergence for the keyed lots that pop first-match
+    /// (this lot and the mutator lots below — `pending_toggle_peer_link`,
+    /// `pending_ban_toggles`, `pending_member_chats`,
+    /// `pending_peer_link_requests`, `pending_process_request`,
+    /// `pending_process_all_requests`): the C++ parks each mutator's
+    /// promise in its own query handler (per-query pairing), while the
+    /// port's keyed lots pop first-match per community, so two
+    /// concurrent same-community requests can swap error outcomes
+    /// between their promises (the ok-paths are indistinguishable) — a
+    /// recorded divergence, consistent with the QueryCombiner
+    /// approximation note at `pending_change_dialogs`.
     pub pending_set_notification_settings: Vec<(i64, Promise<()>)>,
     /// The `on_change_community_dialogs` promises keyed by community —
     /// the change-settle parks them while the community full reloads; the
@@ -526,6 +538,11 @@ pub struct CommunityManager {
     pub pending_joined_communities: Vec<Promise<td_api::Communities>>,
 }
 
+/// A keyed-lot slot — the `CommunityManager` field accessor the
+/// first-match pop routes through (an alias because the inline HRTB
+/// fn-pointer spelling trips `clippy::type_complexity`).
+type KeyedLotSlot<T> = for<'a> fn(&'a mut CommunityManager) -> &'a mut Vec<(i64, Promise<T>)>;
+
 impl CommunityManager {
     /// Pop the head promise of a family lot — the answer-routing half of
     /// a query family (the C++ handler's own promise).
@@ -539,6 +556,22 @@ impl CommunityManager {
         } else {
             Some(lot.remove(0))
         }
+    }
+
+    /// Pop the first promise parked under the community in a keyed lot
+    /// — the answer-routing half of a keyed query family (the C++
+    /// handler parks the promise in its own query; the port's
+    /// first-match pop pairs FIFO within the key — the lot-pairing
+    /// divergence is recorded at the keyed-lot declarations).
+    pub(crate) fn take_keyed_promise<T: std::marker::Send>(
+        &mut self,
+        community_id: CommunityId,
+        slot: KeyedLotSlot<T>,
+    ) -> Option<Promise<T>> {
+        let lot = slot(self);
+        lot.iter()
+            .position(|(id, _)| *id == community_id.get())
+            .map(|index| lot.remove(index).1)
     }
 
     pub fn new() -> CommunityManager {

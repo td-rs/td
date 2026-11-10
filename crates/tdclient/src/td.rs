@@ -26171,18 +26171,12 @@ impl Td {
             // and the promise settle (the promise pairs by community, as
             // the C++ query carries its own).
             CommunityNetKind::UpdateNotifySettings { community_id } => {
-                let promise = self
-                    .community_manager
-                    .pending_set_notification_settings
-                    .iter()
-                    .position(|(id, _)| *id == community_id.get())
-                    .map(|index| {
-                        self.community_manager
-                            .pending_set_notification_settings
-                            .remove(index)
-                            .1
-                    });
-                let Some(mut promise) = promise else {
+                let Some(mut promise) = self.community_manager.take_keyed_promise(
+                    community_id,
+                    |m: &mut crate::community_manager::CommunityManager| {
+                        &mut m.pending_set_notification_settings
+                    },
+                ) else {
                     return;
                 };
                 if query.is_error() {
@@ -26213,13 +26207,10 @@ impl Td {
             // change-settle (`on_change_community_dialogs`) with the
             // query's own community. The error arm fails the request.
             CommunityNetKind::ToggleParticipantBanned { community_id } => {
-                let promise = self
-                    .community_manager
-                    .pending_ban_toggles
-                    .iter()
-                    .position(|(id, _)| *id == community_id.get())
-                    .map(|index| self.community_manager.pending_ban_toggles.remove(index).1);
-                let Some(mut promise) = promise else {
+                let Some(mut promise) = self.community_manager.take_keyed_promise(
+                    community_id,
+                    |m: &mut crate::community_manager::CommunityManager| &mut m.pending_ban_toggles,
+                ) else {
                     return;
                 };
                 if query.is_error() {
@@ -26241,13 +26232,12 @@ impl Td {
             // creation, and the chat-id objects; the owned (creator) and
             // joined vectors split into the communityMemberChats answer.
             CommunityNetKind::GetParticipantJoinedChats { community_id } => {
-                let promise = self
-                    .community_manager
-                    .pending_member_chats
-                    .iter()
-                    .position(|(id, _)| *id == community_id.get())
-                    .map(|index| self.community_manager.pending_member_chats.remove(index).1);
-                let Some(mut promise) = promise else {
+                let Some(mut promise) = self.community_manager.take_keyed_promise(
+                    community_id,
+                    |m: &mut crate::community_manager::CommunityManager| {
+                        &mut m.pending_member_chats
+                    },
+                ) else {
                     return;
                 };
                 if query.is_error() {
@@ -26299,18 +26289,12 @@ impl Td {
             // manager's intake (the users + chats intakes, the total
             // clamp, the invalid-entry drops, the hidden inversion).
             CommunityNetKind::GetPeerLinkRequests { community_id } => {
-                let promise = self
-                    .community_manager
-                    .pending_peer_link_requests
-                    .iter()
-                    .position(|(id, _)| *id == community_id.get())
-                    .map(|index| {
-                        self.community_manager
-                            .pending_peer_link_requests
-                            .remove(index)
-                            .1
-                    });
-                let Some(mut promise) = promise else {
+                let Some(mut promise) = self.community_manager.take_keyed_promise(
+                    community_id,
+                    |m: &mut crate::community_manager::CommunityManager| {
+                        &mut m.pending_peer_link_requests
+                    },
+                ) else {
                     return;
                 };
                 if query.is_error() {
@@ -26334,18 +26318,12 @@ impl Td {
                 community_id,
                 dialog_id,
             } => {
-                let promise = self
-                    .community_manager
-                    .pending_process_request
-                    .iter()
-                    .position(|(id, _)| *id == community_id.get())
-                    .map(|index| {
-                        self.community_manager
-                            .pending_process_request
-                            .remove(index)
-                            .1
-                    });
-                let Some(mut promise) = promise else {
+                let Some(mut promise) = self.community_manager.take_keyed_promise(
+                    community_id,
+                    |m: &mut crate::community_manager::CommunityManager| {
+                        &mut m.pending_process_request
+                    },
+                ) else {
                     return;
                 };
                 if query.is_error() {
@@ -26371,18 +26349,12 @@ impl Td {
             // cpp:477-505) — the `Bool` answer is ignored; the popped
             // promise settles through the change-settle.
             CommunityNetKind::ToggleAllPeerLinkRequestApproval { community_id } => {
-                let promise = self
-                    .community_manager
-                    .pending_process_all_requests
-                    .iter()
-                    .position(|(id, _)| *id == community_id.get())
-                    .map(|index| {
-                        self.community_manager
-                            .pending_process_all_requests
-                            .remove(index)
-                            .1
-                    });
-                let Some(mut promise) = promise else {
+                let Some(mut promise) = self.community_manager.take_keyed_promise(
+                    community_id,
+                    |m: &mut crate::community_manager::CommunityManager| {
+                        &mut m.pending_process_all_requests
+                    },
+                ) else {
                     return;
                 };
                 if query.is_error() {
@@ -26439,18 +26411,12 @@ impl Td {
                 community_id,
                 dialog_id,
             } => {
-                let promise = self
-                    .community_manager
-                    .pending_toggle_peer_link
-                    .iter()
-                    .position(|(id, _)| *id == community_id.get())
-                    .map(|index| {
-                        self.community_manager
-                            .pending_toggle_peer_link
-                            .remove(index)
-                            .1
-                    });
-                let Some(mut promise) = promise else {
+                let Some(mut promise) = self.community_manager.take_keyed_promise(
+                    community_id,
+                    |m: &mut crate::community_manager::CommunityManager| {
+                        &mut m.pending_toggle_peer_link
+                    },
+                ) else {
                     return;
                 };
                 if query.is_error() {
