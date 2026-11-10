@@ -220,6 +220,31 @@ pub(crate) struct TdSink {
     /// sink's batching boundary: the tuple parks here, the drain runs
     /// the ported machine (the gap detector of the M.10.19 design note).
     pub(crate) pending_channel_updates: Vec<ChannelDifferencePendingUpdate>,
+    /// The 1.8.70 widgets family intake — the three direct-routed bot
+    /// query updates (UpdatesManager.cpp:5233-5255) and the applied
+    /// `updateMessageWidgetData` pts arm (the in-place widget-data
+    /// apply); the drain runs the WidgetManager guards and the messages
+    /// walk.
+    pub(crate) widget_intakes: Vec<WidgetIntake>,
+}
+
+/// One parked widget intake — the drain's WidgetManager hop input.
+pub(crate) enum WidgetIntake {
+    /// `updateBotWidgetQuery` → `on_new_widget_query`.
+    Query(tdmtproto::telegram_api::updateBotWidgetQuery),
+    /// `updateInlineBotWidgetQuery` → `on_new_inline_widget_query`.
+    InlineQuery(tdmtproto::telegram_api::updateInlineBotWidgetQuery),
+    /// `updateBotWidgetCopyQuery` → `on_new_widget_copy_query`.
+    CopyQuery(tdmtproto::telegram_api::updateBotWidgetCopyQuery),
+    /// The applied `updateMessageWidgetData` pts arm →
+    /// `on_update_message_widget_data` (cpp:5822-5827's
+    /// `update_chat_data = true`).
+    DataEdit {
+        message_full_id: crate::messages_manager::MessageFullId,
+        public_data: String,
+        public_data_hash: i64,
+        chat_data: String,
+    },
 }
 
 /// One parked channel-pts update — the drain's
@@ -398,6 +423,27 @@ impl UpdatesSink for TdSink {
             .push(WalletIntake::TonConnectDisconnect(session_ids));
     }
 
+    fn on_update_bot_widget_query(
+        &mut self,
+        update: tdmtproto::telegram_api::updateBotWidgetQuery,
+    ) {
+        self.widget_intakes.push(WidgetIntake::Query(update));
+    }
+
+    fn on_update_inline_bot_widget_query(
+        &mut self,
+        update: tdmtproto::telegram_api::updateInlineBotWidgetQuery,
+    ) {
+        self.widget_intakes.push(WidgetIntake::InlineQuery(update));
+    }
+
+    fn on_update_bot_widget_copy_query(
+        &mut self,
+        update: tdmtproto::telegram_api::updateBotWidgetCopyQuery,
+    ) {
+        self.widget_intakes.push(WidgetIntake::CopyQuery(update));
+    }
+
     fn on_user(&mut self, user: tdmtproto::telegram_api::User) {
         self.users.push(user);
     }
@@ -522,6 +568,31 @@ impl UpdatesSink for TdSink {
             }
             // `updateReadMessagesContents` (read_message_content_from_updates,
             // MessagesManager.cpp:9325) rides the TTL content-read plane,
+            PendingUpdate::Wire(telegram_api::Update::updateMessageWidgetData(update)) => {
+                // `MessagesManager::process_update`'s Widget case
+                // (MessagesManager.cpp:5822-5827) — `update_chat_data =
+                // true` from the update; the peer is the pts machine's
+                // dialog gate.
+                match update.peer {
+                    Some(peer) => {
+                        let message_full_id = crate::messages_manager::MessageFullId::new(
+                            crate::messages_manager::DialogId::from_peer(&peer),
+                            crate::messages_manager::MessageId::from_server_message_id(
+                                crate::messages_manager::ServerMessageId::new(update.msg_id),
+                            ),
+                        );
+                        self.widget_intakes.push(WidgetIntake::DataEdit {
+                            message_full_id,
+                            public_data: update.public_data,
+                            public_data_hash: update.public_data_hash,
+                            chat_data: update.chat_data,
+                        });
+                    }
+                    None => {
+                        tdutils::log_error!("Receive updateMessageWidgetData without the peer");
+                    }
+                }
+            }
             // `updatePinnedMessages`/`updatePinnedChannelMessages` the
             // M.10.14 pinned tail, and `updateReadChannelInbox` the
             // `on_read_channel_inbox` pts/reconcile machine
@@ -25848,6 +25919,53 @@ impl Td {
         }
     }
 
+    /// The shared in-place widget-data apply behind
+    /// `updateMessageWidgetData` and the `widgetPublicData` answer —
+    /// `MessagesManager::on_update_message_widget_data`
+    /// (MessagesManager.cpp:5222-5251) with the Td-level
+    /// `updateMessageContent` emission.
+    pub(crate) fn apply_message_widget_data(
+        &mut self,
+        message_full_id: crate::messages_manager::MessageFullId,
+        public_data: String,
+        public_data_hash: i64,
+        chat_data: String,
+        update_chat_data: bool,
+    ) {
+        let td_ptr = std::ptr::from_mut(self);
+        // SAFETY: the raw-pointer split-borrow convention of the apply
+        // walks (manager / ctx alias one Td, used strictly sequentially;
+        // the emission runs after the walk borrows end).
+        let global: &crate::global::Global = unsafe { &(*td_ptr).global };
+        let manager: &mut crate::messages_manager::MessagesManager =
+            unsafe { &mut (*td_ptr).messages_manager };
+        let ctx: &dyn crate::messages_manager::MessageObjectContext = unsafe { &*td_ptr };
+        let time = crate::user_manager::TimeCtx::from_global(global);
+        let new_content = crate::messages_manager::on_update_message_widget_data(
+            global,
+            manager,
+            ctx,
+            &time,
+            message_full_id,
+            public_data,
+            public_data_hash,
+            chat_data,
+            update_chat_data,
+        );
+        // `send_update_message_content_impl` (MessagesManager.cpp:5271-5283)
+        // — the emission runs after the walk borrows end.
+        if let Some(new_content) = new_content {
+            let td: &mut Td = unsafe { &mut *td_ptr };
+            td.send_update(td_api::Object::updateMessageContent(
+                td_api::updateMessageContent {
+                    chat_id: message_full_id.get_dialog_id().get(),
+                    message_id: message_full_id.get_message_id().get(),
+                    new_content: Some(new_content),
+                },
+            ));
+        }
+    }
+
     /// Route one WidgetManager net answer by kind (the C++ query handler
     /// halves of WidgetManager.cpp:125-313). The `on_get_message_error`
     /// hop of the C++ `on_error` halves is the unported walking-lane
@@ -32606,6 +32724,94 @@ impl Td {
                                 session_ids,
                             },
                         ),
+                    );
+                }
+            }
+        }
+        // The 1.8.70 widgets family (UpdatesManager.cpp:5233-5255 +
+        // MessagesManager.cpp:5822-5827) — the WidgetManager guards run
+        // for the query intakes, the in-place apply for the data edits.
+        for intake in sink.widget_intakes {
+            match intake {
+                WidgetIntake::Query(update) => {
+                    let mut manager = std::mem::take(&mut self.widget_manager);
+                    {
+                        let mut env = WidgetEnv { td: self };
+                        manager.on_new_widget_query(
+                            &mut env,
+                            update.query_id,
+                            update.query_type,
+                            crate::user_manager::UserId::new(update.user_id),
+                            update
+                                .peer
+                                .as_ref()
+                                .map(crate::messages_manager::DialogId::from_peer)
+                                .unwrap_or_default(),
+                            crate::messages_manager::MessageId::from_server_message_id(
+                                crate::messages_manager::ServerMessageId::new(update.msg_id),
+                            ),
+                            update.data,
+                            update.chat_instance,
+                            update.chat_type,
+                            update.widget_id,
+                            update.wallet_card,
+                        );
+                    }
+                    self.widget_manager = manager;
+                }
+                WidgetIntake::InlineQuery(update) => {
+                    let Some(inline_message_id) = update.inline_message_id else {
+                        tdutils::log_error!(
+                            "Receive updateInlineBotWidgetQuery without the inline message id"
+                        );
+                        continue;
+                    };
+                    let mut manager = std::mem::take(&mut self.widget_manager);
+                    {
+                        let mut env = WidgetEnv { td: self };
+                        manager.on_new_inline_widget_query(
+                            &mut env,
+                            update.query_id,
+                            update.query_type,
+                            crate::user_manager::UserId::new(update.user_id),
+                            inline_message_id,
+                            update.data,
+                            update.chat_instance,
+                            update.chat_type,
+                            update.widget_id,
+                            update.wallet_card,
+                        );
+                    }
+                    self.widget_manager = manager;
+                }
+                WidgetIntake::CopyQuery(update) => {
+                    let mut manager = std::mem::take(&mut self.widget_manager);
+                    {
+                        let mut env = WidgetEnv { td: self };
+                        manager.on_new_widget_copy_query(
+                            &mut env,
+                            update.query_id,
+                            update.query_type,
+                            crate::user_manager::UserId::new(update.user_id),
+                            update.data,
+                            update.widget_id,
+                            update.wallet_card,
+                        );
+                    }
+                    self.widget_manager = manager;
+                }
+                WidgetIntake::DataEdit {
+                    message_full_id,
+                    public_data,
+                    public_data_hash,
+                    chat_data,
+                } => {
+                    self.apply_message_widget_data(
+                        message_full_id,
+                        public_data,
+                        public_data_hash,
+                        chat_data,
+                        true,
                     );
                 }
             }
@@ -41835,38 +42041,13 @@ impl crate::widget_manager::WidgetManagerEnv for WidgetEnv<'_> {
         chat_data: String,
         update_chat_data: bool,
     ) {
-        let td_ptr = std::ptr::from_mut(self.td);
-        // SAFETY: the raw-pointer split-borrow convention of the apply
-        // walks (manager / ctx alias one Td, used strictly sequentially;
-        // the emission runs after the walk borrows end).
-        let global: &crate::global::Global = unsafe { &(*td_ptr).global };
-        let manager: &mut crate::messages_manager::MessagesManager =
-            unsafe { &mut (*td_ptr).messages_manager };
-        let ctx: &dyn crate::messages_manager::MessageObjectContext = unsafe { &*td_ptr };
-        let time = crate::user_manager::TimeCtx::from_global(global);
-        let new_content = crate::messages_manager::on_update_message_widget_data(
-            global,
-            manager,
-            ctx,
-            &time,
+        self.td.apply_message_widget_data(
             message_full_id,
             public_data,
             public_data_hash,
             chat_data,
             update_chat_data,
         );
-        // `send_update_message_content_impl` (MessagesManager.cpp:5271-5283)
-        // — the emission runs after the walk borrows end.
-        if let Some(new_content) = new_content {
-            let td: &mut Td = unsafe { &mut *td_ptr };
-            td.send_update(td_api::Object::updateMessageContent(
-                td_api::updateMessageContent {
-                    chat_id: message_full_id.get_dialog_id().get(),
-                    message_id: message_full_id.get_message_id().get(),
-                    new_content: Some(new_content),
-                },
-            ));
-        }
     }
 
     fn get_inline_message_id(

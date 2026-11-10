@@ -617,6 +617,7 @@ impl InlineMessageManager {
     /// `InlineMessageManager::edit_inline_message_widget_data`
     /// (InlineMessageManager.cpp:372-384) — the 1.8.70 widgets family:
     /// the data-only edit, the both-flags-false band answers immediately.
+    #[allow(clippy::too_many_arguments)] // the C++ signature has the same shape
     pub fn edit_inline_message_widget_data(
         &mut self,
         env: &mut impl InlineMessageManagerEnv,

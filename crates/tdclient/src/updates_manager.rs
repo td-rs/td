@@ -574,6 +574,19 @@ pub trait UpdatesSink {
     fn on_update_wallet_ton_connect_session(&mut self, _session: telegram_api::TonConnectSession) {}
     /// `on_update(updateWalletTonConnectPendingDisconnect)` (cpp:5142-5147).
     fn on_update_wallet_ton_connect_disconnect(&mut self, _session_ids: Vec<i64>) {}
+    /// `on_update(updateBotWidgetQuery)` — the direct
+    /// `WidgetManager::on_new_widget_query` routing (cpp:5233-5239); the
+    /// default no-op keeps the test sinks inert.
+    fn on_update_bot_widget_query(&mut self, _update: telegram_api::updateBotWidgetQuery) {}
+    /// `on_update(updateInlineBotWidgetQuery)` (cpp:5241-5248).
+    fn on_update_inline_bot_widget_query(
+        &mut self,
+        _update: telegram_api::updateInlineBotWidgetQuery,
+    ) {
+    }
+    /// `on_update(updateBotWidgetCopyQuery)` (cpp:5250-5255).
+    fn on_update_bot_widget_copy_query(&mut self, _update: telegram_api::updateBotWidgetCopyQuery) {
+    }
     /// `MessagesManager::process_pts_update` — the applied-pts-update
     /// switch (the M.7.13 flip; the impl fans out per update kind).
     fn process_pts_update(&mut self, update: PendingUpdate);
@@ -4762,31 +4775,20 @@ impl<S: UpdatesSink> UpdatesManager<S> {
                     promise,
                 );
             }
-            // 1.8.70 widget updates (cpp:5233-5255) — the widget_manager
-            // seam; the promise settles like the C++ direct routing.
-            PendingUpdate::Wire(telegram_api::Update::updateBotWidgetQuery(_)) => {
-                self.drop_unsupported(
-                    telegram_api::updateBotWidgetQuery::ID,
-                    "updateBotWidgetQuery",
-                    5233,
-                    promise,
-                );
+            // 1.8.70 widget updates (cpp:5233-5255) — the direct
+            // WidgetManager::on_new_* routing rides the sink hop; the
+            // promise settles like the C++ direct routing.
+            PendingUpdate::Wire(telegram_api::Update::updateBotWidgetQuery(update)) => {
+                self.sink.on_update_bot_widget_query(update);
+                promise.set_value(());
             }
-            PendingUpdate::Wire(telegram_api::Update::updateInlineBotWidgetQuery(_)) => {
-                self.drop_unsupported(
-                    telegram_api::updateInlineBotWidgetQuery::ID,
-                    "updateInlineBotWidgetQuery",
-                    5240,
-                    promise,
-                );
+            PendingUpdate::Wire(telegram_api::Update::updateInlineBotWidgetQuery(update)) => {
+                self.sink.on_update_inline_bot_widget_query(update);
+                promise.set_value(());
             }
-            PendingUpdate::Wire(telegram_api::Update::updateBotWidgetCopyQuery(_)) => {
-                self.drop_unsupported(
-                    telegram_api::updateBotWidgetCopyQuery::ID,
-                    "updateBotWidgetCopyQuery",
-                    5248,
-                    promise,
-                );
+            PendingUpdate::Wire(telegram_api::Update::updateBotWidgetCopyQuery(update)) => {
+                self.sink.on_update_bot_widget_copy_query(update);
+                promise.set_value(());
             }
             // 1.8.70 `updateMessageWidgetData` (cpp:4046-4051) — the
             // pts-affected widget-data update.
