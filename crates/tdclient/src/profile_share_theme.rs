@@ -312,6 +312,12 @@ impl ProfileShareTheme {
         // invalid while the intake seam parks (the module docs), so the
         // gift body never stores.
         let has_star_gift = self.star_gift.is_valid();
+        // the flag must never half-fire: a valid gift reaches the store
+        // only with the StarGift seam's body — the assert flips with it
+        debug_assert!(
+            !has_star_gift,
+            "a valid share-theme gift reached the store before the StarGift seam"
+        );
         store_parse::store_flags(
             out,
             [

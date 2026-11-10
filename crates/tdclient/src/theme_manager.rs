@@ -1954,6 +1954,15 @@ impl ThemeManager {
     /// (ThemeManager.cpp:286-304) — the refetch tail runs at the drain
     /// (the my-user-full / channel-full reloads ride the Td managers).
     /// FIFO head pop (the `pending_set_chat_theme` convention).
+    ///
+    /// Recorded divergence: the C++ pairs the promise per query handler
+    /// (each SetShareThemeQuery owns its promise_ + dialog_id_,
+    /// ThemeManager.cpp:270-305); the parked-net FIFO pairs the head
+    /// promise with whichever answer drains first, so two concurrent
+    /// sets to different dialogs can settle a promise through the other
+    /// dialog's refetch tail. The single-query client shape (the walking
+    /// skeleton's serialized net plane) keeps this unobservable in
+    /// practice; the pairing tightens with the per-query promise plane.
     pub fn pop_pending_set_share_theme(&mut self) -> Option<Promise<()>> {
         if self.pending_set_share_theme_queries.is_empty() {
             None
