@@ -598,7 +598,7 @@ getTonConnectSessionNextEventId	dispatched
 getTonConnectSessionPendingRequests	dispatched
 getTonConnectSessions	dispatched
 getTonTransactions	dispatched
-getTonWalletCardBackgroundGiftCollectionNames	interim
+getTonWalletCardBackgroundGiftCollectionNames	dispatched
 getTonWalletNfts	dispatched
 getTonWalletOwnershipProofChallenge	dispatched
 getTonWalletSecretPhrase	dispatched
@@ -990,7 +990,7 @@ setSupergroupUnrestrictBoostCount	dispatched
 setSupergroupUsername	dispatched
 setTdlibParameters	dispatched
 setTonConnectSessionWalletClientId	dispatched
-setTonWalletCardStickers	interim
+setTonWalletCardStickers	dispatched
 setUpgradedGiftColors	dispatched
 setUserEmojiStatus	dispatched
 setUserNote	dispatched

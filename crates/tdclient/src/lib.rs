@@ -97,6 +97,7 @@ pub mod keyboard_button_style;
 pub mod language_pack_manager;
 pub mod link_manager;
 pub mod manager_option_states;
+pub mod media_area_coordinates;
 pub mod message_content;
 pub mod message_content_dup_type;
 pub mod message_db;
