@@ -1336,6 +1336,114 @@ impl ThemeSettings {
     }
 }
 
+/// `ThemeManager::ShareThemeBackdrop` (ThemeManager.h:145-165) — the
+/// "share_theme_backdrops" row element (e8601c748/319f2a116).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ShareThemeBackdrop {
+    /// `id_`.
+    pub id: i32,
+    /// `name_`.
+    pub name: String,
+    /// `center_color_`.
+    pub center_color: i32,
+    /// `edge_color_`.
+    pub edge_color: i32,
+    /// `pattern_color_` — the td_api `symbol_color` slot.
+    pub pattern_color: i32,
+    /// `text_color_`.
+    pub text_color: i32,
+}
+
+impl ShareThemeBackdrop {
+    /// `ShareThemeBackdrop::ShareThemeBackdrop(shareThemeBackdropOption)`
+    /// (ThemeManager.cpp:307-315).
+    pub fn from_telegram(backdrop: telegram_api::ShareThemeBackdropOption) -> ShareThemeBackdrop {
+        ShareThemeBackdrop {
+            id: backdrop.backdrop_id,
+            name: backdrop.name,
+            center_color: backdrop.center_color,
+            edge_color: backdrop.edge_color,
+            pattern_color: backdrop.pattern_color,
+            text_color: backdrop.text_color,
+        }
+    }
+
+    /// `ShareThemeBackdrop::get_profile_share_theme_backdrop_object`
+    /// (ThemeManager.cpp:317-323).
+    pub fn get_profile_share_theme_backdrop_object(&self) -> td_api::ProfileShareThemeBackdrop {
+        td_api::ProfileShareThemeBackdrop {
+            id: self.id,
+            name: self.name.clone(),
+            colors: Some(td_api::UpgradedGiftBackdropColors {
+                center_color: self.center_color,
+                edge_color: self.edge_color,
+                symbol_color: self.pattern_color,
+                text_color: self.text_color,
+            }),
+        }
+    }
+
+    /// `ShareThemeBackdrop::store` (ThemeManager.cpp:532-540).
+    pub fn store(&self, out: &mut Vec<u8>) {
+        store_parse::store_i32(out, self.id);
+        store_parse::store_string(out, &self.name);
+        store_parse::store_i32(out, self.center_color);
+        store_parse::store_i32(out, self.edge_color);
+        store_parse::store_i32(out, self.pattern_color);
+        store_parse::store_i32(out, self.text_color);
+    }
+
+    /// `ShareThemeBackdrop::parse` (ThemeManager.cpp:542-550).
+    pub fn parse(parser: &mut Parser) -> Result<ShareThemeBackdrop, &'static str> {
+        let id = parser.i32_()?;
+        let name = parser.string()?.to_owned();
+        let center_color = parser.i32_()?;
+        let edge_color = parser.i32_()?;
+        let pattern_color = parser.i32_()?;
+        let text_color = parser.i32_()?;
+        Result::Ok(ShareThemeBackdrop {
+            id,
+            name,
+            center_color,
+            edge_color,
+            pattern_color,
+            text_color,
+        })
+    }
+}
+
+/// `ThemeManager::ShareThemeBackdrops` (ThemeManager.h:167-174) — the
+/// cached "share_theme_backdrops" pmc row.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ShareThemeBackdrops {
+    /// `backdrops_`.
+    pub backdrops: Vec<ShareThemeBackdrop>,
+    /// `hash_`.
+    pub hash: i32,
+}
+
+impl ShareThemeBackdrops {
+    /// `ShareThemeBackdrops::store` (ThemeManager.cpp:552-555).
+    pub fn store(&self, out: &mut Vec<u8>) {
+        store_parse::store_i32(out, self.backdrops.len() as i32);
+        for backdrop in &self.backdrops {
+            backdrop.store(out);
+        }
+        store_parse::store_i32(out, self.hash);
+    }
+
+    /// `ShareThemeBackdrops::parse` (ThemeManager.cpp:558-561).
+    pub fn parse(parser: &mut Parser) -> Result<ShareThemeBackdrops, &'static str> {
+        let size = parser.i32_()?;
+        let mut backdrops = Vec::with_capacity(size.max(0) as usize);
+        for _ in 0..size {
+            backdrops.push(ShareThemeBackdrop::parse(parser)?);
+        }
+        let hash = parser.i32_()?;
+        Result::Ok(ShareThemeBackdrops { backdrops, hash })
+    }
+}
+
 /// The `G()`/`td_` surface of the manager. The four net queries ride
 /// the dispatcher at the `ThemeEnv` arms; the `send_update` outbox is
 /// drained by `crate::td::Td::flush_user_updates`.
@@ -1443,6 +1551,26 @@ pub trait ThemeManagerEnv {
             "Send account.getUniqueGiftChatThemes(offset = {offset}, limit = {limit}) — [net-inert]"
         );
     }
+
+    /// `GetShareThemeBackdropsQuery::send` (ThemeManager.cpp:185-187) —
+    /// the answers drain through `Td::on_theme_net_answer`.
+    fn send_get_share_theme_backdrops_query(&mut self, hash: i32) {
+        tdutils::log_info!("Send messages.getShareThemeBackdrops(hash = {hash}) — [net-inert]");
+    }
+
+    /// `SetShareThemeQuery::send` (ThemeManager.cpp:277-284) — the peer
+    /// is built at the dispatcher arm (the ThemeEnv carries no dialog
+    /// manager); the Bool answer drains through
+    /// `Td::on_theme_net_answer`.
+    fn send_set_share_theme_query(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        input_peer: telegram_api::InputPeer,
+        theme: telegram_api::ShareTheme,
+    ) {
+        let _ = (dialog_id, input_peer, theme);
+        tdutils::log_info!("Send messages.setShareTheme — [net-inert]");
+    }
 }
 
 /// The theme query kinds riding the dispatcher — the C++ ResultHandler
@@ -1458,6 +1586,15 @@ pub(crate) enum ThemeNetKind {
     /// `GetUniqueGiftChatThemesQuery` (cpp:122) — answers
     /// `account_ChatThemes`.
     UniqueGiftChatThemes,
+    /// `GetShareThemeBackdropsQuery` (cpp:178-201) — answers the
+    /// `ShareThemeBackdrops` container.
+    ShareThemeBackdrops,
+    /// `SetShareThemeQuery` (cpp:269-305) — the kind carries the
+    /// handler's `dialog_id_` member (the refetch tail's target); the
+    /// parked promise rides the manager FIFO lot.
+    SetShareTheme {
+        dialog_id: crate::dialog_id::DialogId,
+    },
 }
 
 /// The parked get-unique-gift-chat-themes promise (the C++ promise
@@ -1489,8 +1626,20 @@ pub struct ThemeManager {
     accent_colors: AccentColors,
     /// `profile_accent_colors_`.
     profile_accent_colors: ProfileAccentColors,
+    /// `share_theme_backdrops_` (ThemeManager.h:251, e8601c748).
+    share_theme_backdrops: ShareThemeBackdrops,
+    /// `next_share_theme_backdrops_reload_time_` (ThemeManager.h:252).
+    next_share_theme_backdrops_reload_time: f64,
+    /// `is_share_theme_backdrops_being_reloaded_` (ThemeManager.h:253).
+    is_share_theme_backdrops_being_reloaded: bool,
     /// The parked get-unique-gift-chat-themes promises.
     pending_gift_theme_queries: Vec<PendingGiftThemesQuery>,
+    /// `get_share_theme_backdrops_queries_` (ThemeManager.h:254) — the
+    /// parked get-backdrops promises (the cache-miss lot).
+    get_share_theme_backdrops_queries: Vec<Promise<td_api::ProfileShareThemeBackdrops>>,
+    /// The parked set-profile-share-theme promises (the C++ promise
+    /// rides the SetShareThemeQuery handler; the answers pair FIFO).
+    pending_set_share_theme_queries: Vec<Promise<()>>,
 }
 
 impl ThemeManager {
@@ -1533,6 +1682,7 @@ impl ThemeManager {
         // the constructor block (cpp:379-382)
         self.load_accent_colors(env);
         self.load_profile_accent_colors(env);
+        self.load_share_theme_backdrops(env);
         // start_up → init (cpp:384-452)
         self.load_chat_themes(env);
         if self.chat_themes.hash == 0 {
@@ -1619,6 +1769,35 @@ impl ThemeManager {
         }
     }
 
+    /// `ThemeManager::load_share_theme_backdrops` (ThemeManager.cpp:624-641,
+    /// e8601c748) — the constructor band; a cached row answers
+    /// immediately and reloads on the first request.
+    fn load_share_theme_backdrops(&mut self, env: &mut impl ThemeManagerEnv) {
+        if !Self::is_active(env) {
+            return;
+        }
+        let log_event_string =
+            env.binlog_pmc_get_raw(Self::get_share_theme_backdrops_database_key().as_bytes());
+        if !log_event_string.is_empty() {
+            let parsed = Parser::new_log_event(&log_event_string)
+                .and_then(|mut parser| ShareThemeBackdrops::parse(&mut parser));
+            match parsed {
+                Result::Ok(share_theme_backdrops) => {
+                    self.share_theme_backdrops = share_theme_backdrops;
+                    // the backdrops can be returned immediately, but
+                    // must be reloaded on the first request
+                    self.next_share_theme_backdrops_reload_time = tdutils::time::now();
+                }
+                Result::Err(status) => {
+                    tdutils::log_error!(
+                        "Failed to parse share theme backdrops from binlog: {status}"
+                    );
+                    self.share_theme_backdrops = ShareThemeBackdrops::default();
+                }
+            }
+        }
+    }
+
     /// `ThemeManager::save_chat_themes` (ThemeManager.cpp:773-775).
     fn save_chat_themes(&self, env: &mut impl ThemeManagerEnv) {
         // `log_event_store` framing — the version prefix leads each row.
@@ -1645,6 +1824,142 @@ impl ThemeManager {
             Self::get_profile_accent_colors_database_key().as_bytes(),
             &out,
         );
+    }
+
+    /// `ThemeManager::get_share_theme_backdrops_database_key`
+    /// (ThemeManager.cpp:983-985).
+    fn get_share_theme_backdrops_database_key() -> &'static str {
+        "share_theme_backdrops"
+    }
+
+    /// `ThemeManager::save_share_theme_backdrops` (ThemeManager.cpp:987-990).
+    fn save_share_theme_backdrops(&self, env: &mut impl ThemeManagerEnv) {
+        let mut out = Vec::new();
+        store_parse::store_log_event_version(&mut out);
+        self.share_theme_backdrops.store(&mut out);
+        env.binlog_pmc_set_raw(
+            Self::get_share_theme_backdrops_database_key().as_bytes(),
+            &out,
+        );
+    }
+
+    /// `ThemeManager::get_profile_share_theme_backdrops_object`
+    /// (ThemeManager.cpp:1327-1332).
+    fn get_profile_share_theme_backdrops_object(&self) -> td_api::ProfileShareThemeBackdrops {
+        td_api::ProfileShareThemeBackdrops {
+            backdrops: self
+                .share_theme_backdrops
+                .backdrops
+                .iter()
+                .map(|backdrop| backdrop.get_profile_share_theme_backdrop_object())
+                .collect(),
+        }
+    }
+
+    /// `ThemeManager::get_profile_share_theme_backdrops`
+    /// (ThemeManager.cpp:1244-1260) — the cached row answers
+    /// immediately (with the background reload past the 3600 s
+    /// horizon); a miss parks the promise and reloads.
+    pub fn get_profile_share_theme_backdrops(
+        &mut self,
+        env: &mut impl ThemeManagerEnv,
+        mut promise: Promise<td_api::ProfileShareThemeBackdrops>,
+    ) {
+        if self.next_share_theme_backdrops_reload_time != 0.0 {
+            // the backdrops were loaded; return them immediately and
+            // reload them in background if needed
+            promise.set_value(self.get_profile_share_theme_backdrops_object());
+            if tdutils::time::now() >= self.next_share_theme_backdrops_reload_time {
+                self.reload_share_theme_backdrops(env);
+            }
+            return;
+        }
+
+        self.get_share_theme_backdrops_queries.push(promise);
+        self.reload_share_theme_backdrops(env);
+    }
+
+    /// `ThemeManager::reload_share_theme_backdrops` (ThemeManager.cpp:1262-1275).
+    fn reload_share_theme_backdrops(&mut self, env: &mut impl ThemeManagerEnv) {
+        if self.is_share_theme_backdrops_being_reloaded {
+            return;
+        }
+        self.is_share_theme_backdrops_being_reloaded = true;
+        env.send_get_share_theme_backdrops_query(self.share_theme_backdrops.hash);
+    }
+
+    /// `ThemeManager::on_get_share_theme_backdrops` (ThemeManager.cpp:1277-1315)
+    /// — the answer handler; an error fails the parked lot (there are
+    /// no pending queries once the backdrops were loaded).
+    pub fn on_get_share_theme_backdrops(
+        &mut self,
+        env: &mut impl ThemeManagerEnv,
+        result: Result<telegram_api::ShareThemeBackdrops, Status>,
+    ) {
+        debug_assert!(self.is_share_theme_backdrops_being_reloaded);
+        self.is_share_theme_backdrops_being_reloaded = false;
+
+        let promises = std::mem::take(&mut self.get_share_theme_backdrops_queries);
+        let backdrops = match result {
+            Result::Err(status) => {
+                // if the backdrops were loaded before, then there are no
+                // pending queries
+                for mut promise in promises {
+                    promise.set_error(status.clone());
+                }
+                return;
+            }
+            Result::Ok(backdrops) => backdrops,
+        };
+        self.next_share_theme_backdrops_reload_time = tdutils::time::now() + 3600.0;
+
+        match backdrops {
+            telegram_api::ShareThemeBackdrops::shareThemeBackdropsNotModified(_) => {}
+            telegram_api::ShareThemeBackdrops::shareThemeBackdrops(backdrops) => {
+                self.share_theme_backdrops.backdrops = backdrops
+                    .backdrops
+                    .into_iter()
+                    .map(ShareThemeBackdrop::from_telegram)
+                    .collect();
+                self.share_theme_backdrops.hash = backdrops.hash;
+                self.save_share_theme_backdrops(env);
+            }
+        }
+
+        let answer = self.get_profile_share_theme_backdrops_object();
+        for mut promise in promises {
+            promise.set_value(answer.clone());
+        }
+    }
+
+    /// `ThemeManager::set_profile_share_theme` send half
+    /// (ThemeManager.cpp:1317-1326 via the collapsed
+    /// `Requests.cpp:9514-9519` arm) — the access check, the
+    /// my-dialog/channel band and the input-theme validation run at the
+    /// request arm; the promise parks in the FIFO lot and the
+    /// dialog-validated input peer + query go through the env sender.
+    pub fn set_profile_share_theme(
+        &mut self,
+        env: &mut impl ThemeManagerEnv,
+        dialog_id: crate::dialog_id::DialogId,
+        input_peer: telegram_api::InputPeer,
+        theme: telegram_api::ShareTheme,
+        promise: Promise<()>,
+    ) {
+        env.send_set_share_theme_query(dialog_id, input_peer, theme);
+        self.pending_set_share_theme_queries.push(promise);
+    }
+
+    /// `SetShareThemeQuery::on_result`/`on_error` pop half
+    /// (ThemeManager.cpp:286-304) — the refetch tail runs at the drain
+    /// (the my-user-full / channel-full reloads ride the Td managers).
+    /// FIFO head pop (the `pending_set_chat_theme` convention).
+    pub fn pop_pending_set_share_theme(&mut self) -> Option<Promise<()>> {
+        if self.pending_set_share_theme_queries.is_empty() {
+            None
+        } else {
+            Some(self.pending_set_share_theme_queries.remove(0))
+        }
     }
 
     /// `ThemeManager::send_update_chat_themes` (ThemeManager.cpp:787-789)
@@ -2462,6 +2777,19 @@ mod tests {
         fn send_get_unique_gift_chat_themes_query(&mut self, offset: &str, limit: i32) {
             self.queries
                 .push(format!("unique_gift_chat_themes:{offset}:{limit}"));
+        }
+
+        fn send_get_share_theme_backdrops_query(&mut self, hash: i32) {
+            self.queries.push(format!("share_theme_backdrops:{hash}"));
+        }
+
+        fn send_set_share_theme_query(
+            &mut self,
+            dialog_id: crate::dialog_id::DialogId,
+            _input_peer: telegram_api::InputPeer,
+            _theme: telegram_api::ShareTheme,
+        ) {
+            self.queries.push(format!("set_share_theme:{dialog_id:?}"));
         }
     }
 
@@ -3359,6 +3687,198 @@ mod tests {
         assert!(theme.is_default());
     }
 
+    // --- the share-theme-backdrops plane (e8601c748/319f2a116) ---
+
+    fn wire_share_theme_backdrops() -> telegram_api::ShareThemeBackdrops {
+        telegram_api::ShareThemeBackdrops::shareThemeBackdrops(telegram_api::shareThemeBackdrops {
+            backdrops: vec![telegram_api::ShareThemeBackdropOption {
+                backdrop_id: 3,
+                name: "Aurora".to_owned(),
+                center_color: 1,
+                edge_color: 2,
+                pattern_color: 3,
+                text_color: 4,
+            }],
+            hash: 7,
+        })
+    }
+
+    /// `ShareThemeBackdrops::store`/`parse` (ThemeManager.cpp:552-561).
+    #[test]
+    fn share_theme_backdrops_store_parse_round_trip() {
+        let backdrops = ShareThemeBackdrops {
+            backdrops: vec![ShareThemeBackdrop {
+                id: 3,
+                name: "Aurora".to_owned(),
+                center_color: 1,
+                edge_color: 2,
+                pattern_color: 3,
+                text_color: 4,
+            }],
+            hash: 7,
+        };
+        let mut out = Vec::new();
+        backdrops.store(&mut out);
+        let parsed = ShareThemeBackdrops::parse(&mut Parser::new(&out)).expect("parse");
+        assert_eq!(parsed, backdrops);
+    }
+
+    /// The cache-miss lot: the promises park, one query flies regardless
+    /// of the lot size (`is_share_theme_backdrops_being_reloaded_`,
+    /// ThemeManager.cpp:1262-1266), and the full answer settles everyone,
+    /// persists the row, and arms the 3600 s horizon
+    /// (cpp:1277-1315) — a follow-up get answers from the cache without
+    /// another query.
+    #[test]
+    fn get_profile_share_theme_backdrops_miss_parks_reloads_and_settles() {
+        let mut env = TestEnv::default();
+        let mut manager = ThemeManager::default();
+        manager.init(&mut env);
+        env.queries.clear();
+
+        let (promise_a, recorded_a) = recording_promise();
+        let (promise_b, recorded_b) = recording_promise();
+        manager.get_profile_share_theme_backdrops(&mut env, promise_a);
+        manager.get_profile_share_theme_backdrops(&mut env, promise_b);
+        assert_eq!(
+            recorded_a.0.lock().unwrap().as_ref(),
+            None,
+            "the miss lot stays parked"
+        );
+        assert_eq!(
+            env.queries,
+            vec!["share_theme_backdrops:0".to_owned()],
+            "one in-flight query"
+        );
+
+        manager.on_get_share_theme_backdrops(&mut env, Ok(wire_share_theme_backdrops()));
+        let answer = recorded_a.0.lock().unwrap().take().expect("settled");
+        assert_eq!(answer.backdrops.len(), 1);
+        assert_eq!(answer.backdrops[0].name, "Aurora");
+        assert!(
+            recorded_b.0.lock().unwrap().take().is_some(),
+            "the lot settles"
+        );
+        assert!(
+            env.pmc.contains_key(b"share_theme_backdrops".as_slice()),
+            "the row persists"
+        );
+        assert_eq!(
+            env.queries,
+            vec!["share_theme_backdrops:0".to_owned()],
+            "no refetch inside the horizon"
+        );
+
+        // the cached band (cpp:1246-1251): immediate answer, no query
+        let (promise_c, recorded_c) = recording_promise();
+        manager.get_profile_share_theme_backdrops(&mut env, promise_c);
+        let cached = recorded_c.0.lock().unwrap().take().expect("cached answer");
+        assert_eq!(cached.backdrops.len(), 1);
+        assert_eq!(env.queries.len(), 1);
+    }
+
+    /// `shareThemeBackdropsNotModified` keeps the cache and settles the
+    /// lot with it (ThemeManager.cpp:1290-1291).
+    #[test]
+    fn share_theme_backdrops_not_modified_settles_from_the_cache() {
+        let mut env = TestEnv::default();
+        let mut manager = ThemeManager::default();
+        manager.init(&mut env);
+        env.queries.clear();
+
+        let (promise, recorded) = recording_promise();
+        manager.get_profile_share_theme_backdrops(&mut env, promise);
+        manager.on_get_share_theme_backdrops(
+            &mut env,
+            Ok(
+                telegram_api::ShareThemeBackdrops::shareThemeBackdropsNotModified(
+                    telegram_api::shareThemeBackdropsNotModified,
+                ),
+            ),
+        );
+        let answer = recorded.0.lock().unwrap().take().expect("settled");
+        assert!(answer.backdrops.is_empty(), "the empty cache answers");
+    }
+
+    /// The error band fails the whole parked lot with the status
+    /// (ThemeManager.cpp:1285-1288).
+    #[test]
+    fn share_theme_backdrops_error_fails_the_parked_lot() {
+        let mut env = TestEnv::default();
+        let mut manager = ThemeManager::default();
+        manager.init(&mut env);
+
+        let (promise_a, result_a) = error_recording_promise();
+        let (promise_b, result_b) = error_recording_promise();
+        manager.get_profile_share_theme_backdrops(&mut env, promise_a);
+        manager.get_profile_share_theme_backdrops(&mut env, promise_b);
+        manager.on_get_share_theme_backdrops(&mut env, Err(Status::error(400, "TEST ERR")));
+        assert_eq!(
+            result_a.0.lock().unwrap().as_ref(),
+            Some(&Err("TEST ERR".to_owned()))
+        );
+        assert_eq!(
+            result_b.0.lock().unwrap().as_ref(),
+            Some(&Err("TEST ERR".to_owned()))
+        );
+    }
+
+    /// A persisted row loads at init (ThemeManager.cpp:624-641): the
+    /// backdrops answer immediately and the first get fires the
+    /// background reload (`next_..._reload_time_ == Time::now()`).
+    #[test]
+    fn share_theme_backdrops_cached_row_answers_and_background_reloads() {
+        let mut env = TestEnv::default();
+        let mut manager = ThemeManager::default();
+        manager.init(&mut env);
+        let (warm_promise, _) = recording_promise();
+        manager.get_profile_share_theme_backdrops(&mut env, warm_promise);
+        manager.on_get_share_theme_backdrops(&mut env, Ok(wire_share_theme_backdrops()));
+        let pmc = std::mem::take(&mut env.pmc);
+
+        let mut env = TestEnv {
+            pmc,
+            ..TestEnv::default()
+        };
+        let mut manager = ThemeManager::default();
+        manager.init(&mut env);
+        env.queries.clear();
+
+        let (promise, recorded) = recording_promise();
+        manager.get_profile_share_theme_backdrops(&mut env, promise);
+        let answer = recorded.0.lock().unwrap().take().expect("immediate");
+        assert_eq!(answer.backdrops.len(), 1);
+        assert_eq!(
+            env.queries,
+            vec!["share_theme_backdrops:7".to_owned()],
+            "the reload carries the cached hash"
+        );
+    }
+
+    /// `set_profile_share_theme` sends the query and parks the promise
+    /// FIFO (the `pending_set_chat_theme` convention).
+    #[test]
+    fn set_profile_share_theme_sends_the_query_and_parks_fifo() {
+        let mut env = TestEnv::default();
+        let mut manager = ThemeManager::default();
+        let (promise, _) = recording_promise::<()>();
+        let dialog_id = crate::dialog_id::DialogId::new(700000001);
+        manager.set_profile_share_theme(
+            &mut env,
+            dialog_id,
+            telegram_api::InputPeer::inputPeerEmpty(telegram_api::inputPeerEmpty),
+            telegram_api::ShareTheme::shareThemeDefault(telegram_api::shareThemeDefault),
+            promise,
+        );
+        assert!(
+            env.queries
+                .iter()
+                .any(|query| query.starts_with("set_share_theme:"))
+        );
+        assert!(manager.pop_pending_set_share_theme().is_some());
+        assert!(manager.pop_pending_set_share_theme().is_none());
+    }
+
     // --- the test promise helpers (the M.40 RecordingPromise convention) ---
 
     struct Recorded<T: Send + 'static>(std::sync::Arc<std::sync::Mutex<Option<T>>>);
@@ -3382,6 +3902,32 @@ mod tests {
         let recorded = Recorded(std::sync::Arc::new(std::sync::Mutex::new(None)));
         (
             Promise::from_interface(RecordingPromise {
+                recorded: Recorded(recorded.0.clone()),
+            }),
+            recorded,
+        )
+    }
+
+    /// The error-band variant — records the settle as
+    /// `Some(Ok(value))` / `Some(Err(message))`; `None` = never settled.
+    struct ErrRecordingPromise<T: Send + 'static> {
+        recorded: Recorded<Result<T, String>>,
+    }
+
+    impl<T: Send + 'static> PromiseInterface<T> for ErrRecordingPromise<T> {
+        fn set_value(&mut self, value: T) {
+            *self.recorded.0.lock().unwrap() = Some(Ok(value));
+        }
+
+        fn set_error(&mut self, error: Status) {
+            *self.recorded.0.lock().unwrap() = Some(Err(error.message().to_owned()));
+        }
+    }
+
+    fn error_recording_promise<T: Send + 'static>() -> (Promise<T>, Recorded<Result<T, String>>) {
+        let recorded = Recorded(std::sync::Arc::new(std::sync::Mutex::new(None)));
+        (
+            Promise::from_interface(ErrRecordingPromise {
                 recorded: Recorded(recorded.0.clone()),
             }),
             recorded,

@@ -23800,6 +23800,9 @@ impl Td {
     /// (ThemeManager.cpp:798-803/863-871/948-956/1024-1027).
     fn on_theme_net_answer(&mut self, kind: crate::theme_manager::ThemeNetKind, query: NetQuery) {
         let parse_error = || Status::error(500, "Failed to parse the theme answer");
+        // snapshotted before the env split (the SetShareTheme refetch
+        // band compares against it)
+        let my_dialog_id = crate::dialog_manager::get_my_dialog_id(self);
         let mut manager = std::mem::take(&mut self.theme_manager);
         {
             let mut env = ThemeEnv {
@@ -23856,6 +23859,79 @@ impl Td {
                             .map_err(|_| parse_error())
                     };
                     manager.on_get_unique_gift_chat_themes(&mut env, result);
+                }
+                crate::theme_manager::ThemeNetKind::ShareThemeBackdrops => {
+                    let result = if query.is_error() {
+                        Err(query.error().clone())
+                    } else {
+                        telegram_api::ShareThemeBackdrops::parse(query.ok())
+                            .map_err(|_| parse_error())
+                    };
+                    manager.on_get_share_theme_backdrops(&mut env, result);
+                }
+                crate::theme_manager::ThemeNetKind::SetShareTheme { dialog_id } => {
+                    // `SetShareThemeQuery::on_result`/`on_error`
+                    // (ThemeManager.cpp:286-304): the ok answer refetches
+                    // the owning *Full record with the parked promise;
+                    // the dialog-error fan-out runs first. The env is
+                    // destructured for the refetch halves (the
+                    // `on_get_users` slice convention).
+                    let crate::td::ThemeEnv {
+                        global,
+                        options,
+                        auth_is_bot,
+                        user_manager,
+                        chat_manager,
+                        ..
+                    } = env;
+                    let result = if query.is_error() {
+                        Err(query.error().clone())
+                    } else {
+                        parse_wire_bool_value(query.ok()).ok_or_else(parse_error)
+                    };
+                    if let Err(status) = &result {
+                        crate::dialog_manager::on_get_dialog_error(
+                            global,
+                            dialog_id,
+                            status,
+                            "SetShareThemeQuery",
+                        );
+                    }
+                    let promise = manager.pop_pending_set_share_theme();
+                    let Some(mut promise) = promise else {
+                        return;
+                    };
+                    let Some(options) = options else {
+                        promise.set_error(parse_error());
+                        return;
+                    };
+                    let mut user_env = crate::user_manager::UserEnv {
+                        global,
+                        options,
+                        auth_is_bot,
+                    };
+                    match result {
+                        Ok(_) if dialog_id == my_dialog_id => {
+                            let my_id = user_manager.get_my_id();
+                            user_manager.reload_user_full(
+                                &mut user_env,
+                                my_id,
+                                promise,
+                                "SetShareThemeQuery",
+                            );
+                        }
+                        Ok(_) if dialog_id.get_type() == crate::dialog_id::DialogType::Channel => {
+                            let channel_id = dialog_id.get_channel_id();
+                            chat_manager.reload_channel_full(
+                                &mut user_env,
+                                channel_id,
+                                promise,
+                                "SetShareThemeQuery",
+                            );
+                        }
+                        Ok(_) => promise.set_value(()),
+                        Err(status) => promise.set_error(status),
+                    }
                 }
             }
         }
@@ -46018,6 +46094,47 @@ impl crate::theme_manager::ThemeManagerEnv for ThemeEnv<'_> {
             None => tdutils::log_info!(
                 "Send account.getUniqueGiftChatThemes(offset = {offset}, limit = {limit}) — [net-inert]"
             ),
+        }
+    }
+
+    fn send_get_share_theme_backdrops_query(&mut self, hash: i32) {
+        match self.theme_net.clone() {
+            Some(net) => net.dispatch(
+                crate::theme_manager::ThemeNetKind::ShareThemeBackdrops,
+                telegram_api::Function::messages_getShareThemeBackdrops(
+                    telegram_api::messages_getShareThemeBackdrops { hash },
+                ),
+            ),
+            None => {
+                tdutils::log_info!(
+                    "Send messages.getShareThemeBackdrops(hash = {hash}) — [net-inert]"
+                );
+            }
+        }
+    }
+
+    fn send_set_share_theme_query(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        input_peer: telegram_api::InputPeer,
+        theme: telegram_api::ShareTheme,
+    ) {
+        // `SetShareThemeQuery::send` (ThemeManager.cpp:277-284); the
+        // Write peer is built at the request arm (the ThemeEnv carries
+        // no dialog manager).
+        match self.theme_net.clone() {
+            Some(net) => net.dispatch(
+                crate::theme_manager::ThemeNetKind::SetShareTheme { dialog_id },
+                telegram_api::Function::messages_setShareTheme(
+                    telegram_api::messages_setShareTheme {
+                        peer: Some(Box::new(input_peer)),
+                        theme: Some(theme),
+                    },
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send messages.setShareTheme — [net-inert]");
+            }
         }
     }
 }
