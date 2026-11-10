@@ -5435,6 +5435,17 @@ impl CliClient {
                 },
             ));
             true
+        } else if op == "tcacc" {
+            // cli.cpp:3937-3941 — `tcacc <community_id> <are_chats_collapsed>`
+            // (get_args: as_community_id + as_bool).
+            let (community_id, are_chats_collapsed) = tokenizer::split(args, ' ');
+            self.send_request(Function::toggleCommunityAreChatsCollapsed(
+                td_api::toggleCommunityAreChatsCollapsed {
+                    community_id: tokenizer::to_integer_i64(trim_td(&community_id)),
+                    are_chats_collapsed: as_bool(&are_chats_collapsed),
+                },
+            ));
+            true
         } else if op == "gcc" {
             let (user_id, offset_chat_id, limit) = {
                 let (w0, rest0) = tokenizer::split(args, ' ');
@@ -17282,6 +17293,8 @@ mod tests {
             ("gac", 8),
             ("sale", 8),
             ("gjc", 6),
+            // The community slice (#128) routes `tcacc` (chain 2).
+            ("tcacc", 2),
         ];
 
         let guard = TEST_LOCK.lock().unwrap();

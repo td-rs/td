@@ -7219,6 +7219,26 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             );
             td.community_manager = manager;
         }
+        Function::toggleCommunityAreChatsCollapsed(request) => {
+            // Requests.cpp:3533-3538 — CHECK_IS_USER, then
+            // CommunityManager::toggle_community_are_dialogs_collapsed
+            // (the known-community gate only, no rights gate; the
+            // communities.toggleCommunityCollapsedInDialogs send rides
+            // the net step and the promise settles on the Updates
+            // answer that re-enters the updates intake).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut manager, mut env) = community_split(td);
+            manager.toggle_community_are_dialogs_collapsed(
+                &mut env,
+                CommunityId::new(request.community_id),
+                request.are_chats_collapsed,
+                promise,
+            );
+            td.community_manager = manager;
+        }
 
         // -- the payments set (M.43): Requests.cpp:8372-8436, 8757-8771,
         //    9247-9251; the CHECK_IS_USER/CHECK_IS_BOT gates match the
@@ -20323,7 +20343,7 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 26, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            1059,
+            1060,
             "dispatched count"
         );
         // the 23383aef sync base (1.8.70): the 34 new scheme functions
@@ -20372,14 +20392,20 @@ mod request_census_tests {
         // vs joined chat ids over the per-channel known gate): 1,055 + 2
         // = 1,057 dispatched / 18 - 2 = 16 interim, sync unmoved 26 (the
         // tip counts plus the pair's two flips).
+        // The community collapse slice (#128) flipped
+        // toggleCommunityAreChatsCollapsed (the
+        // communities.toggleCommunityCollapsedInDialogs send whose
+        // Updates answer re-enters the updates intake; the collapse
+        // state comes back through on_get_community): 1,055 + 1 = 1,056
+        // dispatched / 18 - 1 = 17 interim, sync unmoved 26.
         // The community family slice (#131) flipped the link-mutator pair
         // (addCommunityChat — the visible and hidden bands of the shared
         // communities.togglePeerLink query over the is_dialog_owner gate,
         // removeCommunityChat — the deleted band over the
         // linked-peer-administrator-or-owner gate; both settle through
-        // the #127 change-settle): 1,057 + 2 = 1,059 dispatched /
-        // 16 - 2 = 14 interim, sync unmoved 26 (the #131-over-#133
+        // the #127 change-settle): 1,058 + 2 = 1,060 dispatched /
+        // 15 - 2 = 13 interim, sync unmoved 26 (the #131-over-#128/#133
         // merge pin).
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 14, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 13, "interim count");
     }
 }

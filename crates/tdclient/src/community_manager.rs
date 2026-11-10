@@ -285,6 +285,26 @@ pub trait CommunityManagerEnv {
     /// ChatManager.cpp:5767-5773 hop lives with the community slice),
     /// so callers hand this seam the non-community remainder.
     fn on_get_chats(&mut self, _chats: Vec<telegram_api::Chat>, _source: &str) {}
+
+    /// `ToggleCommunityCollapsedInDialogsQuery::send`
+    /// (CommunityManager.cpp:511-540) —
+    /// `communities.toggleCommunityCollapsedInDialogs` over
+    /// `get_input_community`; the answer is an Updates that re-enters
+    /// the updates intake (`on_get_updates`), so the collapse state
+    /// comes back through the normal community intake, not the
+    /// callback. The resolved input channel rides the seam (the
+    /// manager is taken out under the env).
+    fn send_toggle_community_collapsed_in_dialogs_query(
+        &mut self,
+        input_community: telegram_api::InputChannel,
+        are_dialogs_collapsed: bool,
+    ) {
+        tdutils::log_info!(
+            "Send communities.toggleCommunityCollapsedInDialogs(collapsed = \
+             {are_dialogs_collapsed}) — [net-inert]"
+        );
+        let _ = input_community;
+    }
 }
 
 /// `CommunityManager::Community` — the cached community record. The
@@ -403,6 +423,10 @@ pub struct CommunityManager {
     /// per-community object, so concurrent settles pair with their own
     /// answer.
     pub pending_member_chats: Vec<(i64, Promise<td_api::CommunityMemberChats>)>,
+    /// The `ToggleCommunityCollapsedInDialogsQuery` promise lot (the
+    /// collapse toggle's promise settles on the Updates answer, parked
+    /// until the update lands).
+    pub pending_collapse: Vec<Promise<()>>,
     /// `get_community_notification_settings_queries_` (ea8219749,
     /// 09634ee46) — the communities with an in-flight
     /// `GetCommunityNotifySettingsQuery`.
@@ -1679,6 +1703,35 @@ impl CommunityManager {
             updates.push(self.get_update_community_object(CommunityId::new(*community_id)));
         }
     }
+
+    /// `toggle_community_are_dialogs_collapsed`
+    /// (CommunityManager.cpp:2098-2105) — the known-community gate only
+    /// (no rights gate); the `communities
+    /// .toggleCommunityCollapsedInDialogs` send rides the net step and
+    /// the promise settles on the Updates answer (the collapse state
+    /// comes back through `on_get_community`).
+    pub fn toggle_community_are_dialogs_collapsed(
+        &mut self,
+        env: &mut impl CommunityManagerEnv,
+        community_id: CommunityId,
+        are_dialogs_collapsed: bool,
+        mut promise: Promise<()>,
+    ) {
+        if !self.have_community(community_id) {
+            return promise.set_error(Status::error(400, "Community not found"));
+        }
+        // `ToggleCommunityCollapsedInDialogsQuery::send` resolves
+        // `get_input_community` (the C++ CHECK band is the
+        // cached-community invariant above).
+        let Some(input_community) = self.get_input_community(env, community_id) else {
+            return promise.set_error(Status::error(500, "Community not found"));
+        };
+        env.send_toggle_community_collapsed_in_dialogs_query(
+            input_community,
+            are_dialogs_collapsed,
+        );
+        self.pending_collapse.push(promise);
+    }
 }
 
 #[cfg(test)]
@@ -1708,6 +1761,10 @@ mod tests {
         known_members: Vec<i64>,
         /// The shared chat-intake seam records (chat count, source).
         intaken_chats: Vec<(usize, String)>,
+        /// The `remove_community_from_dialog_filters` fan-out records
+        /// (the community ids whose expansion removed them from the
+        /// chat folders).
+        filter_removals: Vec<i64>,
     }
 
     impl TestEnv {
@@ -1724,6 +1781,7 @@ mod tests {
                 editable_bots: Vec::new(),
                 known_members: Vec::new(),
                 intaken_chats: Vec::new(),
+                filter_removals: Vec::new(),
             }
         }
     }
@@ -1934,6 +1992,24 @@ mod tests {
 
         fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &str) {
             self.intaken_chats.push((chats.len(), source.to_owned()));
+        }
+
+        fn remove_community_from_dialog_filters(&mut self, community_id: CommunityId) {
+            self.filter_removals.push(community_id.get());
+        }
+
+        fn send_toggle_community_collapsed_in_dialogs_query(
+            &mut self,
+            input_community: telegram_api::InputChannel,
+            are_dialogs_collapsed: bool,
+        ) {
+            let channel_id = match &input_community {
+                telegram_api::InputChannel::inputChannel(channel) => channel.channel_id,
+                _ => 0,
+            };
+            self.queries.push(format!(
+                "toggleCommunityCollapsedInDialogs {channel_id} {are_dialogs_collapsed}"
+            ));
         }
     }
 
@@ -3534,5 +3610,101 @@ mod tests {
             recorded.0.lock().unwrap().is_none(),
             "the member-chats promise parks at the query"
         );
+    }
+
+    #[test]
+    fn toggle_collapse_gates_and_parks() {
+        // CommunityManager.cpp:2098-2105: the known-community gate only
+        // (no rights gate) — a plain member toggles fine; the query send
+        // parks the promise on the FIFO lot.
+        let mut env = TestEnv::new();
+        let mut manager = CommunityManager::new();
+        let (promise, recorded) = record();
+        manager.toggle_community_are_dialogs_collapsed(
+            &mut env,
+            CommunityId::new(8),
+            true,
+            promise,
+        );
+        assert_eq!(
+            recorded
+                .0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap_err()
+                .message(),
+            "Community not found"
+        );
+        assert!(env.queries.is_empty(), "no query without the community");
+
+        manager.on_get_community(&mut env, &wire_member_community(7), "test");
+        let (promise, recorded) = record();
+        manager.toggle_community_are_dialogs_collapsed(
+            &mut env,
+            CommunityId::new(7),
+            true,
+            promise,
+        );
+        assert!(
+            env.queries
+                .iter()
+                .any(|q| q == "toggleCommunityCollapsedInDialogs 7 true"),
+            "the wire toggle rides the seam"
+        );
+        assert_eq!(manager.pending_collapse.len(), 1);
+        assert!(
+            !recorded.0.lock().unwrap().is_some(),
+            "the promise parks for the Updates answer"
+        );
+    }
+
+    #[test]
+    fn collapse_flip_quiet_expansion_fans_out() {
+        // the collapsed flag diff (CommunityManager.cpp + ea2241d48):
+        // the collapse itself is a quiet change tracking (no folder
+        // removal), the expansion fires the
+        // remove-community-from-dialog_filters fan-out.
+        let mut env = TestEnv::new();
+        let mut manager = CommunityManager::new();
+        manager.on_get_community(&mut env, &wire_community(7, "c"), "test");
+        assert!(env.filter_removals.is_empty());
+
+        // collapse: the flag flips, updateCommunity fires, no fan-out
+        let mut wire = wire_community(7, "c");
+        wire.collapsed_in_dialogs = true;
+        manager.on_get_community(&mut env, &wire, "test");
+        assert_eq!(env.updates.len(), 2, "the flip emits updateCommunity");
+        assert!(matches!(
+            env.updates.last(),
+            Some(td_api::Update::updateCommunity(update)) if update.community.as_ref().unwrap().are_chats_collapsed
+        ));
+        assert!(env.filter_removals.is_empty(), "the collapse stays quiet");
+        assert!(
+            manager.communities.get(&7).unwrap().collapsed_in_dialogs,
+            "the flag sticks"
+        );
+
+        // the object shape follows the flag (can_edit_chat_list inverts)
+        let object = manager.get_community_object(CommunityId::new(7)).unwrap();
+        assert!(object.are_chats_collapsed);
+        assert!(!object.permissions.as_ref().unwrap().can_edit_chat_list);
+
+        // a same-state re-intake is fully quiet
+        env.updates.clear();
+        manager.on_get_community(&mut env, &wire, "test");
+        assert!(env.updates.is_empty(), "no update without a diff");
+
+        // expansion: the flag flips back and the folder fan-out fires
+        manager.on_get_community(&mut env, &wire_community(7, "c"), "test");
+        assert_eq!(env.updates.len(), 1, "the expansion emits updateCommunity");
+        assert!(matches!(
+            env.updates.last(),
+            Some(td_api::Update::updateCommunity(update)) if !update.community.as_ref().unwrap().are_chats_collapsed
+        ));
+        assert_eq!(env.filter_removals, vec![7], "the expansion fans out");
+        assert_eq!(env.filter_removals.len(), 1, "exactly one fan-out");
     }
 }

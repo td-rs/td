@@ -3174,6 +3174,11 @@ enum CommunityNetKind {
     /// `GetJoinedCommunitiesQuery` (cpp:197-237) — the joined-communities
     /// list; the answer intakes its chats then resolves the cached ids.
     GetJoinedCommunities,
+    /// `ToggleCommunityCollapsedInDialogsQuery` (cpp:511-540) — the
+    /// collapse toggle's wire write; the answer is an Updates that
+    /// re-enters `on_get_updates` with the popped promise (the collapse
+    /// state comes back through the normal community intake).
+    ToggleCommunityCollapsedInDialogs,
 }
 
 /// The cloned community dispatch surface the [`CommunityEnv`] senders
@@ -25855,6 +25860,32 @@ impl Td {
                     None => promise.set_error(parse_error("communities_togglePeerLink")),
                 }
             }
+            // `ToggleCommunityCollapsedInDialogsQuery` (cpp:511-540) —
+            // the Updates answer re-enters `on_get_updates` with the
+            // popped promise; the collapse state itself comes back
+            // through the normal community intake (`on_get_community`).
+            CommunityNetKind::ToggleCommunityCollapsedInDialogs => {
+                if let Some(mut promise) = self.community_manager.take_promise(
+                    |m: &mut crate::community_manager::CommunityManager| &mut m.pending_collapse,
+                ) {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::Updates::parse(query.ok()) {
+                            Ok(updates) => {
+                                self.um_send(UmMessage::OnGetUpdates {
+                                    updates: Box::new(updates),
+                                    promise,
+                                });
+                            }
+                            Err(_) => {
+                                promise
+                                    .set_error(parse_error("the community collapse toggle answer"));
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -41713,6 +41744,30 @@ impl CommunityManagerEnv for CommunityEnv<'_> {
     /// own intake (the `ChatManager::on_get_chat` consume-drop).
     fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &str) {
         self.td.intake_chats(chats, source);
+    }
+
+    /// `ToggleCommunityCollapsedInDialogsQuery::send` (cpp:511-540).
+    fn send_toggle_community_collapsed_in_dialogs_query(
+        &mut self,
+        input_community: telegram_api::InputChannel,
+        are_dialogs_collapsed: bool,
+    ) {
+        match self.td.community_net() {
+            Some(net) => net.dispatch(
+                CommunityNetKind::ToggleCommunityCollapsedInDialogs,
+                telegram_api::Function::communities_toggleCommunityCollapsedInDialogs(
+                    telegram_api::communities_toggleCommunityCollapsedInDialogs {
+                        flags: 0,
+                        collapsed: are_dialogs_collapsed,
+                        community: Some(input_community),
+                    },
+                ),
+            ),
+            None => tdutils::log_info!(
+                "Send communities.toggleCommunityCollapsedInDialogs(collapsed = \
+                 {are_dialogs_collapsed}) — [net-inert]"
+            ),
+        }
     }
 }
 
@@ -60382,6 +60437,111 @@ mod tests {
             recorded.lock().unwrap().as_ref(),
             Some(tdutils::status::Result::Ok(()))
         ));
+        assert!(td.community_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn community_collapse_toggle_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(community_collapse_toggle_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn community_collapse_toggle_rides_the_dispatcher_impl() {
+        use crate::community_id::CommunityId;
+
+        let (mut td, rec) = netted_td("netfix-cm-collapse");
+        // Cache a creator community, then drive the collapse toggle —
+        // the known-community gate passes and the
+        // communities.toggleCommunityCollapsedInDialogs query rides the
+        // dispatcher.
+        with_community_manager(&mut td, |manager, env| {
+            manager.on_get_community(
+                env,
+                &telegram_api::community {
+                    flags: 1,
+                    creator: true,
+                    left: false,
+                    min: false,
+                    flags2: 0,
+                    collapsed_in_dialogs: false,
+                    id: 7,
+                    access_hash: 11,
+                    title: "My community".to_owned(),
+                    photo: None,
+                    date: 10,
+                    admin_rights: None,
+                    default_banned_rights: None,
+                },
+                "test",
+            );
+        });
+        let (promise, recorded) = record_ton_unit();
+        with_community_manager(&mut td, |manager, env| {
+            manager.toggle_community_are_dialogs_collapsed(env, CommunityId::new(7), true, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::communities_toggleCommunityCollapsedInDialogs::ID
+        );
+        // The answer is an Updates: it re-enters `on_get_updates` with
+        // the popped promise (CommunityManager.cpp:531-536), carrying
+        // the community chat whose `collapsed_in_dialogs` bit is the
+        // toggled state (the C++ flip happens through
+        // ChatManager::on_get_chats → CommunityManager::on_get_community).
+        // In the port the chats intake accepts the wire community
+        // (community-first ordering) but `ChatManager::on_get_chat`'s
+        // M.5.20 community stub consumes and drops it — the flag walk is
+        // proven at the manager seam by
+        // `collapse_flip_quiet_expansion_fans_out` instead. The promise
+        // still settles ok — updates processing cannot fail it
+        // (UpdatesManager.cpp:1188-1194).
+        let wire = telegram_api::community {
+            flags: 1,
+            creator: true,
+            left: false,
+            min: false,
+            flags2: 0,
+            collapsed_in_dialogs: true,
+            id: 7,
+            access_hash: 11,
+            title: "My community".to_owned(),
+            photo: None,
+            date: 10,
+            admin_rights: None,
+            default_banned_rights: None,
+        };
+        let mut answer = Vec::new();
+        telegram_api::Updates::updates(telegram_api::updates {
+            updates: vec![],
+            chats: vec![telegram_api::Chat::community(wire)],
+            users: vec![],
+            date: 0,
+            seq: 0,
+        })
+        .store(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_community_net();
+        assert!(matches!(
+            recorded.lock().unwrap().as_ref(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        // the recorded stub divergence: the wire community is dropped
+        // upstream of the manager, so the cached flag stays un-flipped
+        // here (flip this assert when the chats→community hop is wired)
+        with_community_manager(&mut td, |manager, _| {
+            assert!(
+                !manager
+                    .get_community_object(CommunityId::new(7))
+                    .expect("the seeded community")
+                    .are_chats_collapsed
+            );
+        });
         assert!(td.community_net_completed.lock().is_empty(), "drained");
     }
 
