@@ -5391,6 +5391,98 @@ impl CliClient {
                 name,
             }));
             true
+        } else if op == "acc" || op == "acch" {
+            // cli.cpp:3910-3914 — the visible (`acc`) and hidden (`acch`)
+            // addCommunityChat arms.
+            let (community_id, chat_id) = tokenizer::split(args, ' ');
+            self.send_request(Function::addCommunityChat(td_api::addCommunityChat {
+                community_id: tokenizer::to_integer_i64(trim_td(&community_id)),
+                chat_id: self.as_chat_id(&chat_id),
+                is_hidden: op == "acch",
+            }));
+            true
+        } else if op == "rcc" {
+            // cli.cpp:3915-3919 — removeCommunityChat.
+            let (community_id, chat_id) = tokenizer::split(args, ' ');
+            self.send_request(Function::removeCommunityChat(td_api::removeCommunityChat {
+                community_id: tokenizer::to_integer_i64(trim_td(&community_id)),
+                chat_id: self.as_chat_id(&chat_id),
+            }));
+            true
+        } else if op == "tcmib" {
+            // cli.cpp:3942-3947 — the member ban toggle over the
+            // message-sender form of the member id.
+            let (community_id, member_id, is_banned) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::toggleCommunityMemberIsBanned(
+                td_api::toggleCommunityMemberIsBanned {
+                    community_id: tokenizer::to_integer_i64(trim_td(&community_id)),
+                    member_id: self.as_message_sender(&member_id),
+                    is_banned: as_bool(&is_banned),
+                },
+            ));
+            true
+        } else if op == "gcomc" {
+            // cli.cpp:3949-3953 — the member's owned/joined chats.
+            let (community_id, member_id) = tokenizer::split(args, ' ');
+            self.send_request(Function::getCommunityMemberChats(
+                td_api::getCommunityMemberChats {
+                    community_id: tokenizer::to_integer_i64(trim_td(&community_id)),
+                    member_id: self.as_message_sender(&member_id),
+                },
+            ));
+            true
+        } else if op == "tcacc" {
+            // cli.cpp:3937-3941 — `tcacc <community_id> <are_chats_collapsed>`
+            // (get_args: as_community_id + as_bool).
+            let (community_id, are_chats_collapsed) = tokenizer::split(args, ' ');
+            self.send_request(Function::toggleCommunityAreChatsCollapsed(
+                td_api::toggleCommunityAreChatsCollapsed {
+                    community_id: tokenizer::to_integer_i64(trim_td(&community_id)),
+                    are_chats_collapsed: as_bool(&are_chats_collapsed),
+                },
+            ));
+            true
+        } else if op == "gcacr" {
+            // cli.cpp:3920-3924 — CommunityId, offset, as_limit(limit)
+            let (w0, rest0) = tokenizer::split(args, ' ');
+            let (offset, limit) = tokenizer::split(&rest0, ' ');
+            self.send_request(Function::getCommunityAddChatRequests(
+                td_api::getCommunityAddChatRequests {
+                    community_id: tokenizer::to_integer_i64(trim_td(&w0)),
+                    offset,
+                    limit: as_limit(&limit, 10),
+                },
+            ));
+            true
+        } else if op == "pcacr" {
+            // cli.cpp:3926-3930 — CommunityId, ChatId, approve
+            let (w0, w1, w2) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::processCommunityAddChatRequest(
+                td_api::processCommunityAddChatRequest {
+                    community_id: tokenizer::to_integer_i64(trim_td(&w0)),
+                    chat_id: tokenizer::to_integer_i64(trim_td(&w1)),
+                    approve: as_bool(&w2),
+                },
+            ));
+            true
+        } else if op == "pcacrs" {
+            // cli.cpp:3932-3936 — CommunityId, approve
+            let (w0, w1) = tokenizer::split(args, ' ');
+            self.send_request(Function::processCommunityAddChatRequests(
+                td_api::processCommunityAddChatRequests {
+                    community_id: tokenizer::to_integer_i64(trim_td(&w0)),
+                    approve: as_bool(&w1),
+                },
+            ));
+            true
         } else if op == "gcc" {
             let (user_id, offset_chat_id, limit) = {
                 let (w0, rest0) = tokenizer::split(args, ' ');
@@ -8048,6 +8140,9 @@ impl CliClient {
                     community_id: tokenizer::to_integer_i64(trim_td(args)),
                 },
             ));
+            true
+        } else if op == "gjc" {
+            self.send_request(Function::getJoinedCommunities(td_api::getJoinedCommunities));
             true
         } else if op == "open" {
             let chat_id = self.as_chat_id(args);
@@ -13348,6 +13443,11 @@ impl CliClient {
                 td_api::getSuitablePersonalChats,
             ));
             true
+        } else if op == "gscoc" {
+            self.send_request(Function::getSuitableCommunityChats(
+                td_api::getSuitableCommunityChats,
+            ));
+            true
         } else if op == "cpc" {
             let (user_id, force) = tokenizer::split(args, ' ');
             self.send_request(Function::createPrivateChat(td_api::createPrivateChat {
@@ -16281,6 +16381,8 @@ mod tests {
             ("ug", 1),
             ("voi", 1),
             ("q", 18),
+            ("acc", 2),
+            ("acch", 2),
             ("acslp", 2),
             ("alpk", 2),
             ("amr", 2),
@@ -16309,12 +16411,14 @@ mod tests {
             ("gc", 2),
             ("gca", 2),
             ("gcapmrs", 2),
+            ("gcacr", 2),
             ("gcc", 2),
             ("gcera", 2),
             ("gcmbd", 2),
             ("gcmc", 2),
             ("gcmca", 2),
             ("gcmp", 2),
+            ("gcomc", 2),
             ("gcsa", 2),
             ("gcsm", 2),
             ("gcsmp", 2),
@@ -16355,7 +16459,10 @@ mod tests {
             ("lca", 2),
             ("ldmct", 2),
             ("lsmt", 2),
+            ("pcacr", 2),
+            ("pcacrs", 2),
             ("radmctr", 2),
+            ("rcc", 2),
             ("react", 2),
             ("reactbot", 2),
             ("reactbotbig", 2),
@@ -16406,6 +16513,7 @@ mod tests {
             ("ssms", 2),
             ("ssmtl", 2),
             ("synclp", 2),
+            ("tcmib", 2),
             ("tdmctcsum", 2),
             ("tsmtip", 2),
             ("uadmctm", 2),
@@ -16628,6 +16736,7 @@ mod tests {
             ("gcscc", 13),
             ("gisc", 13),
             ("grc", 13),
+            ("gscoc", 13),
             ("gsdc", 13),
             ("gspc", 13),
             ("obsb", 13),
@@ -17445,6 +17554,9 @@ mod tests {
             ("gtpjs", 8),
             ("gac", 8),
             ("sale", 8),
+            ("gjc", 6),
+            // The community slice (#128) routes `tcacc` (chain 2).
+            ("tcacc", 2),
             ("gulf", 1),
             ("gulfp", 1),
             ("gulfr", 1),

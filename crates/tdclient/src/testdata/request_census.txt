@@ -10,7 +10,7 @@ addChatMembers	dispatched
 addChatToList	dispatched
 addChatWelcomeMessage	dispatched
 addChecklistTasks	dispatched
-addCommunityChat	interim
+addCommunityChat	dispatched
 addContact	dispatched
 addCustomServerLanguagePack	dispatched
 addFavoriteSticker	dispatched
@@ -259,7 +259,7 @@ editQuickReplyMessage	dispatched
 editStarSubscription	dispatched
 editStory	dispatched
 editStoryCover	dispatched
-editStoryMusic	interim
+editStoryMusic	dispatched
 editTextCompositionStyle	dispatched
 editUserStarSubscription	dispatched
 editWidgetData	dispatched
@@ -365,9 +365,9 @@ getChatsToPostStories	dispatched
 getCloseFriends	dispatched
 getCollectibleItemInfo	dispatched
 getCommands	dispatched
-getCommunityAddChatRequests	interim
+getCommunityAddChatRequests	dispatched
 getCommunityFullInfo	dispatched
-getCommunityMemberChats	interim
+getCommunityMemberChats	dispatched
 getConnectedAffiliateProgram	dispatched
 getConnectedAffiliatePrograms	dispatched
 getConnectedWebsites	dispatched
@@ -437,7 +437,7 @@ getInstalledBackgrounds	dispatched
 getInstalledStickerSets	dispatched
 getInternalLink	dispatched
 getInternalLinkType	dispatched
-getJoinedCommunities	interim
+getJoinedCommunities	dispatched
 getJsonString	sync
 getJsonValue	sync
 getKeywordEmojis	dispatched
@@ -576,7 +576,7 @@ getStoryPublicForwards	dispatched
 getStoryStatistics	dispatched
 getSuggestedFileName	dispatched
 getSuggestedStickerSetName	dispatched
-getSuitableCommunityChats	interim
+getSuitableCommunityChats	dispatched
 getSuitableDiscussionChats	dispatched
 getSuitablePersonalChats	dispatched
 getSupergroup	dispatched
@@ -586,7 +586,7 @@ getSupportName	dispatched
 getSupportUser	dispatched
 getTemporaryPasswordState	dispatched
 getTextCompositionStyleExample	dispatched
-getTextEmojiRanges	interim
+getTextEmojiRanges	sync
 getTextEntities	sync
 getThemeParametersJsonString	sync
 getThemedChatEmojiStatuses	dispatched
@@ -684,8 +684,8 @@ processChatFolderNewChats	dispatched
 processChatHasProtectedContentDisableRequest	dispatched
 processChatJoinRequest	dispatched
 processChatJoinRequests	dispatched
-processCommunityAddChatRequest	interim
-processCommunityAddChatRequests	interim
+processCommunityAddChatRequest	dispatched
+processCommunityAddChatRequests	dispatched
 processGiftPurchaseOffer	dispatched
 processPushNotification	dispatched
 processWebProxyCarrierMessage	dispatched
@@ -712,7 +712,7 @@ removeAllFilesFromDownloads	dispatched
 removeAllWebBrowserSettingsExceptions	dispatched
 removeBusinessConnectedBotFromChat	dispatched
 removeChatActionBar	dispatched
-removeCommunityChat	interim
+removeCommunityChat	dispatched
 removeContacts	dispatched
 removeFavoriteSticker	dispatched
 removeFileFromDownloads	dispatched
@@ -1042,8 +1042,8 @@ toggleChatIsMarkedAsUnread	dispatched
 toggleChatIsPinned	dispatched
 toggleChatIsTranslatable	dispatched
 toggleChatViewAsTopics	dispatched
-toggleCommunityAreChatsCollapsed	interim
-toggleCommunityMemberIsBanned	interim
+toggleCommunityAreChatsCollapsed	dispatched
+toggleCommunityMemberIsBanned	dispatched
 toggleDirectMessagesChatTopicCanSendUnpaidMessages	dispatched
 toggleDownloadIsPaused	dispatched
 toggleForumTopicIsClosed	dispatched

@@ -15857,6 +15857,22 @@ pub fn is_file_reference_error(status: &Status) -> bool {
     status.is_error() && status.code() == 400 && status.message().starts_with("FILE_REFERENCE_")
 }
 
+/// `FileManager::extract_file_reference(const
+/// telegram_api::object_ptr<telegram_api::InputDocument> &)`
+/// (FileManager.cpp:4651-4658) — the raw `file_reference` bytes of a
+/// concrete document, empty for the empty form (the InputMedia variant's
+/// `#` normalization is not applied here).
+pub fn extract_input_document_file_reference(
+    input_document: &telegram_api::InputDocument,
+) -> String {
+    match input_document {
+        telegram_api::InputDocument::inputDocument(document) => {
+            String::from_utf8_lossy(&document.file_reference).into_owned()
+        }
+        telegram_api::InputDocument::inputDocumentEmpty(_) => String::new(),
+    }
+}
+
 /// `FileManager::get_missing_file_parts` (FileManager.cpp:1435-1449) —
 /// the `FILE_PART_*` error parse.
 pub fn get_missing_file_parts(error: &Status) -> Vec<i32> {

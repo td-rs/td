@@ -3222,6 +3222,50 @@ enum CommunityNetKind {
     /// `UpdateCommunityNotifySettingsQuery` (99302f0e2, cpp:140-168) —
     /// the set flow's server write.
     UpdateNotifySettings { community_id: CommunityId },
+    /// `ToggleCommunityPeerLinkQuery` (1747ecde1, cpp:350-386) — the
+    /// add/remove community-dialog link toggle; the Bool answer's value
+    /// is ignored and the request settles through the change-settle; the
+    /// error arm runs the dialog-error convention over `dialog_id`.
+    TogglePeerLink {
+        community_id: CommunityId,
+        dialog_id: DialogId,
+    },
+    /// `ToggleCommunityParticipantBannedQuery` (20fc28e23, cpp:541-568)
+    /// — the participant-ban toggle; the Bool answer's value is ignored
+    /// and the popped promise settles through the change-settle
+    /// (`on_change_community_dialogs`) with the query's own community.
+    /// The invoke-after chain `{{community_id}}` collapses with the
+    /// port's no-dependency-set NetQuery.
+    ToggleParticipantBanned { community_id: CommunityId },
+    /// `GetCommunityParticipantJoinedChatsQuery` (4cd0dae69,
+    /// cpp:570-620) — the member-chats query; the answer builds the
+    /// `communityMemberChats` object (the owned/joined split over the
+    /// per-channel known gate).
+    GetParticipantJoinedChats { community_id: CommunityId },
+    /// `GetCommunityPeerLinkRequestsQuery` (ffc06ec75, cpp:388-440) —
+    /// the add-chat requests page; the answer kind's community_id pairs
+    /// its own parked promise.
+    GetPeerLinkRequests { community_id: CommunityId },
+    /// `ProcessCommunityPeerLinkRequestQuery` (2b80bf533, cpp:442-475) —
+    /// the single approval toggle; the `Bool` answer is ignored (the
+    /// settle rides the change-settle), the error arm's
+    /// `on_get_dialog_error` keys on the requested chat.
+    TogglePeerLinkRequestApproval {
+        community_id: CommunityId,
+        dialog_id: DialogId,
+    },
+    /// `ProcessCommunityPeerLinkRequestsQuery` (79a943019, cpp:477-505)
+    /// — the all-approvals toggle; the `Bool` answer is ignored (the
+    /// settle rides the change-settle).
+    ToggleAllPeerLinkRequestApproval { community_id: CommunityId },
+    /// `GetJoinedCommunitiesQuery` (cpp:197-237) — the joined-communities
+    /// list; the answer intakes its chats then resolves the cached ids.
+    GetJoinedCommunities,
+    /// `ToggleCommunityCollapsedInDialogsQuery` (cpp:511-540) — the
+    /// collapse toggle's wire write; the answer is an Updates that
+    /// re-enters `on_get_updates` with the popped promise (the collapse
+    /// state comes back through the normal community intake).
+    ToggleCommunityCollapsedInDialogs,
 }
 
 /// The cloned community dispatch surface the [`CommunityEnv`] senders
@@ -6379,6 +6423,9 @@ pub struct Td {
     /// twin.
     pub(crate) saved_music_upload_callback:
         Arc<parking_lot::Mutex<dyn crate::files::UploadCallback>>,
+    /// `AudiosManager::upload_audio_file_callback_`
+    /// (AudiosManager.cpp:83-95) — the story-music upload outbox bridge.
+    pub(crate) audios_upload_callback: Arc<parking_lot::Mutex<dyn crate::files::UploadCallback>>,
     /// `TranscriptionManager`'s `UploadAudioFileCallback`
     /// (TranscriptionManager.cpp:500-515) — the
     /// `recognizeSpeechInFile` upload outbox bridge.
@@ -7056,6 +7103,10 @@ impl Td {
             Arc::new(Mutex::new(TdSavedMusicUploadCallback {
                 events: Arc::clone(&file_shared.lock().saved_music_upload_events),
             }));
+        let audios_upload_callback: Arc<parking_lot::Mutex<dyn crate::files::UploadCallback>> =
+            Arc::new(Mutex::new(TdAudiosUploadCallback {
+                events: Arc::clone(&file_shared.lock().audios_upload_events),
+            }));
         let audio_upload_callback: Arc<parking_lot::Mutex<dyn crate::files::UploadCallback>> =
             Arc::new(Mutex::new(TdAudioUploadCallback {
                 events: Arc::clone(&file_shared.lock().audio_upload_events),
@@ -7220,6 +7271,7 @@ impl Td {
             file_load_manager,
             profile_photo_upload_callback,
             saved_music_upload_callback,
+            audios_upload_callback,
             audio_upload_callback,
             download_manager,
             file_shared,
@@ -10520,6 +10572,7 @@ impl Td {
             voice_notes_manager,
             video_notes_manager,
             notification_updates,
+            audios_upload_callback,
             ..
         } = self;
         let mut env = StoryEnv {
@@ -10539,6 +10592,7 @@ impl Td {
             video_notes: video_notes_manager,
             updates: notification_updates,
             net,
+            audios_upload_callback: audios_upload_callback.clone(),
         };
         run(&mut env, story_manager)
     }
@@ -14055,6 +14109,240 @@ impl Td {
                         }),
                         Err(_) => promise.set_error(parse_error("stories.editStory")),
                     },
+                }
+            }
+            // `EditStoryMusicQuery` (StoryManager.cpp:638-676) — the
+            // Updates ride the engine with the caller promise (the
+            // STORY_NOT_MODIFIED !bot value band); the file-reference
+            // band deletes the bad reference, runs the repair seam and
+            // continues in the reupload chain; the other errors run the
+            // dialog-error head.
+            StoryNetKind::EditStoryMusic {
+                dialog_id,
+                story_id,
+                music_file_id,
+            } => {
+                let Some((file_reference, mut promise)) =
+                    self.story_manager.take_edit_story_music_query_promise()
+                else {
+                    return;
+                };
+                let status = match story_error(&query) {
+                    Some(status) => status,
+                    None => match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => {
+                            self.um_send(UmMessage::OnGetUpdates {
+                                updates: Box::new(updates),
+                                promise,
+                            });
+                            return;
+                        }
+                        Err(_) => parse_error("stories.editStory"),
+                    },
+                };
+                if status.message() == "STORY_NOT_MODIFIED" && !self.auth_manager.is_bot() {
+                    promise.set_value(());
+                } else if !self.auth_manager.is_bot()
+                    && music_file_id.is_valid()
+                    && crate::files::is_file_reference_error(&status)
+                {
+                    // cpp:648-668 — the reference delete, then the repair
+                    // seam: `repair_file_reference` is [blocked: net], and
+                    // the collapse answers the failure the C++ promise
+                    // would eventually carry, so the repair-failure band
+                    // runs at once — the profile-audio reupload chain
+                    // (`AudiosManager::reupload_audio`) with the story
+                    // tail keyed by the resumed upload (the C++ lambda
+                    // captures).
+                    tdutils::log_info!(
+                        "Receive {status} for the story music file reference repair"
+                    );
+                    self.file_manager
+                        .lock()
+                        .delete_file_reference(music_file_id, file_reference.as_bytes());
+                    let file_upload_id = {
+                        let mut files = self.file_manager.lock();
+                        let mut fllm = self.file_load_manager.lock();
+                        self.audios_manager.reupload_audio(
+                            &mut files,
+                            &mut fllm,
+                            &self.audios_upload_callback,
+                            music_file_id,
+                            tdutils::promise::Promise::default(),
+                        )
+                    };
+                    self.story_manager.park_edit_story_music_upload_tail(
+                        file_upload_id,
+                        dialog_id,
+                        story_id,
+                        promise,
+                    );
+                } else {
+                    // cpp:670-673 — the expected-error head + the
+                    // promise error
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        &status,
+                        "EditStoryMusicQuery",
+                    );
+                    promise.set_error(status);
+                }
+            }
+            // `AudiosManager::UploadAudioFileQuery::on_result`/`on_error`
+            // (AudiosManager.cpp:63-79) over the `on_uploaded_audio_file`
+            // bands (:478-512) — the story-music `messages.uploadMedia`
+            // leg; the ok tail merges the parsed document, cancels the
+            // upload and refires `do_edit_story_music` through the keyed
+            // story tail, the error band runs the parts/partial-location
+            // machinery and fails the layer-1 carrier + the tail.
+            StoryNetKind::UploadStoryMusic {
+                file_upload_id,
+                is_url,
+                was_uploaded,
+            } => {
+                // the `is_url` member is signature parity (the C++
+                // `on_uploaded_audio_file` body never reads it)
+                let _ = is_url;
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    telegram_api::MessageMedia::parse(query.ok())
+                        .map_err(|_| parse_error("messages_uploadMedia"))
+                };
+                let file_id = file_upload_id.file_id;
+                // the C++ `UploadAudioFileQuery::on_error` band
+                // (AudiosManager.cpp:70-87) — the parts/partial machinery,
+                // the upload cancel, then the layer-1 carrier + the keyed
+                // story tail fail together (the C++ promise_ error passes
+                // through the edit lambda)
+                let fail_query = |td: &mut Self, status: &Status| {
+                    let close_flag = td.global.close_flag();
+                    {
+                        let mut files = td.file_manager.lock();
+                        let mut fllm = td.file_load_manager.lock();
+                        if was_uploaded {
+                            debug_assert!(file_upload_id.is_valid());
+                            let bad_parts = crate::files::get_missing_file_parts(status);
+                            if bad_parts.is_empty() {
+                                // `delete_partial_remote_location_if_needed`
+                                files.delete_partial_remote_location_on_error(
+                                    file_upload_id,
+                                    status,
+                                    close_flag,
+                                    &mut fllm,
+                                );
+                            } else {
+                                // TODO on_upload_audio_file_parts_missing
+                                // (the C++ carries the same TODO)
+                            }
+                        } else if crate::files::is_file_reference_error(status) {
+                            tdutils::log_error!(
+                                "Receive file reference error for UploadAudioFileQuery"
+                            );
+                        }
+                        files.cancel_upload(file_upload_id, &mut fllm);
+                    }
+                    if let Some(mut carrier) =
+                        td.story_manager.take_upload_story_music_query_promise()
+                    {
+                        carrier.set_error(status.clone());
+                    }
+                    if let Some((_, _, mut tail)) = td
+                        .story_manager
+                        .take_edit_story_music_upload_tail(file_upload_id)
+                    {
+                        tail.set_error(status.clone());
+                    }
+                };
+                // the `on_uploaded_audio_file` 400 bands — the partial
+                // location drop + the error that passes through the edit
+                // lambda to the caller promise
+                let fail_uploaded = |td: &mut Self, message: &str| {
+                    {
+                        let mut files = td.file_manager.lock();
+                        let mut fllm = td.file_load_manager.lock();
+                        files.delete_partial_remote_location(file_upload_id, &mut fllm);
+                    }
+                    if let Some(mut carrier) =
+                        td.story_manager.take_upload_story_music_query_promise()
+                    {
+                        carrier.set_error(Status::error(400, message));
+                    }
+                    if let Some((_, _, mut tail)) = td
+                        .story_manager
+                        .take_edit_story_music_upload_tail(file_upload_id)
+                    {
+                        tail.set_error(Status::error(400, message));
+                    }
+                };
+                match result {
+                    Ok(telegram_api::MessageMedia::messageMediaDocument(media)) => {
+                        let Some(document) = media.document else {
+                            // the C++ `document_` null is the wrong-type band
+                            fail_uploaded(self, "Can't upload audio file: wrong file type");
+                            return;
+                        };
+                        match document {
+                            telegram_api::Document::documentEmpty(_) => {
+                                fail_uploaded(self, "Can't upload audio file: empty file");
+                            }
+                            telegram_api::Document::document(document) => {
+                                let (mut denv, documents) = self.documents_env();
+                                let parsed = documents.on_get_document(
+                                    &mut denv,
+                                    crate::documents_manager::RemoteDocument::from_server_document(
+                                        document,
+                                    ),
+                                    crate::messages_manager::DialogId::default(),
+                                    false,
+                                    false,
+                                    crate::document::DocumentType::General,
+                                    crate::documents_manager::Subtype::Other,
+                                );
+                                if parsed.type_ != crate::document::DocumentType::Audio {
+                                    fail_uploaded(self, "Wrong file type");
+                                    return;
+                                }
+                                if parsed.file_id != file_id {
+                                    // must not delete the old audio, because
+                                    // the file_id could be used for
+                                    // simultaneous URL uploads
+                                    self.audios_manager.merge_audios(parsed.file_id, file_id);
+                                }
+                                let mut files = self.file_manager.lock();
+                                let mut fllm = self.file_load_manager.lock();
+                                files.cancel_upload(file_upload_id, &mut fllm);
+                                drop(files);
+                                drop(fllm);
+                                // the `promise_.set_value` hop: the story
+                                // lambda's ok band refires
+                                // `do_edit_story_music` with the file id
+                                if let Some(mut carrier) =
+                                    self.story_manager.take_upload_story_music_query_promise()
+                                {
+                                    carrier.set_value(());
+                                }
+                                if let Some((dialog_id, story_id, tail)) = self
+                                    .story_manager
+                                    .take_edit_story_music_upload_tail(file_upload_id)
+                                {
+                                    self.with_story_manager(|env, manager| {
+                                        manager.do_edit_story_music(
+                                            env, dialog_id, story_id, file_id, tail,
+                                        );
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        // `media->get_id() != messageMediaDocument::ID`
+                        fail_uploaded(self, "Can't upload audio file: wrong file type");
+                    }
+                    Err(status) => {
+                        fail_query(self, &status);
+                    }
                 }
             }
             // `ToggleStoryPinnedQuery` (StoryManager.cpp:653-687) — the C++
@@ -25883,18 +26171,12 @@ impl Td {
             // and the promise settle (the promise pairs by community, as
             // the C++ query carries its own).
             CommunityNetKind::UpdateNotifySettings { community_id } => {
-                let promise = self
-                    .community_manager
-                    .pending_set_notification_settings
-                    .iter()
-                    .position(|(id, _)| *id == community_id.get())
-                    .map(|index| {
-                        self.community_manager
-                            .pending_set_notification_settings
-                            .remove(index)
-                            .1
-                    });
-                let Some(mut promise) = promise else {
+                let Some(mut promise) = self.community_manager.take_keyed_promise(
+                    community_id,
+                    |m: &mut crate::community_manager::CommunityManager| {
+                        &mut m.pending_set_notification_settings
+                    },
+                ) else {
                     return;
                 };
                 if query.is_error() {
@@ -25917,6 +26199,270 @@ impl Td {
                     Some(true) => promise.set_value(()),
                     Some(false) => promise.set_error(Status::error(400, "Receive false as result")),
                     None => promise.set_error(parse_error("account_updateNotifySettings")),
+                }
+            }
+            // `ToggleCommunityParticipantBannedQuery` (20fc28e23,
+            // cpp:541-568) — the Bool answer's value is ignored
+            // (LOG(INFO) only); the promise settles through the
+            // change-settle (`on_change_community_dialogs`) with the
+            // query's own community. The error arm fails the request.
+            CommunityNetKind::ToggleParticipantBanned { community_id } => {
+                let Some(mut promise) = self.community_manager.take_keyed_promise(
+                    community_id,
+                    |m: &mut crate::community_manager::CommunityManager| &mut m.pending_ban_toggles,
+                ) else {
+                    return;
+                };
+                if query.is_error() {
+                    return promise.set_error(query.error().clone());
+                }
+                if parse_wire_bool_value(query.ok()).is_none() {
+                    // The C++ `fetch_result` failure routes on_error.
+                    return promise.set_error(parse_error("communities_toggleParticipantBanned"));
+                }
+                let mut manager = std::mem::take(&mut self.community_manager);
+                let mut env = CommunityEnv { td: &mut *self };
+                manager.on_change_community_dialogs(&mut env, community_id, promise);
+                self.community_manager = manager;
+            }
+            // `GetCommunityParticipantJoinedChatsQuery` (4cd0dae69,
+            // cpp:570-620) — the users/chats intakes, then the
+            // `get_chat_ids` lambda: the per-channel known gate (an
+            // unknown channel logs and drops), the forced dialog
+            // creation, and the chat-id objects; the owned (creator) and
+            // joined vectors split into the communityMemberChats answer.
+            CommunityNetKind::GetParticipantJoinedChats { community_id } => {
+                let Some(mut promise) = self.community_manager.take_keyed_promise(
+                    community_id,
+                    |m: &mut crate::community_manager::CommunityManager| {
+                        &mut m.pending_member_chats
+                    },
+                ) else {
+                    return;
+                };
+                if query.is_error() {
+                    return promise.set_error(query.error().clone());
+                }
+                let Ok(joined_chats) =
+                    telegram_api::communities_ParticipantJoinedChats::parse(query.ok())
+                else {
+                    return promise.set_error(parse_error("communities_getParticipantJoinedChats"));
+                };
+                self.intake_users(
+                    joined_chats.users,
+                    "GetCommunityParticipantJoinedChatsQuery",
+                );
+                self.intake_chats(
+                    joined_chats.chats,
+                    "GetCommunityParticipantJoinedChatsQuery",
+                );
+                let get_chat_ids = |td: &mut Self, channel_ids: &[i64]| -> Vec<i64> {
+                    let mut chat_ids = Vec::new();
+                    for &channel_id_int in channel_ids {
+                        let channel_id = crate::chat_manager::ChannelId::new(channel_id_int);
+                        if !td.chat_manager.have_channel(channel_id) {
+                            tdutils::log_error!("Receive unknown {channel_id:?}");
+                            continue;
+                        }
+                        let dialog_id = crate::dialog_id::DialogId::from_channel_id(channel_id);
+                        crate::dialog_manager::force_create_dialog(
+                            td,
+                            dialog_id,
+                            "GetCommunityParticipantJoinedChatsQuery",
+                        );
+                        chat_ids.push(crate::dialog_manager::get_chat_id_object(
+                            dialog_id,
+                            "communityMemberChats",
+                        ));
+                    }
+                    chat_ids
+                };
+                let owned_chat_ids = get_chat_ids(self, &joined_chats.creator_chat_ids);
+                let joined_chat_ids = get_chat_ids(self, &joined_chats.joined_chat_ids);
+                promise.set_value(td_api::CommunityMemberChats {
+                    owned_chat_ids,
+                    joined_chat_ids,
+                });
+            }
+            // `GetCommunityPeerLinkRequestsQuery` (ffc06ec75,
+            // cpp:388-440) — the answer builds the page through the
+            // manager's intake (the users + chats intakes, the total
+            // clamp, the invalid-entry drops, the hidden inversion).
+            CommunityNetKind::GetPeerLinkRequests { community_id } => {
+                let Some(mut promise) = self.community_manager.take_keyed_promise(
+                    community_id,
+                    |m: &mut crate::community_manager::CommunityManager| {
+                        &mut m.pending_peer_link_requests
+                    },
+                ) else {
+                    return;
+                };
+                if query.is_error() {
+                    return promise.set_error(query.error().clone());
+                }
+                match telegram_api::communities_PeerLinkRequests::parse(query.ok()) {
+                    Ok(ptr) => {
+                        let mut manager = std::mem::take(&mut self.community_manager);
+                        let mut env = CommunityEnv { td: &mut *self };
+                        manager.on_get_community_peer_link_requests(&mut env, ptr, promise);
+                        self.community_manager = manager;
+                    }
+                    Err(_) => promise.set_error(parse_error("communities_getPeerLinkRequests")),
+                }
+            }
+            // `ProcessCommunityPeerLinkRequestQuery` (2b80bf533,
+            // cpp:442-475) — the `Bool` answer is ignored; the popped
+            // promise settles through the change-settle. The error arm
+            // runs `on_get_dialog_error` on the requested chat first.
+            CommunityNetKind::TogglePeerLinkRequestApproval {
+                community_id,
+                dialog_id,
+            } => {
+                let Some(mut promise) = self.community_manager.take_keyed_promise(
+                    community_id,
+                    |m: &mut crate::community_manager::CommunityManager| {
+                        &mut m.pending_process_request
+                    },
+                ) else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        &status,
+                        "ProcessCommunityPeerLinkRequestQuery",
+                    );
+                    return promise.set_error(status);
+                }
+                if parse_wire_bool_value(query.ok()).is_none() {
+                    return promise
+                        .set_error(parse_error("communities_togglePeerLinkRequestApproval"));
+                }
+                let mut manager = std::mem::take(&mut self.community_manager);
+                let mut env = CommunityEnv { td: &mut *self };
+                manager.on_change_community_dialogs(&mut env, community_id, promise);
+                self.community_manager = manager;
+            }
+            // `ProcessCommunityPeerLinkRequestsQuery` (79a943019,
+            // cpp:477-505) — the `Bool` answer is ignored; the popped
+            // promise settles through the change-settle.
+            CommunityNetKind::ToggleAllPeerLinkRequestApproval { community_id } => {
+                let Some(mut promise) = self.community_manager.take_keyed_promise(
+                    community_id,
+                    |m: &mut crate::community_manager::CommunityManager| {
+                        &mut m.pending_process_all_requests
+                    },
+                ) else {
+                    return;
+                };
+                if query.is_error() {
+                    return promise.set_error(query.error().clone());
+                }
+                if parse_wire_bool_value(query.ok()).is_none() {
+                    return promise
+                        .set_error(parse_error("communities_toggleAllPeerLinkRequestApproval"));
+                }
+                let mut manager = std::mem::take(&mut self.community_manager);
+                let mut env = CommunityEnv { td: &mut *self };
+                manager.on_change_community_dialogs(&mut env, community_id, promise);
+                self.community_manager = manager;
+            }
+            // method; the slice-shaped answer logs the C++ error and
+            // processes the slice chats anyway (cpp:223-228).
+            CommunityNetKind::GetJoinedCommunities => {
+                let promise = self.community_manager.take_promise(
+                    |m: &mut crate::community_manager::CommunityManager| {
+                        &mut m.pending_joined_communities
+                    },
+                );
+                let Some(mut promise) = promise else {
+                    return;
+                };
+                if query.is_error() {
+                    return promise.set_error(query.error().clone());
+                }
+                let chats = match telegram_api::messages_Chats::parse(query.ok()) {
+                    Ok(telegram_api::messages_Chats::messages_chats(chats)) => chats.chats,
+                    Ok(telegram_api::messages_Chats::messages_chatsSlice(chats)) => {
+                        tdutils::log_error!(
+                            "Receive chatsSlice in result of GetJoinedCommunitiesQuery"
+                        );
+                        chats.chats
+                    }
+                    Err(_) => {
+                        return promise.set_error(parse_error("communities_getJoinedCommunities"));
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.community_manager);
+                let mut env = CommunityEnv { td: &mut *self };
+                manager.on_get_joined_communities(&mut env, chats, promise);
+                self.community_manager = manager;
+            }
+            // `ToggleCommunityPeerLinkQuery` (1747ecde1, cpp:350-386) —
+            // the add/remove link toggle. The Bool answer's value is
+            // ignored: the request settles through the change-settle
+            // (`on_change_community_dialogs`), which resolves it now
+            // without a cached full or parks it on the full reload. The
+            // error arm runs the dialog-error convention over the
+            // toggled dialog first (cpp:381-384).
+            CommunityNetKind::TogglePeerLink {
+                community_id,
+                dialog_id,
+            } => {
+                let Some(mut promise) = self.community_manager.take_keyed_promise(
+                    community_id,
+                    |m: &mut crate::community_manager::CommunityManager| {
+                        &mut m.pending_toggle_peer_link
+                    },
+                ) else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        &status,
+                        "ToggleCommunityPeerLinkQuery",
+                    );
+                    return promise.set_error(status);
+                }
+                match parse_wire_bool_value(query.ok()) {
+                    Some(_) => {
+                        let mut manager = std::mem::take(&mut self.community_manager);
+                        let mut env = CommunityEnv { td: &mut *self };
+                        manager.on_change_community_dialogs(&mut env, community_id, promise);
+                        self.community_manager = manager;
+                    }
+                    None => promise.set_error(parse_error("communities_togglePeerLink")),
+                }
+            }
+            // `ToggleCommunityCollapsedInDialogsQuery` (cpp:511-540) —
+            // the Updates answer re-enters `on_get_updates` with the
+            // popped promise; the collapse state itself comes back
+            // through the normal community intake (`on_get_community`).
+            CommunityNetKind::ToggleCommunityCollapsedInDialogs => {
+                if let Some(mut promise) = self.community_manager.take_promise(
+                    |m: &mut crate::community_manager::CommunityManager| &mut m.pending_collapse,
+                ) {
+                    if query.is_error() {
+                        promise.set_error(query.error().clone());
+                    } else {
+                        match telegram_api::Updates::parse(query.ok()) {
+                            Ok(updates) => {
+                                self.um_send(UmMessage::OnGetUpdates {
+                                    updates: Box::new(updates),
+                                    promise,
+                                });
+                            }
+                            Err(_) => {
+                                promise
+                                    .set_error(parse_error("the community collapse toggle answer"));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -31329,6 +31875,14 @@ impl Td {
         for event in saved_music_uploads {
             self.run_saved_music_upload_event(event);
         }
+        // the `AudiosManager::UploadAudioFileCallback` hops — the
+        // `send_closure_later` re-entries of the C++ story-music upload
+        // callback (AudiosManager.cpp:83-95) replay here
+        let audios_uploads =
+            std::mem::take(&mut *self.file_shared.lock().audios_upload_events.lock());
+        for event in audios_uploads {
+            self.run_audios_upload_event(event);
+        }
         // the `UploadAudioFileCallback` hops — the
         // `send_closure_later` re-entries of the C++ speech-recognition
         // upload callback (TranscriptionManager.cpp:500-515) replay here
@@ -31427,6 +31981,76 @@ impl Td {
             }
         }
         self.user_manager = user_manager;
+    }
+
+    /// One `AudiosManager::UploadAudioFileCallback` hop — the C++
+    /// `on_upload_audio_file[_error]` re-entries (AudiosManager.cpp
+    /// :427-457): the ok resolves the audios input media (the env locks
+    /// the file manager, so it runs before the story tail takes the
+    /// borrow) and continues in the `UploadStoryMusic` query send; the
+    /// close gate keeps the parked promises (the C++ early return).
+    fn run_audios_upload_event(&mut self, event: UserUploadEvent) {
+        if self.global.close_flag() {
+            return;
+        }
+        match event {
+            UserUploadEvent::Ok {
+                file_upload_id,
+                input_file,
+            } => {
+                tdutils::log_info!("Audio {file_upload_id:?} has been uploaded");
+                let promise = self
+                    .audios_manager
+                    .take_uploaded_audio_promise(file_upload_id);
+                let had_input_file = input_file.is_some();
+                let input_media = self
+                    .audios_manager
+                    .get_input_media(self, file_upload_id.file_id, input_file, None)
+                    .expect("CHECK(input_media != nullptr)");
+                let was_uploaded = crate::files::extract_was_uploaded(&input_media);
+                if had_input_file && !was_uploaded {
+                    // if we had InputFile, but has failed to use it for
+                    // input_media, then we need to immediately cancel file
+                    // upload so the next upload with the same file can
+                    // succeed
+                    let mut files = self.file_manager.lock();
+                    let mut fllm = self.file_load_manager.lock();
+                    files.cancel_upload(file_upload_id, &mut fllm);
+                }
+                self.with_story_manager(|_, manager| {
+                    manager.do_upload_story_music_query(
+                        file_upload_id,
+                        !had_input_file,
+                        was_uploaded,
+                        input_media,
+                        promise,
+                    );
+                });
+            }
+            UserUploadEvent::Error {
+                file_upload_id,
+                status,
+            } => {
+                tdutils::log_warning!("Audio {file_upload_id:?} has upload error {status}");
+                let mut promise = self
+                    .audios_manager
+                    .take_uploaded_audio_promise(file_upload_id);
+                // the C++ band: `status.code() > 0 ? status.code() : 500`
+                let status = if status.code() > 0 {
+                    status
+                } else {
+                    tdutils::status::Status::error(500, status.message())
+                };
+                promise.set_error(status.clone());
+                // the story lambda's error pass-through
+                if let Some((_, _, mut tail)) = self
+                    .story_manager
+                    .take_edit_story_music_upload_tail(file_upload_id)
+                {
+                    tail.set_error(status);
+                }
+            }
+        }
     }
 
     /// One `UploadSavedMusicCallback` hop — the C++
@@ -33567,6 +34191,10 @@ pub(crate) struct TdFileShared {
     /// both completions re-enter
     /// `UserManager::on_upload_saved_music[_error]` at the drive end.
     pub(crate) saved_music_upload_events: Arc<parking_lot::Mutex<Vec<UserUploadEvent>>>,
+    /// The `AudiosManager::UploadAudioFileCallback` hops
+    /// (AudiosManager.cpp:83-95) — both completions re-enter the story
+    /// music upload's `on_upload_audio_file[_error]` at the drive end.
+    pub(crate) audios_upload_events: Arc<parking_lot::Mutex<Vec<UserUploadEvent>>>,
     /// The `UploadAudioFileCallback` hops (TranscriptionManager.cpp:
     /// 500-515) — both completions re-enter
     /// `TranscriptionManager::on_upload_audio_file[_error]` at the
@@ -33620,6 +34248,7 @@ impl TdFileShared {
             user_download_finished_events: Arc::new(Mutex::new(Vec::new())),
             profile_photo_upload_events: Arc::new(Mutex::new(Vec::new())),
             saved_music_upload_events: Arc::new(Mutex::new(Vec::new())),
+            audios_upload_events: Arc::new(Mutex::new(Vec::new())),
             audio_upload_events: Arc::new(Mutex::new(Vec::new())),
             files_dir: String::new(),
             secure_files_dir: String::new(),
@@ -34215,6 +34844,36 @@ struct TdAudioUploadCallback {
 }
 
 impl crate::files::UploadCallback for TdAudioUploadCallback {
+    fn on_upload_ok(
+        &mut self,
+        file_upload_id: crate::files::FileUploadId,
+        input_file: Option<telegram_api::InputFile>,
+    ) {
+        self.events.lock().push(UserUploadEvent::Ok {
+            file_upload_id,
+            input_file,
+        });
+    }
+
+    fn on_upload_error(
+        &mut self,
+        file_upload_id: crate::files::FileUploadId,
+        status: tdutils::status::Status,
+    ) {
+        self.events.lock().push(UserUploadEvent::Error {
+            file_upload_id,
+            status,
+        });
+    }
+}
+
+/// `AudiosManager::UploadAudioFileCallback` (AudiosManager.cpp:83-95)
+/// — the story-music upload twin of [`TdProfilePhotoUploadCallback`].
+struct TdAudiosUploadCallback {
+    events: Arc<parking_lot::Mutex<Vec<UserUploadEvent>>>,
+}
+
+impl crate::files::UploadCallback for TdAudiosUploadCallback {
     fn on_upload_ok(
         &mut self,
         file_upload_id: crate::files::FileUploadId,
@@ -41739,6 +42398,20 @@ impl CommunityManagerEnv for CommunityEnv<'_> {
         self.td.auth_manager.is_bot()
     }
 
+    /// `DialogManager::get_input_peer(dialog_id, AccessRights::Know)`
+    /// (CommunityManager.cpp:2116) — the member peer lookup of the
+    /// member pair; the null answer is the "Member not found" band.
+    fn get_input_peer_know(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+    ) -> Option<tdmtproto::telegram_api::InputPeer> {
+        crate::dialog_manager::get_input_peer(
+            self.td,
+            dialog_id,
+            crate::user_manager::AccessRights::Know,
+        )
+    }
+
     // ---- The net query senders — the C++ ResultHandler send legs
     // (CommunityManager.cpp:120-260). ----
 
@@ -41910,6 +42583,292 @@ impl CommunityManagerEnv for CommunityEnv<'_> {
                 ),
             ),
             None => tdutils::log_info!("Reload community full {community_id:?} — [net-inert]"),
+        }
+    }
+
+    // ---- The #131 link-toggle lookups and sender
+    // (CommunityManager.cpp:2019-2047, 350-386). ----
+
+    fn get_bot_can_be_edited(&self, user_id: crate::user_manager::UserId) -> bool {
+        self.td
+            .user_manager
+            .get_bot_data(user_id)
+            .map(|bot_data| bot_data.can_be_edited)
+            .unwrap_or(false)
+    }
+
+    fn get_chat_status(
+        &self,
+        chat_id: crate::chat_manager::ChatId,
+    ) -> crate::chat_manager::DialogParticipantStatus {
+        self.td.chat_manager.get_chat_status(chat_id)
+    }
+
+    fn get_channel_status(
+        &self,
+        channel_id: crate::chat_manager::ChannelId,
+    ) -> crate::chat_manager::DialogParticipantStatus {
+        self.td.chat_manager.get_channel_status(channel_id)
+    }
+
+    /// `ToggleCommunityPeerLinkQuery::send` (cpp:350-386) — the wire
+    /// flag band `visible = !is_deleted && !is_hidden`, `hidden =
+    /// !is_deleted && is_hidden`, `deleted = is_deleted` over the input
+    /// community and the dialog's read-access input peer.
+    fn send_toggle_community_peer_link_query(
+        &mut self,
+        community_id: CommunityId,
+        input_community: telegram_api::InputChannel,
+        dialog_id: DialogId,
+        is_deleted: bool,
+        is_hidden: bool,
+    ) {
+        let Some(net) = self.td.community_net() else {
+            return tdutils::log_info!(
+                "Send communities.togglePeerLink for {community_id:?} — [net-inert]"
+            );
+        };
+        // `DialogManager::get_input_peer(dialog_id, Read)` — the C++
+        // CHECK band; the None arm drops the query (the recorded CHECK
+        // collapse, as the create sender).
+        let Some(peer) = crate::dialog_manager::get_input_peer(
+            self.td,
+            dialog_id,
+            crate::user_manager::AccessRights::Read,
+        ) else {
+            return tdutils::log_info!(
+                "ToggleCommunityPeerLinkQuery — no input peer for {dialog_id:?}"
+            );
+        };
+        net.dispatch(
+            CommunityNetKind::TogglePeerLink {
+                community_id,
+                dialog_id,
+            },
+            telegram_api::Function::communities_togglePeerLink(
+                telegram_api::communities_togglePeerLink {
+                    flags: 0,
+                    visible: !is_deleted && !is_hidden,
+                    hidden: !is_deleted && is_hidden,
+                    deleted: is_deleted,
+                    community: Some(input_community),
+                    peer: Some(Box::new(peer)),
+                },
+            ),
+        )
+    }
+
+    /// `ToggleCommunityParticipantBannedQuery::send` (20fc28e23,
+    /// cpp:549-560) — `communities.toggleParticipantBanned(0,
+    /// unban = !is_banned, input_community, participant)`; the kind
+    /// carries the community the change-settle runs over.
+    fn send_toggle_participant_banned_query(
+        &mut self,
+        community_id: CommunityId,
+        input_community: telegram_api::InputChannel,
+        participant: telegram_api::InputPeer,
+        is_banned: bool,
+    ) {
+        let Some(net) = self.td.community_net() else {
+            return tdutils::log_info!(
+                "Send communities.toggleParticipantBanned for {community_id:?} — [net-inert]"
+            );
+        };
+        net.dispatch(
+            CommunityNetKind::ToggleParticipantBanned { community_id },
+            telegram_api::Function::communities_toggleParticipantBanned(
+                telegram_api::communities_toggleParticipantBanned {
+                    flags: 0,
+                    unban: !is_banned,
+                    community: Some(input_community),
+                    participant: Some(Box::new(participant)),
+                },
+            ),
+        );
+    }
+
+    /// `GetCommunityParticipantJoinedChatsQuery::send` (4cd0dae69,
+    /// cpp:583-589) — `communities.getParticipantJoinedChats(
+    /// input_community, participant)`.
+    fn send_get_participant_joined_chats_query(
+        &mut self,
+        community_id: CommunityId,
+        input_community: telegram_api::InputChannel,
+        participant: telegram_api::InputPeer,
+    ) {
+        let Some(net) = self.td.community_net() else {
+            return tdutils::log_info!(
+                "Send communities.getParticipantJoinedChats for {community_id:?} — [net-inert]"
+            );
+        };
+        net.dispatch(
+            CommunityNetKind::GetParticipantJoinedChats { community_id },
+            telegram_api::Function::communities_getParticipantJoinedChats(
+                telegram_api::communities_getParticipantJoinedChats {
+                    community: Some(input_community),
+                    participant: Some(Box::new(participant)),
+                },
+            ),
+        );
+    }
+    // ---- The add-chat requests queue senders (ffc06ec75, 2b80bf533,
+    // 79a943019; CommunityManager.cpp:388-505). ----
+
+    /// `GetCommunityPeerLinkRequestsQuery::send` (cpp:396-401) — the
+    /// page query over the input community.
+    fn send_get_community_peer_link_requests_query(
+        &mut self,
+        community_id: CommunityId,
+        input_community: telegram_api::InputChannel,
+        offset: &str,
+        limit: i32,
+    ) {
+        let Some(net) = self.td.community_net() else {
+            return tdutils::log_info!(
+                "Send communities_getPeerLinkRequests for {community_id:?} — [net-inert]"
+            );
+        };
+        net.dispatch(
+            CommunityNetKind::GetPeerLinkRequests { community_id },
+            telegram_api::Function::communities_getPeerLinkRequests(
+                telegram_api::communities_getPeerLinkRequests {
+                    community: Some(input_community),
+                    offset: offset.to_owned(),
+                    limit,
+                },
+            ),
+        )
+    }
+
+    /// `ProcessCommunityPeerLinkRequestQuery::send` (cpp:454-464) —
+    /// `communities_togglePeerLinkRequestApproval(0, !approve, ...)`;
+    /// the requested chat's read-access input peer resolves here (the
+    /// C++ CHECK band; the None arm parks the family promise).
+    fn send_process_community_peer_link_request_query(
+        &mut self,
+        community_id: CommunityId,
+        dialog_id: DialogId,
+        input_community: telegram_api::InputChannel,
+        approve: bool,
+    ) {
+        let Some(net) = self.td.community_net() else {
+            return tdutils::log_info!(
+                "Send communities_togglePeerLinkRequestApproval for {community_id:?} — [net-inert]"
+            );
+        };
+        let Some(peer) = crate::dialog_manager::get_input_peer(
+            self.td,
+            dialog_id,
+            crate::user_manager::AccessRights::Read,
+        ) else {
+            return tdutils::log_info!(
+                "ProcessCommunityPeerLinkRequestQuery — no input peer for {dialog_id:?}"
+            );
+        };
+        net.dispatch(
+            CommunityNetKind::TogglePeerLinkRequestApproval {
+                community_id,
+                dialog_id,
+            },
+            telegram_api::Function::communities_togglePeerLinkRequestApproval(
+                telegram_api::communities_togglePeerLinkRequestApproval {
+                    flags: 0,
+                    reject: !approve,
+                    community: Some(input_community),
+                    peer: Some(Box::new(peer)),
+                },
+            ),
+        )
+    }
+
+    /// `ProcessCommunityPeerLinkRequestsQuery::send` (cpp:489-494) —
+    /// `communities_toggleAllPeerLinkRequestApproval(0, !approve, ...)`.
+    fn send_process_community_peer_link_requests_query(
+        &mut self,
+        community_id: CommunityId,
+        input_community: telegram_api::InputChannel,
+        approve: bool,
+    ) {
+        let Some(net) = self.td.community_net() else {
+            return tdutils::log_info!(
+                "Send communities_toggleAllPeerLinkRequestApproval for {community_id:?} — [net-inert]"
+            );
+        };
+        net.dispatch(
+            CommunityNetKind::ToggleAllPeerLinkRequestApproval { community_id },
+            telegram_api::Function::communities_toggleAllPeerLinkRequestApproval(
+                telegram_api::communities_toggleAllPeerLinkRequestApproval {
+                    flags: 0,
+                    reject: !approve,
+                    community: Some(input_community),
+                },
+            ),
+        )
+    }
+
+    /// `UserManager::on_get_users` — the page answer's users intake.
+    fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &str) {
+        self.td.intake_users(users, source);
+    }
+
+    /// `DialogManager::force_create_dialog` — the documented no-op stub.
+    fn force_create_dialog(&mut self, dialog_id: DialogId, source: &str) {
+        crate::dialog_manager::force_create_dialog(self.td, dialog_id, source);
+    }
+
+    /// `UserManager::get_user_id_object` — the collapsed sync form over
+    /// the user manager.
+    fn get_user_id_object(&mut self, user_id: crate::user_manager::UserId, source: &str) -> i64 {
+        self.td.with_user_manager_env(|user_manager, env| {
+            user_manager.get_user_id_object(env, user_id, source)
+        })
+    }
+
+    /// `GetJoinedCommunitiesQuery::send` (cpp:205-207).
+    fn send_get_joined_communities_query(&mut self) {
+        match self.td.community_net() {
+            Some(net) => net.dispatch(
+                CommunityNetKind::GetJoinedCommunities,
+                telegram_api::Function::communities_getJoinedCommunities(
+                    telegram_api::communities_getJoinedCommunities,
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send communities.getJoinedCommunities — [net-inert]")
+            }
+        }
+    }
+
+    /// `ChatManager::on_get_chats` (cpp:1867) — the non-community
+    /// remainder of the answer reaches the shared chat intake
+    /// (`Td::intake_chats`, the `GetCommunitiesQuery` arm's seam); the
+    /// community-family entries already routed through the manager's
+    /// own intake (the `ChatManager::on_get_chat` consume-drop).
+    fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &str) {
+        self.td.intake_chats(chats, source);
+    }
+
+    /// `ToggleCommunityCollapsedInDialogsQuery::send` (cpp:511-540).
+    fn send_toggle_community_collapsed_in_dialogs_query(
+        &mut self,
+        input_community: telegram_api::InputChannel,
+        are_dialogs_collapsed: bool,
+    ) {
+        match self.td.community_net() {
+            Some(net) => net.dispatch(
+                CommunityNetKind::ToggleCommunityCollapsedInDialogs,
+                telegram_api::Function::communities_toggleCommunityCollapsedInDialogs(
+                    telegram_api::communities_toggleCommunityCollapsedInDialogs {
+                        flags: 0,
+                        collapsed: are_dialogs_collapsed,
+                        community: Some(input_community),
+                    },
+                ),
+            ),
+            None => tdutils::log_info!(
+                "Send communities.toggleCommunityCollapsedInDialogs(collapsed = \
+                 {are_dialogs_collapsed}) — [net-inert]"
+            ),
         }
     }
 }
@@ -49700,6 +50659,11 @@ pub(crate) struct StoryEnv<'a> {
     /// The story net dispatch surface — `None` keeps the net-inert
     /// posture (the §3.5 net-drain 20 families dispatch through it).
     pub net: Option<StoryNetHandle>,
+    /// The `AudiosManager::upload_audio_file_callback_` outbox bridge —
+    /// the story-music upload leg registers the file-plane uploads
+    /// through it.
+    pub audios_upload_callback:
+        std::sync::Arc<parking_lot::Mutex<dyn crate::files::UploadCallback>>,
 }
 
 impl<'a> StoryEnv<'a> {
@@ -51067,6 +52031,51 @@ impl<'a> crate::story_manager::StoryManagerEnv for StoryEnv<'a> {
             },
             None => tdutils::log_info!("Send stories.editStory (business) — [net-inert]"),
         }
+    }
+
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn get_story_music_input_document(
+        &mut self,
+        music_file_id: crate::files::FileId,
+    ) -> tdutils::status::Result<telegram_api::InputDocument> {
+        // `get_story_music_input_document` (StoryManager.cpp:6637-6648)
+        // — the empty/audio-type/main-remote gates, then the wire form.
+        const INVALID_AUDIO_FILE_ID: &str = "Invalid audio file identifier specified";
+        let files = self.file_manager.lock();
+        let Some(file_view) = files.get_file_view(music_file_id) else {
+            return tdutils::status::Result::Err(Status::error(400, INVALID_AUDIO_FILE_ID));
+        };
+        if file_view.get_type() != crate::files::FileType::Audio {
+            return tdutils::status::Result::Err(Status::error(400, INVALID_AUDIO_FILE_ID));
+        }
+        let Some(main_remote_location) = file_view.get_main_remote_location() else {
+            return tdutils::status::Result::Err(Status::error(400, INVALID_AUDIO_FILE_ID));
+        };
+        if main_remote_location.is_web() {
+            return tdutils::status::Result::Err(Status::error(400, INVALID_AUDIO_FILE_ID));
+        }
+        tdutils::status::Result::Ok(telegram_api::InputDocument::inputDocument(
+            main_remote_location.as_input_document(),
+        ))
+    }
+
+    fn upload_story_music_audio(
+        &mut self,
+        input_audio: td_api::InputAudio,
+        promise: tdutils::promise::Promise<()>,
+    ) -> tdutils::status::Result<crate::audios_manager::AudioUploadOutcome> {
+        let mut files = self.file_manager.lock();
+        let mut fllm = self.file_load_manager.lock();
+        self.audios.upload_audio(
+            &mut files,
+            &mut fllm,
+            &self.audios_upload_callback,
+            Some(input_audio),
+            promise,
+        )
     }
 }
 
@@ -60923,6 +61932,111 @@ mod tests {
     }
 
     #[test]
+    fn community_collapse_toggle_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(community_collapse_toggle_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn community_collapse_toggle_rides_the_dispatcher_impl() {
+        use crate::community_id::CommunityId;
+
+        let (mut td, rec) = netted_td("netfix-cm-collapse");
+        // Cache a creator community, then drive the collapse toggle —
+        // the known-community gate passes and the
+        // communities.toggleCommunityCollapsedInDialogs query rides the
+        // dispatcher.
+        with_community_manager(&mut td, |manager, env| {
+            manager.on_get_community(
+                env,
+                &telegram_api::community {
+                    flags: 1,
+                    creator: true,
+                    left: false,
+                    min: false,
+                    flags2: 0,
+                    collapsed_in_dialogs: false,
+                    id: 7,
+                    access_hash: 11,
+                    title: "My community".to_owned(),
+                    photo: None,
+                    date: 10,
+                    admin_rights: None,
+                    default_banned_rights: None,
+                },
+                "test",
+            );
+        });
+        let (promise, recorded) = record_ton_unit();
+        with_community_manager(&mut td, |manager, env| {
+            manager.toggle_community_are_dialogs_collapsed(env, CommunityId::new(7), true, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::communities_toggleCommunityCollapsedInDialogs::ID
+        );
+        // The answer is an Updates: it re-enters `on_get_updates` with
+        // the popped promise (CommunityManager.cpp:531-536), carrying
+        // the community chat whose `collapsed_in_dialogs` bit is the
+        // toggled state (the C++ flip happens through
+        // ChatManager::on_get_chats → CommunityManager::on_get_community).
+        // In the port the chats intake accepts the wire community
+        // (community-first ordering) but `ChatManager::on_get_chat`'s
+        // M.5.20 community stub consumes and drops it — the flag walk is
+        // proven at the manager seam by
+        // `collapse_flip_quiet_expansion_fans_out` instead. The promise
+        // still settles ok — updates processing cannot fail it
+        // (UpdatesManager.cpp:1188-1194).
+        let wire = telegram_api::community {
+            flags: 1,
+            creator: true,
+            left: false,
+            min: false,
+            flags2: 0,
+            collapsed_in_dialogs: true,
+            id: 7,
+            access_hash: 11,
+            title: "My community".to_owned(),
+            photo: None,
+            date: 10,
+            admin_rights: None,
+            default_banned_rights: None,
+        };
+        let mut answer = Vec::new();
+        telegram_api::Updates::updates(telegram_api::updates {
+            updates: vec![],
+            chats: vec![telegram_api::Chat::community(wire)],
+            users: vec![],
+            date: 0,
+            seq: 0,
+        })
+        .store(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_community_net();
+        assert!(matches!(
+            recorded.lock().unwrap().as_ref(),
+            Some(tdutils::status::Result::Ok(()))
+        ));
+        // the recorded stub divergence: the wire community is dropped
+        // upstream of the manager, so the cached flag stays un-flipped
+        // here (flip this assert when the chats→community hop is wired)
+        with_community_manager(&mut td, |manager, _| {
+            assert!(
+                !manager
+                    .get_community_object(CommunityId::new(7))
+                    .expect("the seeded community")
+                    .are_chats_collapsed
+            );
+        });
+        assert!(td.community_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
     fn community_notification_settings_ride_the_dispatcher() {
         std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
@@ -61172,6 +62286,1033 @@ mod tests {
             .store_boxed(&mut out);
             out
         });
+        td.dispatch_completed_community_net();
+        assert!(td.community_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn community_peer_link_toggles_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(community_peer_link_toggles_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn community_member_ban_toggle_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(community_member_ban_toggle_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn community_joined_communities_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(community_joined_communities_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn community_peer_link_toggles_ride_the_dispatcher_impl() {
+        use crate::dialog_id::DialogId;
+
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-cm-peer-link");
+        const BOOL_TRUE: i32 = 0x9972_75b5u32 as i32;
+
+        // seed a creator community + the owner's creator channel (the
+        // is_dialog_owner channel arm and the Read input peer resolve
+        // against it)
+        let wire_community = telegram_api::community {
+            flags: 1,
+            creator: true,
+            left: false,
+            min: false,
+            flags2: 0,
+            collapsed_in_dialogs: false,
+            id: 7,
+            access_hash: 11,
+            title: "My community".to_owned(),
+            photo: None,
+            date: 10,
+            admin_rights: None,
+            default_banned_rights: None,
+        };
+        with_community_manager(&mut td, |manager, env| {
+            manager.on_get_community(env, &wire_community, "test");
+        });
+        let owner_channel = crate::chat_manager::ChannelId::new(703);
+        let owner_dialog = DialogId::from_channel_id(owner_channel);
+        with_chat_managers(&mut td, |chat_manager, user_manager, env| {
+            chat_manager.on_get_chat(
+                user_manager,
+                env,
+                telegram_api::Chat::channel(telegram_api::channel {
+                    creator: true,
+                    broadcast: true,
+                    id: owner_channel.get(),
+                    access_hash: 777,
+                    title: "owner's channel".to_owned(),
+                    ..telegram_api::channel::default()
+                }),
+                "test",
+            );
+        });
+
+        // 1. addCommunityChat (the visible band, cpp:366-368) — the
+        //    boolTrue answer's value is ignored and the request settles
+        //    through the change-settle now (no cached full)
+        td.request(
+            1,
+            Function::addCommunityChat(td_api::addCommunityChat {
+                community_id: 7,
+                chat_id: owner_dialog.get(),
+                is_hidden: false,
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent_query(&rec, telegram_api::communities_togglePeerLink::ID);
+        let body =
+            telegram_api::communities_togglePeerLink::parse(sent.query()).expect("the sent body");
+        assert!(body.visible, "add-visible sends the visible band");
+        assert!(!body.hidden);
+        assert!(!body.deleted);
+        assert!(matches!(
+            body.community,
+            Some(telegram_api::InputChannel::inputChannel(_))
+        ));
+        assert!(matches!(
+            body.peer.as_deref().expect("the input peer"),
+            telegram_api::InputPeer::inputPeerChannel(_)
+        ));
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_community_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 2. addCommunityChat hidden — the hidden band rides the same
+        //    query (boolFalse settles ok alike: the value is ignored)
+        td.request(
+            2,
+            Function::addCommunityChat(td_api::addCommunityChat {
+                community_id: 7,
+                chat_id: owner_dialog.get(),
+                is_hidden: true,
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent_query(&rec, telegram_api::communities_togglePeerLink::ID);
+        let body =
+            telegram_api::communities_togglePeerLink::parse(sent.query()).expect("the sent body");
+        assert!(!body.visible);
+        assert!(body.hidden, "the hidden add sends the hidden band");
+        assert!(!body.deleted);
+        const BOOL_FALSE: i32 = 0xbc79_9737u32 as i32;
+        net_complete(sent, BOOL_FALSE.to_le_bytes().to_vec());
+        td.dispatch_completed_community_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 3. removeCommunityChat with a cached full — the deleted band;
+        //    the settle rides the full reload (on_change_community_dialogs
+        //    parks the request until channels.getFullChannel answers)
+        with_community_manager(&mut td, |manager, env| {
+            manager.on_get_community_full(
+                env,
+                &telegram_api::communityFull {
+                    flags: 0,
+                    id: 7,
+                    about: "about".to_owned(),
+                    chat_photo: None,
+                    linked_peers: vec![],
+                    admins_count: 0,
+                    kicked_count: 0,
+                    peer_link_requests_pending: 0,
+                },
+            );
+        });
+        // the unsynchronized settings trigger the Get query — answer it
+        // so the later reload intakes stay silent
+        let get = take_sent_query(&rec, telegram_api::account_getNotifySettings::ID);
+        net_complete(get, {
+            let mut out = Vec::new();
+            telegram_api::PeerNotifySettings {
+                flags: 0,
+                show_previews: true,
+                silent: false,
+                mute_until: 0,
+                ios_sound: None,
+                android_sound: None,
+                other_sound: None,
+                stories_muted: false,
+                stories_hide_sender: false,
+                stories_ios_sound: None,
+                stories_android_sound: None,
+                stories_other_sound: None,
+            }
+            .store_boxed(&mut out);
+            out
+        });
+        td.dispatch_completed_community_net();
+
+        td.request(
+            3,
+            Function::removeCommunityChat(td_api::removeCommunityChat {
+                community_id: 7,
+                chat_id: owner_dialog.get(),
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent_query(&rec, telegram_api::communities_togglePeerLink::ID);
+        let body =
+            telegram_api::communities_togglePeerLink::parse(sent.query()).expect("the sent body");
+        assert!(!body.visible);
+        assert!(!body.hidden);
+        assert!(body.deleted, "the remove sends the deleted band");
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_community_net();
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 3).is_empty(),
+            "the settle parks on the community full reload"
+        );
+        let reload = take_sent_query(&rec, telegram_api::channels_getFullChannel::ID);
+        net_complete(reload, {
+            let mut out = Vec::new();
+            telegram_api::messages_ChatFull {
+                full_chat: Some(telegram_api::ChatFull::communityFull(
+                    telegram_api::communityFull {
+                        flags: 0,
+                        id: 7,
+                        about: "about".to_owned(),
+                        chat_photo: None,
+                        linked_peers: vec![],
+                        admins_count: 0,
+                        kicked_count: 0,
+                        peer_link_requests_pending: 0,
+                    },
+                )),
+                chats: vec![],
+                users: vec![],
+            }
+            .store_boxed(&mut out);
+            out
+        });
+        td.dispatch_completed_community_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 3).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 4. the error arm — the dialog-error convention runs and the
+        //    request answers the forwarded error
+        td.request(
+            4,
+            Function::addCommunityChat(td_api::addCommunityChat {
+                community_id: 7,
+                chat_id: owner_dialog.get(),
+                is_hidden: false,
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent_query(&rec, telegram_api::communities_togglePeerLink::ID);
+        net_fail(sent, 400, "CHAT_ID_INVALID");
+        td.dispatch_completed_community_net();
+        td.flush_deferred_results();
+        assert_eq!(error_of(&callback, 4).message, "CHAT_ID_INVALID");
+        assert!(td.community_net_completed.lock().is_empty(), "drained");
+        with_community_manager(&mut td, |manager, _env| {
+            assert!(manager.pending_toggle_peer_link.is_empty());
+            assert!(manager.pending_change_dialogs.is_empty());
+        });
+    }
+
+    /// The `toggleCommunityMemberIsBanned` walk (20fc28e23,
+    /// Requests.cpp:3540-3546 + CommunityManager.cpp:2107-2122/541-568):
+    /// the sender→dialog resolution bands answer their 400s before any
+    /// query, the gates send the participant-banned toggle with the
+    /// unban inversion band, and the ignored Bool answer settles through
+    /// the change-settle — ok now without a cached full, ok after the
+    /// reload once one is cached. The error arm fails the request.
+    fn community_member_ban_toggle_rides_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-cm-member-ban");
+        const BOOL_TRUE: i32 = 0x9972_75b5u32 as i32;
+
+        // seed the creator community + the member user (the Know peer
+        // lookup needs the user cached)
+        with_community_manager(&mut td, |manager, env| {
+            manager.on_get_community(
+                env,
+                &telegram_api::community {
+                    flags: 1,
+                    creator: true,
+                    left: false,
+                    min: false,
+                    flags2: 0,
+                    collapsed_in_dialogs: false,
+                    id: 7,
+                    access_hash: 11,
+                    title: "My community".to_owned(),
+                    photo: None,
+                    date: 10,
+                    admin_rights: None,
+                    default_banned_rights: None,
+                },
+                "test",
+            );
+        });
+        td.intake_users(vec![wire_user(5, "Member")], "test");
+
+        // 1. the sender→dialog resolution bands (MessageSender.cpp:180,
+        //    189) answer before any query
+        td.request(
+            1,
+            Function::toggleCommunityMemberIsBanned(td_api::toggleCommunityMemberIsBanned {
+                community_id: 7,
+                member_id: None,
+                is_banned: true,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 1);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Message sender must be non-empty")
+        );
+        td.request(
+            2,
+            Function::toggleCommunityMemberIsBanned(td_api::toggleCommunityMemberIsBanned {
+                community_id: 7,
+                member_id: Some(td_api::MessageSender::messageSenderUser(
+                    td_api::messageSenderUser { user_id: 0 },
+                )),
+                is_banned: true,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 2);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Invalid user identifier specified")
+        );
+        assert!(rec.sent.lock().is_empty(), "the bands send no query");
+
+        // 2. the gates pass: the wire toggle carries the unban inversion
+        //    band + the resolved input forms
+        td.request(
+            3,
+            Function::toggleCommunityMemberIsBanned(td_api::toggleCommunityMemberIsBanned {
+                community_id: 7,
+                member_id: Some(td_api::MessageSender::messageSenderUser(
+                    td_api::messageSenderUser { user_id: 5 },
+                )),
+                is_banned: true,
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent_query(&rec, telegram_api::communities_toggleParticipantBanned::ID);
+        let body = telegram_api::communities_toggleParticipantBanned::parse(sent.query())
+            .expect("the sent body");
+        assert!(!body.unban, "unban = !is_banned");
+        match body.community {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!((channel.channel_id, channel.access_hash), (7, 11));
+            }
+            other => panic!("the input community: {other:?}"),
+        }
+        match body.participant {
+            Some(participant) => match *participant {
+                telegram_api::InputPeer::inputPeerUser(user) => {
+                    assert_eq!((user.user_id, user.access_hash), (5, 42));
+                }
+                other => panic!("the participant peer: {other:?}"),
+            },
+            None => panic!("the participant peer rides the query"),
+        }
+
+        // the ignored Bool settles through the change-settle — no cached
+        // full, so the request settles ok now
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_community_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 3).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 3. the error arm fails the request
+        td.request(
+            4,
+            Function::toggleCommunityMemberIsBanned(td_api::toggleCommunityMemberIsBanned {
+                community_id: 7,
+                member_id: Some(td_api::MessageSender::messageSenderUser(
+                    td_api::messageSenderUser { user_id: 5 },
+                )),
+                is_banned: false,
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent_query(&rec, telegram_api::communities_toggleParticipantBanned::ID);
+        let body = telegram_api::communities_toggleParticipantBanned::parse(sent.query())
+            .expect("the unban body");
+        assert!(body.unban, "unban = !is_banned lifts on the unban arm");
+        net_fail(sent, 400, "USER_NOT_PARTICIPANT");
+        td.dispatch_completed_community_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 4);
+        assert_eq!(error.message, "USER_NOT_PARTICIPANT");
+
+        // 4. with a cached full the same Bool answer settles through the
+        //    change-settle's reload: the full reloads first, then the
+        //    request settles ok
+        let wire_full = telegram_api::communityFull {
+            flags: 0,
+            id: 7,
+            about: "about".to_owned(),
+            chat_photo: None,
+            linked_peers: vec![],
+            admins_count: 2,
+            kicked_count: 1,
+            peer_link_requests_pending: 0,
+        };
+        with_community_manager(&mut td, |manager, env| {
+            manager.on_get_community_full(env, &wire_full);
+        });
+        // the unsynchronized settings query the full intake fires
+        let notify = take_sent_query(&rec, telegram_api::account_getNotifySettings::ID);
+        net_complete(notify, {
+            let mut out = Vec::new();
+            telegram_api::PeerNotifySettings {
+                flags: 0,
+                show_previews: true,
+                silent: false,
+                mute_until: 0,
+                ios_sound: None,
+                android_sound: None,
+                other_sound: None,
+                stories_muted: false,
+                stories_hide_sender: false,
+                stories_ios_sound: None,
+                stories_android_sound: None,
+                stories_other_sound: None,
+            }
+            .store_boxed(&mut out);
+            out
+        });
+        td.dispatch_completed_community_net();
+
+        td.request(
+            5,
+            Function::toggleCommunityMemberIsBanned(td_api::toggleCommunityMemberIsBanned {
+                community_id: 7,
+                member_id: Some(td_api::MessageSender::messageSenderUser(
+                    td_api::messageSenderUser { user_id: 5 },
+                )),
+                is_banned: true,
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent_query(&rec, telegram_api::communities_toggleParticipantBanned::ID);
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_community_net();
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 5).is_empty(),
+            "the settle parks on the reload"
+        );
+        // the change-settle's full reload settles the request ok at its
+        // answer
+        let reload = take_sent_query(&rec, telegram_api::channels_getFullChannel::ID);
+        match telegram_api::channels_getFullChannel::parse(reload.query()) {
+            Ok(body) => match body.channel {
+                Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                    assert_eq!(channel.channel_id, 7);
+                }
+                other => panic!("the reload community: {other:?}"),
+            },
+            Err(what) => panic!("the reload body: {what}"),
+        }
+        net_complete(
+            reload,
+            messages_chat_full_answer(
+                telegram_api::ChatFull::communityFull(wire_full),
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        td.dispatch_completed_community_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 5).first(),
+            Some(Object::ok(_))
+        ));
+        assert!(td.community_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn community_member_chats_walk_the_split() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(community_member_chats_walk_the_split_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The `getCommunityMemberChats` walk (4cd0dae69,
+    /// Requests.cpp:3549-3556 + CommunityManager.cpp:2124-2140/570-620):
+    /// the same gates over the joined-chats query, then the answer's
+    /// users/chats intake, the per-channel known gate (an id whose
+    /// channel never arrived logs and drops), the forced dialogs, and
+    /// the owned (creator) vs joined split of the communityMemberChats
+    /// answer.
+    fn community_member_chats_walk_the_split_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-cm-member-chats");
+
+        // seed the creator community + the member user
+        with_community_manager(&mut td, |manager, env| {
+            manager.on_get_community(
+                env,
+                &telegram_api::community {
+                    flags: 1,
+                    creator: true,
+                    left: false,
+                    min: false,
+                    flags2: 0,
+                    collapsed_in_dialogs: false,
+                    id: 7,
+                    access_hash: 11,
+                    title: "My community".to_owned(),
+                    photo: None,
+                    date: 10,
+                    admin_rights: None,
+                    default_banned_rights: None,
+                },
+                "test",
+            );
+        });
+        td.intake_users(vec![wire_user(5, "Member")], "test");
+
+        // 1. the Know band answers before any query — the member user is
+        //    not cached
+        td.request(
+            1,
+            Function::getCommunityMemberChats(td_api::getCommunityMemberChats {
+                community_id: 7,
+                member_id: Some(td_api::MessageSender::messageSenderUser(
+                    td_api::messageSenderUser { user_id: 55 },
+                )),
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 1);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Member not found")
+        );
+        assert!(rec.sent.lock().is_empty(), "the band sends no query");
+
+        // 2. the gates pass: the joined-chats query carries the resolved
+        //    input forms
+        td.request(
+            2,
+            Function::getCommunityMemberChats(td_api::getCommunityMemberChats {
+                community_id: 7,
+                member_id: Some(td_api::MessageSender::messageSenderUser(
+                    td_api::messageSenderUser { user_id: 5 },
+                )),
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent_query(
+            &rec,
+            telegram_api::communities_getParticipantJoinedChats::ID,
+        );
+        let body = telegram_api::communities_getParticipantJoinedChats::parse(sent.query())
+            .expect("the sent body");
+        match body.community {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!((channel.channel_id, channel.access_hash), (7, 11));
+            }
+            other => panic!("the input community: {other:?}"),
+        }
+        match body.participant {
+            Some(participant) => match *participant {
+                telegram_api::InputPeer::inputPeerUser(user) => {
+                    assert_eq!((user.user_id, user.access_hash), (5, 42));
+                }
+                other => panic!("the participant peer: {other:?}"),
+            },
+            None => panic!("the participant peer rides the query"),
+        }
+
+        // 3. the answer walk: channels 50/51 arrive as the member's owned
+        //    chats, 52 as joined — the chats intake creates them so the
+        //    known gate passes; 53 never arrives, so its id drops with
+        //    the LOG ERROR band
+        let answer = telegram_api::communities_ParticipantJoinedChats {
+            creator_chat_ids: vec![50, 51],
+            joined_chat_ids: vec![52, 53],
+            chats: vec![
+                telegram_api::Chat::channel(wire_channel(50, "owned one")),
+                telegram_api::Chat::channel(wire_channel(51, "owned two")),
+                telegram_api::Chat::channel(wire_channel(52, "joined one")),
+            ],
+            users: vec![wire_user(5, "Member")],
+        };
+        let mut out = Vec::new();
+        answer.store_boxed(&mut out);
+        net_complete(sent, out);
+        td.dispatch_completed_community_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 2).first() {
+            Some(Object::communityMemberChats(member_chats)) => {
+                let channel_dialog_id = |channel_id: i64| {
+                    crate::dialog_id::DialogId::from_channel_id(
+                        crate::chat_manager::ChannelId::new(channel_id),
+                    )
+                    .get()
+                };
+                assert_eq!(
+                    member_chats.owned_chat_ids,
+                    vec![channel_dialog_id(50), channel_dialog_id(51)]
+                );
+                assert_eq!(member_chats.joined_chat_ids, vec![channel_dialog_id(52)]);
+            }
+            other => panic!("the member chats answer: {other:?}"),
+        }
+        assert!(
+            td.chat_manager
+                .have_channel(crate::chat_manager::ChannelId::new(50)),
+            "the answer's chats intake created the channels"
+        );
+
+        // 4. the error arm fails the request
+        td.request(
+            3,
+            Function::getCommunityMemberChats(td_api::getCommunityMemberChats {
+                community_id: 7,
+                member_id: Some(td_api::MessageSender::messageSenderUser(
+                    td_api::messageSenderUser { user_id: 5 },
+                )),
+            }),
+        );
+        td.flush_deferred_results();
+        let sent = take_sent_query(
+            &rec,
+            telegram_api::communities_getParticipantJoinedChats::ID,
+        );
+        net_fail(sent, 400, "CHAT_ADMIN_REQUIRED");
+        td.dispatch_completed_community_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 3);
+        assert_eq!(error.message, "CHAT_ADMIN_REQUIRED");
+        assert!(td.community_net_completed.lock().is_empty(), "drained");
+    }
+
+    /// One wire broadcast channel record with a full access hash (the
+    /// member-chats answer's chats intake accepts it as received).
+    fn wire_channel(id: i64, title: &str) -> telegram_api::channel {
+        telegram_api::channel {
+            flags: (1 << 13) | (1 << 17),
+            creator: false,
+            broadcast: true,
+            id,
+            access_hash: 40,
+            title: title.to_owned(),
+            ..telegram_api::channel::default()
+        }
+    }
+
+    #[test]
+    fn community_add_chat_requests_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(community_add_chat_requests_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn community_add_chat_requests_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-cm-add-chat-requests");
+        const BOOL_TRUE: i32 = 0x9972_75b5u32 as i32;
+
+        // seed a creator community (flags.13 carries the access hash
+        // through the wire round-trip)
+        with_community_manager(&mut td, |manager, env| {
+            manager.on_get_community(
+                env,
+                &telegram_api::community {
+                    flags: 1,
+                    creator: true,
+                    left: false,
+                    min: false,
+                    flags2: 0,
+                    collapsed_in_dialogs: false,
+                    id: 7,
+                    access_hash: 11,
+                    title: "My community".to_owned(),
+                    photo: None,
+                    date: 10,
+                    admin_rights: None,
+                    default_banned_rights: None,
+                },
+                "test",
+            );
+        });
+
+        // 1. the page query — the offset cleans at the request arm
+        //    (CLEAN_INPUT_STRING, Requests.cpp:3514), the query rides
+        //    the community dispatcher over the input community
+        td.request(
+            1,
+            Function::getCommunityAddChatRequests(td_api::getCommunityAddChatRequests {
+                community_id: 7,
+                offset: "o\u{2}ff".to_owned(),
+                limit: 10,
+            }),
+        );
+        let sent = take_sent_query(&rec, telegram_api::communities_getPeerLinkRequests::ID);
+        let body = telegram_api::communities_getPeerLinkRequests::parse(sent.query())
+            .expect("the sent body");
+        match body.community {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!(channel.channel_id, 7);
+                assert_eq!(channel.access_hash, 11);
+            }
+            other => panic!("unexpected input community {other:?}"),
+        }
+        assert_eq!(body.offset, "o ff", "the control byte cleans to a space");
+        assert_eq!(body.limit, 10);
+
+        // 2. the answer builds the page: the chats intake runs first (the
+        //    channel 3 record caches the requested dialog), the total
+        //    clamps up to the page, the invalid entry drops with the
+        //    count decremented, the hidden inversion rides the entry
+        net_complete(sent, {
+            let mut out = Vec::new();
+            telegram_api::communities_PeerLinkRequests {
+                flags: 1,
+                total_count: 0,
+                requests: vec![
+                    telegram_api::CommunityPeerRequest {
+                        flags: 0,
+                        visible: false,
+                        peer: Some(telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                            channel_id: 3,
+                        })),
+                        requested_by: 42,
+                        date: 77,
+                    },
+                    telegram_api::CommunityPeerRequest {
+                        flags: 0,
+                        visible: true,
+                        // an invalid dialog id drops the entry
+                        peer: Some(telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                            channel_id: 0,
+                        })),
+                        requested_by: 42,
+                        date: 78,
+                    },
+                ],
+                next_offset: "next".to_owned(),
+                chats: vec![telegram_api::Chat::channel(telegram_api::channel {
+                    flags: (1 << 13) | (1 << 17),
+                    flags2: 0,
+                    creator: true,
+                    broadcast: true,
+                    id: 3,
+                    access_hash: 40,
+                    title: "requested".to_owned(),
+                    ..telegram_api::channel::default()
+                })],
+                users: Vec::new(),
+            }
+            .store_boxed(&mut out);
+            out
+        });
+        td.dispatch_completed_community_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 1).first() {
+            Some(Object::communityAddChatRequests(page)) => {
+                assert_eq!(page.total_count, 1, "0 clamps up to 2, the drop decrements");
+                assert_eq!(page.next_offset, "next");
+                assert_eq!(page.requests.len(), 1);
+                let request = &page.requests[0];
+                assert_eq!(request.chat_id, -1_000_000_000_003);
+                assert!(request.is_hidden, "the hidden inversion");
+                assert_eq!(request.sender_user_id, 42);
+                assert_eq!(request.date, 77);
+            }
+            other => panic!("the add-chat requests answer: {other:?}"),
+        }
+
+        // 3. the single approval — reject inverts approve, the requested
+        //    chat's input peer resolves through the page's channel intake;
+        //    the Bool answer is ignored and, with no cached full, the
+        //    change-settle resolves the request now
+        td.request(
+            2,
+            Function::processCommunityAddChatRequest(td_api::processCommunityAddChatRequest {
+                community_id: 7,
+                chat_id: -1_000_000_000_003,
+                approve: false,
+            }),
+        );
+        let sent = take_sent_query(
+            &rec,
+            telegram_api::communities_togglePeerLinkRequestApproval::ID,
+        );
+        let body = telegram_api::communities_togglePeerLinkRequestApproval::parse(sent.query())
+            .expect("the sent body");
+        assert!(body.reject, "the reject band inverts approve");
+        match body.community {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!(channel.channel_id, 7);
+            }
+            other => panic!("unexpected input community {other:?}"),
+        }
+        match body.peer {
+            Some(peer) => match *peer {
+                telegram_api::InputPeer::inputPeerChannel(channel) => {
+                    assert_eq!(channel.channel_id, 3);
+                    assert_eq!(channel.access_hash, 40);
+                }
+                other => panic!("unexpected input peer {other:?}"),
+            },
+            None => panic!("the requested chat's input peer resolves"),
+        }
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_community_net();
+        td.flush_deferred_results();
+        assert!(
+            matches!(responses_of(&callback, 2).first(), Some(Object::ok(_))),
+            "no cached full settles the request now"
+        );
+
+        // 4. the wire error band reaches the request
+        td.request(
+            3,
+            Function::processCommunityAddChatRequest(td_api::processCommunityAddChatRequest {
+                community_id: 7,
+                chat_id: -1_000_000_000_003,
+                approve: true,
+            }),
+        );
+        let sent = take_sent_query(
+            &rec,
+            telegram_api::communities_togglePeerLinkRequestApproval::ID,
+        );
+        let body = telegram_api::communities_togglePeerLinkRequestApproval::parse(sent.query())
+            .expect("the sent body");
+        assert!(!body.reject);
+        net_fail(sent, 400, "CHAT_ADMIN_REQUIRED");
+        td.dispatch_completed_community_net();
+        td.flush_deferred_results();
+        assert_eq!(error_of(&callback, 3).message, "CHAT_ADMIN_REQUIRED");
+
+        // 5. the all-approvals toggle over a cached full — the change-settle
+        //    parks the request on the community-full reload and resolves
+        //    it when the reload answers
+        with_community_manager(&mut td, |manager, env| {
+            manager.on_get_community_full(
+                env,
+                &telegram_api::communityFull {
+                    flags: 0,
+                    id: 7,
+                    about: "about".to_owned(),
+                    chat_photo: None,
+                    linked_peers: Vec::new(),
+                    admins_count: 2,
+                    kicked_count: 1,
+                    peer_link_requests_pending: 3,
+                },
+            );
+        });
+        // the full's unsynchronized settings trigger the 99302f0e2
+        // settings query — complete it so the walk stays drained
+        let sent = take_sent_query(&rec, telegram_api::account_getNotifySettings::ID);
+        net_complete(sent, {
+            let mut out = Vec::new();
+            telegram_api::PeerNotifySettings {
+                flags: 0,
+                show_previews: true,
+                silent: false,
+                mute_until: 0,
+                ios_sound: None,
+                android_sound: None,
+                other_sound: None,
+                stories_muted: false,
+                stories_hide_sender: false,
+                stories_ios_sound: None,
+                stories_android_sound: None,
+                stories_other_sound: None,
+            }
+            .store_boxed(&mut out);
+            out
+        });
+        td.dispatch_completed_community_net();
+
+        td.request(
+            4,
+            Function::processCommunityAddChatRequests(td_api::processCommunityAddChatRequests {
+                community_id: 7,
+                approve: true,
+            }),
+        );
+        let sent = take_sent_query(
+            &rec,
+            telegram_api::communities_toggleAllPeerLinkRequestApproval::ID,
+        );
+        let body = telegram_api::communities_toggleAllPeerLinkRequestApproval::parse(sent.query())
+            .expect("the sent body");
+        assert!(!body.reject, "the reject band inverts approve");
+        match body.community {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!(channel.channel_id, 7);
+            }
+            other => panic!("unexpected input community {other:?}"),
+        }
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_community_net();
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 4).is_empty(),
+            "the settle waits for the community-full reload"
+        );
+        let reload = take_sent_query(&rec, telegram_api::channels_getFullChannel::ID);
+        net_complete(reload, {
+            let mut out = Vec::new();
+            telegram_api::messages_ChatFull {
+                full_chat: Some(telegram_api::ChatFull::communityFull(
+                    telegram_api::communityFull {
+                        flags: 0,
+                        id: 7,
+                        about: "about".to_owned(),
+                        chat_photo: None,
+                        linked_peers: Vec::new(),
+                        admins_count: 2,
+                        kicked_count: 1,
+                        peer_link_requests_pending: 0,
+                    },
+                )),
+                chats: Vec::new(),
+                users: Vec::new(),
+            }
+            .store_boxed(&mut out);
+            out
+        });
+        td.dispatch_completed_community_net();
+        td.flush_deferred_results();
+        assert!(
+            matches!(responses_of(&callback, 4).first(), Some(Object::ok(_))),
+            "the reload answer settles the request"
+        );
+    }
+
+    fn community_joined_communities_ride_the_dispatcher_impl() {
+        let (mut td, rec) = netted_td("netfix-cm-joined");
+        // flags.13 carries access_hash through the wire round-trip —
+        // without it the parsed community reaches the intake with
+        // access_hash 0 and the non-min no-hash band drops it.
+        let wire_community = telegram_api::community {
+            flags: 1 | (1 << 13),
+            creator: true,
+            left: false,
+            min: false,
+            flags2: 0,
+            collapsed_in_dialogs: false,
+            id: 7,
+            access_hash: 11,
+            title: "My community".to_owned(),
+            photo: None,
+            date: 10,
+            admin_rights: None,
+            default_banned_rights: None,
+        };
+        let mut other = wire_community.clone();
+        other.id = 9;
+        // No pre-caching: the answer's own chats intake must populate the
+        // community cache (cpp:1867 before the filter at cpp:1869-1874) —
+        // communities 7 and 9 exist only because the answer carries them.
+
+        // 1. The send: one bare communities.getJoinedCommunities query,
+        //    the promise parked in the manager lot.
+        type CommunitiesSlot =
+            std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<td_api::Communities>>>>;
+        struct Rec(CommunitiesSlot);
+        impl tdutils::promise::PromiseInterface<td_api::Communities> for Rec {
+            fn set_value(&mut self, value: td_api::Communities) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: CommunitiesSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let promise = Promise::from_interface(Rec(slot.clone()));
+        with_community_manager(&mut td, |manager, env| {
+            manager.get_joined_communities(env, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::communities_getJoinedCommunities::ID
+        );
+
+        // 2. The slice-shaped answer (cpp:223-228): the C++ error is
+        //    logged and the slice chats are processed anyway — the cached
+        //    ids answer in input order.
+        let mut answer = Vec::new();
+        telegram_api::messages_Chats::messages_chatsSlice(telegram_api::messages_chatsSlice {
+            count: 3,
+            chats: vec![
+                telegram_api::Chat::community(other.clone()),
+                telegram_api::Chat::chatForbidden(telegram_api::chatForbidden {
+                    id: 3,
+                    title: "forbidden".to_owned(),
+                }),
+                telegram_api::Chat::community(wire_community.clone()),
+            ],
+        })
+        .store(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_community_net();
+        assert!(matches!(
+            slot.lock().unwrap().as_ref(),
+            Some(tdutils::status::Result::Ok(communities))
+                if communities.community_ids == vec![9, 7]
+        ));
+
+        // 3. The error band (cpp:233-235) and the empty lot.
+        let slot: CommunitiesSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let promise = Promise::from_interface(Rec(slot.clone()));
+        with_community_manager(&mut td, |manager, env| {
+            manager.get_joined_communities(env, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        net_fail(sent.into_iter().next().unwrap(), 400, "Community not found");
+        td.dispatch_completed_community_net();
+        assert!(matches!(
+            slot.lock().unwrap().as_ref(),
+            Some(tdutils::status::Result::Err(status)) if status.message() == "Community not found"
+        ));
         td.dispatch_completed_community_net();
         assert!(td.community_net_completed.lock().is_empty(), "drained");
     }
@@ -82155,6 +84296,144 @@ mod tests {
     }
 
     #[test]
+    fn suitable_community_chats_walk_the_cache_seams() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(suitable_community_chats_walk_the_cache_seams_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The `getSuitableCommunityChats` walk over the widened
+    /// created-public-dialogs cache (cpp:4146-4198, the ForCommunityDialog
+    /// plane): the community flag band rides the wire (cpp:1440-1446), the
+    /// linked creator channel is filtered out while the unlinked candidate
+    /// answers (cpp:4136-4137), and a linked-community change through the
+    /// channel intake re-filters the inited cache (the cpp:5502-5506
+    /// `update_channel` band over the four-type walk cpp:4224-4240).
+    fn suitable_community_chats_walk_the_cache_seams_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-suitable-community");
+
+        // the wire answer pair: 820 is a creator broadcast already linked
+        // into community 900, 821 is a creator broadcast with no community
+        let linked = telegram_api::channel {
+            flags: (1 << 13) | (1 << 17),
+            flags2: 1 << 20,
+            creator: true,
+            broadcast: true,
+            id: 820,
+            access_hash: 40,
+            title: "linked".to_owned(),
+            linked_community_id: 900,
+            ..telegram_api::channel::default()
+        };
+        let unlinked = telegram_api::channel {
+            flags: (1 << 13) | (1 << 17),
+            creator: true,
+            broadcast: true,
+            id: 821,
+            access_hash: 41,
+            title: "loose".to_owned(),
+            ..telegram_api::channel::default()
+        };
+
+        // 1. the dispatcher arms the ForCommunityDialog plane; the query
+        //    carries the community flag band
+        td.request(
+            1,
+            Function::getSuitableCommunityChats(td_api::getSuitableCommunityChats),
+        );
+        let sent = take_sent_query(&rec, telegram_api::channels_getAdminedPublicChannels::ID);
+        let body = telegram_api::channels_getAdminedPublicChannels::parse(sent.query())
+            .expect("the sent body");
+        assert!(!body.by_location);
+        assert!(!body.check_limit);
+        assert!(!body.for_personal);
+        assert!(body.for_community_peer);
+
+        // 2. the answer walks the cache seams: the linked creator is
+        //    excluded, the unlinked candidate lands — the request settles
+        //    with the filtered chats
+        net_complete(
+            sent,
+            messages_chats_answer(vec![
+                telegram_api::Chat::channel(linked),
+                telegram_api::Chat::channel(unlinked),
+            ]),
+        );
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 1).first() {
+            Some(Object::chats(chats)) => {
+                assert_eq!(chats.total_count, 1);
+                assert_eq!(chats.chat_ids, vec![821]);
+            }
+            other => panic!("the community chats answer: {other:?}"),
+        }
+
+        // 3. the re-filter seam: 821 links into a community through the
+        //    channel intake; the update_channel band re-filters the inited
+        //    cache and refires the community reload query
+        with_chat_managers(&mut td, |chat_manager, user_manager, env| {
+            chat_manager.on_get_chats(
+                user_manager,
+                env,
+                vec![telegram_api::Chat::channel(telegram_api::channel {
+                    flags: (1 << 13) | (1 << 17),
+                    flags2: 1 << 20,
+                    creator: true,
+                    broadcast: true,
+                    id: 821,
+                    access_hash: 41,
+                    title: "loose".to_owned(),
+                    linked_community_id: 901,
+                    ..telegram_api::channel::default()
+                })],
+                "test",
+            );
+        });
+        let sent = {
+            let mut sent = std::mem::take(&mut *rec.sent.lock());
+            let index = sent
+                .iter()
+                .position(|query| {
+                    query.tl_constructor() == telegram_api::channels_getAdminedPublicChannels::ID
+                })
+                .expect("the re-filter refires the community query");
+            sent.remove(index)
+        };
+        let body = telegram_api::channels_getAdminedPublicChannels::parse(sent.query())
+            .expect("the refired body");
+        assert!(
+            body.for_community_peer,
+            "the community band rides the refire"
+        );
+
+        // 4. the drained refire empties the cache; the next caller answers
+        //    from the cache with no query
+        net_complete(sent, messages_chats_answer(Vec::new()));
+        td.dispatch_completed_chat_net();
+        td.request(
+            2,
+            Function::getSuitableCommunityChats(td_api::getSuitableCommunityChats),
+        );
+        td.flush_deferred_results();
+        assert_not_sent(
+            &rec,
+            telegram_api::channels_getAdminedPublicChannels::ID,
+            "the inited cache answers inline",
+        );
+        match responses_of(&callback, 2).first() {
+            Some(Object::chats(chats)) => {
+                assert_eq!(chats.total_count, 0);
+                assert!(chats.chat_ids.is_empty());
+            }
+            other => panic!("the emptied cache answer: {other:?}"),
+        }
+    }
+
+    #[test]
     fn channel_settings_queries_ride_the_dispatcher() {
         std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
@@ -85387,6 +87666,145 @@ mod tests {
         }
         .store_boxed(&mut answer);
         answer
+    }
+
+    #[test]
+    fn story_music_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(story_music_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn story_music_rides_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain19-story-music");
+        let my_dialog = seed_my_story_identity(&mut td);
+        let my_chat = my_dialog.get();
+
+        // seed my story 15 with photo content (the updates-engine
+        // storyItem intake)
+        td.with_story_manager(|env, manager| {
+            manager.on_get_story(
+                env,
+                my_dialog,
+                Some(wire_photo_story(15, false, 2_000_000_000)),
+            );
+        });
+
+        // 1. the gates — an unknown story answers 400 before any query
+        td.request(
+            1,
+            Function::editStoryMusic(td_api::editStoryMusic {
+                story_poster_chat_id: my_chat,
+                story_id: 99,
+                music: None,
+            }),
+        );
+        td.flush_deferred_results();
+        let error = error_of(&callback, 1);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "Story not found")
+        );
+        assert_not_sent(&rec, telegram_api::stories_editStory::ID, "the gate");
+
+        // 2. the null-music band — the music-only editStory constructor
+        td.request(
+            2,
+            Function::editStoryMusic(td_api::editStoryMusic {
+                story_poster_chat_id: my_chat,
+                story_id: 15,
+                music: None,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_editStory::ID,
+        );
+        let body = telegram_api::stories_editStory::parse(sent.query()).expect("the body");
+        assert_eq!(body.flags, 1 << 4); // MUSIC_MASK only
+        assert_eq!(body.id, 15);
+        assert!(matches!(
+            body.music,
+            Some(telegram_api::InputDocument::inputDocumentEmpty(_))
+        ));
+        match body.peer.as_deref() {
+            // the owner dialog is the client's own user — the self peer
+            Some(telegram_api::InputPeer::inputPeerSelf(_)) => {}
+            other => panic!("the write peer: {other:?}"),
+        }
+        // the STORY_NOT_MODIFIED value band answers ok (non-bot)
+        net_fail(sent, 400, "STORY_NOT_MODIFIED");
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 3. the remote-audio fast path — the wire document rides the
+        //    registered audio's main remote
+        let audio_file_id = td.file_manager.lock().register_remote(
+            crate::files::FullRemoteFileLocation::from_document(
+                crate::files::FileType::Audio,
+                500,
+                42,
+                crate::chat_manager::DcId::main(),
+                "ref".to_owned(),
+            ),
+            crate::files::FileLocationSource::FromServer,
+            crate::messages_manager::DialogId::default(),
+            128,
+            128,
+            "song.mp3".to_owned(),
+        );
+        td.request(
+            3,
+            Function::editStoryMusic(td_api::editStoryMusic {
+                story_poster_chat_id: my_chat,
+                story_id: 15,
+                music: Some(td_api::InputAudio {
+                    audio: Some(td_api::InputFile::inputFileId(td_api::inputFileId {
+                        id: audio_file_id.get(),
+                    })),
+                    album_cover_thumbnail: None,
+                    duration: 180,
+                    title: "Song".to_owned(),
+                    performer: "Artist".to_owned(),
+                }),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::stories_editStory::ID,
+        );
+        let body = telegram_api::stories_editStory::parse(sent.query()).expect("the body");
+        assert_eq!(body.flags, 1 << 4); // MUSIC_MASK only
+        match body.music {
+            Some(telegram_api::InputDocument::inputDocument(document)) => {
+                assert_eq!(document.id, 500);
+                assert_eq!(document.access_hash, 42);
+                assert_eq!(document.file_reference, b"ref");
+            }
+            other => panic!("the music document: {other:?}"),
+        }
+        // 4. the FILE_REFERENCE band — the reference delete + the
+        //    reupload chain park the caller promise (the repair seam is
+        //    [blocked: net]; the resumed upload idles in the outbox)
+        net_fail(sent, 400, "FILE_REFERENCE_EXPIRED");
+        td.dispatch_completed_story_net();
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 3).is_empty(),
+            "the promise parks across the repair"
+        );
+        assert_eq!(
+            td.audios_manager.being_uploaded_audio_files.len(),
+            1,
+            "the reupload registered"
+        );
     }
 
     #[test]

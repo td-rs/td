@@ -1089,12 +1089,31 @@ pub(crate) enum StoryNetKind {
     /// `getChatsToPostStories` leg; the promise parks in
     /// `pending_dialogs_to_send_stories`.
     GetChatsToSendStories,
-    /// `StoryManager::EditBusinessStoryQuery` (StoryManager.cpp:1656-1717)
+    /// `EditBusinessStoryQuery` (StoryManager.cpp:1656-1717)
     /// — the bot business edit; the `BeingEditedBusinessStory` (the
     /// content/areas/caption/privacy rules + the promise — the C++
     /// `being_edited_business_stories_` row) parks keyed by the kind's
     /// `send_story_num`.
     EditBusinessStory { send_story_num: u32 },
+    /// `StoryManager::EditStoryMusicQuery` (StoryManager.cpp:599-676) —
+    /// the kind carries the handler's `dialog_id_`/`story_id_`/
+    /// `music_file_id_` members; the (`file_reference_`, promise) pair
+    /// parks in [`StoryManager::pending_edit_story_music`].
+    EditStoryMusic {
+        dialog_id: DialogId,
+        story_id: StoryId,
+        music_file_id: FileId,
+    },
+    /// `AudiosManager::UploadAudioFileQuery` (AudiosManager.cpp:37-102)
+    /// — the story-music upload's `messages.uploadMedia` leg; the kind
+    /// carries the handler's `file_upload_id_`/`is_url_`/`was_uploaded_`
+    /// members, the promise carrier parks in
+    /// [`StoryManager::pending_upload_story_music_queries`].
+    UploadStoryMusic {
+        file_upload_id: crate::files::FileUploadId,
+        is_url: bool,
+        was_uploaded: bool,
+    },
 }
 
 /// The post-`on_get_updates` continuations of the story-core answer
@@ -1843,6 +1862,29 @@ pub trait StoryManagerEnv {
         let _ = reaction_type;
         tdutils::log_info!("add_recent_reaction — [blocked: ReactionManager]");
     }
+
+    /// `StoryManager::get_story_music_input_document`
+    /// (StoryManager.cpp:6637-6648) — the audio-type + main-remote gates
+    /// over the file view; the web location is the same 400.
+    fn get_story_music_input_document(
+        &mut self,
+        music_file_id: FileId,
+    ) -> Result<telegram_api::InputDocument>;
+
+    /// `td_->audios_manager_->upload_audio(...)`
+    /// (AudiosManager.cpp:367-405) — the story-music upload leg; the
+    /// files/fllm/callback planes ride the env, and the url band's
+    /// `messages.uploadMedia` media is built inside (the C++
+    /// `do_upload_audio_file(..., nullptr, ...)` leg — the caller
+    /// dispatches the query).
+    fn upload_story_music_audio(
+        &mut self,
+        input_audio: td_api::InputAudio,
+        promise: Promise<()>,
+    ) -> Result<crate::audios_manager::AudioUploadOutcome>;
+
+    /// `G()->close_flag()` — the `close_status()` gates.
+    fn close_flag(&self) -> bool;
 }
 
 /// `StoryManager::PendingStory` (StoryManager.h:125-146) — the send/edit
@@ -2086,6 +2128,19 @@ pub struct StoryManager {
     /// The parked `setStoryPrivacySettings` promises
     /// (EditStoryPrivacyQuery's `promise_`, StoryManager.cpp:611).
     pending_edit_story_privacy: Vec<Promise<()>>,
+    /// The music-upload tails — the C++ `edit_story_music` upload
+    /// lambda's captures (`owner_dialog_id`, `story_id`, the caller
+    /// promise) keyed by the upload id the audios plane completes with;
+    /// the EditStoryMusicQuery repair band's reupload refire parks here
+    /// too.
+    pending_edit_story_music_uploads:
+        HashMap<crate::files::FileUploadId, (DialogId, StoryId, Promise<()>)>,
+    /// The story-music `messages.uploadMedia` §5 carrier queue (the
+    /// `UploadAudioFileQuery::promise_` layer).
+    pending_upload_story_music_queries: Vec<Promise<()>>,
+    /// The `EditStoryMusicQuery` answer queue — the handler's
+    /// (`file_reference_`, `promise_`) members, popped FIFO by the drain.
+    pending_edit_story_music: Vec<(String, Promise<()>)>,
     /// The parked `toggleStoryIsPostedToChatPage` promises
     /// (ToggleStoryPinnedQuery's `promise_`, StoryManager.cpp:655).
     pending_toggle_story_pinned: Vec<Promise<()>>,
@@ -2174,6 +2229,41 @@ impl StoryManager {
     /// (StoryManager.cpp:611).
     pub(crate) fn take_edit_story_privacy_promise(&mut self) -> Option<Promise<()>> {
         Self::pop_head(&mut self.pending_edit_story_privacy)
+    }
+
+    /// `EditStoryMusicQuery::on_result`'s (`file_reference_`, `promise_`)
+    /// pop (StoryManager.cpp:611-analog, the §5 FIFO).
+    pub(crate) fn take_edit_story_music_query_promise(&mut self) -> Option<(String, Promise<()>)> {
+        Self::pop_head(&mut self.pending_edit_story_music)
+    }
+
+    /// The music-upload tail pop — the audios completion sites (the
+    /// upload callback / the `messages.uploadMedia` answer) read the
+    /// story continuation keyed by the upload id.
+    pub(crate) fn take_edit_story_music_upload_tail(
+        &mut self,
+        file_upload_id: crate::files::FileUploadId,
+    ) -> Option<(DialogId, StoryId, Promise<()>)> {
+        self.pending_edit_story_music_uploads
+            .remove(&file_upload_id)
+    }
+
+    /// The music-upload tail park — the repair band's reupload refire
+    /// (td.rs side) keys the continuation on the resumed upload id.
+    pub(crate) fn park_edit_story_music_upload_tail(
+        &mut self,
+        file_upload_id: crate::files::FileUploadId,
+        dialog_id: DialogId,
+        story_id: StoryId,
+        promise: Promise<()>,
+    ) {
+        self.pending_edit_story_music_uploads
+            .insert(file_upload_id, (dialog_id, story_id, promise));
+    }
+
+    /// The story-music `messages.uploadMedia` carrier pop (the §5 FIFO).
+    pub(crate) fn take_upload_story_music_query_promise(&mut self) -> Option<Promise<()>> {
+        Self::pop_head(&mut self.pending_upload_story_music_queries)
     }
 
     /// `ToggleStoryPinnedQuery::on_result`'s promise pop
@@ -9022,6 +9112,190 @@ impl StoryManager {
         // → input media] (the cover re-upload); the promise parks
         env.send_edit_story_cover_query(story_full_id, main_frame_timestamp);
         self.pending_unit_queries.push(promise);
+    }
+
+    /// `StoryManager::check_story_music_can_be_edited`
+    /// (StoryManager.cpp:6650-6662) — the story/content/editability
+    /// gates shared by the edit_story_music entry and the
+    /// do_edit_story_music refires.
+    fn check_story_music_can_be_edited(
+        &self,
+        env: &impl StoryManagerEnv,
+        story_full_id: StoryFullId,
+    ) -> Result<()> {
+        let Some(story) = self.get_story(story_full_id) else {
+            return Result::Err(Status::error(400, "Story not found"));
+        };
+        if story.content.is_none() {
+            return Result::Err(Status::error(400, "Story not found"));
+        }
+        if !self.can_edit_story(env, story_full_id, Some(story)) {
+            return Result::Err(Status::error(400, "Story can't be edited"));
+        }
+        if self.being_edited_stories.contains_key(&story_full_id) {
+            return Result::Err(Status::error(400, "Story is being edited"));
+        }
+        Result::Ok(())
+    }
+
+    /// `StoryManager::edit_story_music` (StoryManager.cpp:6664-6682) —
+    /// the editability gates, then the null-music direct band or the
+    /// audios upload leg (the C++ `PromiseCreator::lambda` continuation
+    /// keys on the upload id).
+    pub fn edit_story_music(
+        &mut self,
+        env: &mut impl StoryManagerEnv,
+        owner_dialog_id: DialogId,
+        story_id: StoryId,
+        music: Option<td_api::InputAudio>,
+        mut promise: Promise<()>,
+    ) {
+        if let Result::Err(status) =
+            self.check_story_music_can_be_edited(env, StoryFullId::new(owner_dialog_id, story_id))
+        {
+            return promise.set_error(status);
+        }
+        let Some(music) = music else {
+            return self.do_edit_story_music(
+                env,
+                owner_dialog_id,
+                story_id,
+                FileId::default(),
+                promise,
+            );
+        };
+        match env.upload_story_music_audio(music, Promise::default()) {
+            Result::Err(status) => {
+                promise.set_error(status);
+            }
+            Result::Ok(crate::audios_manager::AudioUploadOutcome::Ready(file_id)) => {
+                self.do_edit_story_music(env, owner_dialog_id, story_id, file_id, promise);
+            }
+            Result::Ok(crate::audios_manager::AudioUploadOutcome::Started {
+                file_upload_id,
+                url_input_media,
+            }) => {
+                self.pending_edit_story_music_uploads
+                    .insert(file_upload_id, (owner_dialog_id, story_id, promise));
+                if let Some(input_media) = url_input_media {
+                    // the C++ url band's `do_upload_audio_file` leg
+                    // (AudiosManager.cpp:398-400) — the uploadMedia query
+                    // sends at once with the layer-1 carrier
+                    let was_uploaded = crate::files::extract_was_uploaded(&input_media);
+                    self.do_upload_story_music_query(
+                        file_upload_id,
+                        true,
+                        was_uploaded,
+                        *input_media,
+                        Promise::default(),
+                    );
+                }
+            }
+        }
+    }
+
+    /// `StoryManager::do_edit_story_music` (StoryManager.cpp:6684-6699)
+    /// — the close gate, the editability gates, the input-document
+    /// resolution, then the `EditStoryMusicQuery` send.
+    pub fn do_edit_story_music(
+        &mut self,
+        env: &mut impl StoryManagerEnv,
+        owner_dialog_id: DialogId,
+        story_id: StoryId,
+        music_file_id: FileId,
+        mut promise: Promise<()>,
+    ) {
+        // TRY_STATUS_PROMISE(promise, G()->close_status())
+        if env.close_flag() {
+            return promise.set_error(Status::error(500, "Request aborted"));
+        }
+        if let Result::Err(status) =
+            self.check_story_music_can_be_edited(env, StoryFullId::new(owner_dialog_id, story_id))
+        {
+            return promise.set_error(status);
+        }
+        let input_document = if music_file_id == FileId::default() {
+            telegram_api::InputDocument::inputDocumentEmpty(telegram_api::inputDocumentEmpty)
+        } else {
+            match env.get_story_music_input_document(music_file_id) {
+                Result::Ok(input_document) => input_document,
+                Result::Err(status) => return promise.set_error(status),
+            }
+        };
+
+        // `EditStoryMusicQuery::send` (StoryManager.cpp:615-636) — the
+        // Write peer with the music document (the other editStory fields
+        // are the C++ empty forms); the null band is the C++ on_error
+        // head + the promise error.
+        let Some(input_peer) =
+            env.get_input_peer(owner_dialog_id, crate::user_manager::AccessRights::Write)
+        else {
+            let status = Status::error(400, "Can't access the chat");
+            env.on_get_dialog_error(owner_dialog_id, &status, "EditStoryMusicQuery");
+            promise.set_error(status);
+            return;
+        };
+        let file_reference = crate::files::extract_input_document_file_reference(&input_document);
+        self.pending_edit_story_music
+            .push((file_reference, promise));
+        self.send_story_net_query(
+            StoryNetKind::EditStoryMusic {
+                dialog_id: owner_dialog_id,
+                story_id,
+                music_file_id,
+            },
+            telegram_api::Function::stories_editStory(telegram_api::stories_editStory {
+                flags: 1 << 4, // telegram_api::stories_editStory::MUSIC_MASK
+                peer: Some(Box::new(input_peer)),
+                id: story_id.get(),
+                media: None,
+                media_areas: Vec::new(),
+                caption: String::new(),
+                entities: Vec::new(),
+                privacy_rules: Vec::new(),
+                music: Some(input_document),
+            }),
+            "stories.editStory(music)",
+        );
+    }
+
+    /// `AudiosManager::do_upload_audio_file` (AudiosManager.cpp:459-477)
+    /// collapsed into the story manager — the `messages.uploadMedia`
+    /// send over the audios input media with the §5 carrier (the C++
+    /// `UploadAudioFileQuery::promise_`); the manager owns the story-net
+    /// dispatch the audios upload rides. The input-media
+    /// had-input-file cancel band is the caller's (the media is already
+    /// built there, like the saved-music twin).
+    pub(crate) fn do_upload_story_music_query(
+        &mut self,
+        file_upload_id: crate::files::FileUploadId,
+        is_url: bool,
+        was_uploaded: bool,
+        input_media: telegram_api::InputMedia,
+        promise: Promise<()>,
+    ) {
+        // The C++ `TRY_STATUS_PROMISE(promise, G()->close_status())` head
+        // (AudiosManager.cpp:459-460) is subsumed by the collapsed
+        // dispatcher: a close()ed Td answers "Request aborted" at the
+        // state gate, and the async continuations reach this send through
+        // the close-gated upload-callback hop only.
+        self.pending_upload_story_music_queries.push(promise);
+        self.send_story_net_query(
+            StoryNetKind::UploadStoryMusic {
+                file_upload_id,
+                is_url,
+                was_uploaded,
+            },
+            telegram_api::Function::messages_uploadMedia(telegram_api::messages_uploadMedia {
+                flags: 0,
+                business_connection_id: String::new(),
+                peer: Some(Box::new(telegram_api::InputPeer::inputPeerSelf(
+                    telegram_api::inputPeerSelf,
+                ))),
+                media: Some(Box::new(input_media)),
+            }),
+            "messages.uploadMedia(story music)",
+        );
     }
 
     /// `StoryManager::set_story_privacy_settings`

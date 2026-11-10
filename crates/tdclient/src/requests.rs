@@ -7102,6 +7102,62 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             );
             td.community_manager = manager;
         }
+        Function::toggleCommunityMemberIsBanned(request) => {
+            // Requests.cpp:3540-3546 (20fc28e23) — CHECK_IS_USER,
+            // CREATE_OK_REQUEST_PROMISE, the member sender→dialog
+            // resolution (check_access = false, allow_empty = false),
+            // then CommunityManager::toggle_community_participant_is_banned
+            // (the restrict gate, the Know "Member not found" band, the
+            // participant-banned wire toggle whose Bool answer settles
+            // through the change-settle).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let participant_dialog_id = match member_dialog_id(td, request.member_id.as_ref()) {
+                tdutils::status::Result::Ok(dialog_id) => dialog_id,
+                tdutils::status::Result::Err(status) => {
+                    return send_error_status(td, id, status);
+                }
+            };
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut manager, mut env) = community_split(td);
+            manager.toggle_community_participant_is_banned(
+                &mut env,
+                CommunityId::new(request.community_id),
+                participant_dialog_id,
+                request.is_banned,
+                promise,
+            );
+            td.community_manager = manager;
+        }
+        Function::getCommunityMemberChats(request) => {
+            // Requests.cpp:3549-3556 (4cd0dae69) — CHECK_IS_USER,
+            // CREATE_REQUEST_PROMISE, the same sender→dialog resolution,
+            // then CommunityManager::get_community_participant_dialogs
+            // (the same gates over the participant-joined-chats query; the
+            // answer splits the owned vs joined chat ids).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let participant_dialog_id = match member_dialog_id(td, request.member_id.as_ref()) {
+                tdutils::status::Result::Ok(dialog_id) => dialog_id,
+                tdutils::status::Result::Err(status) => {
+                    return send_error_status(td, id, status);
+                }
+            };
+            let promise = td.deferred_promise::<td_api::CommunityMemberChats, _>(
+                id,
+                Object::communityMemberChats,
+            );
+            let (mut manager, mut env) = community_split(td);
+            manager.get_community_participant_dialogs(
+                &mut env,
+                CommunityId::new(request.community_id),
+                participant_dialog_id,
+                promise,
+            );
+            td.community_manager = manager;
+        }
         Function::deleteCommunity(request) => {
             // Requests.cpp:3449-3453 (f5f7fe5fd) — CHECK_IS_USER, then
             // CommunityManager::delete_community (the
@@ -7112,6 +7168,134 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
             let (mut manager, mut env) = community_split(td);
             manager.delete_community(&mut env, CommunityId::new(request.community_id), promise);
+            td.community_manager = manager;
+        }
+        Function::getJoinedCommunities(_) => {
+            // Requests.cpp:3456-3459 — CHECK_IS_USER, then
+            // CommunityManager::get_joined_communities (the
+            // communities.getJoinedCommunities send rides the net step;
+            // the answer intakes its chats then resolves the cached ids).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Communities, _>(id, Object::communities);
+            let (mut manager, mut env) = community_split(td);
+            manager.get_joined_communities(&mut env, promise);
+            td.community_manager = manager;
+        }
+        Function::addCommunityChat(request) => {
+            // Requests.cpp:3497-3502 (1747ecde1 + the da0e19cf3 owner
+            // gate) — CHECK_IS_USER, then CommunityManager::
+            // add_community_dialog (the communities.togglePeerLink send
+            // and the change-settle ride the net answer drain).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut manager, mut env) = community_split(td);
+            manager.add_community_dialog(
+                &mut env,
+                CommunityId::new(request.community_id),
+                crate::dialog_id::DialogId::new(request.chat_id),
+                request.is_hidden,
+                promise,
+            );
+            td.community_manager = manager;
+        }
+        Function::removeCommunityChat(request) => {
+            // Requests.cpp:3504-3509 (f027a2d06) — CHECK_IS_USER, then
+            // CommunityManager::remove_community_dialog (the deleted-band
+            // toggle and the change-settle ride the net answer drain).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut manager, mut env) = community_split(td);
+            manager.remove_community_dialog(
+                &mut env,
+                CommunityId::new(request.community_id),
+                crate::dialog_id::DialogId::new(request.chat_id),
+                promise,
+            );
+            td.community_manager = manager;
+        }
+        Function::toggleCommunityAreChatsCollapsed(request) => {
+            // Requests.cpp:3533-3538 — CHECK_IS_USER, then
+            // CommunityManager::toggle_community_are_dialogs_collapsed
+            // (the known-community gate only, no rights gate; the
+            // communities.toggleCommunityCollapsedInDialogs send rides
+            // the net step and the promise settles on the Updates
+            // answer that re-enters the updates intake).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut manager, mut env) = community_split(td);
+            manager.toggle_community_are_dialogs_collapsed(
+                &mut env,
+                CommunityId::new(request.community_id),
+                request.are_chats_collapsed,
+                promise,
+            );
+            td.community_manager = manager;
+        }
+        Function::getCommunityAddChatRequests(request) => {
+            // Requests.cpp:3511-3517 (ffc06ec75) — CHECK_IS_USER,
+            // CLEAN_INPUT_STRING(offset), CREATE_REQUEST_PROMISE, then
+            // CommunityManager::get_community_add_dialog_requests.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(offset) = clean_or_utf8_error(td, id, &request.offset) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::CommunityAddChatRequests, _>(
+                id,
+                Object::communityAddChatRequests,
+            );
+            let (mut manager, mut env) = community_split(td);
+            manager.get_community_add_dialog_requests(
+                &mut env,
+                CommunityId::new(request.community_id),
+                &offset,
+                request.limit,
+                promise,
+            );
+            td.community_manager = manager;
+        }
+        Function::processCommunityAddChatRequest(request) => {
+            // Requests.cpp:3519-3524 (2b80bf533) — CHECK_IS_USER,
+            // CREATE_OK_REQUEST_PROMISE, then
+            // CommunityManager::process_community_add_dialog_request.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut manager, mut env) = community_split(td);
+            manager.process_community_add_dialog_request(
+                &mut env,
+                CommunityId::new(request.community_id),
+                crate::dialog_id::DialogId::new(request.chat_id),
+                request.approve,
+                promise,
+            );
+            td.community_manager = manager;
+        }
+        Function::processCommunityAddChatRequests(request) => {
+            // Requests.cpp:3526-3530 (79a943019) — CHECK_IS_USER,
+            // CREATE_OK_REQUEST_PROMISE, then
+            // CommunityManager::process_community_add_dialog_requests.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut manager, mut env) = community_split(td);
+            manager.process_community_add_dialog_requests(
+                &mut env,
+                CommunityId::new(request.community_id),
+                request.approve,
+                promise,
+            );
             td.community_manager = manager;
         }
 
@@ -8018,6 +8202,23 @@ fn run_story_requests(td: &mut Td, id: u64, function: Function) {
                     crate::dialog_id::DialogId::new(request.story_poster_chat_id),
                     crate::story_ids::StoryId::new(request.story_id),
                     request.cover_frame_timestamp,
+                    promise,
+                );
+            });
+        }
+
+        // editStoryMusic (Requests.cpp:4965-4971)
+        Function::editStoryMusic(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            story_arm(td, |env, manager| {
+                manager.edit_story_music(
+                    env,
+                    crate::dialog_id::DialogId::new(request.story_poster_chat_id),
+                    crate::story_ids::StoryId::new(request.story_id),
+                    request.music,
                     promise,
                 );
             });
@@ -16686,6 +16887,23 @@ fn run_chat_and_group_requests(td: &mut Td, id: u64, function: Function) {
             }
             let _promise = td.deferred_promise::<td_api::Chats, _>(id, Object::chats);
         }
+        Function::getSuitableCommunityChats(_) => {
+            // Requests.cpp:3636-3640 — the ForCommunityDialog plane of the
+            // created-public-dialogs cache; the C++ third argument `false`
+            // is `from_binlog` (the check_limit=false reload path).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Chats, _>(id, Object::chats);
+            let (mut env, user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.get_created_public_dialogs(
+                user_manager,
+                &mut env,
+                crate::chat_manager::PublicDialogType::ForCommunityDialog,
+                promise,
+                false,
+            );
+        }
         Function::getSupergroup(request) => {
             if let Some(supergroup) = td
                 .chat_manager
@@ -20010,6 +20228,20 @@ fn community_split(
     (manager, env)
 }
 
+/// The `get_message_sender_dialog_id(td_, member_id, /*check_access=*/false,
+/// /*allow_empty=*/false)` resolution the two member-id community arms share
+/// (Requests.cpp:3542-3544, 3551-3553; the error bands live in
+/// MessageSender.cpp:180/189/203). The member is parsed in one env, the
+/// community manager runs in the next (the two-phase borrow of the collapsed
+/// dispatcher).
+fn member_dialog_id(
+    td: &mut Td,
+    member_id: Option<&td_api::MessageSender>,
+) -> tdutils::status::Result<crate::dialog_id::DialogId> {
+    let (_manager, mut env) = bot_env_split(td);
+    crate::message_sender::get_message_sender_dialog_id(&mut env, member_id, false, false)
+}
+
 fn widget_split(
     td: &mut Td,
 ) -> (
@@ -20520,10 +20752,10 @@ mod request_census_tests {
         // setGiftSettings (the GlobalPrivacySettings gift leg over the
         // StarGiftSettings value plane) (986 + 10 = 996 dispatched /
         // 10 - 10 = 0 interim, sync unmoved 26 — the census closes).
-        assert_eq!(*counts.get("sync").unwrap_or(&0), 26, "sync count");
+        assert_eq!(*counts.get("sync").unwrap_or(&0), 27, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            1061,
+            1072,
             "dispatched count"
         );
         // the 23383aef sync base (1.8.70): the 34 new scheme functions
@@ -20560,6 +20792,64 @@ mod request_census_tests {
         // the WebProxyManager carrier plane over the #114-band
         // Proxy::web records): 1,051 + 2 = 1,053 dispatched / 22 - 2 =
         // 20 interim, sync unmoved 26.
+        // The community joined-communities slice (#129) flipped
+        // getJoinedCommunities (the GetJoinedCommunitiesQuery kind over
+        // the communities.getJoinedCommunities wire query, the chats
+        // intaken before the cached-id resolution): 1,053 + 1 = 1,054
+        // dispatched / 20 - 1 = 19 interim, sync unmoved 26.
+        // The community family slice (#130) flipped
+        // getSuitableCommunityChats (the ForCommunityDialog plane of the
+        // created-public-dialogs cache): 1,054 + 1 = 1,055 dispatched /
+        // 19 - 1 = 18 interim, sync unmoved 26 (the composed #129 + #130
+        // merge pin: 1,053 + 2 = 1,055 / 20 - 2 = 18).
+        // The community member pair slice (#133) flipped the pair
+        // (toggleCommunityMemberIsBanned — the participant-banned wire
+        // toggle whose ignored Bool settles through the #127
+        // change-settle; getCommunityMemberChats — the
+        // participant-joined-chats query whose answer splits the owned
+        // vs joined chat ids over the per-channel known gate): 1,055 + 2
+        // = 1,057 dispatched / 18 - 2 = 16 interim, sync unmoved 26 (the
+        // tip counts plus the pair's two flips).
+        // The community collapse slice (#128) flipped
+        // toggleCommunityAreChatsCollapsed (the
+        // communities.toggleCommunityCollapsedInDialogs send whose
+        // Updates answer re-enters the updates intake; the collapse
+        // state comes back through on_get_community): 1,055 + 1 = 1,056
+        // dispatched / 18 - 1 = 17 interim, sync unmoved 26.
+        // The community family slice (#132) flipped the add-chat
+        // requests trio (getCommunityAddChatRequests — the page query
+        // over communities.getPeerLinkRequests, and the two approval
+        // toggles processCommunityAddChatRequest /
+        // processCommunityAddChatRequests whose Bool answers settle
+        // through the change-settle): 1,055 + 3 = 1,058 dispatched /
+        // 18 - 3 = 15 interim, sync unmoved 26.
+        // The community family slice (#131) flipped the link-mutator pair
+        // (addCommunityChat — the visible and hidden bands of the shared
+        // communities.togglePeerLink query over the is_dialog_owner gate,
+        // removeCommunityChat — the deleted band over the
+        // linked-peer-administrator-or-owner gate; both settle through
+        // the #127 change-settle): 1,058 + 2 = 1,060 dispatched /
+        // 15 - 2 = 13 interim, sync unmoved 26 (the #131-over-#128/#133
+        // merge pin).
+        // The community family close-out (#134): the six function
+        // slices composed flip all ten family functions
+        // interim -> dispatched — getJoinedCommunities (#129),
+        // getSuitableCommunityChats (#130), the member pair
+        // toggleCommunityMemberIsBanned / getCommunityMemberChats
+        // (#133), toggleCommunityAreChatsCollapsed (#128), the
+        // add-chat-requests trio getCommunityAddChatRequests /
+        // processCommunityAddChatRequest /
+        // processCommunityAddChatRequests (#132) and the link-mutator
+        // pair addCommunityChat / removeCommunityChat (#131) —
+        // composed over the post-#125 landing base: 1,053 + 10 = 1,063
+        // dispatched / 20 - 10 = 10 interim, sync unmoved 26 of 1,099
+        // — the family close-out pin. The spec's projected 1,050/23 is
+        // stale base arithmetic: authored over the post-#113 1,040/33
+        // base, it predates the #123 TON-cards and #125 web-proxy
+        // landings that (with the #121/#122 flips recorded above)
+        // moved the landing-time base 1,040/33 -> 1,053/20; the
+        // family's own delta arithmetic — ten flips, -10 interim — is
+        // exactly as specced.
         // The profile-themes family slice (#124) flipped the two
         // profile-theme arms (getProfileShareThemeBackdrops — the
         // ThemeManager share-theme-backdrops cache over the
@@ -20573,7 +20863,20 @@ mod request_census_tests {
         // getWidgetQueryAnswer) over the WidgetManager plane:
         // 1,055 + 6 = 1,061 dispatched / 18 - 6 = 12 interim, sync
         // unmoved 26.
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 12, "interim count");
+        // The #126 misc-family slice flipped the pair: editStoryMusic
+        // (the StoryManager edit_story_music arm over the
+        // AudiosManager::upload_audio plane — the remote fast path, the
+        // url band and the fresh-upload outbox live; the
+        // EditStoryMusicQuery + UploadStoryMusic kinds ride the story
+        // net family, the repair band runs the [blocked: net] repair
+        // seam + the reupload chain) and getTextEmojiRanges (the
+        // synchronous arm over the tdutils find_emojis walk): 1,061 + 1
+        // = 1,062 dispatched / 12 - 2 = 10 interim, 26 + 1 = 27 sync.
+        // The master sync composition: master 1,062/10/27 @ 1e4737c plus
+        // the family's ten community flips above -> 1,062 + 10 = 1,072
+        // dispatched / 10 - 10 = 0 interim, sync unmoved 27 of 1,099 —
+        // the merged pin.
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 0, "interim count");
     }
 }
 
