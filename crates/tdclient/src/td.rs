@@ -3157,6 +3157,34 @@ enum CommunityNetKind {
 /// use — the answers drain through [`Td::on_community_net_answer`].
 type CommunityNetHandle = NetKindHandle<CommunityNetKind>;
 
+/// The WidgetManager in-flight query kinds — the C++ `ResultHandler`
+/// classes of WidgetManager.cpp:125-313 (the 1.8.70 widgets family,
+/// #119). The handlers are stateless besides their promises; the promise
+/// lots live on `crate::widget_manager::WidgetManager`.
+#[derive(Clone, Copy)]
+enum WidgetNetKind {
+    /// `GetBotWidgetQueryAnswerQuery` (cpp:125-166).
+    GetBotWidgetQueryAnswer,
+    /// `SetBotWidgetQueryAnswerQuery` (cpp:168-196).
+    SetBotWidgetQueryAnswer,
+    /// `EditMessageWidgetDataQuery` (cpp:198-244) — the answer is an
+    /// Updates umbrella routed through the updates pipe.
+    EditMessageWidgetData,
+    /// `EditWidgetDataQuery` (cpp:246-275).
+    EditWidgetData,
+    /// `GetWidgetPublicDataQuery` (cpp:277-313) — the answer routes into
+    /// `WidgetManager::on_get_widget_public_data`; the handler carries
+    /// the request pair for the not-modified re-read (the C++
+    /// dialog_id_/message_id_ members).
+    GetWidgetPublicData {
+        message_full_id: crate::messages_manager::MessageFullId,
+    },
+}
+
+/// The cloned widget dispatch surface the [`WidgetEnv`] senders use —
+/// the answers drain through [`Td::on_widget_net_answer`].
+type WidgetNetHandle = NetKindHandle<WidgetNetKind>;
+
 /// The AccountManager in-flight query kinds — the C++ ResultHandler
 /// classes of AccountManager.cpp:180-612 (the sessions/authorizations,
 /// web-authorization, contact-token and TTL families) plus the sibling
@@ -6083,6 +6111,8 @@ pub struct Td {
     /// The community plane's `send_update` outbox; drained by
     /// [`Td::flush_user_updates`].
     pub(crate) community_updates: Vec<td_api::Update>,
+    /// `Td::widget_manager_` (the C++ init_managers block, Td.h:312).
+    pub(crate) widget_manager: crate::widget_manager::WidgetManager,
     /// `Td::ton_wallet_manager_` (the C++ init_managers block).
     pub(crate) ton_wallet_manager: crate::ton_wallet::TonWalletManager,
     /// `Td::device_token_manager_` (`Td.cpp:1345`, M.13S).
@@ -6318,6 +6348,9 @@ pub struct Td {
     /// The callback-parked CommunityManager query answers, parked by
     /// kind (the `Td::on_community_net_answer` drain).
     community_net_completed: Arc<Mutex<Vec<(CommunityNetKind, NetQuery)>>>,
+    /// The callback-parked WidgetManager query answers, parked by kind
+    /// (the `Td::on_widget_net_answer` drain).
+    widget_net_completed: Arc<Mutex<Vec<(WidgetNetKind, NetQuery)>>>,
     /// The callback-parked AccountManager query answers, parked by kind
     /// (the `Td::on_account_net_answer` drain).
     account_net_completed: Arc<Mutex<Vec<(AccountNetKind, NetQuery)>>>,
@@ -7053,6 +7086,7 @@ impl Td {
             statistics_net_completed: Arc::new(Mutex::new(Vec::new())),
             community_manager: CommunityManager::new(),
             community_updates: Vec::new(),
+            widget_manager: crate::widget_manager::WidgetManager::default(),
             ton_wallet_manager: crate::ton_wallet::TonWalletManager::new(),
             device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
             language_pack_manager: crate::language_pack_manager::LanguagePackManager::new(),
@@ -7128,6 +7162,7 @@ impl Td {
             updates_net_completed: Arc::new(Mutex::new(Vec::new())),
             ton_wallet_net_completed: Arc::new(Mutex::new(Vec::new())),
             community_net_completed: Arc::new(Mutex::new(Vec::new())),
+            widget_net_completed: Arc::new(Mutex::new(Vec::new())),
             account_net_completed: Arc::new(Mutex::new(Vec::new())),
             star_net_completed: Arc::new(Mutex::new(Vec::new())),
             link_net_completed: Arc::new(Mutex::new(Vec::new())),
@@ -9564,6 +9599,7 @@ impl Td {
         self.dispatch_completed_updates_net();
         self.dispatch_completed_ton_wallet_net();
         self.dispatch_completed_community_net();
+        self.dispatch_completed_widget_net();
         self.dispatch_completed_account_net();
         self.dispatch_completed_star_net();
         self.dispatch_completed_link_net();
@@ -9737,6 +9773,16 @@ impl Td {
         Some(CommunityNetHandle {
             dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
             completed: Arc::clone(&self.community_net_completed),
+            shared: self.net_shared.clone(),
+        })
+    }
+
+    /// The cloned widget dispatch surface for the [`WidgetEnv`]
+    /// senders — `None` keeps the net-inert posture.
+    fn widget_net(&self) -> Option<WidgetNetHandle> {
+        Some(WidgetNetHandle {
+            dispatcher: self.net_query_dispatcher.as_ref()?.clone(),
+            completed: Arc::clone(&self.widget_net_completed),
             shared: self.net_shared.clone(),
         })
     }
@@ -11576,6 +11622,17 @@ impl Td {
         let completed = std::mem::take(&mut *self.community_net_completed.lock());
         for (kind, query) in completed {
             self.on_community_net_answer(kind, query);
+        }
+        self.drain_sink();
+    }
+
+    /// Drain the callback-parked WidgetManager answers — the C++
+    /// ResultHandler `on_result`/`on_error` halves (WidgetManager.cpp:
+    /// 125-313).
+    fn dispatch_completed_widget_net(&mut self) {
+        let completed = std::mem::take(&mut *self.widget_net_completed.lock());
+        for (kind, query) in completed {
+            self.on_widget_net_answer(kind, query);
         }
         self.drain_sink();
     }
@@ -25747,6 +25804,169 @@ impl Td {
                     Some(false) => promise.set_error(Status::error(400, "Receive false as result")),
                     None => promise.set_error(parse_error("account_updateNotifySettings")),
                 }
+            }
+        }
+    }
+
+    /// Route one WidgetManager net answer by kind (the C++ query handler
+    /// halves of WidgetManager.cpp:125-313). The `on_get_message_error`
+    /// hop of the C++ `on_error` halves is the unported walking-lane
+    /// seam — the raw error settles the promise.
+    fn on_widget_net_answer(&mut self, kind: WidgetNetKind, query: NetQuery) {
+        fn pop_front<T>(lot: &mut Vec<T>) -> Option<T> {
+            if lot.is_empty() {
+                None
+            } else {
+                Some(lot.remove(0))
+            }
+        }
+        let error = if query.is_error() {
+            Some(query.error().clone())
+        } else {
+            None
+        };
+        match kind {
+            // `GetBotWidgetQueryAnswerQuery` (cpp:149-165) — the answer's
+            // result string answers the td_api widgetQueryAnswer; the
+            // BOT_RESPONSE_TIMEOUT remap is the query's 502 band.
+            WidgetNetKind::GetBotWidgetQueryAnswer => {
+                let Some(mut promise) = pop_front(&mut self.widget_manager.get_answer_promises)
+                else {
+                    return;
+                };
+                let Some(status) = error else {
+                    let answer =
+                        match telegram_api::messages_BotWidgetQueryAnswer::parse(query.ok()) {
+                            Ok(answer) => answer,
+                            Err(_) => {
+                                return promise
+                                    .set_error(Status::error(500, "Failed to parse the answer"));
+                            }
+                        };
+                    return promise.set_value(td_api::WidgetQueryAnswer {
+                        data: answer.result,
+                    });
+                };
+                let mut status = status;
+                if status.message() == "BOT_RESPONSE_TIMEOUT" {
+                    status = Status::error(502, "The bot is not responding");
+                }
+                promise.set_error(status);
+            }
+            // `SetBotWidgetQueryAnswerQuery` (cpp:180-195) — the Bool is
+            // logged when false, the promise settles either way.
+            WidgetNetKind::SetBotWidgetQueryAnswer => {
+                let Some(mut promise) = pop_front(&mut self.widget_manager.set_answer_promises)
+                else {
+                    return;
+                };
+                let Some(status) = error else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(true) => promise.set_value(()),
+                        Some(false) => {
+                            tdutils::log_info!("Sending answer to a widget query has failed");
+                            promise.set_value(());
+                        }
+                        None => {
+                            promise.set_error(Status::error(
+                                500,
+                                "Failed to parse the setBotWidgetQueryAnswer answer",
+                            ));
+                        }
+                    }
+                    return;
+                };
+                promise.set_error(status);
+            }
+            // `EditMessageWidgetDataQuery` (cpp:229-243) — the answer is
+            // an Updates umbrella routed through the updates pipe before
+            // the request settles (the C++ `on_get_updates` chain).
+            WidgetNetKind::EditMessageWidgetData => {
+                let Some(mut promise) =
+                    pop_front(&mut self.widget_manager.edit_message_data_promises)
+                else {
+                    return;
+                };
+                let Some(status) = error else {
+                    match telegram_api::Updates::parse(query.ok()) {
+                        Ok(updates) => {
+                            // the answer IS an Updates umbrella — the same
+                            // boxed serialization the session driver pushes
+                            let mut buffer = Vec::new();
+                            updates.store(&mut buffer);
+                            self.on_net_update(buffer);
+                            promise.set_value(());
+                        }
+                        Err(_) => {
+                            promise.set_error(Status::error(
+                                500,
+                                "Failed to parse the editMessageWidgetData answer",
+                            ));
+                        }
+                    }
+                    return;
+                };
+                promise.set_error(status);
+            }
+            // `EditWidgetDataQuery` (cpp:262-274) — the Bool is logged
+            // when false, the promise settles either way.
+            WidgetNetKind::EditWidgetData => {
+                let Some(mut promise) =
+                    pop_front(&mut self.widget_manager.edit_widget_data_promises)
+                else {
+                    return;
+                };
+                let Some(status) = error else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(true) => promise.set_value(()),
+                        Some(false) => {
+                            tdutils::log_error!("Receive false in result of editWidgetData");
+                            promise.set_value(());
+                        }
+                        None => {
+                            promise.set_error(Status::error(
+                                500,
+                                "Failed to parse the editWidgetData answer",
+                            ));
+                        }
+                    }
+                    return;
+                };
+                promise.set_error(status);
+            }
+            // `GetWidgetPublicDataQuery` (cpp:298-312) — the answer
+            // routes into `on_get_widget_public_data`.
+            WidgetNetKind::GetWidgetPublicData { message_full_id } => {
+                let Some(mut promise) =
+                    pop_front(&mut self.widget_manager.get_public_data_promises)
+                else {
+                    return;
+                };
+                let Some(status) = error else {
+                    let public_data =
+                        match telegram_api::messages_WidgetPublicData::parse(query.ok()) {
+                            Ok(public_data) => public_data,
+                            Err(_) => {
+                                return promise.set_error(Status::error(
+                                    500,
+                                    "Failed to parse the widgetPublicData answer",
+                                ));
+                            }
+                        };
+                    let mut manager = std::mem::take(&mut self.widget_manager);
+                    {
+                        let mut env = WidgetEnv { td: self };
+                        manager.on_get_widget_public_data(
+                            &mut env,
+                            message_full_id,
+                            public_data,
+                            promise,
+                        );
+                    }
+                    self.widget_manager = manager;
+                    return;
+                };
+                promise.set_error(status);
             }
         }
     }
@@ -41485,6 +41705,300 @@ impl crate::ton_wallet::TonWalletUpdateEnv for TonWalletEnv<'_> {
 
     fn send_update(&mut self, update: td_api::Update) {
         self.td.send_update(td_api::Object::from(update));
+    }
+}
+
+/// The td-level [`crate::widget_manager::WidgetManagerEnv`] — the
+/// community env shape over `&mut Td` (the manager is `mem::take`n out
+/// of `Td` under the env).
+pub(crate) struct WidgetEnv<'a> {
+    pub(crate) td: &'a mut Td,
+}
+
+impl crate::widget_manager::WidgetManagerEnv for WidgetEnv<'_> {
+    fn auth_is_bot(&self) -> bool {
+        self.td.auth_manager.is_bot()
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.td.send_update(td_api::Object::from(update));
+    }
+
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: DialogId,
+    ) -> std::result::Result<(), tdutils::status::Status> {
+        // `DialogManager::check_dialog_access(dialog_id, false, Read,
+        // _)` — the full access-check plane is the M.6 continuation; the
+        // seam answers valid dialogs only.
+        if dialog_id.is_valid() {
+            Ok(())
+        } else {
+            Err(tdutils::status::Status::error(400, "Chat not found"))
+        }
+    }
+
+    fn force_create_dialog(&mut self, dialog_id: DialogId, source: &str) {
+        crate::dialog_manager::force_create_dialog(self.td, dialog_id, source);
+    }
+
+    fn have_min_user(&mut self, user_id: crate::user_manager::UserId) -> bool {
+        self.td.user_manager.have_min_user(user_id)
+    }
+
+    fn get_user_id_object(&mut self, user_id: crate::user_manager::UserId, source: &str) -> i64 {
+        let mut env = crate::user_manager::UserEnv {
+            global: &mut self.td.global,
+            options: self
+                .td
+                .option_manager
+                .as_mut()
+                .expect("the widget plane runs with the option manager"),
+            auth_is_bot: self.td.auth_manager.is_bot(),
+        };
+        self.td
+            .user_manager
+            .get_user_id_object(&mut env, user_id, source)
+    }
+
+    fn get_chat_id_object(&mut self, dialog_id: DialogId) -> i64 {
+        dialog_id.get()
+    }
+
+    fn have_message_force(
+        &mut self,
+        message_full_id: crate::messages_manager::MessageFullId,
+        source: &str,
+    ) -> bool {
+        crate::messages_manager::have_message_force_full(
+            &self.td.messages_manager,
+            message_full_id,
+            source,
+        )
+    }
+
+    fn get_message_widget_public_data(
+        &mut self,
+        message_full_id: crate::messages_manager::MessageFullId,
+    ) -> std::result::Result<(String, i64), tdutils::status::Status> {
+        crate::messages_manager::get_message_widget_public_data(
+            &self.td.messages_manager,
+            message_full_id,
+        )
+    }
+
+    fn on_update_message_widget_data(
+        &mut self,
+        message_full_id: crate::messages_manager::MessageFullId,
+        public_data: String,
+        public_data_hash: i64,
+        chat_data: String,
+        update_chat_data: bool,
+    ) {
+        let td_ptr = std::ptr::from_mut(self.td);
+        // SAFETY: the raw-pointer split-borrow convention of the apply
+        // walks (manager / ctx alias one Td, used strictly sequentially;
+        // the emission runs after the walk borrows end).
+        let global: &crate::global::Global = unsafe { &(*td_ptr).global };
+        let manager: &mut crate::messages_manager::MessagesManager =
+            unsafe { &mut (*td_ptr).messages_manager };
+        let ctx: &dyn crate::messages_manager::MessageObjectContext = unsafe { &*td_ptr };
+        let time = crate::user_manager::TimeCtx::from_global(global);
+        let new_content = crate::messages_manager::on_update_message_widget_data(
+            global,
+            manager,
+            ctx,
+            &time,
+            message_full_id,
+            public_data,
+            public_data_hash,
+            chat_data,
+            update_chat_data,
+        );
+        // `send_update_message_content_impl` (MessagesManager.cpp:5271-5283)
+        // — the emission runs after the walk borrows end.
+        if let Some(new_content) = new_content {
+            let td: &mut Td = unsafe { &mut *td_ptr };
+            td.send_update(td_api::Object::updateMessageContent(
+                td_api::updateMessageContent {
+                    chat_id: message_full_id.get_dialog_id().get(),
+                    message_id: message_full_id.get_message_id().get(),
+                    new_content: Some(new_content),
+                },
+            ));
+        }
+    }
+
+    fn get_inline_message_id(
+        &mut self,
+        inline_message_id: telegram_api::InputBotInlineMessageID,
+    ) -> String {
+        crate::inline_queries_manager::get_inline_message_id(Some(inline_message_id))
+    }
+
+    // ---- The net query senders — the C++ ResultHandler send legs
+    // (WidgetManager.cpp:125-313). ----
+
+    /// `GetBotWidgetQueryAnswerQuery::send` (cpp:135-147) — the
+    /// read-access input peer of the message dialog (the C++ CHECK band
+    /// drops the query when the peer is missing).
+    fn send_get_bot_widget_query_answer_query(
+        &mut self,
+        message_full_id: crate::messages_manager::MessageFullId,
+        query_type: telegram_api::WidgetQueryType,
+        data: &[u8],
+    ) {
+        let Some(net) = self.td.widget_net() else {
+            return tdutils::log_info!("Send messages.getBotWidgetQueryAnswer — [net-inert]");
+        };
+        let dialog_id = message_full_id.get_dialog_id();
+        let Some(peer) = crate::dialog_manager::get_input_peer(
+            self.td,
+            dialog_id,
+            crate::user_manager::AccessRights::Read,
+        ) else {
+            tdutils::log_info!("GetBotWidgetQueryAnswerQuery — no input peer for {dialog_id:?}");
+            return;
+        };
+        let server_message_id = message_full_id.get_message_id().get_server_message_id();
+        net.dispatch(
+            crate::td::WidgetNetKind::GetBotWidgetQueryAnswer,
+            telegram_api::Function::messages_getBotWidgetQueryAnswer(
+                telegram_api::messages_getBotWidgetQueryAnswer {
+                    peer: Some(Box::new(peer)),
+                    msg_id: server_message_id.get(),
+                    query_type: Some(query_type),
+                    data: data.to_vec(),
+                },
+            ),
+        );
+    }
+
+    /// `SetBotWidgetQueryAnswerQuery::send` (cpp:175-178).
+    fn send_set_bot_widget_query_answer_query(&mut self, widget_query_id: i64, data: &str) {
+        let Some(net) = self.td.widget_net() else {
+            return tdutils::log_info!("Send messages.setBotWidgetQueryAnswer — [net-inert]");
+        };
+        net.dispatch(
+            crate::td::WidgetNetKind::SetBotWidgetQueryAnswer,
+            telegram_api::Function::messages_setBotWidgetQueryAnswer(
+                telegram_api::messages_setBotWidgetQueryAnswer {
+                    flags: 0,
+                    query_id: widget_query_id,
+                    result: data.to_owned(),
+                },
+            ),
+        );
+    }
+
+    /// `EditMessageWidgetDataQuery::send` (cpp:207-227) — the
+    /// read-access input peer of the message dialog.
+    fn send_edit_message_widget_data_query(
+        &mut self,
+        message_full_id: crate::messages_manager::MessageFullId,
+        edit_public_data: bool,
+        public_data: &str,
+        edit_chat_data: bool,
+        chat_data: &str,
+    ) {
+        let Some(net) = self.td.widget_net() else {
+            return tdutils::log_info!(
+                "Send messages.editMessageWidgetData for {message_full_id:?} — [net-inert]"
+            );
+        };
+        let dialog_id = message_full_id.get_dialog_id();
+        let Some(peer) = crate::dialog_manager::get_input_peer(
+            self.td,
+            dialog_id,
+            crate::user_manager::AccessRights::Read,
+        ) else {
+            tdutils::log_info!("EditMessageWidgetDataQuery — no input peer for {dialog_id:?}");
+            return;
+        };
+        let server_message_id = message_full_id.get_message_id().get_server_message_id();
+        let mut flags = 0;
+        if edit_public_data {
+            flags |= 1 << 0; // PUBLIC_DATA_MASK
+        }
+        if edit_chat_data {
+            flags |= 1 << 1; // CHAT_DATA_MASK
+        }
+        net.dispatch(
+            crate::td::WidgetNetKind::EditMessageWidgetData,
+            telegram_api::Function::messages_editMessageWidgetData(
+                telegram_api::messages_editMessageWidgetData {
+                    flags,
+                    peer: Some(Box::new(peer)),
+                    id: server_message_id.get(),
+                    public_data: if edit_public_data {
+                        public_data.to_owned()
+                    } else {
+                        String::new()
+                    },
+                    chat_data: if edit_chat_data {
+                        chat_data.to_owned()
+                    } else {
+                        String::new()
+                    },
+                },
+            ),
+        );
+    }
+
+    /// `EditWidgetDataQuery::send` (cpp:253-260).
+    fn send_edit_widget_data_query(&mut self, widget_id: i64, public_data: &str, cache_time: i32) {
+        let Some(net) = self.td.widget_net() else {
+            return tdutils::log_info!("Send messages.editWidgetData — [net-inert]");
+        };
+        let mut flags = 0;
+        if cache_time > 0 {
+            flags |= 1 << 0; // CACHE_TIME_MASK
+        }
+        net.dispatch(
+            crate::td::WidgetNetKind::EditWidgetData,
+            telegram_api::Function::messages_editWidgetData(
+                telegram_api::messages_editWidgetData {
+                    flags,
+                    widget_id,
+                    public_data: public_data.to_owned(),
+                    cache_time,
+                },
+            ),
+        );
+    }
+
+    /// `GetWidgetPublicDataQuery::send` (cpp:287-296) — the
+    /// read-access input peer of the message dialog.
+    fn send_get_widget_public_data_query(
+        &mut self,
+        message_full_id: crate::messages_manager::MessageFullId,
+        hash: i64,
+    ) {
+        let Some(net) = self.td.widget_net() else {
+            return tdutils::log_info!(
+                "Send messages.getWidgetPublicData for {message_full_id:?} — [net-inert]"
+            );
+        };
+        let dialog_id = message_full_id.get_dialog_id();
+        let Some(peer) = crate::dialog_manager::get_input_peer(
+            self.td,
+            dialog_id,
+            crate::user_manager::AccessRights::Read,
+        ) else {
+            tdutils::log_info!("GetWidgetPublicDataQuery — no input peer for {dialog_id:?}");
+            return;
+        };
+        let server_message_id = message_full_id.get_message_id().get_server_message_id();
+        net.dispatch(
+            crate::td::WidgetNetKind::GetWidgetPublicData { message_full_id },
+            telegram_api::Function::messages_getWidgetPublicData(
+                telegram_api::messages_getWidgetPublicData {
+                    peer: Some(Box::new(peer)),
+                    msg_id: server_message_id.get(),
+                    hash,
+                },
+            ),
+        );
     }
 }
 

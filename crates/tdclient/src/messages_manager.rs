@@ -13792,6 +13792,111 @@ fn on_message_changed(
     }
 }
 
+/// `MessagesManager::get_message_widget_public_data`
+/// (MessagesManager.cpp:5253-5261) — the local widget-data read behind
+/// `WidgetManager::get_widget_public_data`. The `get_message_force`
+/// database leg is the message-db seam (the in-memory probe).
+pub fn get_message_widget_public_data(
+    manager: &MessagesManager,
+    message_full_id: MessageFullId,
+) -> Result<(String, i64), Status> {
+    let content = manager
+        .get_dialog(message_full_id.get_dialog_id())
+        .and_then(|d| d.messages.get(&message_full_id.get_message_id()))
+        .and_then(|m| m.content.as_ref());
+    let Some(content) = content else {
+        return Err(Status::error(400, "Message not found"));
+    };
+    if content.get_type() != crate::message_content::MessageContentType::Widget {
+        return Err(Status::error(400, "Message has no widget"));
+    }
+    Ok(crate::message_content::get_message_content_widget_public_data(content))
+}
+
+/// `MessagesManager::on_update_message_widget_data`
+/// (MessagesManager.cpp:5222-5251) — the in-place widget-data apply
+/// behind the `updateMessageWidgetData` pts update and the
+/// `widgetPublicData` answer. The `get_dialog_force`/`get_message_force`
+/// database legs are the message-db seam (unknown dialogs/messages are
+/// ignored); the `send_update_message_content` side-band (the
+/// bot-command/reply re-registration) rides its unported M.10 plane.
+/// Returns the new content object for the caller's `updateMessageContent`
+/// emission (the Td update-plane seam), `None` when nothing changed.
+#[allow(clippy::too_many_arguments)] // the C++ signature has the same shape
+pub fn on_update_message_widget_data(
+    global: &crate::global::Global,
+    manager: &mut MessagesManager,
+    ctx: &dyn MessageObjectContext,
+    time: &crate::user_manager::TimeCtx,
+    message_full_id: MessageFullId,
+    public_data: String,
+    public_data_hash: i64,
+    chat_data: String,
+    update_chat_data: bool,
+) -> Option<td_api::MessageContent> {
+    let dialog_id = message_full_id.get_dialog_id();
+    let message_id = message_full_id.get_message_id();
+    if !message_id.is_valid() {
+        tdutils::log_error!("Receive widget data for invalid {message_full_id:?}");
+        return None;
+    }
+    let mut is_content_changed = false;
+    let mut need_update = false;
+    {
+        let Some(d) = manager.get_dialog_mut(dialog_id) else {
+            tdutils::log_info!("Ignore update of message widget data in unknown {dialog_id:?}");
+            return None;
+        };
+        let Some(m) = d.messages.get_mut(&message_id) else {
+            tdutils::log_info!(
+                "Ignore update of message widget data in unknown {message_full_id:?}"
+            );
+            return None;
+        };
+        crate::message_content::update_message_content_widget_data(
+            m.content.as_mut()?,
+            public_data,
+            public_data_hash,
+            chat_data,
+            update_chat_data,
+            &mut is_content_changed,
+            &mut need_update,
+        );
+    }
+    if !(is_content_changed || need_update) {
+        return None;
+    }
+    let mut new_content = None;
+    if need_update {
+        // `send_update_message_content(d, m, true,
+        // "on_update_message_widget_data 3")` — the emission skips
+        // yet-unsent messages like the C++
+        // `send_update_message_content_impl`.
+        new_content = manager
+            .get_dialog(dialog_id)
+            .and_then(|d| d.messages.get(&message_id))
+            .filter(|m| m.is_update_sent)
+            .map(|m| get_message_message_content_object(manager, ctx, dialog_id, m));
+    }
+    if let Some(m) = manager
+        .get_dialog(dialog_id)
+        .and_then(|d| d.messages.get(&message_id))
+        .cloned()
+    {
+        on_message_changed(
+            global,
+            manager,
+            ctx,
+            time,
+            dialog_id,
+            &m,
+            need_update,
+            "on_update_message_widget_data 4",
+        );
+    }
+    new_content
+}
+
 /// The `update_message` edit outcome — the emission decisions the update
 /// plane (the Td wiring) consumes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
