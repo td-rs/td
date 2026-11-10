@@ -7114,6 +7114,26 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             manager.delete_community(&mut env, CommunityId::new(request.community_id), promise);
             td.community_manager = manager;
         }
+        Function::toggleCommunityAreChatsCollapsed(request) => {
+            // Requests.cpp:3533-3538 — CHECK_IS_USER, then
+            // CommunityManager::toggle_community_are_dialogs_collapsed
+            // (the known-community gate only, no rights gate; the
+            // communities.toggleCommunityCollapsedInDialogs send rides
+            // the net step and the promise settles on the Updates
+            // answer that re-enters the updates intake).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut manager, mut env) = community_split(td);
+            manager.toggle_community_are_dialogs_collapsed(
+                &mut env,
+                CommunityId::new(request.community_id),
+                request.are_chats_collapsed,
+                promise,
+            );
+            td.community_manager = manager;
+        }
 
         // -- the payments set (M.43): Requests.cpp:8372-8436, 8757-8771,
         //    9247-9251; the CHECK_IS_USER/CHECK_IS_BOT gates match the
@@ -20187,7 +20207,7 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 26, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            1053,
+            1054,
             "dispatched count"
         );
         // the 23383aef sync base (1.8.70): the 34 new scheme functions
@@ -20213,17 +20233,17 @@ mod request_census_tests {
         // getSpeechRecognitionLanguages, fixRecognizedTextWithAi,
         // fixRecognizedRichMessageWithAi): 1,045 + 4 = 1,049
         // dispatched / 28 - 4 = 24 interim, sync unmoved 26.
-        // The TON wallet cards family slice (#123) flipped the pair:
-        // getTonWalletCardBackgroundGiftCollectionNames (the
-        // `\xFF`-separated option answer) and setTonWalletCardStickers
-        // (the validation ladder over the SetWalletCardStickersQuery net
-        // tail): 1,049 + 2 = 1,051 dispatched / 24 - 2 = 22 interim, sync
-        // unmoved 26.
         // The web-proxy-carrier family slice (#125) flipped the pair
         // (processWebProxyCarrierMessage, reportWebProxyCarrierError —
         // the WebProxyManager carrier plane over the #114-band
         // Proxy::web records): 1,051 + 2 = 1,053 dispatched / 22 - 2 =
         // 20 interim, sync unmoved 26.
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 20, "interim count");
+        // The community collapse slice (#128) flipped
+        // toggleCommunityAreChatsCollapsed (the
+        // communities.toggleCommunityCollapsedInDialogs send whose
+        // Updates answer re-enters the updates intake; the collapse
+        // state comes back through on_get_community): 1,053 + 1 = 1,054
+        // dispatched / 20 - 1 = 19 interim, sync unmoved 26.
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 19, "interim count");
     }
 }
