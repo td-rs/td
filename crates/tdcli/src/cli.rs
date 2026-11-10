@@ -13155,6 +13155,11 @@ impl CliClient {
                 td_api::getSuitablePersonalChats,
             ));
             true
+        } else if op == "gscoc" {
+            self.send_request(Function::getSuitableCommunityChats(
+                td_api::getSuitableCommunityChats,
+            ));
+            true
         } else if op == "cpc" {
             let (user_id, force) = tokenizer::split(args, ' ');
             self.send_request(Function::createPrivateChat(td_api::createPrivateChat {
@@ -16424,6 +16429,7 @@ mod tests {
             ("gcscc", 13),
             ("gisc", 13),
             ("grc", 13),
+            ("gscoc", 13),
             ("gsdc", 13),
             ("gspc", 13),
             ("obsb", 13),
