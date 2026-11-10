@@ -52,6 +52,10 @@ pub(crate) enum InlineMessageNetKind {
     /// `GetInlineGameHighScoresQuery` (InlineMessageManager.cpp:179-210)
     /// — `messages.getInlineGameHighScores`.
     GetInlineGameHighScores,
+    /// `EditInlineMessageWidgetDataQuery` (InlineMessageManager.cpp:
+    /// 131-172, the 1.8.70 widgets family) —
+    /// `messages.editInlineBotMessageWidgetData`.
+    EditInlineMessageWidgetData,
 }
 
 /// The parked inline-message queries (the net-drain 61 families): the
@@ -65,6 +69,9 @@ pub(crate) struct PendingInlineMessageQueries {
     pub(crate) scores: Vec<Promise<()>>,
     /// The parked `messages.getInlineGameHighScores` promises.
     pub(crate) high_scores: Vec<Promise<td_api::GameHighScores>>,
+    /// The parked `messages.editInlineBotMessageWidgetData` promises
+    /// (the 1.8.70 widgets family).
+    pub(crate) widget_edits: Vec<Promise<()>>,
 }
 
 /// `DcId::MAX_RAW_DC_ID` (net/DcId.h:30).
@@ -157,6 +164,14 @@ pub trait InlineMessageManagerEnv: InlineQueriesManagerEnv {
         &mut self,
         query: telegram_api::messages_getInlineGameHighScores,
         promise: Promise<td_api::GameHighScores>,
+    );
+    /// `EditInlineMessageWidgetDataQuery` (InlineMessageManager.cpp:
+    /// 131-172, the 1.8.70 widgets family) — the data-only edit rides
+    /// the same per-DC routing.
+    fn send_edit_inline_message_widget_data_query(
+        &mut self,
+        query: telegram_api::messages_editInlineBotMessageWidgetData,
+        promise: Promise<()>,
     );
     /// `get_input_message_content` + `get_message_content_input_media` +
     /// `get_message_content_caption` (MessageContent.{h,cpp}) —
@@ -597,6 +612,60 @@ impl InlineMessageManager {
             None,
         );
         env.send_edit_inline_message_query(query, promise);
+    }
+
+    /// `InlineMessageManager::edit_inline_message_widget_data`
+    /// (InlineMessageManager.cpp:372-384) — the 1.8.70 widgets family:
+    /// the data-only edit, the both-flags-false band answers immediately.
+    #[allow(clippy::too_many_arguments)] // the C++ signature has the same shape
+    pub fn edit_inline_message_widget_data(
+        &mut self,
+        env: &mut impl InlineMessageManagerEnv,
+        inline_message_id: &str,
+        edit_public_data: bool,
+        public_data: &str,
+        edit_chat_data: bool,
+        chat_data: &str,
+        mut promise: Promise<()>,
+    ) {
+        debug_assert!(
+            env.auth_is_bot(),
+            "edit_inline_message_widget_data is bot-only"
+        );
+
+        let input_bot_inline_message_id = match get_input_bot_inline_message_id(inline_message_id) {
+            Ok(id) => id,
+            Err(status) => {
+                promise.set_error(status);
+                return;
+            }
+        };
+        if !edit_public_data && !edit_chat_data {
+            return promise.set_value(());
+        }
+
+        let mut flags = 0;
+        if edit_public_data {
+            flags |= 1 << 0; // PUBLIC_DATA_MASK
+        }
+        if edit_chat_data {
+            flags |= 1 << 1; // CHAT_DATA_MASK
+        }
+        let query = telegram_api::messages_editInlineBotMessageWidgetData {
+            flags,
+            id: Some(input_bot_inline_message_id),
+            public_data: if edit_public_data {
+                public_data.to_owned()
+            } else {
+                String::new()
+            },
+            chat_data: if edit_chat_data {
+                chat_data.to_owned()
+            } else {
+                String::new()
+            },
+        };
+        env.send_edit_inline_message_widget_data_query(query, promise);
     }
 
     /// `set_inline_game_score` (InlineMessageManager.cpp:341-350).

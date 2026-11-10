@@ -31,6 +31,10 @@
 //!   is the MessageContent plane, so `register_inline_message_content`
 //!   answers the C++ "content == nullptr" band and the wire intake drops
 //!   such results until the integration.
+//!   The 1.8.70 widgets family rides the same seam: the
+//!   `botInlineMessageWidget` decode arm (122a0c135) and the
+//!   `inputBotInlineMessageWidget{,Id}` result arms (aa2166ae9/11f71de11)
+//!   land with the MessageContent-plane integration.
 //! - `register_thumbnail` (`get_web_document_photo_size` +
 //!   `get_thumbnail_object`) — `[blocked: Files]`: the temp-file
 //!   registration and the file-object builders ride FileManager (M.12

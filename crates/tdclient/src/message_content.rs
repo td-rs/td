@@ -242,6 +242,7 @@ pub enum MessageContentType {
     GramTransfer,
     WalletTonConnectRequest,
     UnpaidMessagesAllowedByLink,
+    Widget,
 }
 
 /// `can_be_secret_message_content` (MessageContentType.cpp) — the C++
@@ -291,6 +292,7 @@ pub fn is_service_message_content(content_type: MessageContentType) -> bool {
             | Video
             | VideoNote
             | VoiceNote
+            | Widget
     )
 }
 
@@ -336,7 +338,7 @@ pub fn can_send_message_content_to_secret_chat(content_type: MessageContentType)
         | Text | Venue | Video | VideoNote | VoiceNote => true,
         Dice | Game | Giveaway | GiveawayWinners | Invoice | PaidMedia | Poll | Story
         | ToDoList => false,
-        GramTransfer | WalletTonConnectRequest | UnpaidMessagesAllowedByLink => false,
+        GramTransfer | WalletTonConnectRequest | UnpaidMessagesAllowedByLink | Widget => false,
         _ => unreachable!(),
     }
 }
@@ -459,6 +461,7 @@ impl TryFrom<i32> for MessageContentType {
             96 => Ok(MessageContentType::GramTransfer),
             97 => Ok(MessageContentType::WalletTonConnectRequest),
             98 => Ok(MessageContentType::UnpaidMessagesAllowedByLink),
+            99 => Ok(MessageContentType::Widget),
             _ => Err(()),
         }
     }
@@ -2371,8 +2374,8 @@ impl MessageUnsupported {
     /// `MessageUnsupported::CURRENT_VERSION` (MessageContent.cpp:554) —
     /// bumped each time a new message content type is added (the
     /// UnpaidMessagesAllowedByLink insertion is the 63 → 64 bump,
-    /// 39e3d8c73).
-    pub const CURRENT_VERSION: i32 = 64;
+    /// 39e3d8c73; the widget addition is the 64 → 65 bump, 10dbacbc0).
+    pub const CURRENT_VERSION: i32 = 65;
 }
 
 impl Default for MessageUnsupported {
@@ -3010,6 +3013,26 @@ pub struct MessageWalletTonConnectRequest {
 /// wire action lands as (39e3d8c73).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MessageUnpaidMessagesAllowedByLink {}
+/// `MessageWidget` (MessageContent.cpp:1890-1923) — the embedded-widget
+/// media plane (10dbacbc0). `is_shared` is for sending only (the C++
+/// field comment); it persists and compares but never serializes to the
+/// wire except through `inputMediaWidget::shared_widget` (site-less with
+/// the parked input-media plane).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MessageWidget {
+    pub width: i32,
+    pub height: i32,
+    pub html: String,
+    pub public_data: String,
+    pub public_data_hash: i64,
+    pub chat_data: String,
+    pub widget_id: i64,
+    pub caption: FormattedText,
+    pub is_copy: bool,
+    pub can_query: bool,
+    pub background_query: bool,
+    pub is_shared: bool,
+}
 
 /// `td::MessageContent` (MessageContent.h:62-72) — the C++ class hierarchy
 /// flattened into an enum of structs. The C++ header comment applies to
@@ -3121,6 +3144,7 @@ pub enum MessageContent {
     GramTransfer(MessageGramTransfer),
     WalletTonConnectRequest(MessageWalletTonConnectRequest),
     UnpaidMessagesAllowedByLink(MessageUnpaidMessagesAllowedByLink),
+    Widget(MessageWidget),
 }
 
 impl MessageContent {
@@ -3231,6 +3255,7 @@ impl MessageContent {
             MessageContent::UnpaidMessagesAllowedByLink(_) => {
                 MessageContentType::UnpaidMessagesAllowedByLink
             }
+            MessageContent::Widget(_) => MessageContentType::Widget,
         }
     }
 }
@@ -6024,6 +6049,56 @@ pub fn store_message_content(
             // MessageContent.cpp:3111-3114 — the empty flags band.
             store_flags(out, []);
         }
+        MessageContent::Widget(m) => {
+            // MessageContent.cpp:3165-3209 — the eleven-flag word, then
+            // width?, height?, html (always), caption?, public_data?,
+            // chat_data?, widget_id?, public_data_hash?.
+            let has_width = m.width != 0;
+            let has_height = m.height != 0;
+            let has_caption = !m.caption.text.is_empty();
+            let has_public_data = !m.public_data.is_empty();
+            let has_chat_data = !m.chat_data.is_empty();
+            let has_widget_id = m.widget_id != 0;
+            let has_public_data_hash = m.public_data_hash != 0;
+            store_flags(
+                out,
+                [
+                    has_width,
+                    has_height,
+                    has_caption,
+                    has_public_data,
+                    has_chat_data,
+                    has_widget_id,
+                    m.is_copy,
+                    m.can_query,
+                    m.background_query,
+                    has_public_data_hash,
+                    m.is_shared,
+                ],
+            );
+            if has_width {
+                out.extend_from_slice(&m.width.to_le_bytes());
+            }
+            if has_height {
+                out.extend_from_slice(&m.height.to_le_bytes());
+            }
+            store_string(out, &m.html);
+            if has_caption {
+                m.caption.store(out);
+            }
+            if has_public_data {
+                store_string(out, &m.public_data);
+            }
+            if has_chat_data {
+                store_string(out, &m.chat_data);
+            }
+            if has_widget_id {
+                out.extend_from_slice(&m.widget_id.to_le_bytes());
+            }
+            if has_public_data_hash {
+                out.extend_from_slice(&m.public_data_hash.to_le_bytes());
+            }
+        }
     }
 }
 
@@ -7388,6 +7463,44 @@ pub fn parse_message_content(
         }
         // The unmodeled six: StarGift/StarGiftUnique/StarGiftPurchaseOffer/
         // StarGiftPurchaseOfferDeclined/ChatSetTheme/RichText.
+        MessageContentType::Widget => {
+            // MessageContent.cpp:4734-4788 — mirrors the store order.
+            let flags = parser.parse_flags::<11>()?;
+            let width = if flags[0] { parser.i32_()? } else { 0 };
+            let height = if flags[1] { parser.i32_()? } else { 0 };
+            let html = parser.string()?;
+            let caption = if flags[2] {
+                parse_caption(parser)?
+            } else {
+                FormattedText::default()
+            };
+            let public_data = if flags[3] {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            let chat_data = if flags[4] {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            let widget_id = if flags[5] { parser.i64_()? } else { 0 };
+            let public_data_hash = if flags[9] { parser.i64_()? } else { 0 };
+            MessageContent::Widget(MessageWidget {
+                width,
+                height,
+                html,
+                public_data,
+                public_data_hash,
+                chat_data,
+                widget_id,
+                caption,
+                is_copy: flags[6],
+                can_query: flags[7],
+                background_query: flags[8],
+                is_shared: flags[10],
+            })
+        }
         MessageContentType::StarGift
         | MessageContentType::StarGiftUnique
         | MessageContentType::StarGiftPurchaseOffer
@@ -8850,6 +8963,16 @@ pub fn can_send_message_content(
                 ));
             }
         }
+        MessageContentType::Widget => {
+            // MessageContent.cpp:6794-6797 (145ab9477) — the inline-bot
+            // permission gate.
+            if !permissions.can_use_inline_bots() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send widgets to the chat",
+                ));
+            }
+        }
         MessageContentType::Unsupported => {}
         // The C++ tail is the enumerated service types plus
         // `ChatSetTheme`, all `UNREACHABLE()`: sending never offers them.
@@ -8888,6 +9011,7 @@ pub fn can_forward_message_content(
                 | MessageContentType::GiveawayWinners
                 | MessageContentType::PaidMedia
                 | MessageContentType::Invoice
+                | MessageContentType::Widget
         ) {
             return false;
         }
@@ -8939,6 +9063,7 @@ fn get_message_content_caption(content: &MessageContent) -> Option<&FormattedTex
         MessageContent::Photo(m) => Some(&m.caption),
         MessageContent::Video(m) => Some(&m.caption),
         MessageContent::VoiceNote(m) => Some(&m.caption),
+        MessageContent::Widget(m) => Some(&m.caption),
         _ => None,
     }
 }
@@ -11350,6 +11475,26 @@ pub fn compare_message_contents(
                 *need_update = true;
             }
         }
+        (MessageContent::Widget(lhs), MessageContent::Widget(rhs)) => {
+            // MessageContent.cpp:9260-9273 — the hash-only difference is
+            // a content re-save without a client update.
+            if lhs.width != rhs.width
+                || lhs.height != rhs.height
+                || lhs.html != rhs.html
+                || lhs.public_data != rhs.public_data
+                || lhs.chat_data != rhs.chat_data
+                || lhs.widget_id != rhs.widget_id
+                || lhs.caption != rhs.caption
+                || lhs.is_copy != rhs.is_copy
+                || lhs.can_query != rhs.can_query
+                || lhs.background_query != rhs.background_query
+                || lhs.is_shared != rhs.is_shared
+            {
+                *need_update = true;
+            } else if lhs.public_data_hash != rhs.public_data_hash {
+                *is_content_changed = true;
+            }
+        }
         // The C++ no-op arm list (ChatDeletePhoto, ChatDeleteHistory,
         // ScreenshotTaken, ContactRegistered, ExpiredPhoto, ExpiredVideo,
         // ExpiredVideoNote, ExpiredVoiceNote, WriteAccessAllowed,
@@ -12020,6 +12165,13 @@ pub fn extract_input_caption(
         td_api::InputMessageContent::inputMessageVoiceNote(input_voice_note) => {
             input_voice_note.caption.take()
         }
+        // MessageContent.cpp:5046-5054 — the widget caption arms.
+        td_api::InputMessageContent::inputMessageWidget(input_widget) => {
+            input_widget.caption.take()
+        }
+        td_api::InputMessageContent::inputMessageSharedWidget(input_widget) => {
+            input_widget.caption.take()
+        }
         _ => None,
     }
 }
@@ -12038,6 +12190,13 @@ pub fn extract_input_invert_media(input_message_content: &td_api::InputMessageCo
         }
         td_api::InputMessageContent::inputMessageVideo(input_video) => {
             input_video.show_caption_above_media
+        }
+        // MessageContent.cpp:5077-5090 — the widget arms.
+        td_api::InputMessageContent::inputMessageWidget(input_widget) => {
+            input_widget.show_caption_above_media
+        }
+        td_api::InputMessageContent::inputMessageSharedWidget(input_widget) => {
+            input_widget.show_caption_above_media
         }
         _ => false,
     }
@@ -12146,14 +12305,51 @@ pub fn create_input_message_content(
     let is_bot = td.is_bot();
     let is_secret = dialog_id.get_type() == DialogType::SecretChat;
     match input_message_content {
-        // 1.8.70 widgets (MessageContent.cpp:5475-5519) — the bot gate
-        // and the shared-widget id gate port now; the MessageWidget
-        // content kind rides the widgets family follow-up.
-        td_api::InputMessageContent::inputMessageWidget(_) => {
+        // 1.8.70 widgets (MessageContent.cpp:5475-5519).
+        td_api::InputMessageContent::inputMessageWidget(input_widget) => {
             if !is_bot {
                 return Err(Status::error(400, "Only bots can send widget messages"));
             }
-            return Err(Status::error(500, "Widgets are not supported yet"));
+            if input_widget.width < 0 || input_widget.height < 0 {
+                return Err(Status::error(400, "Invalid widget size specified"));
+            }
+            let Some(html) = crate::misc::clean_input_string(&input_widget.html) else {
+                return Err(Status::error(
+                    400,
+                    "Widget HTML code must be encoded in UTF-8",
+                ));
+            };
+            if html.is_empty() {
+                return Err(Status::error(400, "Widget HTML code must be non-empty"));
+            }
+            let Some(public_data) = crate::misc::clean_input_string(&input_widget.public_data)
+            else {
+                return Err(Status::error(
+                    400,
+                    "Widget public data must be encoded in UTF-8",
+                ));
+            };
+            let Some(chat_data) = crate::misc::clean_input_string(&input_widget.chat_data) else {
+                return Err(Status::error(
+                    400,
+                    "Widget chat data must be encoded in UTF-8",
+                ));
+            };
+            invert_media = input_widget.show_caption_above_media && !is_secret;
+            content = MessageContent::Widget(MessageWidget {
+                width: input_widget.width,
+                height: input_widget.height,
+                html,
+                public_data,
+                public_data_hash: 0,
+                chat_data,
+                widget_id: 0,
+                caption,
+                is_copy: false,
+                can_query: input_widget.allow_queries,
+                background_query: false,
+                is_shared: input_widget.is_shared,
+            });
         }
         td_api::InputMessageContent::inputMessageSharedWidget(input_widget) => {
             if !is_bot {
@@ -12162,7 +12358,27 @@ pub fn create_input_message_content(
             if input_widget.widget_id == 0 {
                 return Err(Status::error(400, "Invalid widget identifier specified"));
             }
-            return Err(Status::error(500, "Widgets are not supported yet"));
+            let Some(chat_data) = crate::misc::clean_input_string(&input_widget.chat_data) else {
+                return Err(Status::error(
+                    400,
+                    "Widget chat data must be encoded in UTF-8",
+                ));
+            };
+            invert_media = input_widget.show_caption_above_media && !is_secret;
+            content = MessageContent::Widget(MessageWidget {
+                width: 0,
+                height: 0,
+                html: String::new(),
+                public_data: String::new(),
+                public_data_hash: 0,
+                chat_data,
+                widget_id: input_widget.widget_id,
+                caption,
+                is_copy: false,
+                can_query: false,
+                background_query: false,
+                is_shared: false,
+            });
         }
         td_api::InputMessageContent::inputMessageText(_) => {
             let input_message_text =
@@ -13598,7 +13814,8 @@ pub fn can_message_content_have_input_media(
         | MessageContentType::Venue
         | MessageContentType::Video
         | MessageContentType::VideoNote
-        | MessageContentType::VoiceNote => true,
+        | MessageContentType::VoiceNote
+        | MessageContentType::Widget => true,
         MessageContentType::None => unreachable!(),
     }
 }
@@ -13943,6 +14160,34 @@ fn get_message_content_input_media_impl(
                 unreachable!()
             };
             td.get_voice_note_input_media(m.file_id, input_file, ttl)
+        }
+        MessageContentType::Widget => {
+            // MessageContent.cpp:6221-6228 — the id-carrying shared form
+            // and the html form.
+            let MessageContent::Widget(m) = content else {
+                unreachable!()
+            };
+            if m.widget_id != 0 {
+                return Some(telegram_api::InputMedia::inputMediaWidgetId(
+                    telegram_api::inputMediaWidgetId {
+                        flags: 0,
+                        widget_id: m.widget_id,
+                        chat_data: m.chat_data.clone(),
+                    },
+                ));
+            }
+            Some(telegram_api::InputMedia::inputMediaWidget(
+                telegram_api::inputMediaWidget {
+                    flags: 0,
+                    allow_queries: m.can_query,
+                    shared_widget: m.is_shared,
+                    width: m.width,
+                    height: m.height,
+                    html: m.html.clone(),
+                    public_data: m.public_data.clone(),
+                    chat_data: m.chat_data.clone(),
+                },
+            ))
         }
         _ => None,
     }
@@ -15199,6 +15444,30 @@ pub fn get_message_content(
                 completions,
             })
         }
+        Some(telegram_api::MessageMedia::messageMediaWidget(media)) => {
+            // MessageContent.cpp:10604-10615 — invalid or undecodable
+            // payloads degrade to MessageUnsupported.
+            let html = get_widget_html(&media.payload);
+            if html.is_empty() {
+                tdutils::log_error!("Receive invalid widget payload");
+                MessageContent::Unsupported(MessageUnsupported::default())
+            } else {
+                MessageContent::Widget(MessageWidget {
+                    width: media.width.max(0),
+                    height: media.height.max(0),
+                    html,
+                    public_data: media.public_data,
+                    public_data_hash: media.public_data_hash,
+                    chat_data: media.chat_data,
+                    widget_id: media.widget_id,
+                    caption: message,
+                    is_copy: media.is_copy,
+                    can_query: media.can_query,
+                    background_query: media.background_query,
+                    is_shared: false,
+                })
+            }
+        }
         Some(telegram_api::MessageMedia::messageMediaUnsupported(_)) => {
             MessageContent::Unsupported(MessageUnsupported::default())
         }
@@ -15207,6 +15476,14 @@ pub fn get_message_content(
             MessageContent::Unsupported(MessageUnsupported::default())
         }
     }
+}
+
+/// `get_widget_html` (MessageContent.cpp:1928-1934) — returns an empty
+/// string if the payload is invalid (a failed decompress or a non-UTF-8
+/// document).
+fn get_widget_html(payload: &[u8]) -> String {
+    let html = tdutils::gzip::gzdecode(payload).as_slice().to_vec();
+    String::from_utf8(html).unwrap_or_default()
 }
 
 /// The `get_message_content` break tail (MessageContent.cpp:10136-10145):
@@ -15522,6 +15799,26 @@ pub fn dup_message_content(
                 result.file_id = td.dup_voice_note(file_id, result.file_id);
             }
             Some(MessageContent::VoiceNote(result))
+        }
+        MessageContent::Widget(m) => {
+            // MessageContent.cpp:10857-10872 — a widget cannot be copied
+            // (329b17ee6), the forward transform strips the per-chat data.
+            if dup_type == MessageContentDupType::Copy
+                || dup_type == MessageContentDupType::ServerCopy
+            {
+                return None;
+            }
+            let mut result = m.clone();
+            if replace_caption {
+                result.caption = copy_options.new_caption.clone();
+            }
+            if dup_type == MessageContentDupType::Forward {
+                result.chat_data.clear();
+                result.is_copy = true;
+                result.can_query = false;
+                result.background_query = false;
+            }
+            Some(MessageContent::Widget(result))
         }
         MessageContent::Unsupported(_) => {
             if dup_type == MessageContentDupType::SendViaBot
@@ -16869,6 +17166,22 @@ pub fn get_message_content_object(
                 td_api::messageUnpaidMessagesAllowedByLink {},
             )
         }
+        MessageContent::Widget(m) => {
+            // MessageContent.cpp:12704-12708.
+            td_api::MessageContent::messageWidget(td_api::messageWidget {
+                width: m.width,
+                height: m.height,
+                html: m.html.clone(),
+                public_data: m.public_data.clone(),
+                chat_data: m.chat_data.clone(),
+                widget_id: m.widget_id,
+                caption: Some(get_text_object(&m.caption)),
+                show_caption_above_media: invert_media,
+                is_copy: m.is_copy,
+                can_send_queries: m.can_query,
+                can_send_background_queries: m.background_query,
+            })
+        }
     }
 }
 
@@ -17044,6 +17357,7 @@ fn get_message_content_caption_mut(content: &mut MessageContent) -> Option<&mut 
         MessageContent::Photo(m) => Some(&mut m.caption),
         MessageContent::Video(m) => Some(&mut m.caption),
         MessageContent::VoiceNote(m) => Some(&mut m.caption),
+        MessageContent::Widget(m) => Some(&mut m.caption),
         _ => None,
     }
 }
@@ -17684,6 +17998,54 @@ pub fn update_failed_to_send_message_content(
     }
 }
 
+/// `update_message_content_widget_data` (MessageContent.cpp:13705-13728,
+/// the 41be5c42a out-param shape) — the in-place widget-data mutation.
+/// `Unsupported` is silently skipped, any other wrong type is an error
+/// log; a public-data-hash-only change sets `is_content_changed` (the
+/// re-save) without `need_update` (no client update).
+pub fn update_message_content_widget_data(
+    content: &mut MessageContent,
+    public_data: String,
+    public_data_hash: i64,
+    chat_data: String,
+    update_chat_data: bool,
+    is_content_changed: &mut bool,
+    need_update: &mut bool,
+) {
+    let content_type = content.get_type();
+    if content_type != MessageContentType::Widget {
+        if content_type != MessageContentType::Unsupported {
+            tdutils::log_error!("Receive widget data for a message of type {content_type:?}");
+        }
+        return;
+    }
+    let MessageContent::Widget(m) = content else {
+        unreachable!()
+    };
+    if m.public_data != public_data {
+        m.public_data = public_data;
+        *need_update = true;
+    }
+    if update_chat_data && m.chat_data != chat_data {
+        m.chat_data = chat_data;
+        *need_update = true;
+    }
+    if m.public_data_hash != public_data_hash {
+        m.public_data_hash = public_data_hash;
+        *is_content_changed = true;
+    }
+}
+
+/// `get_message_content_widget_public_data`
+/// (MessageContent.cpp:13730-13735) — the caller CHECKs the type (the
+/// MessagesManager walk answers "Message has no widget" first).
+pub fn get_message_content_widget_public_data(content: &MessageContent) -> (String, i64) {
+    let MessageContent::Widget(m) = content else {
+        unreachable!()
+    };
+    (m.public_data.clone(), m.public_data_hash)
+}
+
 /// `add_message_content_dependencies` (MessageContent.cpp:13351-13687).
 /// The `Dependencies` value class lands with the M.5/M.6 machinery; the
 /// collector closures carry its `add` surfaces until then.
@@ -18103,7 +18465,8 @@ pub fn is_supported_reply_message_content(content_type: MessageContentType) -> b
             | Venue
             | Video
             | VideoNote
-            | VoiceNote // update documentation when the list changes
+            | VoiceNote
+            | Widget // update documentation when the list changes
     )
 }
 
@@ -20330,7 +20693,8 @@ mod tests {
     #[test]
     fn unsupported_defaults_to_the_current_version() {
         // the UnpaidMessagesAllowedByLink insertion is the 63 → 64 bump
-        assert_eq!(MessageUnsupported::CURRENT_VERSION, 64);
+        // the widget addition is the 64 → 65 bump
+        assert_eq!(MessageUnsupported::CURRENT_VERSION, 65);
         let unsupported = MessageUnsupported::default();
         assert_eq!(unsupported.version, MessageUnsupported::CURRENT_VERSION);
         let downgraded = MessageUnsupported { version: 3 };
@@ -21683,6 +22047,20 @@ mod tests {
             MessageContent::ChatJoinedViaCommunity(MessageChatJoinedViaCommunity {
                 community_id: CommunityId::new(78),
             }),
+            MessageContent::Widget(MessageWidget {
+                width: 320,
+                height: 240,
+                html: "<b>widget</b>".to_string(),
+                public_data: "public".to_string(),
+                public_data_hash: 12345,
+                chat_data: "chat".to_string(),
+                widget_id: 42,
+                caption: text("caption"),
+                is_copy: true,
+                can_query: true,
+                background_query: true,
+                is_shared: true,
+            }),
             // The field-less variants.
             MessageContent::ChatDeletePhoto(MessageChatDeletePhoto),
             MessageContent::ChatDeleteHistory(MessageChatDeleteHistory),
@@ -21701,7 +22079,7 @@ mod tests {
     #[test]
     fn every_modeled_variant_round_trips_through_the_db_format() {
         let contents = sample_contents();
-        assert_eq!(contents.len(), 91, "one sample per modeled variant");
+        assert_eq!(contents.len(), 92, "one sample per modeled variant");
         for content in contents {
             let mut out = Vec::new();
             store_message_content(&content, &RawIdStorage, &mut out);
@@ -32084,5 +32462,471 @@ mod tests {
         let parsed = telegram_api::document::parse(&wire).expect("parse");
         assert_eq!(parsed.id, 1001);
         assert_eq!(parsed.attributes.len(), 2);
+    }
+
+    // ---- 1.8.70 widgets (the #119 family) ----
+
+    fn widget_content() -> MessageContent {
+        MessageContent::Widget(MessageWidget {
+            width: 320,
+            height: 240,
+            html: "<b>widget</b>".to_string(),
+            public_data: "public".to_string(),
+            public_data_hash: 12345,
+            chat_data: "chat".to_string(),
+            widget_id: 0,
+            caption: text("caption"),
+            is_copy: false,
+            can_query: true,
+            background_query: false,
+            is_shared: false,
+        })
+    }
+
+    #[test]
+    fn widget_dup_blocks_copy_and_strips_forward_chat_data() {
+        let mut td = TestContext::default();
+        let dialog_id = DialogId::from_user_id(UserId::new(7));
+        let widget = widget_content();
+
+        // 329b17ee6 — Copy and ServerCopy answer None.
+        for dup_type in [
+            MessageContentDupType::Copy,
+            MessageContentDupType::ServerCopy,
+        ] {
+            assert!(
+                dup_message_content(
+                    &mut td,
+                    dialog_id,
+                    &widget,
+                    dup_type,
+                    false,
+                    MessageCopyOptions::default(),
+                )
+                .is_none(),
+                "{dup_type:?} must not dupe a widget"
+            );
+        }
+
+        // Send keeps everything.
+        let duped = dup_message_content(
+            &mut td,
+            dialog_id,
+            &widget,
+            MessageContentDupType::Send,
+            false,
+            MessageCopyOptions::default(),
+        )
+        .unwrap();
+        let MessageContent::Widget(duped) = duped else {
+            panic!("Send must keep the widget type")
+        };
+        assert_eq!(duped.chat_data, "chat");
+        assert!(!duped.is_copy);
+        assert!(duped.can_query);
+
+        // Forward clears the per-chat data and drops the query rights.
+        let duped = dup_message_content(
+            &mut td,
+            dialog_id,
+            &widget,
+            MessageContentDupType::Forward,
+            false,
+            MessageCopyOptions::default(),
+        )
+        .unwrap();
+        let MessageContent::Widget(duped) = duped else {
+            panic!("Forward must keep the widget type")
+        };
+        assert!(duped.chat_data.is_empty());
+        assert!(duped.is_copy);
+        assert!(!duped.can_query);
+        assert!(!duped.background_query);
+    }
+
+    #[test]
+    fn widget_media_decode_rejects_bad_payloads_and_keeps_good_ones() {
+        let mut td = TestContext::default();
+        let empty_text = FormattedText::default();
+        let mut no_preview = false;
+
+        // garbage payload — the gzdecode fails, the arm degrades to
+        // MessageUnsupported (MessageContent.cpp:10604-10615)
+        let content = get_message_content(
+            &mut td,
+            empty_text.clone(),
+            None,
+            Some(telegram_api::MessageMedia::messageMediaWidget(
+                telegram_api::messageMediaWidget {
+                    flags: 0,
+                    is_copy: true,
+                    can_query: true,
+                    background_query: true,
+                    width: -5,
+                    height: -7,
+                    payload: b"not gzip".to_vec(),
+                    public_data: "p".to_string(),
+                    public_data_hash: 1,
+                    chat_data: String::new(),
+                    widget_id: 9,
+                },
+            )),
+            DialogId::from_user_id(UserId::new(7)),
+            1700000000,
+            false,
+            UserId::default(),
+            &mut MessageSelfDestructType::default(),
+            &mut no_preview,
+            "test",
+        );
+        assert!(matches!(content, MessageContent::Unsupported(_)));
+
+        // a valid gzip payload decodes into the populated model; negative
+        // sizes clamp to zero like the C++ max(0, ...)
+        let compressed = tdutils::gzip::gzencode(b"<i>ok</i>", 100.0)
+            .as_slice()
+            .to_vec();
+        let content = get_message_content(
+            &mut td,
+            empty_text,
+            None,
+            Some(telegram_api::MessageMedia::messageMediaWidget(
+                telegram_api::messageMediaWidget {
+                    flags: 0,
+                    is_copy: false,
+                    can_query: true,
+                    background_query: false,
+                    width: -5,
+                    height: 200,
+                    payload: compressed,
+                    public_data: "p".to_string(),
+                    public_data_hash: 1,
+                    chat_data: String::new(),
+                    widget_id: 9,
+                },
+            )),
+            DialogId::from_user_id(UserId::new(7)),
+            1700000000,
+            false,
+            UserId::default(),
+            &mut MessageSelfDestructType::default(),
+            &mut no_preview,
+            "test",
+        );
+        let MessageContent::Widget(widget) = content else {
+            panic!("a valid payload must decode")
+        };
+        assert_eq!(widget.html, "<i>ok</i>");
+        assert_eq!(widget.width, 0);
+        assert_eq!(widget.height, 200);
+        assert_eq!(widget.widget_id, 9);
+        assert!(widget.can_query);
+        assert!(!widget.is_shared);
+    }
+
+    #[test]
+    fn widget_data_mutation_out_params_match_the_cpp_ladder() {
+        let mut content = widget_content();
+
+        // the public-data change needs a client update
+        let mut is_content_changed = false;
+        let mut need_update = false;
+        update_message_content_widget_data(
+            &mut content,
+            "public2".to_string(),
+            12345,
+            String::new(),
+            false,
+            &mut is_content_changed,
+            &mut need_update,
+        );
+        assert!(need_update && !is_content_changed);
+
+        // the hash-only change re-saves without a client update
+        let mut is_content_changed = false;
+        let mut need_update = false;
+        update_message_content_widget_data(
+            &mut content,
+            "public2".to_string(),
+            999,
+            String::new(),
+            false,
+            &mut is_content_changed,
+            &mut need_update,
+        );
+        assert!(!need_update && is_content_changed);
+
+        // the chat data only moves when the update asks for it
+        let mut is_content_changed = false;
+        let mut need_update = false;
+        update_message_content_widget_data(
+            &mut content,
+            "public2".to_string(),
+            999,
+            "chat2".to_string(),
+            true,
+            &mut is_content_changed,
+            &mut need_update,
+        );
+        assert!(need_update && !is_content_changed);
+        let MessageContent::Widget(m) = &content else {
+            panic!()
+        };
+        assert_eq!(m.chat_data, "chat2");
+
+        // the wrong type is a logged no-op
+        let mut text = MessageContent::Text(MessageText::default());
+        let mut is_content_changed = false;
+        let mut need_update = false;
+        update_message_content_widget_data(
+            &mut text,
+            "x".to_string(),
+            0,
+            String::new(),
+            true,
+            &mut is_content_changed,
+            &mut need_update,
+        );
+        assert!(!need_update && !is_content_changed);
+    }
+
+    #[test]
+    fn widget_public_data_helper_reads_the_pair() {
+        let (public_data, hash) = get_message_content_widget_public_data(&widget_content());
+        assert_eq!(public_data, "public");
+        assert_eq!(hash, 12345);
+    }
+
+    #[test]
+    fn widget_input_content_validation_ladder() {
+        let user_dialog = DialogId::from_user_id(UserId::new(7));
+        let caption = FormattedText::default();
+        let widget_input = |html: &str, width: i32| {
+            td_api::InputMessageContent::inputMessageWidget(td_api::inputMessageWidget {
+                width,
+                height: 100,
+                html: html.to_string(),
+                public_data: "p".to_string(),
+                chat_data: "c".to_string(),
+                caption: None,
+                show_caption_above_media: true,
+                allow_queries: true,
+                is_shared: false,
+            })
+        };
+
+        // non-bots cannot send widgets, even with a well-formed input
+        let mut user_td = TestContext::default();
+        let error = create_input_message_content(
+            &mut user_td,
+            user_dialog,
+            widget_input("<b>x</b>", 10),
+            caption.clone(),
+            FileId::default(),
+            PhotoSize::default(),
+            vec![],
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), 400);
+        assert_eq!(error.message(), "Only bots can send widget messages");
+
+        // the ladder: size first, then the empty html (the utf8 rungs are
+        // untestable through the safe td_api structs — every Rust `&str` is
+        // valid UTF-8; they stay for the C-ABI boundary)
+        let mut td = TestContext {
+            is_bot: true,
+            ..TestContext::default()
+        };
+        for (input, code, message) in [
+            (
+                widget_input("<b>x</b>", -1),
+                400,
+                "Invalid widget size specified",
+            ),
+            (
+                widget_input("", 10),
+                400,
+                "Widget HTML code must be non-empty",
+            ),
+        ] {
+            let error = create_input_message_content(
+                &mut td,
+                user_dialog,
+                input,
+                caption.clone(),
+                FileId::default(),
+                PhotoSize::default(),
+                vec![],
+                false,
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), code, "{message}");
+            assert_eq!(error.message(), message);
+        }
+
+        // the happy path: the html moves in, the invert flag respects the
+        // secret-chat gate, allow_queries becomes can_query
+        let result = create_input_message_content(
+            &mut td,
+            user_dialog,
+            widget_input("<b>x</b>", 10),
+            caption,
+            FileId::default(),
+            PhotoSize::default(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        let MessageContent::Widget(widget) = &*result.content else {
+            panic!("the widget input must build")
+        };
+        assert_eq!(widget.html, "<b>x</b>");
+        assert!(widget.can_query);
+        assert!(result.invert_media);
+        assert!(!widget.is_shared);
+
+        // the same input into a secret chat drops the invert flag
+        let secret_dialog = DialogId::from_secret_chat_id(SecretChatId::new(3));
+        let result = create_input_message_content(
+            &mut td,
+            secret_dialog,
+            widget_input("<b>x</b>", 10),
+            FormattedText::default(),
+            FileId::default(),
+            PhotoSize::default(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        assert!(!result.invert_media);
+
+        // the shared form needs a non-zero widget id
+        let error = create_input_message_content(
+            &mut td,
+            user_dialog,
+            td_api::InputMessageContent::inputMessageSharedWidget(
+                td_api::inputMessageSharedWidget {
+                    widget_id: 0,
+                    chat_data: "c".to_string(),
+                    caption: None,
+                    show_caption_above_media: false,
+                },
+            ),
+            FormattedText::default(),
+            FileId::default(),
+            PhotoSize::default(),
+            vec![],
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), 400);
+        assert_eq!(error.message(), "Invalid widget identifier specified");
+        let result = create_input_message_content(
+            &mut td,
+            user_dialog,
+            td_api::InputMessageContent::inputMessageSharedWidget(
+                td_api::inputMessageSharedWidget {
+                    widget_id: 55,
+                    chat_data: "c".to_string(),
+                    caption: None,
+                    show_caption_above_media: false,
+                },
+            ),
+            FormattedText::default(),
+            FileId::default(),
+            PhotoSize::default(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        let MessageContent::Widget(widget) = &*result.content else {
+            panic!("the shared widget input must build")
+        };
+        assert_eq!(widget.widget_id, 55);
+        assert!(widget.html.is_empty());
+        assert!(!widget.can_query);
+    }
+
+    #[test]
+    fn widget_send_gate_needs_the_inline_bot_permission() {
+        let dialog_id = DialogId::from_user_id(UserId::new(7));
+        // full rights pass
+        let td = TestContext::default();
+        assert!(can_send_message_content(&td, dialog_id, &widget_content(), false, true).is_ok());
+        // rights without the inline-bot bit answer the C++ 400
+        let td = TestContext {
+            rights: crate::chat_manager::RestrictedRights::from_bools(
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                false,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                crate::chat_manager::ChannelType::Unknown,
+            ),
+            ..TestContext::default()
+        };
+        let error =
+            can_send_message_content(&td, dialog_id, &widget_content(), false, true).unwrap_err();
+        assert_eq!(error.code(), 400);
+        assert_eq!(
+            error.message(),
+            "Not enough rights to send widgets to the chat"
+        );
+    }
+
+    #[test]
+    fn widget_input_media_serializes_both_forms() {
+        // the id form (a shared widget)
+        let mut shared = widget_content();
+        let MessageContent::Widget(m) = &mut shared else {
+            panic!()
+        };
+        m.widget_id = 77;
+        let input_media = get_message_content_input_media_no_upload(
+            &shared,
+            &TestContext::default(),
+            MessageSelfDestructType::default(),
+            "",
+            true,
+            -1,
+        )
+        .unwrap();
+        assert!(matches!(
+            input_media,
+            telegram_api::InputMedia::inputMediaWidgetId(_)
+        ));
+
+        // the html form carries the query/shared flags
+        let input_media = get_message_content_input_media_no_upload(
+            &widget_content(),
+            &TestContext::default(),
+            MessageSelfDestructType::default(),
+            "",
+            true,
+            -1,
+        )
+        .unwrap();
+        let telegram_api::InputMedia::inputMediaWidget(media) = input_media else {
+            panic!("the plain widget must serialize inputMediaWidget")
+        };
+        assert!(media.allow_queries);
+        assert_eq!(media.html, "<b>widget</b>");
+        assert_eq!(media.public_data, "public");
     }
 }

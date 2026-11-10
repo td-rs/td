@@ -49,7 +49,7 @@ answerPreCheckoutQuery	dispatched
 answerShippingQuery	dispatched
 answerTonConnectRequest	dispatched
 answerWebAppQuery	dispatched
-answerWidgetQuery	interim
+answerWidgetQuery	dispatched
 applyPremiumGiftCode	dispatched
 applyUnpaidMessagesToken	dispatched
 approveSuggestedPost	dispatched
@@ -245,7 +245,7 @@ editInlineMessageLiveLocation	dispatched
 editInlineMessageMedia	dispatched
 editInlineMessageReplyMarkup	dispatched
 editInlineMessageText	dispatched
-editInlineMessageWidgetData	interim
+editInlineMessageWidgetData	dispatched
 editMessageCaption	dispatched
 editMessageChecklist	dispatched
 editMessageLiveLocation	dispatched
@@ -253,7 +253,7 @@ editMessageMedia	dispatched
 editMessageReplyMarkup	dispatched
 editMessageSchedulingState	dispatched
 editMessageText	dispatched
-editMessageWidgetData	interim
+editMessageWidgetData	dispatched
 editProxy	dispatched
 editQuickReplyMessage	dispatched
 editStarSubscription	dispatched
@@ -262,7 +262,7 @@ editStoryCover	dispatched
 editStoryMusic	interim
 editTextCompositionStyle	dispatched
 editUserStarSubscription	dispatched
-editWidgetData	interim
+editWidgetData	dispatched
 enableProxy	dispatched
 enableTonWalletBackup	dispatched
 encryptGroupCallData	dispatched
@@ -631,8 +631,8 @@ getWebAppLinkUrl	dispatched
 getWebAppPlaceholder	dispatched
 getWebAppUrl	dispatched
 getWebPageInstantView	dispatched
-getWidgetPublicData	interim
-getWidgetQueryAnswer	interim
+getWidgetPublicData	dispatched
+getWidgetQueryAnswer	dispatched
 giftPremiumWithStars	dispatched
 hideContactCloseBirthdays	dispatched
 hideSuggestedAction	dispatched

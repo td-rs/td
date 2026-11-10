@@ -247,6 +247,10 @@ impl BusinessConnectionManager {
     }
 
     /// `send_message` (BusinessConnectionManager.cpp:1266-1273) — the
+    /// 1.8.70 widgets family note: the C++ rejects the widget inputs here
+    /// with 400 "Can't send widgets as business" (d2284b3ba,
+    /// BusinessConnectionManager.cpp:1167-1169); the gate lands with this
+    /// seam's content intake.
     /// local validation; the message send is [blocked: M.10 message plane].
     pub fn send_message(
         &self,
