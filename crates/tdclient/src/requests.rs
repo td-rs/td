@@ -11653,6 +11653,134 @@ fn run_bot_requests_46(td: &mut Td, id: u64, function: Function) {
         // answerCallbackQuery (Requests.cpp:8363-8369)
         Function::answerCallbackQuery(request) => arm_answer_callback_query(td, id, request),
 
+        // ---- The 1.8.70 widgets family (#119, Requests.cpp:4484-4553 +
+        // 8875-8903) ----
+        Function::answerWidgetQuery(request) => {
+            // Requests.cpp:8898-8903
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(data) = clean_or_utf8_error(td, id, &request.data) else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut manager, mut env) = widget_split(td);
+            manager.answer_widget_query(&mut env, request.widget_query_id, &data, promise);
+            td.widget_manager = manager;
+        }
+        Function::editMessageWidgetData(request) => {
+            // Requests.cpp:4484-4493
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(public_data) = clean_or_utf8_error(td, id, &request.public_data) else {
+                return;
+            };
+            let Some(chat_data) = clean_or_utf8_error(td, id, &request.chat_data) else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut manager, mut env) = widget_split(td);
+            manager.edit_message_widget_data(
+                &mut env,
+                crate::messages_manager::MessageFullId::new(
+                    crate::messages_manager::DialogId::new(request.chat_id),
+                    crate::messages_manager::MessageId::new(request.message_id),
+                ),
+                request.edit_public_data,
+                &public_data,
+                request.edit_chat_data,
+                &chat_data,
+                promise,
+            );
+            td.widget_manager = manager;
+        }
+        Function::editWidgetData(request) => {
+            // Requests.cpp:4547-4553
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(public_data) = clean_or_utf8_error(td, id, &request.public_data) else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut manager, mut env) = widget_split(td);
+            manager.edit_widget_data(
+                &mut env,
+                request.widget_id,
+                &public_data,
+                request.cache_time,
+                promise,
+            );
+            td.widget_manager = manager;
+        }
+        Function::getWidgetQueryAnswer(request) => {
+            // Requests.cpp:8875-8880
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::WidgetQueryAnswer, _>(id, Object::widgetQueryAnswer);
+            let (mut manager, mut env) = widget_split(td);
+            manager.send_widget_query(
+                &mut env,
+                crate::messages_manager::MessageFullId::new(
+                    crate::messages_manager::DialogId::new(request.chat_id),
+                    crate::messages_manager::MessageId::new(request.message_id),
+                ),
+                request.query_type,
+                request.data,
+                promise,
+            );
+            td.widget_manager = manager;
+        }
+        Function::getWidgetPublicData(request) => {
+            // Requests.cpp:8882-8887 — the const request carries no
+            // string cleaning
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::WidgetPublicData, _>(id, Object::widgetPublicData);
+            let (mut manager, mut env) = widget_split(td);
+            manager.get_widget_public_data(
+                &mut env,
+                crate::messages_manager::MessageFullId::new(
+                    crate::messages_manager::DialogId::new(request.chat_id),
+                    crate::messages_manager::MessageId::new(request.message_id),
+                ),
+                promise,
+            );
+            td.widget_manager = manager;
+        }
+        Function::editInlineMessageWidgetData(request) => {
+            // Requests.cpp:4536-4545 — the C++ CLEANs the id string too
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(inline_message_id) = clean_or_utf8_error(td, id, &request.inline_message_id)
+            else {
+                return;
+            };
+            let Some(public_data) = clean_or_utf8_error(td, id, &request.public_data) else {
+                return;
+            };
+            let Some(chat_data) = clean_or_utf8_error(td, id, &request.chat_data) else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, _, inline_message_manager) = crate::td::inline_env_split(td);
+            inline_message_manager.edit_inline_message_widget_data(
+                &mut env,
+                &inline_message_id,
+                request.edit_public_data,
+                &public_data,
+                request.edit_chat_data,
+                &chat_data,
+                promise,
+            );
+        }
+
         // Everything else waits for its manager step.
         _ => run_secret_chat_requests(td, id, function),
     }
@@ -19880,6 +20008,17 @@ fn community_split(
     (manager, env)
 }
 
+fn widget_split(
+    td: &mut Td,
+) -> (
+    crate::widget_manager::WidgetManager,
+    crate::td::WidgetEnv<'_>,
+) {
+    let manager = std::mem::take(&mut td.widget_manager);
+    let env = crate::td::WidgetEnv { td: &mut *td };
+    (manager, env)
+}
+
 /// `CHECK_IS_USER` (Requests.cpp:1997-2000).
 /// The `DialogId(chat_id)` + `MessageId(message_id)` pair the poll arms
 /// route over (Requests.cpp:8088-8128).
@@ -20382,7 +20521,7 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 26, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            1055,
+            1061,
             "dispatched count"
         );
         // the 23383aef sync base (1.8.70): the 34 new scheme functions
@@ -20426,7 +20565,13 @@ mod request_census_tests {
         // setProfileShareTheme — the messages_setShareTheme query with the
         // SetShareThemeQuery refetch tail): 1,053 + 2 = 1,055
         // dispatched / 20 - 2 = 18 interim, sync unmoved 26.
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 18, "interim count");
+        // The widgets family slice (#119) flipped the six widget arms
+        // (answerWidgetQuery, editInlineMessageWidgetData,
+        // editMessageWidgetData, editWidgetData, getWidgetPublicData,
+        // getWidgetQueryAnswer) over the WidgetManager plane:
+        // 1,055 + 6 = 1,061 dispatched / 18 - 6 = 12 interim, sync
+        // unmoved 26.
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 12, "interim count");
     }
 }
 

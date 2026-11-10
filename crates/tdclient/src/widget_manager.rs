@@ -187,10 +187,14 @@ fn get_input_user_wallet(
     })
 }
 
-/// `get_input_widget_query_type` (WidgetManager.cpp:46-78).
+/// `get_input_widget_query_type` (WidgetManager.cpp:46-78) — the null
+/// query type is the "Query type must be non-empty" band.
 pub(crate) fn get_input_widget_query_type(
-    query_type: td_api::WidgetQueryType,
+    query_type: Option<td_api::WidgetQueryType>,
 ) -> Result<telegram_api::WidgetQueryType, Status> {
+    let Some(query_type) = query_type else {
+        return Err(Status::error(400, "Query type must be non-empty"));
+    };
     Ok(match query_type {
         td_api::WidgetQueryType::widgetQueryTypeData(type_) => {
             telegram_api::WidgetQueryType::widgetQueryTypeData(telegram_api::widgetQueryTypeData {
@@ -293,7 +297,7 @@ impl WidgetManager {
         &mut self,
         env: &mut impl WidgetManagerEnv,
         message_full_id: MessageFullId,
-        query_type: td_api::WidgetQueryType,
+        query_type: Option<td_api::WidgetQueryType>,
         data: Vec<u8>,
         mut promise: Promise<td_api::WidgetQueryAnswer>,
     ) {
@@ -690,8 +694,8 @@ mod tests {
 
         // the sign-data arm wraps the data in a dataJSON and passes the
         // wallet through
-        let wire = get_input_widget_query_type(td_api::WidgetQueryType::widgetQueryTypeSignData(
-            td_api::widgetQueryTypeSignData {
+        let wire = get_input_widget_query_type(Some(
+            td_api::WidgetQueryType::widgetQueryTypeSignData(td_api::widgetQueryTypeSignData {
                 wallet: Some(td_api::WidgetQueryWallet {
                     address: "0:0000000000000000000000000000000000000000000000000000000000000000"
                         .to_owned(),
@@ -700,7 +704,7 @@ mod tests {
                     state_init: Vec::new(),
                 }),
                 sign_data: "{\"a\":1}".to_owned(),
-            },
+            }),
         ))
         .unwrap();
         let telegram_api::WidgetQueryType::widgetQueryTypeSignData(sign) = wire else {
