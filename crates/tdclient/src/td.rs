@@ -81426,6 +81426,144 @@ mod tests {
     }
 
     #[test]
+    fn suitable_community_chats_walk_the_cache_seams() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(suitable_community_chats_walk_the_cache_seams_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The `getSuitableCommunityChats` walk over the widened
+    /// created-public-dialogs cache (cpp:4146-4198, the ForCommunityDialog
+    /// plane): the community flag band rides the wire (cpp:1440-1446), the
+    /// linked creator channel is filtered out while the unlinked candidate
+    /// answers (cpp:4136-4137), and a linked-community change through the
+    /// channel intake re-filters the inited cache (the cpp:5502-5506
+    /// `update_channel` band over the four-type walk cpp:4224-4240).
+    fn suitable_community_chats_walk_the_cache_seams_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-suitable-community");
+
+        // the wire answer pair: 820 is a creator broadcast already linked
+        // into community 900, 821 is a creator broadcast with no community
+        let linked = telegram_api::channel {
+            flags: (1 << 13) | (1 << 17),
+            flags2: 1 << 20,
+            creator: true,
+            broadcast: true,
+            id: 820,
+            access_hash: 40,
+            title: "linked".to_owned(),
+            linked_community_id: 900,
+            ..telegram_api::channel::default()
+        };
+        let unlinked = telegram_api::channel {
+            flags: (1 << 13) | (1 << 17),
+            creator: true,
+            broadcast: true,
+            id: 821,
+            access_hash: 41,
+            title: "loose".to_owned(),
+            ..telegram_api::channel::default()
+        };
+
+        // 1. the dispatcher arms the ForCommunityDialog plane; the query
+        //    carries the community flag band
+        td.request(
+            1,
+            Function::getSuitableCommunityChats(td_api::getSuitableCommunityChats),
+        );
+        let sent = take_sent_query(&rec, telegram_api::channels_getAdminedPublicChannels::ID);
+        let body = telegram_api::channels_getAdminedPublicChannels::parse(sent.query())
+            .expect("the sent body");
+        assert!(!body.by_location);
+        assert!(!body.check_limit);
+        assert!(!body.for_personal);
+        assert!(body.for_community_peer);
+
+        // 2. the answer walks the cache seams: the linked creator is
+        //    excluded, the unlinked candidate lands — the request settles
+        //    with the filtered chats
+        net_complete(
+            sent,
+            messages_chats_answer(vec![
+                telegram_api::Chat::channel(linked),
+                telegram_api::Chat::channel(unlinked),
+            ]),
+        );
+        td.dispatch_completed_chat_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 1).first() {
+            Some(Object::chats(chats)) => {
+                assert_eq!(chats.total_count, 1);
+                assert_eq!(chats.chat_ids, vec![821]);
+            }
+            other => panic!("the community chats answer: {other:?}"),
+        }
+
+        // 3. the re-filter seam: 821 links into a community through the
+        //    channel intake; the update_channel band re-filters the inited
+        //    cache and refires the community reload query
+        with_chat_managers(&mut td, |chat_manager, user_manager, env| {
+            chat_manager.on_get_chats(
+                user_manager,
+                env,
+                vec![telegram_api::Chat::channel(telegram_api::channel {
+                    flags: (1 << 13) | (1 << 17),
+                    flags2: 1 << 20,
+                    creator: true,
+                    broadcast: true,
+                    id: 821,
+                    access_hash: 41,
+                    title: "loose".to_owned(),
+                    linked_community_id: 901,
+                    ..telegram_api::channel::default()
+                })],
+                "test",
+            );
+        });
+        let sent = {
+            let mut sent = std::mem::take(&mut *rec.sent.lock());
+            let index = sent
+                .iter()
+                .position(|query| {
+                    query.tl_constructor() == telegram_api::channels_getAdminedPublicChannels::ID
+                })
+                .expect("the re-filter refires the community query");
+            sent.remove(index)
+        };
+        let body = telegram_api::channels_getAdminedPublicChannels::parse(sent.query())
+            .expect("the refired body");
+        assert!(
+            body.for_community_peer,
+            "the community band rides the refire"
+        );
+
+        // 4. the drained refire empties the cache; the next caller answers
+        //    from the cache with no query
+        net_complete(sent, messages_chats_answer(Vec::new()));
+        td.dispatch_completed_chat_net();
+        td.request(
+            2,
+            Function::getSuitableCommunityChats(td_api::getSuitableCommunityChats),
+        );
+        td.flush_deferred_results();
+        assert_not_sent(
+            &rec,
+            telegram_api::channels_getAdminedPublicChannels::ID,
+            "the inited cache answers inline",
+        );
+        match responses_of(&callback, 2).first() {
+            Some(Object::chats(chats)) => {
+                assert_eq!(chats.total_count, 0);
+                assert!(chats.chat_ids.is_empty());
+            }
+            other => panic!("the emptied cache answer: {other:?}"),
+        }
+    }
+
+    #[test]
     fn channel_settings_queries_ride_the_dispatcher() {
         std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
