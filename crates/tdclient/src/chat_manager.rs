@@ -131,6 +131,10 @@ pub enum PublicDialogType {
     HasUsername = 0,
     IsLocationBased = 1,
     ForPersonalDialog = 2,
+    /// 1.8.70 (PublicDialogType.h:13) — never returned by
+    /// `get_public_dialog_type`; enters only through the dedicated
+    /// `getSuitableCommunityChats` request.
+    ForCommunityDialog = 3,
 }
 
 /// `td::MessageType` (MessageId.h:22).
@@ -4305,6 +4309,7 @@ pub struct Channel {
     pub is_noforwards_changed: bool,
     pub is_is_forum_changed: bool,
     pub is_creator_changed: bool,
+    pub is_linked_community_id_changed: bool,
     pub is_admined_monoforum_changed: bool,
     pub had_read_access: bool,
     pub is_being_updated: bool,
@@ -4392,6 +4397,7 @@ impl Channel {
             is_noforwards_changed: true,
             is_is_forum_changed: true,
             is_creator_changed: true,
+            is_linked_community_id_changed: true,
             is_admined_monoforum_changed: false,
             had_read_access: true,
             is_being_updated: false,
@@ -5694,9 +5700,9 @@ pub struct ChatManager {
     dialogs_for_discussion_inited: bool,
     /// `created_public_channels_` / `created_public_channels_inited_`
     /// (ChatManager.h:963-967), indexed by `PublicDialogType` — the pmc
-    /// keys `public_channels0/1/2` (ChatManager.cpp:4236-4245).
-    created_public_channels: [Vec<i64>; 3],
-    created_public_channels_inited: [bool; 3],
+    /// keys `public_channels0/1/2/3` (ChatManager.cpp:4236-4245).
+    created_public_channels: [Vec<i64>; 4],
+    created_public_channels_inited: [bool; 4],
     /// `inactive_channel_ids_` (ChatManager.h:977) — in-memory only.
     inactive_channel_ids: Vec<i64>,
     inactive_channel_ids_inited: bool,
@@ -5817,7 +5823,7 @@ pub struct ChatManager {
     /// parked td_api chats promises per `PublicDialogType` (the
     /// `reload_created_public_dialogs` queue; the first waiter sends
     /// the query, `finish_get_created_public_dialogs` drains).
-    get_created_public_channels_queries: [Vec<Promise<crate::td_api::Chats>>; 3],
+    get_created_public_channels_queries: [Vec<Promise<crate::td_api::Chats>>; 4],
     /// The `GetChatsQuery` in-flight promises (cpp:1556) — the merger's
     /// result promise per merged batch; popped FIFO by the answers.
     pending_get_chats_queries: Vec<Promise<()>>,
@@ -5868,8 +5874,8 @@ impl ChatManager {
             monoforum_channel_ids: BTreeMap::new(),
             dialogs_for_discussion: Vec::new(),
             dialogs_for_discussion_inited: false,
-            created_public_channels: [Vec::new(), Vec::new(), Vec::new()],
-            created_public_channels_inited: [false; 3],
+            created_public_channels: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+            created_public_channels_inited: [false; 4],
             inactive_channel_ids: Vec::new(),
             inactive_channel_ids_inited: false,
             restricted_channel_ids: BTreeSet::new(),
@@ -5907,7 +5913,7 @@ impl ChatManager {
             get_channel_queries: None,
             get_chat_full_queries: None,
             td_actor_id: None,
-            get_created_public_channels_queries: [Vec::new(), Vec::new(), Vec::new()],
+            get_created_public_channels_queries: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             pending_get_chats_queries: Vec::new(),
             pending_get_channels_queries: Vec::new(),
             pending_get_full_chat_queries: Vec::new(),
@@ -6508,6 +6514,18 @@ impl ChatManager {
         }
     }
 
+    /// `on_update_channel_linked_community_id`
+    /// (ChatManager.cpp:8220-8230) — the Channel-record half. The
+    /// `messages_manager_->on_update_dialog_linked_community_id` fan-out
+    /// is the M.10 stub.
+    fn on_update_channel_linked_community_id(c: &mut Channel, linked_community_id: CommunityId) {
+        if c.linked_community_id != linked_community_id {
+            c.linked_community_id = linked_community_id;
+            c.is_linked_community_id_changed = true;
+            c.need_save_to_database = true;
+        }
+    }
+
     /// `on_update_channel_full_linked_community_id`
     /// (ChatManager.cpp:6899-6913).
     fn on_update_channel_full_linked_community_id(
@@ -6968,6 +6986,23 @@ impl ChatManager {
                 c.is_creator_changed = false;
             }
         }
+        let linked_community_id_changed = self
+            .get_channel(channel_id)
+            .is_some_and(|c| c.is_linked_community_id_changed);
+        if linked_community_id_changed {
+            let is_creator = self
+                .get_channel(channel_id)
+                .is_some_and(|c| c.status.is_creator());
+            if is_creator {
+                let c = self.get_channel(channel_id).cloned();
+                self.update_created_public_channels(env, &c.expect("checked above"), channel_id);
+            }
+            // td_->messages_manager_->on_update_dialog_linked_community_id
+            // — the M.10 stub.
+            if let Some(c) = self.get_channel_mut(channel_id) {
+                c.is_linked_community_id_changed = false;
+            }
+        }
         let noforwards_changed = self
             .get_channel(channel_id)
             .is_some_and(|c| c.is_noforwards_changed);
@@ -7152,12 +7187,14 @@ impl ChatManager {
             PublicDialogType::ForPersonalDialog => {
                 !c.is_megagroup && c.usernames.has_first_username()
             }
+            PublicDialogType::ForCommunityDialog => !c.linked_community_id.is_valid(),
         }
     }
 
-    /// `update_created_public_channels` (ChatManager.cpp:4195-4216). The
-    /// `reload_created_public_dialogs` refire is the net query — the
-    /// interim logs and skips it.
+    /// `update_created_public_channels` (ChatManager.cpp:4195-4216) —
+    /// the per-type retain/push walk; a changed type saves and refires
+    /// `reload_created_public_dialogs` (the refire joins the per-type
+    /// queue; the first waiter owns the query).
     fn update_created_public_channels(
         &mut self,
         env: &mut UserEnv,
@@ -7168,6 +7205,7 @@ impl ChatManager {
             PublicDialogType::HasUsername,
             PublicDialogType::IsLocationBased,
             PublicDialogType::ForPersonalDialog,
+            PublicDialogType::ForCommunityDialog,
         ] {
             let index = public_dialog_type as usize;
             if !self.created_public_channels_inited[index] {
@@ -9641,6 +9679,7 @@ impl ChatManager {
                     by_location: public_dialog_type == PublicDialogType::IsLocationBased,
                     check_limit,
                     for_personal: public_dialog_type == PublicDialogType::ForPersonalDialog,
+                    for_community_peer: public_dialog_type == PublicDialogType::ForCommunityDialog,
                     ..telegram_api::channels_getAdminedPublicChannels::default()
                 },
             ),
@@ -10851,17 +10890,18 @@ impl ChatManager {
                         CustomEmojiId::new(channel.bot_verification_icon),
                     );
                 }
-                let join_quad_changed = c.join_to_send != join_to_send
+                // the cpp:9492-9499 triple — the linked community rides
+                // the setter below, not the join band
+                let join_changed = c.join_to_send != join_to_send
                     || c.join_request != join_request
-                    || c.monoforum_channel_id != monoforum_channel_id
-                    || c.linked_community_id != linked_community_id;
-                if join_quad_changed {
+                    || c.monoforum_channel_id != monoforum_channel_id;
+                if join_changed {
                     c.join_to_send = join_to_send;
                     c.join_request = join_request;
                     c.monoforum_channel_id = monoforum_channel_id;
-                    c.linked_community_id = linked_community_id;
                     c.need_save_to_database = true;
                 }
+                Self::on_update_channel_linked_community_id(c, linked_community_id);
                 // sign_messages isn't known for min-channels
                 if c.is_verified != is_verified {
                     c.is_verified = is_verified;
@@ -11025,17 +11065,18 @@ impl ChatManager {
                     CustomEmojiId::new(channel.bot_verification_icon),
                 );
             }
-            let join_quad_changed = c.join_to_send != join_to_send
+            // the cpp:9624-9631 triple — the linked community rides
+            // the setter below, not the join band
+            let join_changed = c.join_to_send != join_to_send
                 || c.join_request != join_request
-                || c.monoforum_channel_id != monoforum_channel_id
-                || c.linked_community_id != linked_community_id;
-            if join_quad_changed {
+                || c.monoforum_channel_id != monoforum_channel_id;
+            if join_changed {
                 c.join_to_send = join_to_send;
                 c.join_request = join_request;
                 c.monoforum_channel_id = monoforum_channel_id;
-                c.linked_community_id = linked_community_id;
                 c.need_save_to_database = true;
             }
+            Self::on_update_channel_linked_community_id(c, linked_community_id);
             let verify_quad_changed = c.is_verified != is_verified
                 || c.sign_messages != sign_messages
                 || c.show_message_sender != show_message_sender
@@ -17715,6 +17756,7 @@ mod tests {
         assert_eq!(PublicDialogType::HasUsername as i32, 0);
         assert_eq!(PublicDialogType::IsLocationBased as i32, 1);
         assert_eq!(PublicDialogType::ForPersonalDialog as i32, 2);
+        assert_eq!(PublicDialogType::ForCommunityDialog as i32, 3);
     }
 
     #[test]
