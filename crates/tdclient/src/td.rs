@@ -3159,6 +3159,9 @@ enum CommunityNetKind {
         community_id: CommunityId,
         dialog_id: DialogId,
     },
+    /// `GetJoinedCommunitiesQuery` (cpp:197-237) — the joined-communities
+    /// list; the answer intakes its chats then resolves the cached ids.
+    GetJoinedCommunities,
 }
 
 /// The cloned community dispatch surface the [`CommunityEnv`] senders
@@ -25675,6 +25678,39 @@ impl Td {
                     None => promise.set_error(parse_error("account_updateNotifySettings")),
                 }
             }
+            // `GetJoinedCommunitiesQuery` (cpp:197-237) — the chats
+            // intaken then the cached-id resolution ride the manager
+            // method; the slice-shaped answer logs the C++ error and
+            // processes the slice chats anyway (cpp:223-228).
+            CommunityNetKind::GetJoinedCommunities => {
+                let promise = self.community_manager.take_promise(
+                    |m: &mut crate::community_manager::CommunityManager| {
+                        &mut m.pending_joined_communities
+                    },
+                );
+                let Some(mut promise) = promise else {
+                    return;
+                };
+                if query.is_error() {
+                    return promise.set_error(query.error().clone());
+                }
+                let chats = match telegram_api::messages_Chats::parse(query.ok()) {
+                    Ok(telegram_api::messages_Chats::messages_chats(chats)) => chats.chats,
+                    Ok(telegram_api::messages_Chats::messages_chatsSlice(chats)) => {
+                        tdutils::log_error!(
+                            "Receive chatsSlice in result of GetJoinedCommunitiesQuery"
+                        );
+                        chats.chats
+                    }
+                    Err(_) => {
+                        return promise.set_error(parse_error("communities_getJoinedCommunities"));
+                    }
+                };
+                let mut manager = std::mem::take(&mut self.community_manager);
+                let mut env = CommunityEnv { td: &mut *self };
+                manager.on_get_joined_communities(&mut env, chats, promise);
+                self.community_manager = manager;
+            }
             // `ToggleCommunityPeerLinkQuery` (1747ecde1, cpp:350-386) —
             // the add/remove link toggle. The Bool answer's value is
             // ignored: the request settles through the change-settle
@@ -41486,6 +41522,30 @@ impl CommunityManagerEnv for CommunityEnv<'_> {
                 },
             ),
         )
+    }
+
+    /// `GetJoinedCommunitiesQuery::send` (cpp:205-207).
+    fn send_get_joined_communities_query(&mut self) {
+        match self.td.community_net() {
+            Some(net) => net.dispatch(
+                CommunityNetKind::GetJoinedCommunities,
+                telegram_api::Function::communities_getJoinedCommunities(
+                    telegram_api::communities_getJoinedCommunities,
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send communities.getJoinedCommunities — [net-inert]")
+            }
+        }
+    }
+
+    /// `ChatManager::on_get_chats` (cpp:1867) — the non-community
+    /// remainder of the answer reaches the shared chat intake
+    /// (`Td::intake_chats`, the `GetCommunitiesQuery` arm's seam); the
+    /// community-family entries already routed through the manager's
+    /// own intake (the `ChatManager::on_get_chat` consume-drop).
+    fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &str) {
+        self.td.intake_chats(chats, source);
     }
 }
 
@@ -60422,6 +60482,16 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn community_joined_communities_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(community_joined_communities_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     fn community_peer_link_toggles_ride_the_dispatcher_impl() {
         use crate::dialog_id::DialogId;
 
@@ -60640,6 +60710,99 @@ mod tests {
             assert!(manager.pending_toggle_peer_link.is_empty());
             assert!(manager.pending_change_dialogs.is_empty());
         });
+    }
+
+    fn community_joined_communities_ride_the_dispatcher_impl() {
+        let (mut td, rec) = netted_td("netfix-cm-joined");
+        // flags.13 carries access_hash through the wire round-trip —
+        // without it the parsed community reaches the intake with
+        // access_hash 0 and the non-min no-hash band drops it.
+        let wire_community = telegram_api::community {
+            flags: 1 | (1 << 13),
+            creator: true,
+            left: false,
+            min: false,
+            flags2: 0,
+            collapsed_in_dialogs: false,
+            id: 7,
+            access_hash: 11,
+            title: "My community".to_owned(),
+            photo: None,
+            date: 10,
+            admin_rights: None,
+            default_banned_rights: None,
+        };
+        let mut other = wire_community.clone();
+        other.id = 9;
+        // No pre-caching: the answer's own chats intake must populate the
+        // community cache (cpp:1867 before the filter at cpp:1869-1874) —
+        // communities 7 and 9 exist only because the answer carries them.
+
+        // 1. The send: one bare communities.getJoinedCommunities query,
+        //    the promise parked in the manager lot.
+        type CommunitiesSlot =
+            std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<td_api::Communities>>>>;
+        struct Rec(CommunitiesSlot);
+        impl tdutils::promise::PromiseInterface<td_api::Communities> for Rec {
+            fn set_value(&mut self, value: td_api::Communities) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+            }
+            fn set_error(&mut self, error: Status) {
+                *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+            }
+        }
+        let slot: CommunitiesSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let promise = Promise::from_interface(Rec(slot.clone()));
+        with_community_manager(&mut td, |manager, env| {
+            manager.get_joined_communities(env, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].tl_constructor(),
+            telegram_api::communities_getJoinedCommunities::ID
+        );
+
+        // 2. The slice-shaped answer (cpp:223-228): the C++ error is
+        //    logged and the slice chats are processed anyway — the cached
+        //    ids answer in input order.
+        let mut answer = Vec::new();
+        telegram_api::messages_Chats::messages_chatsSlice(telegram_api::messages_chatsSlice {
+            count: 3,
+            chats: vec![
+                telegram_api::Chat::community(other.clone()),
+                telegram_api::Chat::chatForbidden(telegram_api::chatForbidden {
+                    id: 3,
+                    title: "forbidden".to_owned(),
+                }),
+                telegram_api::Chat::community(wire_community.clone()),
+            ],
+        })
+        .store(&mut answer);
+        net_complete(sent.into_iter().next().unwrap(), answer);
+        td.dispatch_completed_community_net();
+        assert!(matches!(
+            slot.lock().unwrap().as_ref(),
+            Some(tdutils::status::Result::Ok(communities))
+                if communities.community_ids == vec![9, 7]
+        ));
+
+        // 3. The error band (cpp:233-235) and the empty lot.
+        let slot: CommunitiesSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let promise = Promise::from_interface(Rec(slot.clone()));
+        with_community_manager(&mut td, |manager, env| {
+            manager.get_joined_communities(env, promise);
+        });
+        let sent = std::mem::take(&mut *rec.sent.lock());
+        assert_eq!(sent.len(), 1);
+        net_fail(sent.into_iter().next().unwrap(), 400, "Community not found");
+        td.dispatch_completed_community_net();
+        assert!(matches!(
+            slot.lock().unwrap().as_ref(),
+            Some(tdutils::status::Result::Err(status)) if status.message() == "Community not found"
+        ));
+        td.dispatch_completed_community_net();
+        assert!(td.community_net_completed.lock().is_empty(), "drained");
     }
 
     // ---- the account net slice: the AccountManager query families
