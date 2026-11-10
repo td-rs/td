@@ -11,7 +11,12 @@
 //! `on_get_updates` into `finish_create_community`); the full
 //! dialog-access plane is the env seam; the dispatch-dependency argument
 //! of the C++ `net_query_creator().create` calls collapses (the port's
-//! NetQuery carries no dependency set).
+//! NetQuery carries no dependency set); `get_community_id_object`
+//! (CommunityManager.cpp:2174-2181) returns the bare id without the C++
+//! unknown-community band (the `unknown_communities_` one-time
+//! `updateUnknownCommunity` emission + LOG(ERROR)) — every current
+//! caller pre-filters by `have_community`, so the band is unreachable
+//! through the real wiring (recorded divergence; #129).
 
 use crate::chat_manager::{AdministratorRights, DialogParticipantStatus, RestrictedRights};
 use crate::community_id::CommunityId;
@@ -220,6 +225,23 @@ pub trait CommunityManagerEnv {
         );
         let _ = (input_community, participant);
     }
+
+    /// `GetJoinedCommunitiesQuery::send` (CommunityManager.cpp:205-207)
+    /// — the bare `communities.getJoinedCommunities`; the answer routes
+    /// through the community net-answer drain (`GetJoinedCommunities`).
+    fn send_get_joined_communities_query(&mut self) {
+        tdutils::log_info!("Send communities.getJoinedCommunities — [net-inert]");
+    }
+
+    /// `ChatManager::on_get_chats` (CommunityManager.cpp:1867 is the
+    /// first community-family caller) — the shared wire-chats intake:
+    /// the community dialogs must exist before an answer resolves. The
+    /// community-family entries route through the manager's own
+    /// `on_get_community`/`on_get_community_forbidden` intakes (the
+    /// port's `ChatManager::on_get_chat` consume-drops them — the C++
+    /// ChatManager.cpp:5767-5773 hop lives with the community slice),
+    /// so callers hand this seam the non-community remainder.
+    fn on_get_chats(&mut self, _chats: Vec<telegram_api::Chat>, _source: &str) {}
 }
 
 /// `CommunityManager::Community` — the cached community record. The
@@ -344,6 +366,10 @@ pub struct CommunityManager {
     /// The `community_unmute_timeout_` MultiTimeout slots (9a16c4396,
     /// d46d51f61); the value is the absolute process-time deadline.
     community_unmute_timeout: std::collections::BTreeMap<i64, f64>,
+    /// The `GetJoinedCommunitiesQuery` promise lot — the promise parks
+    /// at the send and settles on the net answer (the C++ query carries
+    /// its own).
+    pub pending_joined_communities: Vec<Promise<td_api::Communities>>,
 }
 
 impl CommunityManager {
@@ -1270,6 +1296,87 @@ impl CommunityManager {
             .push((community_id.get(), promise));
     }
 
+    /// `get_joined_communities` (CommunityManager.cpp:1853-1855) — the
+    /// `communities.getJoinedCommunities` send; the promise parks until
+    /// the answer drains through [`CommunityNetKind`](crate::td) (no new
+    /// cache: the answer reads the existing community cache only).
+    pub fn get_joined_communities(
+        &mut self,
+        env: &mut impl CommunityManagerEnv,
+        promise: Promise<td_api::Communities>,
+    ) {
+        env.send_get_joined_communities_query();
+        self.pending_joined_communities.push(promise);
+    }
+
+    /// `on_get_joined_communities` (CommunityManager.cpp:1857-1875) —
+    /// the answer intake: the ids collect from the
+    /// `telegram_api::community` chats only (anything else — including
+    /// `communityForbidden` — logs the C++ error and skips the list),
+    /// the chats intaken so the community dialogs exist before the id
+    /// list resolves, then the cached ids answer in input order — an
+    /// entry whose intake fails (the `on_get_community` gates) drops
+    /// silently (the cpp-map §4 note).
+    pub fn on_get_joined_communities(
+        &mut self,
+        env: &mut impl CommunityManagerEnv,
+        chats: Vec<telegram_api::Chat>,
+        mut promise: Promise<td_api::Communities>,
+    ) {
+        let mut community_ids = Vec::new();
+        let mut other_chats = Vec::new();
+        for chat in chats {
+            match chat {
+                telegram_api::Chat::community(community) => {
+                    community_ids.push(CommunityId::new(community.id));
+                    // The community-first intake pass (cpp:1867's
+                    // `on_get_chats` ordering, ChatManager.cpp:5780-5796):
+                    // the port's `ChatManager::on_get_chat` consume-drops
+                    // the community family ("the community slice owns
+                    // them"), so the C++ ChatManager.cpp:5767-5773 hop
+                    // lives here — each community lands in the cache
+                    // BEFORE the `have_community` filter reads it.
+                    self.on_get_community(env, &community, "on_get_joined_communities");
+                }
+                ref chat @ telegram_api::Chat::communityForbidden(ref forbidden) => {
+                    tdutils::log_error!("Receive {chat:?} as a joined community");
+                    self.on_get_community_forbidden(
+                        CommunityId::new(forbidden.id),
+                        "on_get_joined_communities",
+                    );
+                }
+                chat => {
+                    tdutils::log_error!("Receive {chat:?} as a joined community");
+                    other_chats.push(chat);
+                }
+            }
+        }
+        env.on_get_chats(other_chats, "on_get_joined_communities");
+
+        let result = td_api::Communities {
+            community_ids: community_ids
+                .into_iter()
+                .filter(|community_id| self.have_community(*community_id))
+                .map(|community_id| {
+                    self.get_community_id_object(community_id, "on_get_joined_communities")
+                })
+                .collect(),
+        };
+        promise.set_value(result);
+    }
+
+    /// `get_community_id_object` (CommunityManager.cpp:2174-2181) — the
+    /// id form. The unknown-community band (the `unknown_communities_`
+    /// one-time `updateUnknownCommunity` emission + LOG(ERROR)) is a
+    /// recorded divergence (the module doc): the port returns the bare
+    /// id — every current caller pre-filters by `have_community`, so the
+    /// band is unreachable through the real wiring (the joined-communities
+    /// filter drops an unknown id before this call, exactly the C++
+    /// cpp:1869-1874 shape).
+    pub fn get_community_id_object(&self, community_id: CommunityId, _source: &str) -> i64 {
+        community_id.get()
+    }
+
     /// `get_input_community` (1118a50df, CommunityManager.cpp:1373-1385).
     pub fn get_input_community(
         &self,
@@ -1442,6 +1549,8 @@ mod tests {
         /// The dialog ids whose `get_input_peer(Know)` resolves — the
         /// member band of the member pair.
         known_members: Vec<i64>,
+        /// The shared chat-intake seam records (chat count, source).
+        intaken_chats: Vec<(usize, String)>,
     }
 
     impl TestEnv {
@@ -1454,6 +1563,7 @@ mod tests {
                 reloaded_fulls: Vec::new(),
                 fanouts: Vec::new(),
                 known_members: Vec::new(),
+                intaken_chats: Vec::new(),
             }
         }
     }
@@ -1554,6 +1664,10 @@ mod tests {
             self.reloaded_fulls.push(community_id.get());
         }
 
+        fn send_get_joined_communities_query(&mut self) {
+            self.queries.push("getJoinedCommunities".to_owned());
+        }
+
         fn on_community_dialogs_notification_settings_changed(
             &mut self,
             dialog_ids: &[DialogId],
@@ -1608,6 +1722,10 @@ mod tests {
                 community_id.get()
             ));
             let _ = input_community;
+        }
+
+        fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &str) {
+            self.intaken_chats.push((chats.len(), source.to_owned()));
         }
     }
 
@@ -1693,6 +1811,58 @@ mod tests {
         let (promise, recorded) = record_id();
         manager.finish_create_community(&mut env, CommunityId::new(9), promise);
         assert_eq!(recorded.0.lock().unwrap().take().unwrap().id, 9);
+    }
+
+    #[test]
+    fn joined_communities_answer_the_intake_scan_in_order() {
+        // CommunityManager.cpp:1853-1875: the send parks the promise;
+        // the answer intakes its chats BEFORE the id list resolves — the
+        // community-family entries through the manager intake
+        // (cpp:1867's `on_get_chats` routes them there,
+        // ChatManager.cpp:5767-5773), so the `have_community` filter
+        // (cpp:1869-1874) passes for communities that arrive in the
+        // answer itself; non-community chats log the C++ error and ride
+        // the chat seam; an entry whose intake fails drops silently.
+        let mut env = TestEnv::new();
+        let mut manager = CommunityManager::new();
+
+        let (promise, recorded) = record_communities();
+        manager.get_joined_communities(&mut env, promise);
+        assert!(env.queries.iter().any(|q| q == "getJoinedCommunities"));
+        assert_eq!(
+            manager.pending_joined_communities.len(),
+            1,
+            "the promise parks at the send"
+        );
+
+        let promise = manager
+            .take_promise(|m: &mut CommunityManager| &mut m.pending_joined_communities)
+            .expect("the parked promise");
+        let mut intake_failed = wire_member_community(8);
+        intake_failed.access_hash = 0; // the non-min no-hash band — on_get_community drops it
+        let chats = vec![
+            telegram_api::Chat::community(wire_member_community(7)),
+            telegram_api::Chat::community(intake_failed),
+            telegram_api::Chat::chatForbidden(telegram_api::chatForbidden {
+                id: 3,
+                title: "forbidden".to_owned(),
+            }),
+            telegram_api::Chat::community(wire_member_community(9)),
+        ];
+        manager.on_get_joined_communities(&mut env, chats, promise);
+        assert_eq!(
+            env.intaken_chats,
+            vec![(1, "on_get_joined_communities".to_owned())],
+            "the non-community remainder rides the chat seam before the id list resolves"
+        );
+        let settled = recorded.0.lock().unwrap().take().expect("settled");
+        assert_eq!(
+            settled
+                .expect("the intake scan resolves the value")
+                .community_ids,
+            vec![7, 9],
+            "input order; the intake-failed 8 drops silently"
+        );
     }
 
     #[test]
@@ -1809,6 +1979,24 @@ mod tests {
         }
     }
 
+    struct RecordedCommunities(
+        std::sync::Arc<std::sync::Mutex<Option<std::result::Result<td_api::Communities, Status>>>>,
+    );
+
+    struct RecordingCommunities(
+        std::sync::Arc<std::sync::Mutex<Option<std::result::Result<td_api::Communities, Status>>>>,
+    );
+
+    impl tdutils::promise::PromiseInterface<td_api::Communities> for RecordingCommunities {
+        fn set_value(&mut self, value: td_api::Communities) {
+            *self.0.lock().unwrap() = Some(Ok(value));
+        }
+
+        fn set_error(&mut self, error: Status) {
+            *self.0.lock().unwrap() = Some(Err(error));
+        }
+    }
+
     fn record_member_chats() -> (Promise<td_api::CommunityMemberChats>, RecordedMemberChats) {
         let recorded = std::sync::Arc::new(std::sync::Mutex::new(None));
         (
@@ -1844,6 +2032,14 @@ mod tests {
             .unwrap_err()
             .message()
             .to_owned()
+    }
+
+    fn record_communities() -> (Promise<td_api::Communities>, RecordedCommunities) {
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (
+            Promise::from_interface(RecordingCommunities(recorded.clone())),
+            RecordedCommunities(recorded),
+        )
     }
 
     /// A non-creator member wire community (on_get_community derives the
