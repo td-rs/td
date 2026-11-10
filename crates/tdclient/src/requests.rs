@@ -7102,6 +7102,62 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             );
             td.community_manager = manager;
         }
+        Function::toggleCommunityMemberIsBanned(request) => {
+            // Requests.cpp:3540-3546 (20fc28e23) — CHECK_IS_USER,
+            // CREATE_OK_REQUEST_PROMISE, the member sender→dialog
+            // resolution (check_access = false, allow_empty = false),
+            // then CommunityManager::toggle_community_participant_is_banned
+            // (the restrict gate, the Know "Member not found" band, the
+            // participant-banned wire toggle whose Bool answer settles
+            // through the change-settle).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let participant_dialog_id = match member_dialog_id(td, request.member_id.as_ref()) {
+                tdutils::status::Result::Ok(dialog_id) => dialog_id,
+                tdutils::status::Result::Err(status) => {
+                    return send_error_status(td, id, status);
+                }
+            };
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut manager, mut env) = community_split(td);
+            manager.toggle_community_participant_is_banned(
+                &mut env,
+                CommunityId::new(request.community_id),
+                participant_dialog_id,
+                request.is_banned,
+                promise,
+            );
+            td.community_manager = manager;
+        }
+        Function::getCommunityMemberChats(request) => {
+            // Requests.cpp:3549-3556 (4cd0dae69) — CHECK_IS_USER,
+            // CREATE_REQUEST_PROMISE, the same sender→dialog resolution,
+            // then CommunityManager::get_community_participant_dialogs
+            // (the same gates over the participant-joined-chats query; the
+            // answer splits the owned vs joined chat ids).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let participant_dialog_id = match member_dialog_id(td, request.member_id.as_ref()) {
+                tdutils::status::Result::Ok(dialog_id) => dialog_id,
+                tdutils::status::Result::Err(status) => {
+                    return send_error_status(td, id, status);
+                }
+            };
+            let promise = td.deferred_promise::<td_api::CommunityMemberChats, _>(
+                id,
+                Object::communityMemberChats,
+            );
+            let (mut manager, mut env) = community_split(td);
+            manager.get_community_participant_dialogs(
+                &mut env,
+                CommunityId::new(request.community_id),
+                participant_dialog_id,
+                promise,
+            );
+            td.community_manager = manager;
+        }
         Function::deleteCommunity(request) => {
             // Requests.cpp:3449-3453 (f5f7fe5fd) — CHECK_IS_USER, then
             // CommunityManager::delete_community (the
@@ -19700,6 +19756,20 @@ fn community_split(
     let manager = std::mem::take(&mut td.community_manager);
     let env = crate::td::CommunityEnv { td: &mut *td };
     (manager, env)
+}
+
+/// The `get_message_sender_dialog_id(td_, member_id, /*check_access=*/false,
+/// /*allow_empty=*/false)` resolution the two member-id community arms share
+/// (Requests.cpp:3542-3544, 3551-3553; the error bands live in
+/// MessageSender.cpp:180/189/203). The member is parsed in one env, the
+/// community manager runs in the next (the two-phase borrow of the collapsed
+/// dispatcher).
+fn member_dialog_id(
+    td: &mut Td,
+    member_id: Option<&td_api::MessageSender>,
+) -> tdutils::status::Result<crate::dialog_id::DialogId> {
+    let (_manager, mut env) = bot_env_split(td);
+    crate::message_sender::get_message_sender_dialog_id(&mut env, member_id, false, false)
 }
 
 /// `CHECK_IS_USER` (Requests.cpp:1997-2000).
