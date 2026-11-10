@@ -3151,6 +3151,22 @@ enum CommunityNetKind {
     /// `UpdateCommunityNotifySettingsQuery` (99302f0e2, cpp:140-168) —
     /// the set flow's server write.
     UpdateNotifySettings { community_id: CommunityId },
+    /// `GetCommunityPeerLinkRequestsQuery` (ffc06ec75, cpp:388-440) —
+    /// the add-chat requests page; the answer kind's community_id pairs
+    /// its own parked promise.
+    GetPeerLinkRequests { community_id: CommunityId },
+    /// `ProcessCommunityPeerLinkRequestQuery` (2b80bf533, cpp:442-475) —
+    /// the single approval toggle; the `Bool` answer is ignored (the
+    /// settle rides the change-settle), the error arm's
+    /// `on_get_dialog_error` keys on the requested chat.
+    TogglePeerLinkRequestApproval {
+        community_id: CommunityId,
+        dialog_id: DialogId,
+    },
+    /// `ProcessCommunityPeerLinkRequestsQuery` (79a943019, cpp:477-505)
+    /// — the all-approvals toggle; the `Bool` answer is ignored (the
+    /// settle rides the change-settle).
+    ToggleAllPeerLinkRequestApproval { community_id: CommunityId },
 }
 
 /// The cloned community dispatch surface the [`CommunityEnv`] senders
@@ -25667,6 +25683,111 @@ impl Td {
                     None => promise.set_error(parse_error("account_updateNotifySettings")),
                 }
             }
+            // `GetCommunityPeerLinkRequestsQuery` (ffc06ec75,
+            // cpp:388-440) — the answer builds the page through the
+            // manager's intake (the users + chats intakes, the total
+            // clamp, the invalid-entry drops, the hidden inversion).
+            CommunityNetKind::GetPeerLinkRequests { community_id } => {
+                let promise = self
+                    .community_manager
+                    .pending_peer_link_requests
+                    .iter()
+                    .position(|(id, _)| *id == community_id.get())
+                    .map(|index| {
+                        self.community_manager
+                            .pending_peer_link_requests
+                            .remove(index)
+                            .1
+                    });
+                let Some(mut promise) = promise else {
+                    return;
+                };
+                if query.is_error() {
+                    return promise.set_error(query.error().clone());
+                }
+                match telegram_api::communities_PeerLinkRequests::parse(query.ok()) {
+                    Ok(ptr) => {
+                        let mut manager = std::mem::take(&mut self.community_manager);
+                        let mut env = CommunityEnv { td: &mut *self };
+                        manager.on_get_community_peer_link_requests(&mut env, ptr, promise);
+                        self.community_manager = manager;
+                    }
+                    Err(_) => promise.set_error(parse_error("communities_getPeerLinkRequests")),
+                }
+            }
+            // `ProcessCommunityPeerLinkRequestQuery` (2b80bf533,
+            // cpp:442-475) — the `Bool` answer is ignored; the popped
+            // promise settles through the change-settle. The error arm
+            // runs `on_get_dialog_error` on the requested chat first.
+            CommunityNetKind::TogglePeerLinkRequestApproval {
+                community_id,
+                dialog_id,
+            } => {
+                let promise = self
+                    .community_manager
+                    .pending_process_request
+                    .iter()
+                    .position(|(id, _)| *id == community_id.get())
+                    .map(|index| {
+                        self.community_manager
+                            .pending_process_request
+                            .remove(index)
+                            .1
+                    });
+                let Some(mut promise) = promise else {
+                    return;
+                };
+                if query.is_error() {
+                    let status = query.error().clone();
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        &status,
+                        "ProcessCommunityPeerLinkRequestQuery",
+                    );
+                    return promise.set_error(status);
+                }
+                if parse_wire_bool_value(query.ok()).is_none() {
+                    return promise.set_error(parse_error(
+                        "communities_togglePeerLinkRequestApproval",
+                    ));
+                }
+                let mut manager = std::mem::take(&mut self.community_manager);
+                let mut env = CommunityEnv { td: &mut *self };
+                manager.on_change_community_dialogs(&mut env, community_id, promise);
+                self.community_manager = manager;
+            }
+            // `ProcessCommunityPeerLinkRequestsQuery` (79a943019,
+            // cpp:477-505) — the `Bool` answer is ignored; the popped
+            // promise settles through the change-settle.
+            CommunityNetKind::ToggleAllPeerLinkRequestApproval { community_id } => {
+                let promise = self
+                    .community_manager
+                    .pending_process_all_requests
+                    .iter()
+                    .position(|(id, _)| *id == community_id.get())
+                    .map(|index| {
+                        self.community_manager
+                            .pending_process_all_requests
+                            .remove(index)
+                            .1
+                    });
+                let Some(mut promise) = promise else {
+                    return;
+                };
+                if query.is_error() {
+                    return promise.set_error(query.error().clone());
+                }
+                if parse_wire_bool_value(query.ok()).is_none() {
+                    return promise.set_error(parse_error(
+                        "communities_toggleAllPeerLinkRequestApproval",
+                    ));
+                }
+                let mut manager = std::mem::take(&mut self.community_manager);
+                let mut env = CommunityEnv { td: &mut *self };
+                manager.on_change_community_dialogs(&mut env, community_id, promise);
+                self.community_manager = manager;
+            }
         }
     }
 
@@ -41361,6 +41482,128 @@ impl CommunityManagerEnv for CommunityEnv<'_> {
             ),
             None => tdutils::log_info!("Reload community full {community_id:?} — [net-inert]"),
         }
+    }
+
+    // ---- The add-chat requests queue senders (ffc06ec75, 2b80bf533,
+    // 79a943019; CommunityManager.cpp:388-505). ----
+
+    /// `GetCommunityPeerLinkRequestsQuery::send` (cpp:396-401) — the
+    /// page query over the input community.
+    fn send_get_community_peer_link_requests_query(
+        &mut self,
+        community_id: CommunityId,
+        input_community: telegram_api::InputChannel,
+        offset: &str,
+        limit: i32,
+    ) {
+        let Some(net) = self.td.community_net() else {
+            return tdutils::log_info!(
+                "Send communities_getPeerLinkRequests for {community_id:?} — [net-inert]"
+            );
+        };
+        net.dispatch(
+            CommunityNetKind::GetPeerLinkRequests { community_id },
+            telegram_api::Function::communities_getPeerLinkRequests(
+                telegram_api::communities_getPeerLinkRequests {
+                    community: Some(input_community),
+                    offset: offset.to_owned(),
+                    limit,
+                },
+            ),
+        )
+    }
+
+    /// `ProcessCommunityPeerLinkRequestQuery::send` (cpp:454-464) —
+    /// `communities_togglePeerLinkRequestApproval(0, !approve, ...)`;
+    /// the requested chat's read-access input peer resolves here (the
+    /// C++ CHECK band; the None arm parks the family promise).
+    fn send_process_community_peer_link_request_query(
+        &mut self,
+        community_id: CommunityId,
+        dialog_id: DialogId,
+        input_community: telegram_api::InputChannel,
+        approve: bool,
+    ) {
+        let Some(net) = self.td.community_net() else {
+            return tdutils::log_info!(
+                "Send communities_togglePeerLinkRequestApproval for {community_id:?} — [net-inert]"
+            );
+        };
+        let Some(peer) = crate::dialog_manager::get_input_peer(
+            self.td,
+            dialog_id,
+            crate::user_manager::AccessRights::Read,
+        ) else {
+            return tdutils::log_info!(
+                "ProcessCommunityPeerLinkRequestQuery — no input peer for {dialog_id:?}"
+            );
+        };
+        net.dispatch(
+            CommunityNetKind::TogglePeerLinkRequestApproval {
+                community_id,
+                dialog_id,
+            },
+            telegram_api::Function::communities_togglePeerLinkRequestApproval(
+                telegram_api::communities_togglePeerLinkRequestApproval {
+                    flags: 0,
+                    reject: !approve,
+                    community: Some(input_community),
+                    peer: Some(Box::new(peer)),
+                },
+            ),
+        )
+    }
+
+    /// `ProcessCommunityPeerLinkRequestsQuery::send` (cpp:489-494) —
+    /// `communities_toggleAllPeerLinkRequestApproval(0, !approve, ...)`.
+    fn send_process_community_peer_link_requests_query(
+        &mut self,
+        community_id: CommunityId,
+        input_community: telegram_api::InputChannel,
+        approve: bool,
+    ) {
+        let Some(net) = self.td.community_net() else {
+            return tdutils::log_info!(
+                "Send communities_toggleAllPeerLinkRequestApproval for {community_id:?} — [net-inert]"
+            );
+        };
+        net.dispatch(
+            CommunityNetKind::ToggleAllPeerLinkRequestApproval { community_id },
+            telegram_api::Function::communities_toggleAllPeerLinkRequestApproval(
+                telegram_api::communities_toggleAllPeerLinkRequestApproval {
+                    flags: 0,
+                    reject: !approve,
+                    community: Some(input_community),
+                },
+            ),
+        )
+    }
+
+    /// `UserManager::on_get_users` — the page answer's users intake.
+    fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &str) {
+        self.td.intake_users(users, source);
+    }
+
+    /// `ChatManager::on_get_chats` — the shared wire-chats intake.
+    fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &str) {
+        self.td.intake_chats(chats, source);
+    }
+
+    /// `DialogManager::force_create_dialog` — the documented no-op stub.
+    fn force_create_dialog(&mut self, dialog_id: DialogId, source: &str) {
+        crate::dialog_manager::force_create_dialog(self.td, dialog_id, source);
+    }
+
+    /// `UserManager::get_user_id_object` — the collapsed sync form over
+    /// the user manager.
+    fn get_user_id_object(
+        &mut self,
+        user_id: crate::user_manager::UserId,
+        source: &str,
+    ) -> i64 {
+        self.td.with_user_manager_env(|user_manager, env| {
+            user_manager.get_user_id_object(env, user_id, source)
+        })
     }
 }
 
@@ -60285,6 +60528,299 @@ mod tests {
         });
         td.dispatch_completed_community_net();
         assert!(td.community_net_completed.lock().is_empty(), "drained");
+    }
+
+    #[test]
+    fn community_add_chat_requests_ride_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(community_add_chat_requests_ride_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn community_add_chat_requests_ride_the_dispatcher_impl() {
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-cm-add-chat-requests");
+        const BOOL_TRUE: i32 = 0x9972_75b5u32 as i32;
+
+        // seed a creator community (flags.13 carries the access hash
+        // through the wire round-trip)
+        with_community_manager(&mut td, |manager, env| {
+            manager.on_get_community(
+                env,
+                &telegram_api::community {
+                    flags: 1,
+                    creator: true,
+                    left: false,
+                    min: false,
+                    flags2: 0,
+                    collapsed_in_dialogs: false,
+                    id: 7,
+                    access_hash: 11,
+                    title: "My community".to_owned(),
+                    photo: None,
+                    date: 10,
+                    admin_rights: None,
+                    default_banned_rights: None,
+                },
+                "test",
+            );
+        });
+
+        // 1. the page query — the offset cleans at the request arm
+        //    (CLEAN_INPUT_STRING, Requests.cpp:3514), the query rides
+        //    the community dispatcher over the input community
+        td.request(
+            1,
+            Function::getCommunityAddChatRequests(td_api::getCommunityAddChatRequests {
+                community_id: 7,
+                offset: "o\u{2}ff".to_owned(),
+                limit: 10,
+            }),
+        );
+        let sent = take_sent_query(
+            &rec,
+            telegram_api::communities_getPeerLinkRequests::ID,
+        );
+        let body = telegram_api::communities_getPeerLinkRequests::parse(sent.query())
+            .expect("the sent body");
+        match body.community {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!(channel.channel_id, 7);
+                assert_eq!(channel.access_hash, 11);
+            }
+            other => panic!("unexpected input community {other:?}"),
+        }
+        assert_eq!(body.offset, "o ff", "the control byte cleans to a space");
+        assert_eq!(body.limit, 10);
+
+        // 2. the answer builds the page: the chats intake runs first (the
+        //    channel 3 record caches the requested dialog), the total
+        //    clamps up to the page, the invalid entry drops with the
+        //    count decremented, the hidden inversion rides the entry
+        net_complete(sent, {
+            let mut out = Vec::new();
+            telegram_api::communities_PeerLinkRequests {
+                flags: 1,
+                total_count: 0,
+                requests: vec![
+                    telegram_api::CommunityPeerRequest {
+                        flags: 0,
+                        visible: false,
+                        peer: Some(telegram_api::Peer::peerChannel(
+                            telegram_api::peerChannel { channel_id: 3 },
+                        )),
+                        requested_by: 42,
+                        date: 77,
+                    },
+                    telegram_api::CommunityPeerRequest {
+                        flags: 0,
+                        visible: true,
+                        // an invalid dialog id drops the entry
+                        peer: Some(telegram_api::Peer::peerChannel(
+                            telegram_api::peerChannel { channel_id: 0 },
+                        )),
+                        requested_by: 42,
+                        date: 78,
+                    },
+                ],
+                next_offset: "next".to_owned(),
+                chats: vec![telegram_api::Chat::channel(telegram_api::channel {
+                    flags: (1 << 13) | (1 << 17),
+                    flags2: 0,
+                    creator: true,
+                    broadcast: true,
+                    id: 3,
+                    access_hash: 40,
+                    title: "requested".to_owned(),
+                    ..telegram_api::channel::default()
+                })],
+                users: Vec::new(),
+            }
+            .store_boxed(&mut out);
+            out
+        });
+        td.dispatch_completed_community_net();
+        td.flush_deferred_results();
+        match responses_of(&callback, 1).first() {
+            Some(Object::communityAddChatRequests(page)) => {
+                assert_eq!(page.total_count, 1, "0 clamps up to 2, the drop decrements");
+                assert_eq!(page.next_offset, "next");
+                assert_eq!(page.requests.len(), 1);
+                let request = &page.requests[0];
+                assert_eq!(request.chat_id, -1_000_000_000_003);
+                assert!(request.is_hidden, "the hidden inversion");
+                assert_eq!(request.sender_user_id, 42);
+                assert_eq!(request.date, 77);
+            }
+            other => panic!("the add-chat requests answer: {other:?}"),
+        }
+
+        // 3. the single approval — reject inverts approve, the requested
+        //    chat's input peer resolves through the page's channel intake;
+        //    the Bool answer is ignored and, with no cached full, the
+        //    change-settle resolves the request now
+        td.request(
+            2,
+            Function::processCommunityAddChatRequest(td_api::processCommunityAddChatRequest {
+                community_id: 7,
+                chat_id: -1_000_000_000_003,
+                approve: false,
+            }),
+        );
+        let sent = take_sent_query(
+            &rec,
+            telegram_api::communities_togglePeerLinkRequestApproval::ID,
+        );
+        let body =
+            telegram_api::communities_togglePeerLinkRequestApproval::parse(sent.query())
+                .expect("the sent body");
+        assert!(body.reject, "the reject band inverts approve");
+        match body.community {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!(channel.channel_id, 7);
+            }
+            other => panic!("unexpected input community {other:?}"),
+        }
+        match body.peer {
+            Some(peer) => match *peer {
+                telegram_api::InputPeer::inputPeerChannel(channel) => {
+                    assert_eq!(channel.channel_id, 3);
+                    assert_eq!(channel.access_hash, 40);
+                }
+                other => panic!("unexpected input peer {other:?}"),
+            },
+            None => panic!("the requested chat's input peer resolves"),
+        }
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_community_net();
+        td.flush_deferred_results();
+        assert!(
+            matches!(responses_of(&callback, 2).first(), Some(Object::ok(_))),
+            "no cached full settles the request now"
+        );
+
+        // 4. the wire error band reaches the request
+        td.request(
+            3,
+            Function::processCommunityAddChatRequest(td_api::processCommunityAddChatRequest {
+                community_id: 7,
+                chat_id: -1_000_000_000_003,
+                approve: true,
+            }),
+        );
+        let sent = take_sent_query(
+            &rec,
+            telegram_api::communities_togglePeerLinkRequestApproval::ID,
+        );
+        let body =
+            telegram_api::communities_togglePeerLinkRequestApproval::parse(sent.query())
+                .expect("the sent body");
+        assert!(!body.reject);
+        net_fail(sent, 400, "CHAT_ADMIN_REQUIRED");
+        td.dispatch_completed_community_net();
+        td.flush_deferred_results();
+        assert_eq!(error_of(&callback, 3).message, "CHAT_ADMIN_REQUIRED");
+
+        // 5. the all-approvals toggle over a cached full — the change-settle
+        //    parks the request on the community-full reload and resolves
+        //    it when the reload answers
+        with_community_manager(&mut td, |manager, env| {
+            manager.on_get_community_full(
+                env,
+                &telegram_api::communityFull {
+                    flags: 0,
+                    id: 7,
+                    about: "about".to_owned(),
+                    chat_photo: None,
+                    linked_peers: Vec::new(),
+                    admins_count: 2,
+                    kicked_count: 1,
+                    peer_link_requests_pending: 3,
+                },
+            );
+        });
+        // the full's unsynchronized settings trigger the 99302f0e2
+        // settings query — complete it so the walk stays drained
+        let sent = take_sent_query(&rec, telegram_api::account_getNotifySettings::ID);
+        net_complete(sent, {
+            let mut out = Vec::new();
+            telegram_api::PeerNotifySettings {
+                flags: 0,
+                show_previews: true,
+                silent: false,
+                mute_until: 0,
+                ios_sound: None,
+                android_sound: None,
+                other_sound: None,
+                stories_muted: false,
+                stories_hide_sender: false,
+                stories_ios_sound: None,
+                stories_android_sound: None,
+                stories_other_sound: None,
+            }
+            .store_boxed(&mut out);
+            out
+        });
+        td.dispatch_completed_community_net();
+
+        td.request(
+            4,
+            Function::processCommunityAddChatRequests(td_api::processCommunityAddChatRequests {
+                community_id: 7,
+                approve: true,
+            }),
+        );
+        let sent = take_sent_query(
+            &rec,
+            telegram_api::communities_toggleAllPeerLinkRequestApproval::ID,
+        );
+        let body =
+            telegram_api::communities_toggleAllPeerLinkRequestApproval::parse(sent.query())
+                .expect("the sent body");
+        assert!(!body.reject, "the reject band inverts approve");
+        match body.community {
+            Some(telegram_api::InputChannel::inputChannel(channel)) => {
+                assert_eq!(channel.channel_id, 7);
+            }
+            other => panic!("unexpected input community {other:?}"),
+        }
+        net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
+        td.dispatch_completed_community_net();
+        td.flush_deferred_results();
+        assert!(
+            responses_of(&callback, 4).is_empty(),
+            "the settle waits for the community-full reload"
+        );
+        let reload = take_sent_query(&rec, telegram_api::channels_getFullChannel::ID);
+        net_complete(reload, {
+            let mut out = Vec::new();
+            telegram_api::messages_ChatFull {
+                full_chat: Some(telegram_api::ChatFull::communityFull(
+                    telegram_api::communityFull {
+                        flags: 0,
+                        id: 7,
+                        about: "about".to_owned(),
+                        chat_photo: None,
+                        linked_peers: Vec::new(),
+                        admins_count: 2,
+                        kicked_count: 1,
+                        peer_link_requests_pending: 0,
+                    },
+                )),
+                chats: Vec::new(),
+                users: Vec::new(),
+            }
+            .store_boxed(&mut out);
+            out
+        });
+        td.dispatch_completed_community_net();
+        td.flush_deferred_results();
+        assert!(
+            matches!(responses_of(&callback, 4).first(), Some(Object::ok(_))),
+            "the reload answer settles the request"
+        );
     }
 
     // ---- the account net slice: the AccountManager query families

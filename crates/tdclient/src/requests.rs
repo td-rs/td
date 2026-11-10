@@ -7114,6 +7114,66 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             manager.delete_community(&mut env, CommunityId::new(request.community_id), promise);
             td.community_manager = manager;
         }
+        Function::getCommunityAddChatRequests(request) => {
+            // Requests.cpp:3511-3517 (ffc06ec75) — CHECK_IS_USER,
+            // CLEAN_INPUT_STRING(offset), CREATE_REQUEST_PROMISE, then
+            // CommunityManager::get_community_add_dialog_requests.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(offset) = clean_or_utf8_error(td, id, &request.offset) else {
+                return;
+            };
+            let promise =
+                td.deferred_promise::<td_api::CommunityAddChatRequests, _>(
+                    id,
+                    Object::communityAddChatRequests,
+                );
+            let (mut manager, mut env) = community_split(td);
+            manager.get_community_add_dialog_requests(
+                &mut env,
+                CommunityId::new(request.community_id),
+                &offset,
+                request.limit,
+                promise,
+            );
+            td.community_manager = manager;
+        }
+        Function::processCommunityAddChatRequest(request) => {
+            // Requests.cpp:3519-3524 (2b80bf533) — CHECK_IS_USER,
+            // CREATE_OK_REQUEST_PROMISE, then
+            // CommunityManager::process_community_add_dialog_request.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut manager, mut env) = community_split(td);
+            manager.process_community_add_dialog_request(
+                &mut env,
+                CommunityId::new(request.community_id),
+                crate::dialog_id::DialogId::new(request.chat_id),
+                request.approve,
+                promise,
+            );
+            td.community_manager = manager;
+        }
+        Function::processCommunityAddChatRequests(request) => {
+            // Requests.cpp:3526-3530 (79a943019) — CHECK_IS_USER,
+            // CREATE_OK_REQUEST_PROMISE, then
+            // CommunityManager::process_community_add_dialog_requests.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let (mut manager, mut env) = community_split(td);
+            manager.process_community_add_dialog_requests(
+                &mut env,
+                CommunityId::new(request.community_id),
+                request.approve,
+                promise,
+            );
+            td.community_manager = manager;
+        }
 
         // -- the payments set (M.43): Requests.cpp:8372-8436, 8757-8771,
         //    9247-9251; the CHECK_IS_USER/CHECK_IS_BOT gates match the
