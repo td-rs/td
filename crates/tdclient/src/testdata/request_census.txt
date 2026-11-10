@@ -365,7 +365,7 @@ getChatsToPostStories	dispatched
 getCloseFriends	dispatched
 getCollectibleItemInfo	dispatched
 getCommands	dispatched
-getCommunityAddChatRequests	interim
+getCommunityAddChatRequests	dispatched
 getCommunityFullInfo	dispatched
 getCommunityMemberChats	interim
 getConnectedAffiliateProgram	dispatched
@@ -684,8 +684,8 @@ processChatFolderNewChats	dispatched
 processChatHasProtectedContentDisableRequest	dispatched
 processChatJoinRequest	dispatched
 processChatJoinRequests	dispatched
-processCommunityAddChatRequest	interim
-processCommunityAddChatRequests	interim
+processCommunityAddChatRequest	dispatched
+processCommunityAddChatRequests	dispatched
 processGiftPurchaseOffer	dispatched
 processPushNotification	dispatched
 processWebProxyCarrierMessage	dispatched

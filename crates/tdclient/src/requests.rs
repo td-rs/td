@@ -20264,7 +20264,7 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 26, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            1054,
+            1057,
             "dispatched count"
         );
         // the 23383aef sync base (1.8.70): the 34 new scheme functions
@@ -20305,6 +20305,13 @@ mod request_census_tests {
         // getSuitableCommunityChats (the ForCommunityDialog plane of the
         // created-public-dialogs cache): 1,053 + 1 = 1,054 dispatched /
         // 20 - 1 = 19 interim, sync unmoved 26.
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 19, "interim count");
+        // The community family slice (#132) flipped the add-chat
+        // requests trio (getCommunityAddChatRequests — the page query
+        // over communities.getPeerLinkRequests, and the two approval
+        // toggles processCommunityAddChatRequest /
+        // processCommunityAddChatRequests whose Bool answers settle
+        // through the change-settle): 1,054 + 3 = 1,057 dispatched /
+        // 19 - 3 = 16 interim, sync unmoved 26.
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 16, "interim count");
     }
 }
