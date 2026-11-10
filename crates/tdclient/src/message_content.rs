@@ -241,6 +241,7 @@ pub enum MessageContentType {
     ChatJoinedViaCommunity,
     GramTransfer,
     WalletTonConnectRequest,
+    UnpaidMessagesAllowedByLink,
 }
 
 /// `can_be_secret_message_content` (MessageContentType.cpp) — the C++
@@ -335,7 +336,7 @@ pub fn can_send_message_content_to_secret_chat(content_type: MessageContentType)
         | Text | Venue | Video | VideoNote | VoiceNote => true,
         Dice | Game | Giveaway | GiveawayWinners | Invoice | PaidMedia | Poll | Story
         | ToDoList => false,
-        GramTransfer | WalletTonConnectRequest => false,
+        GramTransfer | WalletTonConnectRequest | UnpaidMessagesAllowedByLink => false,
         _ => unreachable!(),
     }
 }
@@ -457,6 +458,7 @@ impl TryFrom<i32> for MessageContentType {
             95 => Ok(MessageContentType::ChatJoinedViaCommunity),
             96 => Ok(MessageContentType::GramTransfer),
             97 => Ok(MessageContentType::WalletTonConnectRequest),
+            98 => Ok(MessageContentType::UnpaidMessagesAllowedByLink),
             _ => Err(()),
         }
     }
@@ -2367,8 +2369,10 @@ pub struct MessageUnsupported {
 
 impl MessageUnsupported {
     /// `MessageUnsupported::CURRENT_VERSION` (MessageContent.cpp:554) —
-    /// bumped each time a new message content type is added.
-    pub const CURRENT_VERSION: i32 = 63;
+    /// bumped each time a new message content type is added (the
+    /// UnpaidMessagesAllowedByLink insertion is the 63 → 64 bump,
+    /// 39e3d8c73).
+    pub const CURRENT_VERSION: i32 = 64;
 }
 
 impl Default for MessageUnsupported {
@@ -3001,6 +3005,12 @@ pub struct MessageWalletTonConnectRequest {
     pub is_declined: bool,
 }
 
+/// `MessageUnpaidMessagesAllowedByLink` (MessageContent.cpp:1883-1889) —
+/// the field-less service kind the `messageActionNoPaidMessagesTokenUsed`
+/// wire action lands as (39e3d8c73).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MessageUnpaidMessagesAllowedByLink {}
+
 /// `td::MessageContent` (MessageContent.h:62-72) — the C++ class hierarchy
 /// flattened into an enum of structs. The C++ header comment applies to
 /// every inheritor: do not forget to update `merge_message_contents` and
@@ -3110,6 +3120,7 @@ pub enum MessageContent {
     ChatJoinedViaCommunity(MessageChatJoinedViaCommunity),
     GramTransfer(MessageGramTransfer),
     WalletTonConnectRequest(MessageWalletTonConnectRequest),
+    UnpaidMessagesAllowedByLink(MessageUnpaidMessagesAllowedByLink),
 }
 
 impl MessageContent {
@@ -3216,6 +3227,9 @@ impl MessageContent {
             MessageContent::GramTransfer(_) => MessageContentType::GramTransfer,
             MessageContent::WalletTonConnectRequest(_) => {
                 MessageContentType::WalletTonConnectRequest
+            }
+            MessageContent::UnpaidMessagesAllowedByLink(_) => {
+                MessageContentType::UnpaidMessagesAllowedByLink
             }
         }
     }
@@ -6006,6 +6020,10 @@ pub fn store_message_content(
                 store_string(out, &m.dapp_name);
             }
         }
+        MessageContent::UnpaidMessagesAllowedByLink(_) => {
+            // MessageContent.cpp:3111-3114 — the empty flags band.
+            store_flags(out, []);
+        }
     }
 }
 
@@ -7362,6 +7380,11 @@ pub fn parse_message_content(
                 is_accepted: flags[2],
                 is_declined: flags[3],
             })
+        }
+        MessageContentType::UnpaidMessagesAllowedByLink => {
+            // MessageContent.cpp:4727-4733 — the empty flags band.
+            let _flags = parser.parse_flags::<0>()?;
+            MessageContent::UnpaidMessagesAllowedByLink(MessageUnpaidMessagesAllowedByLink {})
         }
         // The unmodeled six: StarGift/StarGiftUnique/StarGiftPurchaseOffer/
         // StarGiftPurchaseOfferDeclined/ChatSetTheme/RichText.
@@ -13557,7 +13580,8 @@ pub fn can_message_content_have_input_media(
         | MessageContentType::ChangeCommunity
         | MessageContentType::ChatJoinedViaCommunity
         | MessageContentType::GramTransfer
-        | MessageContentType::WalletTonConnectRequest => false,
+        | MessageContentType::WalletTonConnectRequest
+        | MessageContentType::UnpaidMessagesAllowedByLink => false,
         MessageContentType::Animation
         | MessageContentType::Audio
         | MessageContentType::Contact
@@ -16839,6 +16863,12 @@ pub fn get_message_content_object(
                 trace_id: m.trace_id.clone(),
             })
         }
+        MessageContent::UnpaidMessagesAllowedByLink(_) => {
+            // MessageContent.cpp:12702-12703.
+            td_api::MessageContent::messageUnpaidMessagesAllowedByLink(
+                td_api::messageUnpaidMessagesAllowedByLink {},
+            )
+        }
     }
 }
 
@@ -18604,12 +18634,11 @@ pub fn get_action_message_content(
                 from_user_id,
             })
         }
-        // 1.8.70 (MessageContent.cpp:11858-11859) — the C++ answers the
-        // new MessageUnpaidMessagesAllowedByLink content; its content
-        // kind rides the unpaid-messages family follow-up, so the interim
-        // arm answers the C++ `break` tail (the empty-text fallback).
+        // `messageActionNoPaidMessagesTokenUsed` (MessageContent.cpp:
+        // 11858-11859) — the field-less MessageUnpaidMessagesAllowedByLink
+        // service kind (39e3d8c73).
         telegram_api::MessageAction::messageActionNoPaidMessagesTokenUsed(_) => {
-            fallback_action_message_content()
+            MessageContent::UnpaidMessagesAllowedByLink(MessageUnpaidMessagesAllowedByLink {})
         }
         telegram_api::MessageAction::messageActionGroupCallScheduled(action) => {
             if action.schedule_date <= 0 {
@@ -19845,6 +19874,9 @@ mod tests {
             MessageContentType::RichText,
             MessageContentType::ChangeCommunity,
             MessageContentType::ChatJoinedViaCommunity,
+            MessageContentType::GramTransfer,
+            MessageContentType::WalletTonConnectRequest,
+            MessageContentType::UnpaidMessagesAllowedByLink,
         ];
         for (index, content_type) in all.iter().enumerate() {
             assert_eq!(*content_type as i32, index as i32 - 1);
@@ -20297,7 +20329,8 @@ mod tests {
     /// the default instance.
     #[test]
     fn unsupported_defaults_to_the_current_version() {
-        assert_eq!(MessageUnsupported::CURRENT_VERSION, 63);
+        // the UnpaidMessagesAllowedByLink insertion is the 63 → 64 bump
+        assert_eq!(MessageUnsupported::CURRENT_VERSION, 64);
         let unsupported = MessageUnsupported::default();
         assert_eq!(unsupported.version, MessageUnsupported::CURRENT_VERSION);
         let downgraded = MessageUnsupported { version: 3 };
@@ -21661,13 +21694,14 @@ mod tests {
             MessageContent::ScreenshotTaken(MessageScreenshotTaken),
             MessageContent::WriteAccessAllowed(MessageWriteAccessAllowed),
             MessageContent::WriteAccessAllowedByRequest(MessageWriteAccessAllowedByRequest),
+            MessageContent::UnpaidMessagesAllowedByLink(MessageUnpaidMessagesAllowedByLink {}),
         ]
     }
 
     #[test]
     fn every_modeled_variant_round_trips_through_the_db_format() {
         let contents = sample_contents();
-        assert_eq!(contents.len(), 90, "one sample per modeled variant");
+        assert_eq!(contents.len(), 91, "one sample per modeled variant");
         for content in contents {
             let mut out = Vec::new();
             store_message_content(&content, &RawIdStorage, &mut out);

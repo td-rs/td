@@ -8091,6 +8091,7 @@ pub fn get_default_service_message_content_reactions_are_possible(
             | MessageContentType::WebViewWriteAccessAllowed
             | MessageContentType::WriteAccessAllowed
             | MessageContentType::WriteAccessAllowedByRequest
+            | MessageContentType::UnpaidMessagesAllowedByLink
     )
 }
 

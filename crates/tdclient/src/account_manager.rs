@@ -193,6 +193,32 @@ pub trait AccountManagerEnv {
         tdutils::log_info!("Send contacts.importContactToken — [net-inert]");
         let _ = token;
     }
+
+    /// `td_->user_manager_->get_input_user(user_id)` — the
+    /// applyUnpaidMessagesToken gate (c1c29ea08); the inert envs answer
+    /// the not-found band.
+    fn get_input_user(
+        &mut self,
+        user_id: i64,
+    ) -> std::result::Result<telegram_api::InputUser, tdutils::status::Status> {
+        let _ = user_id;
+        tdutils::log_info!("get_input_user — [blocked: the user plane]");
+        Err(tdutils::status::Status::error(400, "User not found"))
+    }
+
+    /// `ImportNoPaidMessagesTokenQuery::send` (AccountManager.cpp:641-644)
+    /// — `contacts.importNoPaidMessagesToken(input_user, token)`; the
+    /// user id rides for the reload tail (the C++ handler's `user_id_`
+    /// member).
+    fn send_import_no_paid_messages_token_query(
+        &mut self,
+        user_id: i64,
+        input_user: telegram_api::InputUser,
+        token: &str,
+    ) {
+        let _ = (user_id, input_user, token);
+        tdutils::log_info!("Send contacts.importNoPaidMessagesToken — [net-inert]");
+    }
 }
 
 /// `AccountManager::UnconfirmedAuthorization`
@@ -565,6 +591,10 @@ pub struct AccountManager {
     /// The `td_api::User`-typed promises parked at the
     /// ImportContactToken seam.
     pub parked_user_promises: Vec<Promise<td_api::User>>,
+    /// The `()`-typed promises parked at the ImportNoPaidMessagesToken
+    /// seam (the applyUnpaidMessagesToken arm, c1c29ea08); the reload
+    /// tail settles them.
+    pub(crate) parked_no_paid_messages_promises: Vec<Promise<()>>,
 }
 
 impl AccountManager {
@@ -800,6 +830,28 @@ impl AccountManager {
         if !promise.is_empty() {
             self.parked_user_promises.push(promise);
         }
+    }
+
+    /// `AccountManager::apply_unpaid_messages_token`
+    /// (AccountManager.cpp:1296-1303, c1c29ea08) — the input-user gate
+    /// first, then the non-empty token gate (the C++ order); the promise
+    /// parks for the reload tail.
+    pub fn apply_unpaid_messages_token(
+        &mut self,
+        env: &mut impl AccountManagerEnv,
+        user_id: i64,
+        token: String,
+        mut promise: Promise<()>,
+    ) {
+        let input_user = match env.get_input_user(user_id) {
+            Ok(input_user) => input_user,
+            Err(status) => return promise.set_error(status),
+        };
+        if token.is_empty() {
+            return promise.set_error(Status::error(400, "Token must be non-empty"));
+        }
+        env.send_import_no_paid_messages_token_query(user_id, input_user, &token);
+        self.parked_no_paid_messages_promises.push(promise);
     }
 
     /// `set_inactive_session_ttl_days` (cpp:1004-1006 →
@@ -1494,6 +1546,33 @@ mod tests {
             self.queries.push("importContactToken".to_string());
         }
 
+        /// the test registry: user 42 is known (the 99 band errors)
+        fn get_input_user(
+            &mut self,
+            user_id: i64,
+        ) -> std::result::Result<telegram_api::InputUser, tdutils::status::Status> {
+            if user_id == 42 {
+                Ok(telegram_api::InputUser::inputUser(
+                    telegram_api::inputUser {
+                        user_id,
+                        access_hash: 0,
+                    },
+                ))
+            } else {
+                Err(tdutils::status::Status::error(400, "User not found"))
+            }
+        }
+
+        fn send_import_no_paid_messages_token_query(
+            &mut self,
+            user_id: i64,
+            _input_user: telegram_api::InputUser,
+            _token: &str,
+        ) {
+            self.queries
+                .push(format!("importNoPaidMessagesToken {user_id}"));
+        }
+
         fn send_get_account_ttl_query(&mut self) {
             self.queries.push("getAccountTTL".to_string());
         }
@@ -1694,6 +1773,55 @@ mod tests {
         manager.import_contact_token(&mut env, "abc".to_string(), promise);
         assert_eq!(env.queries.len(), 2);
         assert_eq!(manager.parked_user_promises.len(), 1);
+        assert!((*slot.lock().unwrap()).is_none());
+    }
+
+    /// The applyUnpaidMessagesToken gates (c1c29ea08): the input-user
+    /// gate first, then the non-empty token gate; a valid band sends the
+    /// query and parks.
+    #[test]
+    fn apply_unpaid_messages_token_gates() {
+        let mut env = TestEnv::new();
+        let mut manager = AccountManager::default();
+
+        let captured = |slot: &std::sync::Arc<
+            std::sync::Mutex<Option<tdutils::status::Result<()>>>,
+        >| {
+            let capture: std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<()>>>> =
+                slot.clone();
+            tdutils::promise::PromiseCreator::lambda_result(move |r: tdutils::status::Result<()>| {
+                *capture.lock().unwrap() = Some(r);
+            })
+        };
+
+        // an unknown user errors before the token check (the C++ order)
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        manager.apply_unpaid_messages_token(&mut env, 99, String::new(), captured(&slot));
+        let error = match (*slot.lock().unwrap()).take().expect("answered") {
+            tdutils::status::Result::Err(status) => status,
+            tdutils::status::Result::Ok(()) => panic!("expected the error band"),
+        };
+        assert_eq!(error.message(), "User not found");
+        assert!(env.queries.is_empty());
+
+        // a known user with an empty token
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        manager.apply_unpaid_messages_token(&mut env, 42, String::new(), captured(&slot));
+        let error = match (*slot.lock().unwrap()).take().expect("answered") {
+            tdutils::status::Result::Err(status) => status,
+            tdutils::status::Result::Ok(()) => panic!("expected the error band"),
+        };
+        assert_eq!(error.message(), "Token must be non-empty");
+        assert!(env.queries.is_empty());
+
+        // a valid band sends the query and parks
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        manager.apply_unpaid_messages_token(&mut env, 42, "token".to_string(), captured(&slot));
+        assert_eq!(
+            env.queries,
+            vec!["importNoPaidMessagesToken 42".to_string()]
+        );
+        assert_eq!(manager.parked_no_paid_messages_promises.len(), 1);
         assert!((*slot.lock().unwrap()).is_none());
     }
 

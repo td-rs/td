@@ -8615,7 +8615,15 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
     // next (the two-phase borrow of the collapsed dispatcher)
     macro_rules! owner_dialog_id {
         ($td:expr, $sender:expr) => {
-            get_message_sender_dialog_id(&mut star_gift_env!($td), $sender.as_ref())
+            get_message_sender_dialog_id(&mut star_gift_env!($td), $sender.as_ref(), false)
+        };
+    }
+    // the displayUpgradedGift form — `get_message_sender_dialog_id(td_,
+    // sender, true, true)` (cda1364ab): the empty sender answers the
+    // default dialog id (the no-peer form)
+    macro_rules! display_owner_dialog_id {
+        ($td:expr, $sender:expr) => {
+            get_message_sender_dialog_id(&mut star_gift_env!($td), $sender.as_ref(), true)
         };
     }
 
@@ -8748,6 +8756,23 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             let promise = ok_promise!(td);
             let mut env = star_gift_env!(td);
             td.star_gift_manager.convert_gift(
+                &mut env,
+                crate::star_gift_manager::BusinessConnectionId::new(
+                    &request.business_connection_id,
+                ),
+                StarGiftId::from_string(&request.received_gift_id),
+                promise,
+            );
+        }
+
+        // deleteGift (Requests.cpp:9050-9056, d244b8df0)
+        Function::deleteGift(request) => {
+            if td.auth_manager.is_bot() && request.business_connection_id.is_empty() {
+                return td.send_error_impl(id, 400, "The method is not available to bots");
+            }
+            let promise = ok_promise!(td);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.delete_gift(
                 &mut env,
                 crate::star_gift_manager::BusinessConnectionId::new(
                     &request.business_connection_id,
@@ -9133,6 +9158,65 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
                 StarGiftId::from_string(&request.received_gift_id),
                 promise,
             );
+        }
+
+        // withdrawUpgradedGift (Requests.cpp:9203-9209, 2d6075fb1)
+        Function::withdrawUpgradedGift(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.withdraw_star_gift(
+                &mut env,
+                StarGiftId::from_string(&request.received_gift_id),
+                request.keep_on_profile,
+                promise,
+            );
+        }
+
+        // getUpgradedGiftDepositInfo (Requests.cpp:9210-9218, 8b1234636)
+        Function::getUpgradedGiftDepositInfo(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(name) = clean_or_utf8_error(td, id, &request.name) else {
+                return;
+            };
+            let owner_dialog_id = match owner_dialog_id!(td, request.owner_id) {
+                std::result::Result::Ok(dialog_id) => dialog_id,
+                std::result::Result::Err(status) => return send_error_status(td, id, status),
+            };
+            let promise = td.deferred_promise::<td_api::UpgradedGiftDepositInfo, _>(
+                id,
+                Object::upgradedGiftDepositInfo,
+            );
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.get_upgraded_gift_deposit_info(
+                &mut env,
+                owner_dialog_id,
+                &name,
+                request.hide_sender,
+                promise,
+            );
+        }
+
+        // displayUpgradedGift (Requests.cpp:9219-9226, cda1364ab)
+        Function::displayUpgradedGift(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(name) = clean_or_utf8_error(td, id, &request.name) else {
+                return;
+            };
+            let owner_dialog_id = match display_owner_dialog_id!(td, request.owner_id) {
+                std::result::Result::Ok(dialog_id) => dialog_id,
+                std::result::Result::Err(status) => return send_error_status(td, id, status),
+            };
+            let promise = ok_promise!(td);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager
+                .display_upgraded_gift(&mut env, owner_dialog_id, &name, promise);
         }
 
         // getUpgradedGiftsPromotionalAnimation (Requests.cpp:8664-8668)
@@ -18149,6 +18233,35 @@ fn run_misc_glue_requests(td: &mut Td, id: u64, function: Function) {
             td.account_manager
                 .import_contact_token(&mut env, token, promise);
         }
+        Function::applyUnpaidMessagesToken(request) => {
+            // Requests.cpp:2532-2538 — CHECK_IS_USER + the token clean
+            // (c1c29ea08); the contacts.importNoPaidMessagesToken query
+            // parks in the account manager.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(token) = crate::misc::clean_input_string(&request.token) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let net = td.account_net();
+            let mut env = AccountEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
+                device_token_manager: &mut td.device_token_manager,
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.account_updates,
+                net,
+            };
+            td.account_manager.apply_unpaid_messages_token(
+                &mut env,
+                request.user_id,
+                token,
+                promise,
+            );
+        }
         Function::sendCallLog(request) => {
             // Requests.cpp:5148-5152 — CHECK_IS_USER; the CallManager
             // close/call-id bands are real, the M.12 file intake and the
@@ -19942,7 +20055,7 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 26, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            1040,
+            1045,
             "dispatched count"
         );
         // the 23383aef sync base (1.8.70): the 34 new scheme functions
@@ -19956,6 +20069,13 @@ mod request_census_tests {
         // The community notification-settings slice (#113) flipped
         // setCommunityNotificationSettings: 1,039 + 1 = 1,040
         // dispatched / 34 - 1 = 33 interim, sync unmoved 26.
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 33, "interim count");
+        // The gifts family slice (#121) flipped 5 arms: deleteGift,
+        // displayUpgradedGift, getUpgradedGiftDepositInfo,
+        // withdrawUpgradedGift (the StarGiftManager net families over the
+        // Delete/Display/Deposit/WithdrawStarGiftQuery kinds) and
+        // applyUnpaidMessagesToken (the AccountManager
+        // ImportNoPaidMessagesTokenQuery seam): 1,040 + 5 = 1,045
+        // dispatched / 33 - 5 = 28 interim, sync unmoved 26.
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 28, "interim count");
     }
 }

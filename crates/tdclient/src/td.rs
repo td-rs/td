@@ -3200,6 +3200,10 @@ pub(crate) enum AccountNetKind {
     /// `ImportContactTokenQuery` (cpp:574) — the `on_get_user` intake
     /// answers with the stored user object.
     ImportContactToken,
+    /// `ImportNoPaidMessagesTokenQuery` (cpp:628-666, c1c29ea08) — the
+    /// applyUnpaidMessagesToken wire leg; the kind carries the reload
+    /// user id (the handler's `user_id_` member).
+    ImportNoPaidMessagesToken { user_id: i64 },
     /// `GetTermsOfServiceUpdateQuery` (TermsOfServiceManager.cpp:23-62)
     /// — the auth-success poll; the answer routes
     /// [`crate::terms_of_service_manager::TermsOfServiceManager::on_get_terms_of_service`].
@@ -3958,6 +3962,28 @@ struct ConvertGiftChain {
     from_dialog_id: crate::dialog_id::DialogId,
     promise: Option<Promise<()>>,
     convert_queue: ConvertGiftQueue,
+}
+
+/// The `ImportNoPaidMessagesTokenQuery` reload-tail chain
+/// (AccountManager.cpp:653-659, c1c29ea08) — the token has already been
+/// applied when the reload runs, so the C++ lambda settles the parked
+/// promise on either reload half.
+struct ImportNoPaidMessagesTokenChain {
+    promise: Option<Promise<()>>,
+}
+
+impl tdutils::promise::PromiseInterface<()> for ImportNoPaidMessagesTokenChain {
+    fn set_value(&mut self, _value: ()) {
+        if let Some(mut promise) = self.promise.take() {
+            promise.set_value(());
+        }
+    }
+
+    fn set_error(&mut self, _error: Status) {
+        if let Some(mut promise) = self.promise.take() {
+            promise.set_value(());
+        }
+    }
 }
 
 impl tdutils::promise::PromiseInterface<()> for ConvertGiftChain {
@@ -25882,6 +25908,66 @@ impl Td {
                     }
                 }
             }
+            // `ImportNoPaidMessagesTokenQuery` (cpp:645-666, c1c29ea08) —
+            // the `on_get_user` intake feeds the user-full reload whose
+            // completion settles the parked promise on either half.
+            AccountNetKind::ImportNoPaidMessagesToken { user_id } => {
+                let promise = self
+                    .account_manager
+                    .take_promise(|m| &mut m.parked_no_paid_messages_promises);
+                if query.is_error() {
+                    if let Some(mut promise) = promise {
+                        promise.set_error(query.error().clone());
+                    }
+                    return;
+                }
+                match telegram_api::User::parse(query.ok()) {
+                    Ok(user) => {
+                        {
+                            let mut env = UserEnv {
+                                global: &mut self.global,
+                                options: self.option_manager.as_mut().expect(
+                                    "account answers run with the initialized option manager",
+                                ),
+                                auth_is_bot: self.auth_manager.is_bot(),
+                            };
+                            self.user_manager.on_get_user(
+                                &mut env,
+                                user,
+                                "ImportNoPaidMessagesTokenQuery",
+                            );
+                        }
+                        let Some(promise) = promise else {
+                            return;
+                        };
+                        // the token has already been applied; errors
+                        // during the reload are ignored (cpp:656-658)
+                        let chain = ImportNoPaidMessagesTokenChain {
+                            promise: Some(promise),
+                        };
+                        let reload_promise = Promise::from_interface(chain);
+                        let mut env = UserEnv {
+                            global: &mut self.global,
+                            options: self
+                                .option_manager
+                                .as_mut()
+                                .expect("account answers run with the initialized option manager"),
+                            auth_is_bot: self.auth_manager.is_bot(),
+                        };
+                        self.user_manager.reload_user_full(
+                            &mut env,
+                            UserId::new(user_id),
+                            reload_promise,
+                            "ImportNoPaidMessagesTokenQuery",
+                        );
+                    }
+                    Err(_) => {
+                        if let Some(mut promise) = promise {
+                            promise.set_error(parse_error("contacts_importNoPaidMessagesToken"));
+                        }
+                    }
+                }
+            }
             // `GetTermsOfServiceUpdateQuery` (TermsOfServiceManager.cpp:
             // 23-62) — the answer converts the Empty/Update halves
             // into the (expires, TermsOfService) pair (cpp:36-57) and
@@ -29146,6 +29232,85 @@ impl Td {
                 };
                 self.with_star_gift_manager(|_env, manager| {
                     manager.on_get_star_gift_withdrawal_url(result)
+                });
+            }
+            // `DepositStarGiftQuery::on_result`/`on_error`
+            // (StarGiftManager.cpp:2002-2014, 8b1234636).
+            StarGiftNetKind::DepositStarGift => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match telegram_api::payments_StarGiftDepositPayload::parse(query.ok()) {
+                        Ok(ptr) => Ok(ptr),
+                        Err(_) => Err(parse_error("payments.depositStarGift")),
+                    }
+                };
+                self.with_star_gift_manager(|_env, manager| {
+                    manager.on_get_upgraded_gift_deposit_info(result)
+                });
+            }
+            // `DisplayStarGiftQuery::on_result`/`on_error`
+            // (StarGiftManager.cpp:2030-2039, cda1364ab).
+            StarGiftNetKind::DisplayStarGift => {
+                let result = unit_bool_result(&query, "payments.displayStarGift");
+                self.with_star_gift_manager(|_env, manager| {
+                    manager.on_get_display_upgraded_gift(result)
+                });
+            }
+            // `WithdrawStarGiftQuery::on_result`/`on_error`
+            // (StarGiftManager.cpp:2055-2072, 2d6075fb1) — the `false` Bool
+            // is the C++ "failed to withdraw the gift" 500.
+            StarGiftNetKind::WithdrawStarGift => {
+                let result = if query.is_error() {
+                    Err(query.error().clone())
+                } else {
+                    match parse_wire_bool_value(query.ok()) {
+                        Some(true) => Ok(true),
+                        Some(false) => Ok(false),
+                        None => Err(parse_error("payments.withdrawStarGift")),
+                    }
+                };
+                self.with_star_gift_manager(|_env, manager| {
+                    manager.on_get_withdraw_star_gift(result)
+                });
+            }
+            // `DeleteStarGiftQuery::on_result`/`on_error`
+            // (StarGiftManager.cpp:543-555, d244b8df0) — the ok half routes
+            // the transfer tail with the empty receiver (the C++
+            // PromiseCreator lambda of StarGiftManager.cpp:2998-3004).
+            StarGiftNetKind::DeleteStarGift { dialog_id } => {
+                if query.is_error() {
+                    let status = query.error().clone();
+                    crate::dialog_manager::on_get_dialog_error(
+                        &self.global,
+                        dialog_id,
+                        &status,
+                        "DeleteStarGiftQuery",
+                    );
+                    self.with_star_gift_manager(|_env, manager| {
+                        manager.on_get_delete_star_gift(Err(status));
+                    });
+                    return;
+                }
+                let Some(()) = parse_wire_bool(query.ok()) else {
+                    self.with_star_gift_manager(|_env, manager| {
+                        manager
+                            .on_get_delete_star_gift(Err(parse_error("payments.deleteStarGift")));
+                    });
+                    return;
+                };
+                let Some(promise) = self.with_star_gift_manager(|_env, manager| {
+                    manager.on_get_delete_star_gift(Ok(()))
+                }) else {
+                    return;
+                };
+                self.with_star_gift_manager(|env, manager| {
+                    manager.on_dialog_gift_transferred(
+                        env,
+                        dialog_id,
+                        crate::dialog_id::DialogId::default(),
+                        promise,
+                    )
                 });
             }
             // `GetResaleStarGiftsQuery::on_result`/`on_error`
@@ -40120,6 +40285,47 @@ impl AccountManagerEnv for AccountEnv<'_> {
         }
     }
 
+    /// `td_->user_manager_->get_input_user(user_id)` — the
+    /// applyUnpaidMessagesToken gate (c1c29ea08).
+    fn get_input_user(
+        &mut self,
+        user_id: i64,
+    ) -> std::result::Result<telegram_api::InputUser, Status> {
+        let env = UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_mut()
+                .expect("account manager runs with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.get_input_user(&env, UserId::new(user_id))
+    }
+
+    /// `ImportNoPaidMessagesTokenQuery::send` (cpp:641-644, c1c29ea08).
+    fn send_import_no_paid_messages_token_query(
+        &mut self,
+        user_id: i64,
+        input_user: telegram_api::InputUser,
+        token: &str,
+    ) {
+        match self.net.clone() {
+            Some(net) => net.dispatch(
+                AccountNetKind::ImportNoPaidMessagesToken { user_id },
+                telegram_api::Function::contacts_importNoPaidMessagesToken(
+                    telegram_api::contacts_importNoPaidMessagesToken {
+                        user_id: Some(input_user),
+                        token: token.to_owned(),
+                    },
+                ),
+            ),
+            None => {
+                tdutils::log_info!("Send contacts.importNoPaidMessagesToken — [net-inert]");
+                let _ = (user_id, input_user, token);
+            }
+        }
+    }
+
     /// `SetAccountTtlQuery::send` (cpp:188-191).
     fn send_set_account_ttl_query(&mut self, account_ttl: i32) {
         match self.net.clone() {
@@ -45430,6 +45636,90 @@ impl crate::star_gift_manager::StarGiftEnv for StarGiftTdEnv<'_> {
                     &env,
                     dialog_id.get_user_id(),
                     crate::user_manager::AccessRights::Read,
+                )
+            }
+            // the chat/secret-chat halves are the M.6.15a stubs
+            _ => None,
+        }
+    }
+
+    /// `check_dialog_access(dialog_id, false, AccessRights::Write, …)` —
+    /// the display_upgraded_gift leg (cda1364ab) over the same M.6.15a
+    /// inventory with the Write-rights half.
+    fn check_dialog_access_write(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        _source: &str,
+    ) -> std::result::Result<(), tdutils::status::Status> {
+        use crate::dialog_id::DialogType;
+        let have = match dialog_id.get_type() {
+            DialogType::User => self
+                .user_manager
+                .have_accessible_user(dialog_id.get_user_id()),
+            DialogType::SecretChat => self
+                .user_manager
+                .have_secret_chat(dialog_id.get_secret_chat_id()),
+            _ => false,
+        };
+        if !have {
+            if !dialog_id.is_valid() {
+                return std::result::Result::Err(tdutils::status::Status::error(
+                    400,
+                    "Invalid chat identifier specified",
+                ));
+            }
+            return std::result::Result::Err(tdutils::status::Status::error(400, "Chat not found"));
+        }
+        let have_input_peer = match dialog_id.get_type() {
+            DialogType::User => {
+                let global = &mut *self.global;
+                let Some(options) = self.options.as_mut() else {
+                    return std::result::Result::Err(tdutils::status::Status::error(
+                        400,
+                        "Can't access the chat",
+                    ));
+                };
+                let env = UserEnv {
+                    global,
+                    options,
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.user_manager.have_input_peer_user(
+                    &env,
+                    dialog_id.get_user_id(),
+                    crate::user_manager::AccessRights::Write,
+                )
+            }
+            _ => false,
+        };
+        if !have_input_peer {
+            return std::result::Result::Err(tdutils::status::Status::error(
+                400,
+                "Can't access the chat",
+            ));
+        }
+        std::result::Result::Ok(())
+    }
+
+    /// `get_input_peer(dialog_id, AccessRights::Write)` — the
+    /// display_upgraded_gift leg.
+    fn get_input_peer_write(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+    ) -> Option<telegram_api::InputPeer> {
+        use crate::dialog_id::DialogType;
+        match dialog_id.get_type() {
+            DialogType::User => {
+                let options = self.options.as_mut()?;
+                let env = UserEnv {
+                    global: &mut *self.global,
+                    options,
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.user_manager.get_input_peer_user(
+                    &env,
+                    dialog_id.get_user_id(),
+                    crate::user_manager::AccessRights::Write,
                 )
             }
             // the chat/secret-chat halves are the M.6.15a stubs

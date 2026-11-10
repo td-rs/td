@@ -51,7 +51,7 @@ answerTonConnectRequest	dispatched
 answerWebAppQuery	dispatched
 answerWidgetQuery	interim
 applyPremiumGiftCode	dispatched
-applyUnpaidMessagesToken	interim
+applyUnpaidMessagesToken	dispatched
 approveSuggestedPost	dispatched
 assignStoreTransaction	dispatched
 banChatMember	dispatched
@@ -185,7 +185,7 @@ deleteDirectMessagesChatTopicMessagesByDate	dispatched
 deleteEphemeralMessage	dispatched
 deleteFile	dispatched
 deleteForumTopic	dispatched
-deleteGift	interim
+deleteGift	dispatched
 deleteGiftCollection	dispatched
 deleteGroupCallMessages	dispatched
 deleteGroupCallMessagesBySender	dispatched
@@ -219,7 +219,7 @@ disconnectAllWebsites	dispatched
 disconnectTonConnectSession	dispatched
 disconnectWebsite	dispatched
 dismissWebToken	dispatched
-displayUpgradedGift	interim
+displayUpgradedGift	dispatched
 downloadFile	dispatched
 dropGiftOriginalDetails	dispatched
 editBotMediaPreview	dispatched
@@ -608,7 +608,7 @@ getTonWalletTransactions	dispatched
 getTopChats	dispatched
 getTrendingStickerSets	dispatched
 getUpgradedGift	dispatched
-getUpgradedGiftDepositInfo	interim
+getUpgradedGiftDepositInfo	dispatched
 getUpgradedGiftEmojiStatuses	dispatched
 getUpgradedGiftValueInfo	dispatched
 getUpgradedGiftVariants	dispatched
@@ -1095,5 +1095,5 @@ viewPremiumFeature	dispatched
 viewSponsoredChat	dispatched
 viewTrendingStickerSets	dispatched
 viewVideoMessageAdvertisement	dispatched
-withdrawUpgradedGift	interim
+withdrawUpgradedGift	dispatched
 writeGeneratedFilePart	dispatched

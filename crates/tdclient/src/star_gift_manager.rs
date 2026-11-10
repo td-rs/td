@@ -2831,20 +2831,30 @@ impl StarGiftAuctionState {
 // — the MessageSender-plane home is its own track; the star gift request
 // arms need it now ---
 
-/// `get_message_sender_dialog_id(td, message_sender_id, true, false)` —
-/// the check_access = true, allow_empty = false form every star gift arm
-/// uses. `have_dialog_force` halves are the M.6.15a stubs.
+/// `get_message_sender_dialog_id(td, message_sender_id, true,
+/// allow_empty)` — the check_access = true form the star gift arms use
+/// (`allow_empty = false` everywhere but displayUpgradedGift, whose
+/// `(td, sender, true, true)` call lets the empty sender answer the
+/// default dialog id, cda1364ab). `have_dialog_force` halves are the
+/// M.6.15a stubs.
 pub fn get_message_sender_dialog_id(
     env: &mut impl StarGiftEnv,
     message_sender_id: Option<&td_api::MessageSender>,
+    allow_empty: bool,
 ) -> Result<DialogId, Status> {
     let Some(message_sender_id) = message_sender_id else {
+        if allow_empty {
+            return Ok(DialogId::default());
+        }
         return Err(Status::error(400, "Message sender must be non-empty"));
     };
     match message_sender_id {
         td_api::MessageSender::messageSenderUser(sender) => {
             let user_id = UserId::new(sender.user_id);
             if !user_id.is_valid() {
+                if allow_empty && user_id == UserId::default() {
+                    return Ok(DialogId::default());
+                }
                 return Err(Status::error(400, "Invalid user identifier specified"));
             }
             let know_user = env.have_user_force(user_id, "get_message_sender_dialog_id");
@@ -2856,6 +2866,9 @@ pub fn get_message_sender_dialog_id(
         td_api::MessageSender::messageSenderChat(sender) => {
             let dialog_id = DialogId::new(sender.chat_id);
             if !dialog_id.is_valid() {
+                if allow_empty && dialog_id.get() == 0 {
+                    return Ok(DialogId::default());
+                }
                 return Err(Status::error(400, "Invalid chat identifier specified"));
             }
             let know_dialog = if dialog_id.get_type() == DialogType::User {
@@ -2942,6 +2955,24 @@ pub trait StarGiftEnv {
 
     /// `td_->dialog_manager_->get_input_peer(dialog_id, AccessRights::Read)`.
     fn get_input_peer(&mut self, dialog_id: DialogId) -> Option<telegram_api::InputPeer>;
+
+    /// `td_->dialog_manager_->check_dialog_access(dialog_id, false,
+    /// AccessRights::Write, source)` — the display_upgraded_gift leg
+    /// (cda1364ab). The inert envs keep the M.6.15a stub inventory.
+    fn check_dialog_access_write(
+        &mut self,
+        dialog_id: DialogId,
+        source: &str,
+    ) -> Result<(), Status> {
+        let _ = source;
+        self.check_dialog_access(dialog_id, "check_dialog_access_write")
+    }
+
+    /// `td_->dialog_manager_->get_input_peer(dialog_id,
+    /// AccessRights::Write)` — the display_upgraded_gift leg.
+    fn get_input_peer_write(&mut self, dialog_id: DialogId) -> Option<telegram_api::InputPeer> {
+        self.get_input_peer(dialog_id)
+    }
 
     /// `td_->dialog_manager_->have_dialog_force(dialog_id, source)`.
     fn have_dialog_force(&mut self, dialog_id: DialogId, source: &str) -> bool;
@@ -3301,6 +3332,19 @@ pub(crate) enum StarGiftNetKind {
     /// decision (PremiumNetKind's GetPremiumPromo serves the C++
     /// Premium.cpp:312 handler, this one the gifts-animation handler).
     GetStarGiftPromoAnimation,
+    /// `DepositStarGiftQuery` (StarGiftManager.cpp:1986) — the
+    /// `getUpgradedGiftDepositInfo` wire leg (8b1234636).
+    DepositStarGift,
+    /// `DisplayStarGiftQuery` (StarGiftManager.cpp:2016) — the
+    /// `displayUpgradedGift` wire leg (cda1364ab).
+    DisplayStarGift,
+    /// `WithdrawStarGiftQuery` (StarGiftManager.cpp:2041) — the
+    /// `withdrawUpgradedGift` wire leg (2d6075fb1).
+    WithdrawStarGift,
+    /// `DeleteStarGiftQuery` (StarGiftManager.cpp:527) — the
+    /// `deleteGift` wire leg (d244b8df0); the handler's `dialog_id_`
+    /// member (the error head).
+    DeleteStarGift { dialog_id: DialogId },
 }
 
 /// The `get_gift_craft_promise` fail-arm chain (StarGiftManager.cpp:1090-1095)
@@ -3432,6 +3476,16 @@ struct PendingQueries {
     reorder_star_gift_collections: Vec<Promise<()>>,
     /// The parked `DeleteStarGiftCollectionQuery` promises.
     delete_star_gift_collection: Vec<Promise<()>>,
+    /// The parked `DeleteStarGiftQuery` promises — one popped per ok
+    /// answer for the Td-side transfer tail (`on_dialog_gift_transferred`
+    /// with the empty receiver).
+    delete_star_gift: Vec<Promise<()>>,
+    /// The parked `DepositStarGiftQuery` promises.
+    deposit_star_gift: Vec<Promise<td_api::UpgradedGiftDepositInfo>>,
+    /// The parked `DisplayStarGiftQuery` promises.
+    display_star_gift: Vec<Promise<()>>,
+    /// The parked `WithdrawStarGiftQuery` promises.
+    withdraw_star_gift: Vec<Promise<()>>,
 }
 
 /// The port of `td::StarGiftManager` (StarGiftManager.h:41-261).
@@ -5884,6 +5938,254 @@ impl StarGiftManager {
         }
     }
 
+    /// `StarGiftManager::withdraw_star_gift` (StarGiftManager.cpp:3346-3358,
+    /// 2d6075fb1) — the saved temporary password gates the wire query
+    /// (`PasswordManager::get_temp_password_state_sync`).
+    pub fn withdraw_star_gift(
+        &mut self,
+        env: &mut impl StarGiftEnv,
+        star_gift_id: StarGiftId,
+        keep_on_profile: bool,
+        mut promise: Promise<()>,
+    ) {
+        if !star_gift_id.is_valid() {
+            return promise.set_error(Status::error(400, "Invalid gift identifier specified"));
+        }
+        let Some(temp_password) = env.get_temp_password() else {
+            return promise.set_error(Status::error(
+                400,
+                "Temporary password required to withdraw the gift",
+            ));
+        };
+        let kind = StarGiftNetKind::WithdrawStarGift;
+        self.pending.withdraw_star_gift.push(promise);
+        // `WithdrawStarGiftQuery::send` (StarGiftManager.cpp:2049-2053) —
+        // the null-input band is the synchronous on_error ("Gift not
+        // found").
+        let Some(input_gift) = star_gift_id.get_input_saved_star_gift(env) else {
+            self.complete_star_gift_net_error(kind, 400, "Gift not found");
+            return;
+        };
+        self.send_star_gift_net_query(
+            kind,
+            telegram_api::Function::payments_withdrawStarGift(
+                telegram_api::payments_withdrawStarGift {
+                    flags: 0,
+                    keep_on_profile,
+                    stargift: Some(input_gift),
+                    tmp_password: temp_password.into_bytes(),
+                },
+            ),
+            "payments.withdrawStarGift",
+        );
+    }
+
+    /// `WithdrawStarGiftQuery::on_result`/`on_error`
+    /// (StarGiftManager.cpp:2055-2072) — the `false` Bool is the C++
+    /// "failed to withdraw the gift" 500.
+    pub(crate) fn on_get_withdraw_star_gift(&mut self, result: Result<bool, Status>) {
+        let pending = std::mem::take(&mut self.pending.withdraw_star_gift);
+        let result = match result {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(Status::error(
+                500,
+                "Internal Server Error: failed to withdraw the gift",
+            )),
+            Err(status) => Err(status),
+        };
+        for mut query in pending {
+            match &result {
+                Ok(()) => query.set_value(()),
+                Err(status) => query.set_error(status.clone()),
+            }
+        }
+    }
+
+    /// `StarGiftManager::get_upgraded_gift_deposit_info`
+    /// (StarGiftManager.cpp:3319-3330, 8b1234636).
+    pub fn get_upgraded_gift_deposit_info(
+        &mut self,
+        env: &mut impl StarGiftEnv,
+        owner_dialog_id: DialogId,
+        name: &str,
+        hide_sender: bool,
+        mut promise: Promise<td_api::UpgradedGiftDepositInfo>,
+    ) {
+        let Some(input_peer) = env.get_input_peer(owner_dialog_id) else {
+            return promise.set_error(Status::error(400, "Have no access to the new gift owner"));
+        };
+        if name.is_empty() {
+            return promise.set_error(Status::error(400, "Invalid gift name specified"));
+        }
+        // `DepositStarGiftQuery::send` (StarGiftManager.cpp:1997-2000).
+        self.send_star_gift_net_query(
+            StarGiftNetKind::DepositStarGift,
+            telegram_api::Function::payments_depositStarGift(
+                telegram_api::payments_depositStarGift {
+                    flags: 0,
+                    hide_sender,
+                    peer: Some(Box::new(input_peer)),
+                    slug: name.to_owned(),
+                },
+            ),
+            "payments.depositStarGift",
+        );
+        self.pending.deposit_star_gift.push(promise);
+    }
+
+    /// `DepositStarGiftQuery::on_result`/`on_error`
+    /// (StarGiftManager.cpp:2002-2014).
+    pub(crate) fn on_get_upgraded_gift_deposit_info(
+        &mut self,
+        result: Result<telegram_api::payments_StarGiftDepositPayload, Status>,
+    ) {
+        let pending = std::mem::take(&mut self.pending.deposit_star_gift);
+        let result = result.map(|ptr| td_api::UpgradedGiftDepositInfo {
+            nft_address: ptr.nft_address,
+            payload: ptr.payload,
+            gram_amount: ptr.amount,
+        });
+        for mut query in pending {
+            match &result {
+                Ok(info) => query.set_value(info.clone()),
+                Err(status) => query.set_error(status.clone()),
+            }
+        }
+    }
+
+    /// `StarGiftManager::display_upgraded_gift` (StarGiftManager.cpp:3332-3344,
+    /// cda1364ab) — the empty owner is the no-peer form; the valid owner
+    /// takes the Write-rights ladder.
+    pub fn display_upgraded_gift(
+        &mut self,
+        env: &mut impl StarGiftEnv,
+        owner_dialog_id: DialogId,
+        name: &str,
+        mut promise: Promise<()>,
+    ) {
+        let mut input_peer = None;
+        if owner_dialog_id.is_valid()
+            && let Err(status) =
+                env.check_dialog_access_write(owner_dialog_id, "display_upgraded_gift")
+        {
+            return promise.set_error(status);
+        }
+        if owner_dialog_id.is_valid() {
+            // the C++ `CHECK(input_peer != nullptr)` band — the collapsed
+            // port logs the inert skip (the DismissSuggestion convention)
+            input_peer = env.get_input_peer_write(owner_dialog_id);
+            if input_peer.is_none() {
+                tdutils::log_info!(
+                    "DisplayStarGiftQuery has no input peer for {owner_dialog_id} — the C++ CHECK band"
+                );
+            }
+        }
+        if name.is_empty() {
+            return promise.set_error(Status::error(400, "Invalid gift name specified"));
+        }
+        // `DisplayStarGiftQuery::send` (StarGiftManager.cpp:2025-2028) —
+        // the empty peer serializes `inputPeerEmpty` like the C++ null
+        // InputPeer store.
+        self.send_star_gift_net_query(
+            StarGiftNetKind::DisplayStarGift,
+            telegram_api::Function::payments_displayStarGift(
+                telegram_api::payments_displayStarGift {
+                    flags: 0,
+                    peer: Some(Box::new(input_peer.unwrap_or(
+                        telegram_api::InputPeer::inputPeerEmpty(telegram_api::inputPeerEmpty {}),
+                    ))),
+                    slug: name.to_owned(),
+                },
+            ),
+            "payments.displayStarGift",
+        );
+        self.pending.display_star_gift.push(promise);
+    }
+
+    /// `DisplayStarGiftQuery::on_result`/`on_error`
+    /// (StarGiftManager.cpp:2030-2039).
+    pub(crate) fn on_get_display_upgraded_gift(&mut self, result: Result<(), Status>) {
+        let pending = std::mem::take(&mut self.pending.display_star_gift);
+        for mut query in pending {
+            match &result {
+                Ok(()) => query.set_value(()),
+                Err(status) => query.set_error(status.clone()),
+            }
+        }
+    }
+
+    /// `StarGiftManager::delete_gift` (StarGiftManager.cpp:2985-3006,
+    /// d244b8df0) — the ok answer continues through the Td-side tail into
+    /// `on_dialog_gift_transferred` with the empty receiver (the
+    /// `PromiseCreator::lambda` of cpp:2998-3004).
+    pub fn delete_gift(
+        &mut self,
+        env: &mut impl StarGiftEnv,
+        business_connection_id: BusinessConnectionId,
+        star_gift_id: StarGiftId,
+        mut promise: Promise<()>,
+    ) {
+        if business_connection_id.is_valid()
+            && let Err(status) = env.check_business_connection(&business_connection_id)
+        {
+            return promise.set_error(status);
+        }
+        let input_gift = star_gift_id.get_input_saved_star_gift(env);
+        if input_gift.is_none() {
+            return promise.set_error(Status::error(400, "Invalid gift identifier specified"));
+        }
+        let dialog_id = if business_connection_id.is_valid() {
+            DialogId::from_user_id(env.get_business_connection_user_id(&business_connection_id))
+        } else {
+            star_gift_id.get_dialog_id(env)
+        };
+        let kind = StarGiftNetKind::DeleteStarGift { dialog_id };
+        if business_connection_id.is_valid() {
+            // `create_with_prefix(business_connection_id.get_invoke_prefix(),
+            // …)` — the business-invoke prefix dispatch rides the
+            // BusinessConnectionManager plane (no landed family carries
+            // it); the promise parks like the C++ send's continuation.
+            tdutils::log_info!("Send payments.deleteStarGift (business) — [blocked: net]");
+        } else {
+            // `DeleteStarGiftQuery::send` (StarGiftManager.cpp:538-541).
+            self.send_star_gift_net_query(
+                kind,
+                telegram_api::Function::payments_deleteStarGift(
+                    telegram_api::payments_deleteStarGift {
+                        stargift: input_gift,
+                    },
+                ),
+                "payments.deleteStarGift",
+            );
+        }
+        self.pending.delete_star_gift.push(promise);
+    }
+
+    /// `DeleteStarGiftQuery::on_result`/`on_error` — the ok half pops the
+    /// head promise for the Td-side transfer tail (StarGiftManager.cpp:
+    /// 543-555); the error half fails every parked promise (the
+    /// dialog-error head runs on the Td side).
+    pub(crate) fn on_get_delete_star_gift(
+        &mut self,
+        result: Result<(), Status>,
+    ) -> Option<Promise<()>> {
+        match result {
+            Ok(()) => {
+                if self.pending.delete_star_gift.is_empty() {
+                    None
+                } else {
+                    Some(self.pending.delete_star_gift.remove(0))
+                }
+            }
+            Err(status) => {
+                for mut promise in std::mem::take(&mut self.pending.delete_star_gift) {
+                    promise.set_error(status.clone());
+                }
+                None
+            }
+        }
+    }
+
     /// `StarGiftManager::set_star_gift_price` (StarGiftManager.cpp:3217-3222).
     pub fn set_star_gift_price(
         &mut self,
@@ -6860,6 +7162,25 @@ mod tests {
             } else {
                 Err(Status::error(400, "Chat not found"))
             }
+        }
+
+        /// the Write-rights half: the unresolvable dialogs (the
+        /// no_peer_dialogs band) deny like the C++ chat lookup miss
+        fn check_dialog_access_write(
+            &mut self,
+            dialog_id: DialogId,
+            _source: &str,
+        ) -> Result<(), Status> {
+            if dialog_id.is_valid() && self.no_peer_dialogs.contains(&dialog_id.get()) {
+                Err(Status::error(400, "Chat not found"))
+            } else {
+                Ok(())
+            }
+        }
+
+        /// the Write-rights peer: the no_peer_dialogs band stays None
+        fn get_input_peer_write(&mut self, dialog_id: DialogId) -> Option<telegram_api::InputPeer> {
+            self.get_input_peer(dialog_id)
         }
 
         fn get_input_peer(&mut self, dialog_id: DialogId) -> Option<telegram_api::InputPeer> {
@@ -8096,6 +8417,183 @@ mod tests {
         );
     }
 
+    /// The #121 family gates: withdraw (the invalid-id and
+    /// no-temp-password bands + the park), deposit/display (the peer and
+    /// name bands) and delete (the invalid-id band + the transfer tail
+    /// FIFO).
+    #[test]
+    fn withdraw_deposit_display_delete_gates() {
+        let mut env = TestEnv::default();
+        let mut manager = StarGiftManager::new();
+
+        // withdraw: an invalid gift identifier
+        let (promise, recorded) = recording_promise();
+        manager.withdraw_star_gift(&mut env, StarGiftId::default(), false, promise);
+        assert_eq!(
+            recorded.value().expect("answered").unwrap_err().message(),
+            "Invalid gift identifier specified"
+        );
+
+        // withdraw: no saved temporary password (the C++
+        // get_temp_password_state_sync band)
+        let (promise, recorded) = recording_promise();
+        manager.withdraw_star_gift(&mut env, StarGiftId::from_slug("name"), false, promise);
+        assert_eq!(
+            recorded.value().expect("answered").unwrap_err().message(),
+            "Temporary password required to withdraw the gift"
+        );
+
+        // deposit: an inaccessible owner and an empty name, in the C++
+        // order (the test registry models the unresolvable peer through
+        // the no_peer_dialogs band)
+        env.no_peer_dialogs.push(99);
+        let (promise, recorded) = recording_promise::<td_api::UpgradedGiftDepositInfo>();
+        manager.get_upgraded_gift_deposit_info(
+            &mut env,
+            DialogId::from_user_id(UserId::new(99)),
+            "name",
+            false,
+            promise,
+        );
+        assert_eq!(
+            recorded.value().expect("answered").unwrap_err().message(),
+            "Have no access to the new gift owner"
+        );
+        let owner = DialogId::from_user_id(UserId::new(42));
+        env.users.push(42);
+        let (promise, recorded) = recording_promise::<td_api::UpgradedGiftDepositInfo>();
+        manager.get_upgraded_gift_deposit_info(&mut env, owner, "", false, promise);
+        assert_eq!(
+            recorded.value().expect("answered").unwrap_err().message(),
+            "Invalid gift name specified"
+        );
+
+        // deposit: a valid band parks and the answer rewraps the wire
+        // payload
+        let (promise, recorded) = recording_promise::<td_api::UpgradedGiftDepositInfo>();
+        manager.get_upgraded_gift_deposit_info(&mut env, owner, "name", false, promise);
+        assert!(recorded.value().is_none());
+        assert_eq!(manager.pending.deposit_star_gift.len(), 1);
+        manager.on_get_upgraded_gift_deposit_info(Result::Ok(
+            telegram_api::payments_StarGiftDepositPayload {
+                nft_address: "nft".to_owned(),
+                payload: b"payload".to_vec(),
+                amount: 7,
+            },
+        ));
+        let info = recorded.value().expect("answered").expect("ok");
+        assert_eq!(info.nft_address, "nft");
+        assert_eq!(info.payload, b"payload".to_vec());
+        assert_eq!(info.gram_amount, 7);
+
+        // display: an inaccessible owner (the Write-rights ladder) and an
+        // empty name — the test registry denies the write access for the
+        // unknown user 99, the C++ TRY_STATUS band
+        let (promise, recorded) = recording_promise();
+        manager.display_upgraded_gift(
+            &mut env,
+            DialogId::from_user_id(UserId::new(99)),
+            "name",
+            promise,
+        );
+        assert_eq!(
+            recorded.value().expect("answered").unwrap_err().message(),
+            "Chat not found"
+        );
+        let (promise, recorded) = recording_promise();
+        manager.display_upgraded_gift(&mut env, owner, "", promise);
+        assert_eq!(
+            recorded.value().expect("answered").unwrap_err().message(),
+            "Invalid gift name specified"
+        );
+
+        // display: the empty owner takes the no-peer band and parks
+        let (promise, recorded) = recording_promise();
+        manager.display_upgraded_gift(&mut env, DialogId::default(), "name", promise);
+        assert!(recorded.value().is_none());
+        assert_eq!(manager.pending.display_star_gift.len(), 1);
+        manager.on_get_display_upgraded_gift(Result::Ok(()));
+        assert_eq!(recorded.value().expect("answered").expect("ok"), ());
+
+        // delete: an invalid gift identifier
+        let (promise, recorded) = recording_promise();
+        manager.delete_gift(
+            &mut env,
+            BusinessConnectionId::default(),
+            StarGiftId::default(),
+            promise,
+        );
+        assert_eq!(
+            recorded.value().expect("answered").unwrap_err().message(),
+            "Invalid gift identifier specified"
+        );
+
+        // delete: valid slugs park, the ok half hands the head promise to
+        // the Td-side transfer tail (unsettled), the error half fails the
+        // rest
+        let (promise, _recorded) = recording_promise();
+        manager.delete_gift(
+            &mut env,
+            BusinessConnectionId::default(),
+            StarGiftId::from_slug("name"),
+            promise,
+        );
+        let (promise, recorded_error) = recording_promise();
+        manager.delete_gift(
+            &mut env,
+            BusinessConnectionId::default(),
+            StarGiftId::from_slug("other"),
+            promise,
+        );
+        assert!(manager.on_get_delete_star_gift(Result::Ok(())).is_some());
+        manager.on_get_delete_star_gift(Result::Err(Status::error(400, "oops")));
+        assert_eq!(
+            recorded_error
+                .value()
+                .expect("answered")
+                .unwrap_err()
+                .code(),
+            400
+        );
+    }
+
+    /// The withdraw answer ladder (2d6075fb1): the `false` Bool is the
+    /// C++ "failed to withdraw the gift" 500, the `true` Bool settles.
+    #[test]
+    fn withdraw_answer_ladder() {
+        let mut manager = StarGiftManager::new();
+
+        let (promise, recorded) = recording_promise();
+        manager.pending.withdraw_star_gift.push(promise);
+        manager.on_get_withdraw_star_gift(Result::Ok(true));
+        assert_eq!(recorded.value().expect("answered").expect("ok"), ());
+
+        let (promise, recorded) = recording_promise();
+        manager.pending.withdraw_star_gift.push(promise);
+        manager.on_get_withdraw_star_gift(Result::Ok(false));
+        let error = recorded.value().expect("answered").unwrap_err();
+        assert_eq!(error.code(), 500);
+        assert_eq!(
+            error.message(),
+            "Internal Server Error: failed to withdraw the gift"
+        );
+    }
+
+    /// The delete-transfer tail counts the gift off the sending dialog
+    /// (d244b8df0 — the on_dialog_gift_transferred hop with the empty
+    /// receiver).
+    #[test]
+    fn delete_transfer_tail_counts_the_sender() {
+        let mut env = TestEnv::default();
+        let my_dialog_id = DialogId::from_user_id(UserId::new(1));
+        env.my_dialog_id = my_dialog_id;
+        let mut manager = StarGiftManager::new();
+
+        let (promise, recorded) = recording_promise();
+        manager.on_dialog_gift_transferred(&mut env, my_dialog_id, DialogId::default(), promise);
+        assert_eq!(recorded.value().expect("answered").expect("ok"), ());
+    }
+
     #[test]
     fn set_dialog_pinned_gifts_and_notifications_gates() {
         let mut env = TestEnv::default();
@@ -9233,6 +9731,7 @@ mod tests {
             Some(&td_api::MessageSender::messageSenderUser(
                 td_api::messageSenderUser { user_id: 99 },
             )),
+            false,
         )
         .unwrap_err();
         assert_eq!(error.message(), "Unknown user identifier specified");
@@ -9244,11 +9743,50 @@ mod tests {
                 Some(&td_api::MessageSender::messageSenderUser(
                     td_api::messageSenderUser { user_id: 42 },
                 )),
+                false,
             )
             .is_ok()
         );
 
         // a null sender errors
-        assert!(get_message_sender_dialog_id(&mut env, None).is_err());
+        assert!(get_message_sender_dialog_id(&mut env, None, false).is_err());
+    }
+
+    /// The displayUpgradedGift `(td, sender, true, true)` form
+    /// (cda1364ab): the null and default senders answer the default
+    /// dialog id — the no-peer band of `display_upgraded_gift`.
+    #[test]
+    fn get_message_sender_dialog_id_allow_empty() {
+        let mut env = TestEnv::default();
+
+        // a null sender resolves empty
+        assert_eq!(
+            get_message_sender_dialog_id(&mut env, None, true).unwrap(),
+            DialogId::default()
+        );
+
+        // the default user id resolves empty
+        assert_eq!(
+            get_message_sender_dialog_id(
+                &mut env,
+                Some(&td_api::MessageSender::messageSenderUser(
+                    td_api::messageSenderUser { user_id: 0 },
+                )),
+                true,
+            )
+            .unwrap(),
+            DialogId::default()
+        );
+
+        // a non-default invalid user id still errors
+        let error = get_message_sender_dialog_id(
+            &mut env,
+            Some(&td_api::MessageSender::messageSenderUser(
+                td_api::messageSenderUser { user_id: -3 },
+            )),
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(error.message(), "Invalid user identifier specified");
     }
 }
