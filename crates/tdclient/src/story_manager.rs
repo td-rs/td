@@ -9173,23 +9173,20 @@ impl StoryManager {
             }
             Result::Ok(crate::audios_manager::AudioUploadOutcome::Started {
                 file_upload_id,
-                is_url,
                 url_input_media,
             }) => {
                 self.pending_edit_story_music_uploads
                     .insert(file_upload_id, (owner_dialog_id, story_id, promise));
-                if is_url {
+                if let Some(input_media) = url_input_media {
                     // the C++ url band's `do_upload_audio_file` leg
                     // (AudiosManager.cpp:398-400) — the uploadMedia query
                     // sends at once with the layer-1 carrier
-                    let input_media =
-                        *url_input_media.expect("the url band carries its input media");
                     let was_uploaded = crate::files::extract_was_uploaded(&input_media);
                     self.do_upload_story_music_query(
                         file_upload_id,
                         true,
                         was_uploaded,
-                        input_media,
+                        *input_media,
                         Promise::default(),
                     );
                 }
@@ -9277,6 +9274,11 @@ impl StoryManager {
         input_media: telegram_api::InputMedia,
         promise: Promise<()>,
     ) {
+        // The C++ `TRY_STATUS_PROMISE(promise, G()->close_status())` head
+        // (AudiosManager.cpp:459-460) is subsumed by the collapsed
+        // dispatcher: a close()ed Td answers "Request aborted" at the
+        // state gate, and the async continuations reach this send through
+        // the close-gated upload-callback hop only.
         self.pending_upload_story_music_queries.push(promise);
         self.send_story_net_query(
             StoryNetKind::UploadStoryMusic {

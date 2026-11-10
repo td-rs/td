@@ -48,13 +48,14 @@ pub enum AudioUploadOutcome {
     /// The remote fast path — continue with the file id inline
     /// (AudiosManager.cpp:392-395).
     Ready(FileId),
-    /// The upload tail took over (AudiosManager.cpp:397-403); `is_url`
-    /// marks the url band whose `messages.uploadMedia` query sends at
-    /// once — `url_input_media` carries the already-built media (the C++
-    /// `do_upload_audio_file(..., nullptr, ...)` leg).
+    /// The upload tail took over (AudiosManager.cpp:397-403). A `Some`
+    /// `url_input_media` is the url band (AudiosManager.cpp:398-400) —
+    /// the `messages.uploadMedia` query sends at once with the
+    /// already-built media (the C++ `do_upload_audio_file(..., nullptr,
+    /// ...)` leg); a `None` is the upload band registered with the file
+    /// plane.
     Started {
         file_upload_id: FileUploadId,
-        is_url: bool,
         /// The built media rides boxed (the variant-size clippy gate;
         /// the media is moved into the query at the send).
         url_input_media: Option<Box<telegram_api::InputMedia>>,
@@ -350,7 +351,10 @@ impl AudiosManager {
     /// settle it inline, the upload band parks it in the upload map, and
     /// the url band subsumes it into the manager's §5 query carrier. The
     /// story-music continuation keys on the returned upload id (the C++
-    /// `PromiseCreator::lambda` capture).
+    /// `PromiseCreator::lambda` capture). The C++ CHECK(file_id.is_valid())
+    /// / CHECK(is_inserted) invariants are the saved-music twin's
+    /// `debug_assert!`s (the registered-file invariant release builds
+    /// trust; the table-build CHECKs in tdutils/emoji.rs stay `assert!`).
     pub fn upload_audio(
         &mut self,
         files: &mut FileManager,
@@ -447,7 +451,6 @@ impl AudiosManager {
                 .expect("CHECK(input_media != nullptr)");
             return tdutils::status::Result::Ok(AudioUploadOutcome::Started {
                 file_upload_id,
-                is_url: true,
                 url_input_media: Some(Box::new(input_media)),
             });
         }
@@ -455,6 +458,11 @@ impl AudiosManager {
         // `upload_audio_file` (AudiosManager.cpp:417-425) — park the
         // promise on the upload id and ask the file plane (the
         // `upload_audio_file_callback_`, priority 2, order 0).
+        debug_assert!(
+            self.get_input_media_with_files(files, file_id, None, None)
+                .is_none(),
+            "CHECK(get_input_media(file_id, nullptr, nullptr) == nullptr)"
+        );
         debug_assert!(
             self.being_uploaded_audio_files
                 .insert(file_upload_id, promise)
@@ -465,7 +473,6 @@ impl AudiosManager {
         files.upload(file_upload_id, upload_callback.clone(), 2, 0, fllm);
         tdutils::status::Result::Ok(AudioUploadOutcome::Started {
             file_upload_id,
-            is_url: false,
             url_input_media: None,
         })
     }

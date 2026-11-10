@@ -173,7 +173,10 @@ fn is_emoji_element(str: &[u8]) -> bool {
 pub fn is_emoji(str: &str) -> bool {
     let bytes = str.as_bytes();
     // A 0xE2 byte can only be a UTF-8 lead byte, so the found position and
-    // every zero-width joiner position are char boundaries.
+    // every zero-width joiner position are char boundaries. The search runs
+    // over the C++ MAX_EMOJI_LENGTH + 4 window (emoji.cpp:142): an element
+    // longer than the window cannot pass is_emoji_element, so a first
+    // joiner beyond it is indistinguishable from none.
     let limit = (MAX_EMOJI_LENGTH + 4).min(bytes.len());
     let Some(mut i) = bytes[..limit].iter().position(|&b| b == 0xE2) else {
         return is_emoji_element(bytes);
