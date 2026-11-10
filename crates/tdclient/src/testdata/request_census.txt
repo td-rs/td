@@ -576,7 +576,7 @@ getStoryPublicForwards	dispatched
 getStoryStatistics	dispatched
 getSuggestedFileName	dispatched
 getSuggestedStickerSetName	dispatched
-getSuitableCommunityChats	interim
+getSuitableCommunityChats	dispatched
 getSuitableDiscussionChats	dispatched
 getSuitablePersonalChats	dispatched
 getSupergroup	dispatched
