@@ -2109,6 +2109,15 @@ impl DialogParticipantStatus {
         self.get_administrator_rights().can_manage_ranks()
     }
 
+    /// `DialogParticipantStatus::can_manage_linked_peers_as_administrator`
+    /// (DialogParticipant.h:524-526) — the administrator band only; the
+    /// restricted band does not count (the gate the remove-chat and
+    /// approval mutators use, unlike the admin-or-restricted variant
+    /// below).
+    pub fn can_manage_linked_peers_as_administrator(&self) -> bool {
+        self.get_administrator_rights().can_manage_linked_peers()
+    }
+
     pub fn can_manage_linked_peers(&self) -> bool {
         self.get_administrator_rights().can_manage_linked_peers()
             || self.get_restricted_rights().can_manage_linked_peers()
@@ -19216,6 +19225,70 @@ mod tests {
             assert_eq!(status.is_anonymous(), *exp_anon, "anon of {name}");
             assert_eq!(status.get_rank().len(), *exp_rank_len, "rank len of {name}");
         }
+    }
+
+    /// The admin-only linked-peer right (DialogParticipant.h:524-526)
+    /// across the participant-status lattice: the creator and any
+    /// administrator carrying the right count, and nothing in the
+    /// restricted band does — the admin-or-restricted variant (:528-530)
+    /// answers differently exactly there (the ticket's gate split). Its
+    /// restricted-band member/left answers ride the raw flag word:
+    /// `ALL_RESTRICTED_RIGHTS` embeds the admin-permission flags in both
+    /// C++ and Rust, so those statuses hold the restricted right, while
+    /// a banned status carries no flags at all.
+    #[test]
+    fn can_manage_linked_peers_as_administrator_splits_the_bands() {
+        // the community-permission payload sets only the restricted-band
+        // linked-peer right (can_edit_chat_list)
+        let linked_peers =
+            RestrictedRights::from_community_permissions(Some(&td_api::CommunityPermissions {
+                can_edit_chat_list: true,
+            }));
+        let admin_with_right =
+            AdministratorRights::from_flags(AdministratorRights::CAN_MANAGE_LINKED_PEERS);
+        let admin_without_right =
+            AdministratorRights::from_flags(AdministratorRights::CAN_CHANGE_INFO_AND_SETTINGS);
+
+        let creator = DialogParticipantStatus::creator(true, false, String::new());
+        assert!(creator.is_administrator());
+        assert!(creator.can_manage_linked_peers_as_administrator());
+        assert!(creator.can_manage_linked_peers());
+        let creator_non_member = DialogParticipantStatus::creator(false, true, "t".to_owned());
+        assert!(creator_non_member.can_manage_linked_peers_as_administrator());
+
+        let admin = DialogParticipantStatus::administrator(admin_with_right, String::new(), false);
+        assert!(admin.can_manage_linked_peers_as_administrator());
+        assert!(admin.can_manage_linked_peers());
+        let edited =
+            DialogParticipantStatus::administrator(admin_without_right, String::new(), false);
+        assert!(!edited.can_manage_linked_peers_as_administrator());
+        assert!(!edited.can_manage_linked_peers());
+
+        // the AC split: a restricted member holds the right on the
+        // restricted band only
+        let restricted = DialogParticipantStatus::restricted(
+            linked_peers,
+            true,
+            0,
+            ChannelType::Megagroup,
+            String::new(),
+        );
+        assert!(restricted.is_restricted());
+        assert!(restricted.can_manage_linked_peers());
+        assert!(!restricted.can_manage_linked_peers_as_administrator());
+
+        // the plain bands never count as administrators
+        let member = DialogParticipantStatus::member(0, String::new());
+        let left = DialogParticipantStatus::left();
+        let banned = DialogParticipantStatus::banned(0, String::new());
+        for status in [&member, &left, &banned] {
+            assert!(!status.can_manage_linked_peers_as_administrator());
+        }
+        // ... and the admin-or-restricted variant still sees the
+        // restricted-band bit on member/left (see the doc above)
+        assert!(member.can_manage_linked_peers());
+        assert!(left.can_manage_linked_peers());
+        assert!(!banned.can_manage_linked_peers());
     }
 
     /// A writer older than `MakeParticipantFlags64Bit` used a `uint32` flag

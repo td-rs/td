@@ -264,6 +264,15 @@ pub struct CommunityManager {
     /// rides its own query — the answer kind's community_id pairs it
     /// exactly, unlike the single-community FIFO lots above).
     pub pending_set_notification_settings: Vec<(i64, Promise<()>)>,
+    /// The `on_change_community_dialogs` promises keyed by community —
+    /// the change-settle parks them while the community full reloads; the
+    /// shared reload tail (`on_reload_community_full_for_notification_settings`,
+    /// which both reload outcomes funnel through) drains them regardless
+    /// of the outcome. The C++ promise rides the
+    /// `get_community_full_queries_` QueryCombiner, which merges
+    /// concurrent reloads and settles every added promise at the single
+    /// answer, so the whole keyed entry drains at once.
+    pub pending_change_dialogs: Vec<(i64, Promise<()>)>,
     /// `get_community_notification_settings_queries_` (ea8219749,
     /// 09634ee46) — the communities with an in-flight
     /// `GetCommunityNotifySettingsQuery`.
@@ -598,6 +607,26 @@ impl CommunityManager {
         env: &mut impl CommunityManagerEnv,
         community_id: CommunityId,
     ) {
+        // The change-settle tail: the reload's ok outcome arrives here
+        // through the `on_get_community_full` tail and its error outcome
+        // through the answer arm's failed_reload branch, and the C++
+        // settle lambda ignores the reload Result
+        // (CommunityManager.cpp:2054-2057) — every promise parked by
+        // `on_change_community_dialogs` settles ok either way.
+        let pending = std::mem::take(&mut self.pending_change_dialogs);
+        let mut settled = Vec::new();
+        let mut kept = Vec::new();
+        for (key, promise) in pending {
+            if key == community_id.get() {
+                settled.push(promise);
+            } else {
+                kept.push((key, promise));
+            }
+        }
+        self.pending_change_dialogs = kept;
+        for mut promise in settled {
+            promise.set_value(());
+        }
         let Some(mut new_settings) = self
             .pending_community_notification_settings
             .remove(&community_id.get())
@@ -615,6 +644,43 @@ impl CommunityManager {
         if need_update.are_changed || need_update.need_update_local {
             self.do_update_community_notification_settings(env, community_id, new_settings);
         }
+    }
+
+    /// `on_change_community_dialogs` (CommunityManager.cpp:2049-2058) —
+    /// the change-settle every community-dialog-mutating query tail
+    /// funnels into. Without a cached full the request settles now;
+    /// otherwise the full reloads (`reload_community_full`, over the
+    /// `get_community_full_queries_` QueryCombiner in C++) and the
+    /// request settles ok when the reload answers, regardless of its
+    /// outcome — the parked lot drains at the shared reload tail
+    /// `on_reload_community_full_for_notification_settings`, so a reload
+    /// error never propagates to the request.
+    pub fn on_change_community_dialogs(
+        &mut self,
+        env: &mut impl CommunityManagerEnv,
+        community_id: CommunityId,
+        mut promise: Promise<()>,
+    ) {
+        if env.close_flag() {
+            return promise.set_error(Status::error(500, "Request aborted"));
+        }
+        if !self.communities_full.contains_key(&community_id.get()) {
+            return promise.set_value(());
+        }
+        // The C++ `reload_community_full` resolves `get_input_community`
+        // into the reload promise, whose failure the settle lambda
+        // swallows (CommunityManager.cpp:2054-2057) — a missing input
+        // settles the request ok too, without a query. Unreachable in
+        // practice (the full intake gates on the cached community; the
+        // drop path clears both records), kept for the "regardless"
+        // shape.
+        let Some(input_community) = self.get_input_community_impl(env.auth_is_bot(), community_id)
+        else {
+            return promise.set_value(());
+        };
+        env.reload_community_full(community_id, input_community);
+        self.pending_change_dialogs
+            .push((community_id.get(), promise));
     }
 
     /// `do_update_community_notification_settings` (c9ed2c390,
@@ -2335,5 +2401,79 @@ mod tests {
         let settings = info.notification_settings.unwrap();
         assert!(!settings.use_default_mute_for);
         assert_eq!(settings.mute_for, 50);
+    }
+
+    // ---- the change-settle (on_change_community_dialogs) ----
+
+    #[test]
+    fn change_settle_settles_now_without_a_cached_full() {
+        // CommunityManager.cpp:2051-2053 — `get_community_full_const ==
+        // nullptr` settles the request immediately, with a cached
+        // community and for a fully unknown one alike.
+        let mut env = TestEnv::new();
+        let mut manager = CommunityManager::new();
+        manager.on_get_community(&mut env, &wire_community(7, "c"), "test");
+
+        let (promise, recorded) = record();
+        manager.on_change_community_dialogs(&mut env, CommunityId::new(7), promise);
+        assert!(
+            matches!(recorded.0.lock().unwrap().take(), Some(Ok(()))),
+            "the request settles ok now"
+        );
+        assert!(env.reloaded_fulls.is_empty(), "no reload fires");
+
+        let (promise, recorded) = record();
+        manager.on_change_community_dialogs(&mut env, CommunityId::new(8), promise);
+        assert!(matches!(recorded.0.lock().unwrap().take(), Some(Ok(()))));
+        assert!(env.reloaded_fulls.is_empty());
+    }
+
+    #[test]
+    fn change_settle_reloads_and_settles_when_the_reload_answers_ok() {
+        let mut env = TestEnv::new();
+        let mut manager = CommunityManager::new();
+        manager.on_get_community(&mut env, &wire_community(7, "c"), "test");
+        manager.on_get_community_full(&mut env, &wire_community_full(7));
+
+        let (promise, recorded) = record();
+        manager.on_change_community_dialogs(&mut env, CommunityId::new(7), promise);
+        assert_eq!(env.reloaded_fulls, vec![7], "the full reloads");
+        assert_eq!(manager.pending_change_dialogs.len(), 1);
+        assert!(
+            !recorded.0.lock().unwrap().is_some(),
+            "the promise parks on the reload"
+        );
+
+        // the reload answers with the communityFull — the intake tail
+        // drains the parked settle
+        manager.on_get_community_full(&mut env, &wire_community_full(7));
+        assert!(
+            matches!(recorded.0.lock().unwrap().take(), Some(Ok(()))),
+            "the request settles ok on the reload"
+        );
+        assert_eq!(env.reloaded_fulls, vec![7], "the intake itself sends none");
+        assert!(manager.pending_change_dialogs.is_empty());
+    }
+
+    #[test]
+    fn change_settle_settles_ok_on_the_reload_error_too() {
+        // CommunityManager.cpp:2054-2057 — the settle lambda ignores the
+        // reload Result; the failed branch runs the same reload tail the
+        // answer arm's failed_reload body runs.
+        let mut env = TestEnv::new();
+        let mut manager = CommunityManager::new();
+        manager.on_get_community(&mut env, &wire_community(7, "c"), "test");
+        manager.on_get_community_full(&mut env, &wire_community_full(7));
+
+        let (promise, recorded) = record();
+        manager.on_change_community_dialogs(&mut env, CommunityId::new(7), promise);
+        assert_eq!(env.reloaded_fulls, vec![7]);
+
+        manager.on_reload_community_full_for_notification_settings(&mut env, CommunityId::new(7));
+        assert!(
+            matches!(recorded.0.lock().unwrap().take(), Some(Ok(()))),
+            "the reload error never propagates to the request"
+        );
+        assert!(manager.pending_change_dialogs.is_empty());
     }
 }
