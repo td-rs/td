@@ -25748,9 +25748,8 @@ impl Td {
                     return promise.set_error(status);
                 }
                 if parse_wire_bool_value(query.ok()).is_none() {
-                    return promise.set_error(parse_error(
-                        "communities_togglePeerLinkRequestApproval",
-                    ));
+                    return promise
+                        .set_error(parse_error("communities_togglePeerLinkRequestApproval"));
                 }
                 let mut manager = std::mem::take(&mut self.community_manager);
                 let mut env = CommunityEnv { td: &mut *self };
@@ -25779,9 +25778,8 @@ impl Td {
                     return promise.set_error(query.error().clone());
                 }
                 if parse_wire_bool_value(query.ok()).is_none() {
-                    return promise.set_error(parse_error(
-                        "communities_toggleAllPeerLinkRequestApproval",
-                    ));
+                    return promise
+                        .set_error(parse_error("communities_toggleAllPeerLinkRequestApproval"));
                 }
                 let mut manager = std::mem::take(&mut self.community_manager);
                 let mut env = CommunityEnv { td: &mut *self };
@@ -41596,11 +41594,7 @@ impl CommunityManagerEnv for CommunityEnv<'_> {
 
     /// `UserManager::get_user_id_object` — the collapsed sync form over
     /// the user manager.
-    fn get_user_id_object(
-        &mut self,
-        user_id: crate::user_manager::UserId,
-        source: &str,
-    ) -> i64 {
+    fn get_user_id_object(&mut self, user_id: crate::user_manager::UserId, source: &str) -> i64 {
         self.td.with_user_manager_env(|user_manager, env| {
             user_manager.get_user_id_object(env, user_id, source)
         })
@@ -60579,10 +60573,7 @@ mod tests {
                 limit: 10,
             }),
         );
-        let sent = take_sent_query(
-            &rec,
-            telegram_api::communities_getPeerLinkRequests::ID,
-        );
+        let sent = take_sent_query(&rec, telegram_api::communities_getPeerLinkRequests::ID);
         let body = telegram_api::communities_getPeerLinkRequests::parse(sent.query())
             .expect("the sent body");
         match body.community {
@@ -60608,9 +60599,9 @@ mod tests {
                     telegram_api::CommunityPeerRequest {
                         flags: 0,
                         visible: false,
-                        peer: Some(telegram_api::Peer::peerChannel(
-                            telegram_api::peerChannel { channel_id: 3 },
-                        )),
+                        peer: Some(telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                            channel_id: 3,
+                        })),
                         requested_by: 42,
                         date: 77,
                     },
@@ -60618,9 +60609,9 @@ mod tests {
                         flags: 0,
                         visible: true,
                         // an invalid dialog id drops the entry
-                        peer: Some(telegram_api::Peer::peerChannel(
-                            telegram_api::peerChannel { channel_id: 0 },
-                        )),
+                        peer: Some(telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                            channel_id: 0,
+                        })),
                         requested_by: 42,
                         date: 78,
                     },
@@ -60673,9 +60664,8 @@ mod tests {
             &rec,
             telegram_api::communities_togglePeerLinkRequestApproval::ID,
         );
-        let body =
-            telegram_api::communities_togglePeerLinkRequestApproval::parse(sent.query())
-                .expect("the sent body");
+        let body = telegram_api::communities_togglePeerLinkRequestApproval::parse(sent.query())
+            .expect("the sent body");
         assert!(body.reject, "the reject band inverts approve");
         match body.community {
             Some(telegram_api::InputChannel::inputChannel(channel)) => {
@@ -60714,9 +60704,8 @@ mod tests {
             &rec,
             telegram_api::communities_togglePeerLinkRequestApproval::ID,
         );
-        let body =
-            telegram_api::communities_togglePeerLinkRequestApproval::parse(sent.query())
-                .expect("the sent body");
+        let body = telegram_api::communities_togglePeerLinkRequestApproval::parse(sent.query())
+            .expect("the sent body");
         assert!(!body.reject);
         net_fail(sent, 400, "CHAT_ADMIN_REQUIRED");
         td.dispatch_completed_community_net();
@@ -60776,9 +60765,8 @@ mod tests {
             &rec,
             telegram_api::communities_toggleAllPeerLinkRequestApproval::ID,
         );
-        let body =
-            telegram_api::communities_toggleAllPeerLinkRequestApproval::parse(sent.query())
-                .expect("the sent body");
+        let body = telegram_api::communities_toggleAllPeerLinkRequestApproval::parse(sent.query())
+            .expect("the sent body");
         assert!(!body.reject, "the reject band inverts approve");
         match body.community {
             Some(telegram_api::InputChannel::inputChannel(channel)) => {

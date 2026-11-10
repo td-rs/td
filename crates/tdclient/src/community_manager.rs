@@ -200,11 +200,7 @@ pub trait CommunityManagerEnv {
 
     /// `UserManager::get_user_id_object` (UserManager.cpp:10278-10291) —
     /// the collapsed sync form.
-    fn get_user_id_object(
-        &mut self,
-        user_id: crate::user_manager::UserId,
-        _source: &str,
-    ) -> i64 {
+    fn get_user_id_object(&mut self, user_id: crate::user_manager::UserId, _source: &str) -> i64 {
         user_id.get()
     }
 
@@ -803,7 +799,12 @@ impl CommunityManager {
         let Some(input_community) = self.get_input_community(env, community_id) else {
             return promise.set_error(Status::error(500, "Community not found"));
         };
-        env.send_get_community_peer_link_requests_query(community_id, input_community, offset, limit);
+        env.send_get_community_peer_link_requests_query(
+            community_id,
+            input_community,
+            offset,
+            limit,
+        );
         self.pending_peer_link_requests
             .push((community_id.get(), promise));
     }
@@ -821,7 +822,6 @@ impl CommunityManager {
         mut ptr: telegram_api::communities_PeerLinkRequests,
         mut promise: Promise<td_api::CommunityAddChatRequests>,
     ) {
-        let _ = self;
         env.on_get_users(
             std::mem::take(&mut ptr.users),
             "GetCommunityPeerLinkRequestsQuery",
@@ -884,10 +884,7 @@ impl CommunityManager {
         let Some(community) = self.get_community(community_id) else {
             return promise.set_error(Status::error(400, "Community not found"));
         };
-        if !community
-            .status
-            .can_manage_linked_peers_as_administrator()
-        {
+        if !community.status.can_manage_linked_peers_as_administrator() {
             return promise.set_error(Status::error(400, "Have not enough rights"));
         }
         if let Err(status) = env.check_dialog_access(dialog_id) {
@@ -905,7 +902,8 @@ impl CommunityManager {
             input_community,
             approve,
         );
-        self.pending_process_request.push((community_id.get(), promise));
+        self.pending_process_request
+            .push((community_id.get(), promise));
     }
 
     /// `process_community_add_dialog_requests` (79a943019,
@@ -923,10 +921,7 @@ impl CommunityManager {
         let Some(community) = self.get_community(community_id) else {
             return promise.set_error(Status::error(400, "Community not found"));
         };
-        if !community
-            .status
-            .can_manage_linked_peers_as_administrator()
-        {
+        if !community.status.can_manage_linked_peers_as_administrator() {
             return promise.set_error(Status::error(400, "Have not enough rights"));
         }
         let Some(input_community) = self.get_input_community(env, community_id) else {
@@ -1925,17 +1920,13 @@ mod tests {
 
     struct RecordedPage(
         std::sync::Arc<
-            std::sync::Mutex<
-                Option<std::result::Result<td_api::CommunityAddChatRequests, Status>>,
-            >,
+            std::sync::Mutex<Option<std::result::Result<td_api::CommunityAddChatRequests, Status>>>,
         >,
     );
 
     struct RecordingPage(
         std::sync::Arc<
-            std::sync::Mutex<
-                Option<std::result::Result<td_api::CommunityAddChatRequests, Status>>,
-            >,
+            std::sync::Mutex<Option<std::result::Result<td_api::CommunityAddChatRequests, Status>>>,
         >,
     );
 
@@ -2887,7 +2878,13 @@ mod tests {
         );
 
         let (promise, recorded) = record_page();
-        manager.get_community_add_dialog_requests(&mut env, CommunityId::new(7), "off", 10, promise);
+        manager.get_community_add_dialog_requests(
+            &mut env,
+            CommunityId::new(7),
+            "off",
+            10,
+            promise,
+        );
         assert!(
             env.queries
                 .iter()
@@ -2922,9 +2919,9 @@ mod tests {
                     telegram_api::CommunityPeerRequest {
                         flags: 0,
                         visible: false,
-                        peer: Some(telegram_api::Peer::peerChannel(
-                            telegram_api::peerChannel { channel_id: 3 },
-                        )),
+                        peer: Some(telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                            channel_id: 3,
+                        })),
                         requested_by: 42,
                         date: 77,
                     },
@@ -2932,18 +2929,18 @@ mod tests {
                         flags: 0,
                         visible: true,
                         // an invalid dialog id (channel 0) drops the entry
-                        peer: Some(telegram_api::Peer::peerChannel(
-                            telegram_api::peerChannel { channel_id: 0 },
-                        )),
+                        peer: Some(telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                            channel_id: 0,
+                        })),
                         requested_by: 42,
                         date: 78,
                     },
                     telegram_api::CommunityPeerRequest {
                         flags: 0,
                         visible: true,
-                        peer: Some(telegram_api::Peer::peerChannel(
-                            telegram_api::peerChannel { channel_id: 4 },
-                        )),
+                        peer: Some(telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                            channel_id: 4,
+                        })),
                         // an invalid user id drops the entry
                         requested_by: 0,
                         date: 79,
@@ -2966,7 +2963,10 @@ mod tests {
             .take()
             .unwrap()
             .expect("the page resolves");
-        assert_eq!(page.total_count, 1, "0 clamps up to 3, the two drops decrement");
+        assert_eq!(
+            page.total_count, 1,
+            "0 clamps up to 3, the two drops decrement"
+        );
         assert_eq!(page.next_offset, "next");
         assert_eq!(page.requests.len(), 1);
         let request = &page.requests[0];
@@ -3078,8 +3078,9 @@ mod tests {
             promise,
         );
         assert!(
-            env.queries.iter().any(|q| q
-                == "togglePeerLinkRequestApproval 7 DialogId(1) reject=true"),
+            env.queries
+                .iter()
+                .any(|q| q == "togglePeerLinkRequestApproval 7 DialogId(1) reject=true"),
             "the reject band inverts approve"
         );
         assert_eq!(manager.pending_process_request.len(), 1);

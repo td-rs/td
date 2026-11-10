@@ -7124,11 +7124,10 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             let Some(offset) = clean_or_utf8_error(td, id, &request.offset) else {
                 return;
             };
-            let promise =
-                td.deferred_promise::<td_api::CommunityAddChatRequests, _>(
-                    id,
-                    Object::communityAddChatRequests,
-                );
+            let promise = td.deferred_promise::<td_api::CommunityAddChatRequests, _>(
+                id,
+                Object::communityAddChatRequests,
+            );
             let (mut manager, mut env) = community_split(td);
             manager.get_community_add_dialog_requests(
                 &mut env,
