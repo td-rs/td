@@ -9563,6 +9563,118 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
             );
         }
 
+        // getProfileShareThemeBackdrops (Requests.cpp:9509-9512) — bots
+        // call it too (6e7fcda8f removed CHECK_IS_USER).
+        Function::getProfileShareThemeBackdrops(_) => {
+            let promise =
+                td.deferred_promise(id, |backdrops: td_api::ProfileShareThemeBackdrops| {
+                    Object::profileShareThemeBackdrops(backdrops)
+                });
+            let theme_net = td.theme_net();
+            let mut env = ThemeEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
+                file_manager: std::sync::Arc::clone(&td.file_manager),
+                updates: &mut td.theme_updates,
+                file_load_manager: std::sync::Arc::clone(&td.file_load_manager),
+                file_reference_manager: &mut td.file_reference_manager,
+                documents_manager: &mut td.documents_manager,
+                animations: &mut td.animations_manager,
+                audios: &mut td.audios_manager,
+                videos: &mut td.videos_manager,
+                voice_notes: &mut td.voice_notes_manager,
+                video_notes: &mut td.video_notes_manager,
+                background_manager: &mut td.background_manager,
+                background_updates: &mut td.background_updates,
+                theme_net,
+            };
+            td.theme_manager
+                .get_profile_share_theme_backdrops(&mut env, promise);
+        }
+
+        // setProfileShareTheme (Requests.cpp:9514-9519 +
+        // ThemeManager.cpp:1317-1326): the access check, the
+        // my-dialog/channel band and the input-theme validation run at
+        // the arm (the ThemeEnv carries no dialog manager); the query
+        // parks in the manager FIFO lot.
+        Function::setProfileShareTheme(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let mut promise = td.deferred_promise(id, |()| ok_object());
+            let dialog_id = crate::dialog_id::DialogId::new(request.chat_id);
+            if let Result::Err(status) = crate::dialog_manager::check_dialog_access(
+                td,
+                dialog_id,
+                false,
+                crate::user_manager::AccessRights::Write,
+                "set_profile_share_theme",
+            ) {
+                promise.set_error(status);
+                return;
+            }
+            if dialog_id != crate::dialog_manager::get_my_dialog_id(td)
+                && dialog_id.get_type() != crate::dialog_id::DialogType::Channel
+            {
+                promise.set_error(tdutils::status::Status::error(
+                    400,
+                    "Can't change theme of the chat",
+                ));
+                return;
+            }
+            let input_theme = match get_input_share_theme(td, request.theme) {
+                Result::Ok(input_theme) => input_theme,
+                Result::Err(status) => {
+                    promise.set_error(status);
+                    return;
+                }
+            };
+            // `SetShareThemeQuery::send` (ThemeManager.cpp:279-283): the
+            // C++ CHECKs the Write peer; the peer-less band keeps the
+            // promise honest.
+            let Some(input_peer) = crate::dialog_manager::get_input_peer(
+                td,
+                dialog_id,
+                crate::user_manager::AccessRights::Write,
+            ) else {
+                promise.set_error(tdutils::status::Status::error(400, "Can't access the chat"));
+                return;
+            };
+            let theme_net = td.theme_net();
+            let mut env = ThemeEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
+                file_manager: std::sync::Arc::clone(&td.file_manager),
+                updates: &mut td.theme_updates,
+                file_load_manager: std::sync::Arc::clone(&td.file_load_manager),
+                file_reference_manager: &mut td.file_reference_manager,
+                documents_manager: &mut td.documents_manager,
+                animations: &mut td.animations_manager,
+                audios: &mut td.audios_manager,
+                videos: &mut td.videos_manager,
+                voice_notes: &mut td.voice_notes_manager,
+                video_notes: &mut td.video_notes_manager,
+                background_manager: &mut td.background_manager,
+                background_updates: &mut td.background_updates,
+                theme_net,
+            };
+            td.theme_manager.set_profile_share_theme(
+                &mut env,
+                dialog_id,
+                input_peer,
+                input_theme,
+                promise,
+            );
+        }
+
         // --- backgrounds (Requests.cpp:1889-1893, 5826-5834, 8902-8946) ---
         Function::searchBackground(request) => {
             // SearchBackgroundRequest (Requests.cpp:1889-1893): set_tries(3);
@@ -19224,6 +19336,89 @@ fn run_misc_glue_requests(td: &mut Td, id: u64, function: Function) {
     }
 }
 
+/// `get_input_share_theme` (ThemeManager.cpp:206-265) — the
+/// setProfileShareTheme input validation; the td-level halves (the
+/// emoji cleaning, the star-gift id input) ride the caller's `Td`.
+fn get_input_share_theme(
+    td: &mut Td,
+    theme: Option<td_api::InputProfileShareTheme>,
+) -> tdutils::status::Result<tdmtproto::telegram_api::ShareTheme> {
+    let Some(theme) = theme else {
+        return Result::Ok(tdmtproto::telegram_api::ShareTheme::shareThemeDefault(
+            tdmtproto::telegram_api::shareThemeDefault,
+        ));
+    };
+    match theme {
+        td_api::InputProfileShareTheme::inputProfileShareThemeEmoji(emoji_theme) => {
+            if emoji_theme.emojis.len() > crate::profile_share_theme::MAX_EMOJI_COUNT {
+                return Result::Err(Status::error(400, "Too many emoji specified"));
+            }
+            if emoji_theme.emojis.is_empty() && emoji_theme.use_default_background {
+                return Result::Err(Status::error(400, "Emoji or a backdrop must be specified"));
+            }
+            let mut emojis = Vec::with_capacity(emoji_theme.emojis.len());
+            for emoji_type in emoji_theme.emojis {
+                match emoji_type {
+                    td_api::EmojiType::emojiTypeRegular(emoji) => {
+                        let Some(emoji) = crate::misc::clean_input_string(&emoji.emoji) else {
+                            return Result::Err(Status::error(400, "Invalid emoji specified"));
+                        };
+                        if !tdutils::emoji::is_emoji(&emoji) {
+                            return Result::Err(Status::error(400, "Invalid emoji specified"));
+                        }
+                        emojis.push(tdmtproto::telegram_api::Reaction::reactionEmoji(
+                            tdmtproto::telegram_api::reactionEmoji { emoticon: emoji },
+                        ));
+                    }
+                    td_api::EmojiType::emojiTypeCustomEmoji(emoji) => {
+                        let custom_emoji_id =
+                            crate::stickers_manager::CustomEmojiId::new(emoji.custom_emoji_id);
+                        if !custom_emoji_id.is_valid() {
+                            return Result::Err(Status::error(
+                                400,
+                                "Invalid custom emoji identifier specified",
+                            ));
+                        }
+                        emojis.push(tdmtproto::telegram_api::Reaction::reactionCustomEmoji(
+                            tdmtproto::telegram_api::reactionCustomEmoji {
+                                document_id: custom_emoji_id.get(),
+                            },
+                        ));
+                    }
+                }
+            }
+            // the BACKDROP_ID_MASK flag (shareThemeEmojiBackdrop bit 0)
+            let mut flags = 0;
+            if !emoji_theme.use_default_background {
+                flags |= 1;
+            }
+            Result::Ok(
+                tdmtproto::telegram_api::ShareTheme::shareThemeEmojiBackdrop(
+                    tdmtproto::telegram_api::shareThemeEmojiBackdrop {
+                        flags,
+                        backdrop_id: emoji_theme.background_backdrop_id,
+                        emojis,
+                    },
+                ),
+            )
+        }
+        td_api::InputProfileShareTheme::inputProfileShareThemeUpgradedGift(theme) => {
+            let star_gift_id = StarGiftId::from_string(&theme.received_gift_id);
+            let mut env = star_gift_env!(td);
+            match star_gift_id.get_input_saved_star_gift(&mut env) {
+                Some(input_saved_star_gift) => {
+                    Result::Ok(tdmtproto::telegram_api::ShareTheme::inputShareThemeGift(
+                        tdmtproto::telegram_api::inputShareThemeGift {
+                            stargift: Some(input_saved_star_gift),
+                        },
+                    ))
+                }
+                None => Result::Err(Status::error(400, "Invalid gift identifier specified")),
+            }
+        }
+    }
+}
+
 /// The `InviteGroupCallParticipantResult` → `Object` rewrap.
 fn invite_result_to_object(value: td_api::InviteGroupCallParticipantResult) -> Object {
     match value {
@@ -20187,7 +20382,7 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 26, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            1053,
+            1055,
             "dispatched count"
         );
         // the 23383aef sync base (1.8.70): the 34 new scheme functions
@@ -20224,6 +20419,13 @@ mod request_census_tests {
         // the WebProxyManager carrier plane over the #114-band
         // Proxy::web records): 1,051 + 2 = 1,053 dispatched / 22 - 2 =
         // 20 interim, sync unmoved 26.
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 20, "interim count");
+        // The profile-themes family slice (#124) flipped the two
+        // profile-theme arms (getProfileShareThemeBackdrops — the
+        // ThemeManager share-theme-backdrops cache over the
+        // GetShareThemeBackdropsQuery kind, bots allowed per 6e7fcda8f;
+        // setProfileShareTheme — the messages_setShareTheme query with the
+        // SetShareThemeQuery refetch tail): 1,053 + 2 = 1,055
+        // dispatched / 20 - 2 = 18 interim, sync unmoved 26.
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 18, "interim count");
     }
 }

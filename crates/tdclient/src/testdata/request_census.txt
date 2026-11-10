@@ -520,7 +520,7 @@ getPremiumStickerExamples	dispatched
 getPremiumStickers	dispatched
 getPreparedInlineMessage	dispatched
 getPreparedKeyboardButton	dispatched
-getProfileShareThemeBackdrops	interim
+getProfileShareThemeBackdrops	dispatched
 getProxies	dispatched
 getPublicPostSearchLimits	dispatched
 getPushReceiverId	sync
@@ -967,7 +967,7 @@ setPollAnswer	dispatched
 setProfileAccentColor	dispatched
 setProfileAudioPosition	dispatched
 setProfilePhoto	dispatched
-setProfileShareTheme	interim
+setProfileShareTheme	dispatched
 setQuickReplyShortcutName	dispatched
 setReactionNotificationSettings	dispatched
 setReadDatePrivacySettings	dispatched
