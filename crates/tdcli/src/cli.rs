@@ -11575,6 +11575,62 @@ impl CliClient {
                 }));
             }
             true
+        } else if op == "emwd" || op == "emwdp" || op == "emwdc" {
+            // cli.cpp:6857-6871 — the widget-data edit band
+            let (chat_id, rest0) = tokenizer::split(args, ' ');
+            let (message_id, rest1) = tokenizer::split(&rest0, ' ');
+            let (public_data, chat_data) = if op == "emwdp" {
+                let (public_data, _) = tokenizer::split(&rest1, ' ');
+                (public_data, String::new())
+            } else if op == "emwdc" {
+                let (chat_data, _) = tokenizer::split(&rest1, ' ');
+                (String::new(), chat_data)
+            } else {
+                tokenizer::split(&rest1, ' ')
+            };
+            self.send_request(Function::editMessageWidgetData(
+                td_api::editMessageWidgetData {
+                    chat_id: self.as_chat_id(&chat_id),
+                    message_id: as_message_id(&message_id),
+                    edit_public_data: op != "emwdc",
+                    public_data,
+                    edit_chat_data: op != "emwdp",
+                    chat_data,
+                },
+            ));
+            true
+        } else if op == "eimwd" || op == "eimwdp" || op == "eimwdc" {
+            // cli.cpp:6872-6883 — the inline widget-data edit band
+            let (inline_message_id, rest0) = tokenizer::split(args, ' ');
+            let (public_data, chat_data) = if op == "eimwdp" {
+                let (public_data, _) = tokenizer::split(&rest0, ' ');
+                (public_data, String::new())
+            } else if op == "eimwdc" {
+                let (chat_data, _) = tokenizer::split(&rest0, ' ');
+                (String::new(), chat_data)
+            } else {
+                tokenizer::split(&rest0, ' ')
+            };
+            self.send_request(Function::editInlineMessageWidgetData(
+                td_api::editInlineMessageWidgetData {
+                    inline_message_id,
+                    edit_public_data: op != "eimwdc",
+                    public_data,
+                    edit_chat_data: op != "eimwdp",
+                    chat_data,
+                },
+            ));
+            true
+        } else if op == "ewd" {
+            // cli.cpp:6884-6890
+            let (widget_id, rest0) = tokenizer::split(args, ' ');
+            let (public_data, cache_time) = tokenizer::split(&rest0, ' ');
+            self.send_request(Function::editWidgetData(td_api::editWidgetData {
+                widget_id: tokenizer::to_integer_i64(&widget_id),
+                public_data,
+                cache_time: tokenizer::to_integer_i32(&cache_time),
+            }));
+            true
         } else if op == "eqrmd" {
             let (shortcut_id, rest0) = tokenizer::split(args, ' ');
             let (message_id, document) = tokenizer::split(&rest0, ' ');
@@ -12154,6 +12210,68 @@ impl CliClient {
                 },
             ));
             true
+        } else if op == "gwqa" || op == "gwqaw" {
+            // cli.cpp:7201-7207 — the plain-data widget query
+            let (chat_id, rest0) = tokenizer::split(args, ' ');
+            let (message_id, data) = tokenizer::split(&rest0, ' ');
+            self.send_request(Function::getWidgetQueryAnswer(
+                td_api::getWidgetQueryAnswer {
+                    chat_id: self.as_chat_id(&chat_id),
+                    message_id: as_message_id(&message_id),
+                    query_type: Some(td_api::WidgetQueryType::widgetQueryTypeData(
+                        td_api::widgetQueryTypeData {
+                            with_wallet: op == "gwqaw",
+                        },
+                    )),
+                    data: data.into_bytes(),
+                },
+            ));
+            true
+        } else if op == "gwqas" || op == "gwqat" {
+            // cli.cpp:7208-7224 — the wallet-backed sign/transaction query
+            let (chat_id, rest0) = tokenizer::split(args, ' ');
+            let (message_id, rest1) = tokenizer::split(&rest0, ' ');
+            let (address, rest2) = tokenizer::split(&rest1, ' ');
+            let (gram_amount, rest3) = tokenizer::split(&rest2, ' ');
+            let (public_key, rest4) = tokenizer::split(&rest3, ' ');
+            let (state_init, rest5) = tokenizer::split(&rest4, ' ');
+            let (value, data) = tokenizer::split(&rest5, ' ');
+            let wallet = td_api::WidgetQueryWallet {
+                address,
+                gram_amount: tokenizer::to_integer_i64(&gram_amount),
+                public_key: public_key.into_bytes(),
+                state_init: state_init.into_bytes(),
+            };
+            let query_type = if op == "gwqas" {
+                td_api::WidgetQueryType::widgetQueryTypeSignData(td_api::widgetQueryTypeSignData {
+                    wallet: Some(wallet),
+                    sign_data: value,
+                })
+            } else {
+                td_api::WidgetQueryType::widgetQueryTypeSentTransaction(
+                    td_api::widgetQueryTypeSentTransaction {
+                        wallet: Some(wallet),
+                        msg_hash: value,
+                    },
+                )
+            };
+            self.send_request(Function::getWidgetQueryAnswer(
+                td_api::getWidgetQueryAnswer {
+                    chat_id: self.as_chat_id(&chat_id),
+                    message_id: as_message_id(&message_id),
+                    query_type: Some(query_type),
+                    data: data.into_bytes(),
+                },
+            ));
+            true
+        } else if op == "gwpd" {
+            // cli.cpp:7226-7230
+            let (chat_id, message_id) = tokenizer::split(args, ' ');
+            self.send_request(Function::getWidgetPublicData(td_api::getWidgetPublicData {
+                chat_id: self.as_chat_id(&chat_id),
+                message_id: as_message_id(&message_id),
+            }));
+            true
         } else if op == "acq" || op == "acqa" {
             let (callback_query_id, text) = tokenizer::split(args, ' ');
             self.send_request(Function::answerCallbackQuery(td_api::answerCallbackQuery {
@@ -12162,6 +12280,14 @@ impl CliClient {
                 show_alert: op == "acqa",
                 url: String::new(),
                 cache_time: 0,
+            }));
+            true
+        } else if op == "awq" {
+            // cli.cpp:7251-7255
+            let (widget_query_id, data) = tokenizer::split(args, ' ');
+            self.send_request(Function::answerWidgetQuery(td_api::answerWidgetQuery {
+                widget_query_id: tokenizer::to_integer_i64(&widget_query_id),
+                data,
             }));
             true
         } else {
@@ -16866,8 +16992,14 @@ mod tests {
             ("gcqa", 11),
             ("gcpqa", 11),
             ("gcgqa", 11),
+            ("gwqa", 11),
+            ("gwqaw", 11),
+            ("gwqas", 11),
+            ("gwqat", 11),
+            ("gwpd", 11),
             ("acq", 11),
             ("acqa", 11),
+            ("awq", 11),
             ("cc", 7),
             ("ac", 7),
             ("scsd", 7),
@@ -17019,6 +17151,13 @@ mod tests {
             ("eman", 10),
             ("emc", 10),
             ("emd", 10),
+            ("emwd", 10),
+            ("emwdp", 10),
+            ("emwdc", 10),
+            ("eimwd", 10),
+            ("eimwdp", 10),
+            ("eimwdc", 10),
+            ("ewd", 10),
             ("eqrmd", 10),
             ("emp", 10),
             ("eqrmp", 10),
@@ -17295,6 +17434,13 @@ mod tests {
             ("gtpjs", 8),
             ("gac", 8),
             ("sale", 8),
+            ("gulf", 1),
+            ("gulfp", 1),
+            ("gulfr", 1),
+            ("gulfpr", 1),
+            ("cbun2", 17),
+            ("absun", 17),
+            ("dbsun", 17),
         ];
 
         let guard = TEST_LOCK.lock().unwrap();
