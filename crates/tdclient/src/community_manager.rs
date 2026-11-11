@@ -617,6 +617,15 @@ impl CommunityManager {
             return;
         }
         if community.flags == 0 && community.access_hash == 0 && community.title.is_empty() {
+            // CommunityManager.cpp:1238-1245 — the force-load band: log
+            // the anomaly when the community is already cached
+            // (`get_community_force` collapses to the memory lookup)
+            if self.get_community(community_id).is_some() {
+                tdutils::log_error!(
+                    "Receive from {source} empty {community_id:?}, have {:?}",
+                    self.get_community_object(community_id)
+                );
+            }
             return;
         }
         let is_min = community.min;
@@ -649,7 +658,12 @@ impl CommunityManager {
             && (!is_min || community_record.access_hash == 0)
         {
             community_record.access_hash = access_hash;
-            community_record.is_changed = true;
+            // CommunityManager.cpp:1258-1266 — the is_changed mark only
+            // when the new hash is zero; a nonzero relearn is
+            // need_save_to_database only (the save half collapses)
+            if access_hash == 0 {
+                community_record.is_changed = true;
+            }
         }
         if community_record.date != community.date && (!is_min || community_record.date == 0) {
             community_record.date = community.date;
@@ -669,10 +683,12 @@ impl CommunityManager {
                 community_record.status = status;
                 community_record.is_changed = true;
             }
-            if community_record.title != community.title {
-                community_record.title = community.title.clone();
-                community_record.is_changed = true;
-            }
+        }
+        // CommunityManager.cpp:1276 — the title line runs for min
+        // communities too
+        if community_record.title != community.title {
+            community_record.title = community.title.clone();
+            community_record.is_changed = true;
         }
         if community_record.is_changed {
             community_record.is_changed = false;
@@ -680,11 +696,59 @@ impl CommunityManager {
         }
     }
 
-    /// `on_get_community_forbidden` (CommunityManager.cpp).
-    pub fn on_get_community_forbidden(&mut self, community_id: CommunityId, source: &str) {
-        let _ = source;
-        self.communities.remove(&community_id.get());
-        self.communities_full.remove(&community_id.get());
+    /// `on_get_community_forbidden` (CommunityManager.cpp:1302-1341) —
+    /// the forbidden intake KEEPS the record as Banned: the hash
+    /// merges (the is_changed mark only when the new hash is zero —
+    /// CommunityManager.cpp:1323-1328, the need_save half collapses),
+    /// the date zeroes, the status flips to Banned, and the title
+    /// updates; the photo/default-permissions/cache-version planes
+    /// are the recorded field-model collapses (the port's `Community`
+    /// carries no such fields — the emitted object is already the
+    /// empty form). The cache entries are never removed.
+    pub fn on_get_community_forbidden(
+        &mut self,
+        env: &mut impl CommunityManagerEnv,
+        community: &telegram_api::communityForbidden,
+        source: &str,
+    ) {
+        let community_id = CommunityId::new(community.id);
+        if !community_id.is_valid() {
+            tdutils::log_error!("Receive invalid {community_id:?} from {source}");
+            return;
+        }
+        if community.flags == 0 && community.access_hash == 0 && community.title.is_empty() {
+            // `get_community_force` collapses to the memory lookup (the
+            // db/net reload halves are the recorded seam)
+            if self.get_community(community_id).is_some() {
+                tdutils::log_error!(
+                    "Receive from {source} empty {community_id:?}, have {:?}",
+                    self.get_community_object(community_id)
+                );
+            }
+            return;
+        }
+        let access_hash = community.access_hash;
+        let community_record = self.add_community(community_id, "on_get_community_forbidden");
+        if community_record.access_hash != access_hash {
+            community_record.access_hash = access_hash;
+            if access_hash == 0 {
+                community_record.is_changed = true;
+            }
+        }
+        if community_record.date != 0 {
+            community_record.date = 0;
+            community_record.is_changed = true;
+        }
+        let banned = DialogParticipantStatus::banned(0, String::new());
+        if community_record.status != banned {
+            community_record.status = banned;
+            community_record.is_changed = true;
+        }
+        if community_record.title != community.title {
+            community_record.title = community.title.clone();
+            community_record.is_changed = true;
+        }
+        self.update_community(env, community_id);
     }
 
     /// `on_get_community_full` (CommunityManager.cpp:1010-1054).
@@ -1788,10 +1852,7 @@ impl CommunityManager {
                 }
                 ref chat @ telegram_api::Chat::communityForbidden(ref forbidden) => {
                     tdutils::log_error!("Receive {chat:?} as a joined community");
-                    self.on_get_community_forbidden(
-                        CommunityId::new(forbidden.id),
-                        "on_get_joined_communities",
-                    );
+                    self.on_get_community_forbidden(env, forbidden, "on_get_joined_communities");
                 }
                 chat => {
                     tdutils::log_error!("Receive {chat:?} as a joined community");
@@ -1906,6 +1967,9 @@ impl CommunityManager {
     fn get_community_member_status_object(
         status: &DialogParticipantStatus,
     ) -> td_api::CommunityMemberStatus {
+        // DialogParticipant.cpp:523-543 — the type switch; Restricted
+        // collapses to member (with the C++ anomaly log), Banned before
+        // Left (a banned status is_left in the flags model)
         if status.is_creator() {
             td_api::CommunityMemberStatus::communityMemberStatusCreator(
                 td_api::communityMemberStatusCreator,
@@ -1916,6 +1980,15 @@ impl CommunityManager {
                     can_be_edited: status.can_be_edited(),
                     rights: None,
                 },
+            )
+        } else if status.is_restricted() {
+            tdutils::log_error!("Have restricted user in a community");
+            td_api::CommunityMemberStatus::communityMemberStatusMember(
+                td_api::communityMemberStatusMember,
+            )
+        } else if status.is_banned() {
+            td_api::CommunityMemberStatus::communityMemberStatusBanned(
+                td_api::communityMemberStatusBanned,
             )
         } else if status.is_left() {
             td_api::CommunityMemberStatus::communityMemberStatusLeft(
@@ -2391,6 +2464,156 @@ mod tests {
         }
     }
 
+    /// `on_get_community_forbidden` (CommunityManager.cpp:1302-1341) —
+    /// the forbidden intake KEEPS the record as Banned: the hash
+    /// merges, the date zeroes, the status flips to Banned, the title
+    /// updates — the cache entries are never removed.
+    #[test]
+    fn community_forbidden_intake_keeps_the_banned_record() {
+        let mut env = TestEnv::new();
+        let mut manager = CommunityManager::new();
+
+        // a fresh id: the record materializes as Banned with the wire
+        // title and a zeroed date
+        manager.on_get_community_forbidden(
+            &mut env,
+            &telegram_api::communityForbidden {
+                flags: 1 << 13,
+                id: 7,
+                access_hash: 11,
+                title: "Banned community".to_owned(),
+            },
+            "test",
+        );
+        let community = manager
+            .get_community_object(CommunityId::new(7))
+            .expect("the forbidden intake keeps the record");
+        assert!(matches!(
+            community.status,
+            Some(td_api::CommunityMemberStatus::communityMemberStatusBanned(_))
+        ));
+        assert_eq!(community.name, "Banned community");
+        assert_eq!(community.date, 0);
+        assert!(!community.have_access, "a banned community is not accessible");
+        assert!(
+            matches!(
+                manager.get_input_community(&env, CommunityId::new(7)),
+                Some(telegram_api::InputChannel::inputChannel(channel))
+                    if channel.access_hash == 11
+            ),
+            "the hash merge caches the wire hash"
+        );
+        assert!(
+            env.updates
+                .iter()
+                .any(|u| matches!(u, td_api::Update::updateCommunity(_)))
+        );
+
+        // a cached member community converts: the date zeroes and the
+        // status flips to Banned (the record survives)
+        manager.on_get_community(&mut env, &wire_member_community(8), "test");
+        manager.on_get_community_forbidden(
+            &mut env,
+            &telegram_api::communityForbidden {
+                flags: 1 << 13,
+                id: 8,
+                access_hash: 5,
+                title: "My community".to_owned(),
+            },
+            "test",
+        );
+        let converted = manager
+            .get_community_object(CommunityId::new(8))
+            .expect("the converted record survives");
+        assert!(matches!(
+            converted.status,
+            Some(td_api::CommunityMemberStatus::communityMemberStatusBanned(_))
+        ));
+        assert_eq!(converted.date, 0);
+    }
+
+    /// CommunityManager.cpp:1308-1315 — the empty wire form (no
+    /// flags/hash/title) never caches; the force-load band only logs.
+    #[test]
+    fn community_forbidden_empty_wire_logs_and_skips() {
+        let mut env = TestEnv::new();
+        let mut manager = CommunityManager::new();
+        manager.on_get_community_forbidden(
+            &mut env,
+            &telegram_api::communityForbidden {
+                flags: 0,
+                id: 7,
+                access_hash: 0,
+                title: String::new(),
+            },
+            "test",
+        );
+        assert!(manager.get_community_object(CommunityId::new(7)).is_none());
+        assert!(env.updates.is_empty());
+    }
+
+    /// CommunityManager.cpp:1238-1245 — the empty wire form (no
+    /// flags/hash/title) never caches; the force-load band only logs.
+    /// The min flag is irrelevant to the band (a min empty wire skips
+    /// the access-hash gate, so the band is the only intake guard).
+    #[test]
+    fn community_empty_wire_logs_and_skips() {
+        let mut env = TestEnv::new();
+        let mut manager = CommunityManager::new();
+        let mut empty = wire_community(7, "");
+        empty.flags = 0;
+        empty.access_hash = 0;
+        empty.title = String::new();
+        empty.min = true;
+        manager.on_get_community(&mut env, &empty, "test");
+        assert!(manager.get_community_object(CommunityId::new(7)).is_none());
+        assert!(env.updates.is_empty());
+    }
+
+    /// CommunityManager.cpp:1276 — the title line runs for min
+    /// communities too (only the status/date/collapse lines are
+    /// min-gated).
+    #[test]
+    fn min_community_still_updates_the_title() {
+        let mut env = TestEnv::new();
+        let mut manager = CommunityManager::new();
+        manager.on_get_community(&mut env, &wire_community(7, "Old"), "test");
+        let mut min = wire_community(7, "Renamed");
+        min.min = true;
+        manager.on_get_community(&mut env, &min, "test");
+        assert_eq!(
+            manager
+                .get_community_object(CommunityId::new(7))
+                .unwrap()
+                .name,
+            "Renamed"
+        );
+    }
+
+    /// CommunityManager.cpp:1258-1266 — relearning a NONZERO access
+    /// hash marks nothing client-visible (need_save_to_database only,
+    /// which collapses): no second `updateCommunity` for a pure hash
+    /// change.
+    #[test]
+    fn nonzero_hash_change_emits_no_update() {
+        let mut env = TestEnv::new();
+        let mut manager = CommunityManager::new();
+        manager.on_get_community(&mut env, &wire_community(7, "My community"), "test");
+        assert_eq!(env.updates.len(), 1, "the creation emission");
+        let mut rehash = wire_community(7, "My community");
+        rehash.access_hash = 6;
+        manager.on_get_community(&mut env, &rehash, "test");
+        assert_eq!(env.updates.len(), 1, "the hash relearn is not client-visible");
+        assert!(
+            matches!(
+                manager.get_input_community(&env, CommunityId::new(7)),
+                Some(telegram_api::InputChannel::inputChannel(channel))
+                    if channel.access_hash == 6
+            ),
+            "the new hash still caches"
+        );
+    }
+
     #[test]
     fn on_get_community_caches_and_emits() {
         let mut env = TestEnv::new();
@@ -2408,15 +2631,6 @@ mod tests {
                 _
             ))
         ));
-    }
-
-    #[test]
-    fn forbidden_drops_the_record() {
-        let mut env = TestEnv::new();
-        let mut manager = CommunityManager::new();
-        manager.on_get_community(&mut env, &wire_community(7, "My community"), "test");
-        manager.on_get_community_forbidden(CommunityId::new(7), "test");
-        assert!(!manager.have_community(CommunityId::new(7)));
     }
 
     #[test]

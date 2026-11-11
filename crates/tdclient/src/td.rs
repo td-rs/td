@@ -10809,8 +10809,7 @@ impl Td {
                     false
                 }
                 telegram_api::Chat::communityForbidden(forbidden) => {
-                    community_manager
-                        .on_get_community_forbidden(CommunityId::new(forbidden.id), source);
+                    community_manager.on_get_community_forbidden(&mut env, forbidden, source);
                     false
                 }
                 _ => true,
