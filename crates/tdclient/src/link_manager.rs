@@ -7573,7 +7573,6 @@ impl LinkManager {
     }
 
     /// `LinkManager::accept_oauth_request` (cpp:4154-4158, upstream
-    /// `LinkManager::accept_oauth_request` (cpp:4154-4158, upstream
     /// 2485f5889 at LinkManager.cpp:4682-4700; 025086e31 adds the
     /// empty-URL 400 band ahead of the proof validation): the oauth
     /// acceptance rides `AcceptUrlAuthQuery::send` (cpp:2032-2049) —
