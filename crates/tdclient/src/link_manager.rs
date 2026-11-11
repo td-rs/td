@@ -947,7 +947,14 @@ pub trait LinkEnv {
     /// 2485f5889 — the TON Connect session ride along in the C++
     /// `send`; the session rides the wire query only when set, flag
     /// bit 1<<5; the offline tail drops the promise, so the port keeps
-    /// the full parameter shape but never answers).
+    /// the full parameter shape but never answers). Wire-shape rider
+    /// for the future send leg: the C++ codegen auto-ORs the
+    /// conditional-field bits (`(ptr != nullptr) << bit`,
+    /// tl_writer_cpp.cpp:533) into the flags word, the Rust generator
+    /// does not — the send leg must hand-set the `1<<2` url, `1<<4`
+    /// match_code and `1<<5` session bits in `messages_acceptUrlAuth`
+    /// exactly like `get_oauth_link_info` hand-sets the requestUrlAuth
+    /// masks.
     #[allow(clippy::too_many_arguments)] // the C++ handler has the same shape
     fn send_accept_url_auth_query(
         &mut self,
@@ -7423,16 +7430,22 @@ impl LinkManager {
         }
     }
 
-    /// `LinkManager::get_link_login_url` (cpp:4145-4148): the pure
-    /// external form of the acceptance query — `AcceptUrlAuthQuery`
-    /// (cpp:1810) with no peer/button context, `[blocked: net]`.
+    /// `LinkManager::get_link_login_url` (cpp:4145-4148; upstream
+    /// 025086e31 at LinkManager.cpp:4670-4674 adds the empty-URL 400
+    /// band): the pure external form of the acceptance query —
+    /// `AcceptUrlAuthQuery` (cpp:1810) with no peer/button context,
+    /// `[blocked: net]`. The band is offline-observable (the promise
+    /// answers before any net half), so it lands ahead of the net plane.
     pub(crate) fn get_link_login_url(
         &mut self,
         env: &mut impl LinkEnv,
         url: String,
         allow_write_access: bool,
-        promise: tdutils::promise::Promise<String>,
+        mut promise: tdutils::promise::Promise<String>,
     ) {
+        if url.is_empty() {
+            return promise.set_error(Status::error(400, "URL must be non-empty"));
+        }
         env.send_accept_url_auth_query(
             url,
             MessageFullId::default(),
@@ -7459,13 +7472,15 @@ impl LinkManager {
     }
 
     /// `LinkManager::accept_oauth_request` (cpp:4154-4158, upstream
-    /// 2485f5889 at LinkManager.cpp:4682-4700): the oauth acceptance
-    /// rides `AcceptUrlAuthQuery` (cpp:1810) with the match code and
-    /// the phone-number flag, `[blocked: net]`. The TON Connect
-    /// payload validates through `get_wallet_ownership_proof`
-    /// (`TRY_RESULT_PROMISE`: the 400 band answers the promise and
-    /// skips the send) and rides the query as the wire session — only
-    /// when the payload is set.
+    /// 2485f5889 at LinkManager.cpp:4682-4700; 025086e31 adds the
+    /// empty-URL 400 band ahead of the proof validation): the oauth
+    /// acceptance rides `AcceptUrlAuthQuery` (cpp:1810) with the match
+    /// code and the phone-number flag, `[blocked: net]`. The band sits
+    /// before the TON Connect proof validation, so an empty url
+    /// outranks the proof error. The TON Connect payload validates
+    /// through `get_wallet_ownership_proof` (`TRY_RESULT_PROMISE`: the
+    /// 400 band answers the promise and skips the send) and rides the
+    /// query as the wire session — only when the payload is set.
     #[allow(clippy::too_many_arguments)] // the C++ handler has the same shape
     pub(crate) fn accept_oauth_request(
         &mut self,
@@ -7477,6 +7492,9 @@ impl LinkManager {
         connect_data: Option<td_api::TonConnectConnectData>,
         mut promise: tdutils::promise::Promise<String>,
     ) {
+        if url.is_empty() {
+            return promise.set_error(Status::error(400, "URL must be non-empty"));
+        }
         let mut tonconnect_session = None;
         if let Some(connect_data) = connect_data {
             let (_, proof) = match crate::ton_wallet::get_wallet_ownership_proof(connect_data.proof)
@@ -8331,5 +8349,123 @@ mod tests {
             );
         }
         assert_eq!(env.sent.len(), 2, "the error band skips the send");
+    }
+
+    /// The 025086e31 empty-URL 400 band (`get_link_login_url`,
+    /// LinkManager.cpp:4670-4674 at the 23383aef pin): the bare-url
+    /// acceptance form answers the promise offline, ahead of the
+    /// `[blocked: net]` send tail — an empty url never reaches the send.
+    #[test]
+    fn get_link_login_url_empty_url_answers_the_400_band() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct CountingEnv {
+            accept_sends: usize,
+        }
+        impl LinkEnv for CountingEnv {
+            #[allow(clippy::too_many_arguments)] // the C++ handler shape
+            fn send_accept_url_auth_query(
+                &mut self,
+                _url: String,
+                _message_full_id: MessageFullId,
+                _button_id: i32,
+                _allow_write_access: bool,
+                _allow_phone_number_access: bool,
+                _match_code: String,
+                _tonconnect_session: Option<tdmtproto::telegram_api::InputTonConnectOauthSession>,
+                _promise: tdutils::promise::Promise<String>,
+            ) {
+                self.accept_sends += 1;
+            }
+        }
+
+        let answer = Arc::new(Mutex::new(None));
+        let capture = Arc::clone(&answer);
+        let promise = tdutils::promise::PromiseCreator::lambda_result(
+            move |result: tdutils::status::Result<String>| {
+                let actual = match result {
+                    tdutils::status::Result::Err(status) => status.message().to_owned(),
+                    tdutils::status::Result::Ok(_) => panic!("expected the error band"),
+                };
+                *capture.lock().unwrap() = Some(actual);
+            },
+        );
+        let mut env = CountingEnv::default();
+        LinkManager::new().get_link_login_url(&mut env, String::new(), false, promise);
+        assert_eq!(
+            answer.lock().unwrap().take(),
+            Some("URL must be non-empty".to_owned()),
+            "the empty url answers the 400 band"
+        );
+        assert_eq!(env.accept_sends, 0, "the band skips the send");
+    }
+
+    /// The 025086e31 empty-URL 400 band (`accept_oauth_request`,
+    /// LinkManager.cpp:4687-4689 at the 23383aef pin): the band sits
+    /// before the TON Connect proof validation
+    /// (`TRY_RESULT_PROMISE`), so an empty url outranks the proof
+    /// error — the `None` proof that would answer "Proof must be
+    /// non-empty" loses to "URL must be non-empty".
+    #[test]
+    fn accept_oauth_request_empty_url_band_outranks_the_proof_band() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct CountingEnv {
+            accept_sends: usize,
+        }
+        impl LinkEnv for CountingEnv {
+            #[allow(clippy::too_many_arguments)] // the C++ handler shape
+            fn send_accept_url_auth_query(
+                &mut self,
+                _url: String,
+                _message_full_id: MessageFullId,
+                _button_id: i32,
+                _allow_write_access: bool,
+                _allow_phone_number_access: bool,
+                _match_code: String,
+                _tonconnect_session: Option<tdmtproto::telegram_api::InputTonConnectOauthSession>,
+                _promise: tdutils::promise::Promise<String>,
+            ) {
+                self.accept_sends += 1;
+            }
+        }
+
+        // empty url + the proof shape whose own band would answer
+        // "Proof must be non-empty": the url band wins
+        let connect_data = Some(td_api::TonConnectConnectData {
+            session_id: 42,
+            challenge_answer: b"challenge-answer".to_vec(),
+            body: b"connect-body".to_vec(),
+            proof: None,
+        });
+        let answer = Arc::new(Mutex::new(None));
+        let capture = Arc::clone(&answer);
+        let promise = tdutils::promise::PromiseCreator::lambda_result(
+            move |result: tdutils::status::Result<String>| {
+                let actual = match result {
+                    tdutils::status::Result::Err(status) => status.message().to_owned(),
+                    tdutils::status::Result::Ok(_) => panic!("expected the error band"),
+                };
+                *capture.lock().unwrap() = Some(actual);
+            },
+        );
+        let mut env = CountingEnv::default();
+        LinkManager::new().accept_oauth_request(
+            &mut env,
+            String::new(),
+            "code".to_owned(),
+            true,
+            false,
+            connect_data,
+            promise,
+        );
+        assert_eq!(
+            answer.lock().unwrap().take(),
+            Some("URL must be non-empty".to_owned()),
+            "the url band outranks the proof band"
+        );
+        assert_eq!(env.accept_sends, 0, "the band skips the send");
     }
 }
