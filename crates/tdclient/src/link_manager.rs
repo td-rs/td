@@ -943,8 +943,10 @@ pub trait LinkEnv {
 
     /// `AcceptUrlAuthQuery` (cpp:1810-1867, `messages.acceptUrlAuth`) —
     /// the acceptance query behind `getLoginUrl`, `getExternalLink` and
-    /// `acceptOauthRequest` (the peer/button context rides along in the
-    /// C++ `send`; the offline tail drops the promise, so the port keeps
+    /// `acceptOauthRequest` (the peer/button context and — upstream
+    /// 2485f5889 — the TON Connect session ride along in the C++
+    /// `send`; the session rides the wire query only when set, flag
+    /// bit 1<<5; the offline tail drops the promise, so the port keeps
     /// the full parameter shape but never answers).
     #[allow(clippy::too_many_arguments)] // the C++ handler has the same shape
     fn send_accept_url_auth_query(
@@ -955,6 +957,7 @@ pub trait LinkEnv {
         _allow_write_access: bool,
         _allow_phone_number_access: bool,
         _match_code: String,
+        _tonconnect_session: Option<tdmtproto::telegram_api::InputTonConnectOauthSession>,
         _promise: tdutils::promise::Promise<String>,
     ) {
     }
@@ -7412,6 +7415,7 @@ impl LinkManager {
                     allow_write_access,
                     false,
                     String::new(),
+                    None,
                     promise,
                 );
             }
@@ -7436,6 +7440,7 @@ impl LinkManager {
             allow_write_access,
             false,
             String::new(),
+            None,
             promise,
         );
     }
@@ -7453,9 +7458,15 @@ impl LinkManager {
         env.send_check_url_auth_match_code_query(url, match_code, promise);
     }
 
-    /// `LinkManager::accept_oauth_request` (cpp:4154-4158): the oauth
-    /// acceptance rides `AcceptUrlAuthQuery` (cpp:1810) with the match
-    /// code and the phone-number flag, `[blocked: net]`.
+    /// `LinkManager::accept_oauth_request` (cpp:4154-4158, upstream
+    /// 2485f5889 at LinkManager.cpp:4682-4700): the oauth acceptance
+    /// rides `AcceptUrlAuthQuery` (cpp:1810) with the match code and
+    /// the phone-number flag, `[blocked: net]`. The TON Connect
+    /// payload validates through `get_wallet_ownership_proof`
+    /// (`TRY_RESULT_PROMISE`: the 400 band answers the promise and
+    /// skips the send) and rides the query as the wire session — only
+    /// when the payload is set.
+    #[allow(clippy::too_many_arguments)] // the C++ handler has the same shape
     pub(crate) fn accept_oauth_request(
         &mut self,
         env: &mut impl LinkEnv,
@@ -7463,8 +7474,23 @@ impl LinkManager {
         match_code: String,
         allow_write_access: bool,
         allow_phone_number_access: bool,
-        promise: tdutils::promise::Promise<String>,
+        connect_data: Option<td_api::TonConnectConnectData>,
+        mut promise: tdutils::promise::Promise<String>,
     ) {
+        let mut tonconnect_session = None;
+        if let Some(connect_data) = connect_data {
+            let (_, proof) = match crate::ton_wallet::get_wallet_ownership_proof(connect_data.proof)
+            {
+                tdutils::status::Result::Ok(parsed) => parsed,
+                tdutils::status::Result::Err(status) => return promise.set_error(status),
+            };
+            tonconnect_session = Some(tdmtproto::telegram_api::InputTonConnectOauthSession {
+                session_id: connect_data.session_id,
+                challenge_answer: connect_data.challenge_answer,
+                body: connect_data.body,
+                proof: Some(proof),
+            });
+        }
         env.send_accept_url_auth_query(
             url,
             MessageFullId::default(),
@@ -7472,6 +7498,7 @@ impl LinkManager {
             allow_write_access,
             allow_phone_number_access,
             match_code,
+            tonconnect_session,
             promise,
         );
     }
@@ -8183,5 +8210,126 @@ mod tests {
                 .message(),
             "Invalid unpaid messages token specified"
         );
+    }
+
+    /// The 2485f5889 TON Connect vectors (`accept_oauth_request`,
+    /// LinkManager.cpp:4682-4700 at the 23383aef pin): the connect
+    /// payload validates through `get_wallet_ownership_proof` and
+    /// rides the `AcceptUrlAuthQuery` send as the wire session — only
+    /// when set — while the invalid proofs answer the promise with the
+    /// 400 band (`TRY_RESULT_PROMISE`) and skip the send entirely.
+    #[test]
+    fn accept_oauth_request_threads_the_ton_connect_session() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct RecordingEnv {
+            sent: Vec<Option<tdmtproto::telegram_api::InputTonConnectOauthSession>>,
+        }
+        impl LinkEnv for RecordingEnv {
+            #[allow(clippy::too_many_arguments)] // the C++ handler shape
+            fn send_accept_url_auth_query(
+                &mut self,
+                _url: String,
+                _message_full_id: MessageFullId,
+                _button_id: i32,
+                _allow_write_access: bool,
+                _allow_phone_number_access: bool,
+                _match_code: String,
+                tonconnect_session: Option<tdmtproto::telegram_api::InputTonConnectOauthSession>,
+                _promise: tdutils::promise::Promise<String>,
+            ) {
+                self.sent.push(tonconnect_session);
+            }
+        }
+
+        let connect_data = |proof: Option<td_api::TonWalletOwnershipProof>| {
+            Some(td_api::TonConnectConnectData {
+                session_id: 42,
+                challenge_answer: b"challenge-answer".to_vec(),
+                body: b"connect-body".to_vec(),
+                proof,
+            })
+        };
+        let proof_of = |public_key: usize, signature: usize| {
+            Some(td_api::TonWalletOwnershipProof {
+                public_key: vec![1u8; public_key],
+                timestamp: 7,
+                signature: vec![2u8; signature],
+            })
+        };
+
+        // the null payload keeps the session off the wire query
+        let mut env = RecordingEnv::default();
+        LinkManager::new().accept_oauth_request(
+            &mut env,
+            "https://oauth.example/request".to_owned(),
+            "code".to_owned(),
+            true,
+            false,
+            None,
+            Default::default(),
+        );
+        assert_eq!(env.sent, vec![None], "the null payload sends no session");
+
+        // the valid payload becomes the wire session (the proof's
+        // public-key half validates but doesn't ride — only the wire
+        // walletOwnershipProof does)
+        LinkManager::new().accept_oauth_request(
+            &mut env,
+            "https://oauth.example/request".to_owned(),
+            "code".to_owned(),
+            true,
+            false,
+            connect_data(proof_of(32, 64)),
+            Default::default(),
+        );
+        assert_eq!(
+            env.sent[1],
+            Some(tdmtproto::telegram_api::InputTonConnectOauthSession {
+                session_id: 42,
+                challenge_answer: b"challenge-answer".to_vec(),
+                body: b"connect-body".to_vec(),
+                proof: Some(tdmtproto::telegram_api::WalletOwnershipProof {
+                    timestamp: 7,
+                    signature: vec![2u8; 64],
+                }),
+            }),
+            "the payload threads as the wire session"
+        );
+
+        // the invalid proofs answer the 400 band and never reach the send
+        for (proof, message) in [
+            (None, "Proof must be non-empty"),
+            (proof_of(31, 64), "Invalid public key specified"),
+            (proof_of(32, 63), "Invalid signature specified"),
+        ] {
+            let answer = Arc::new(Mutex::new(None));
+            let capture = Arc::clone(&answer);
+            let promise = tdutils::promise::PromiseCreator::lambda_result(
+                move |result: tdutils::status::Result<String>| {
+                    let actual = match result {
+                        tdutils::status::Result::Err(status) => status.message().to_owned(),
+                        tdutils::status::Result::Ok(_) => panic!("expected the error band"),
+                    };
+                    *capture.lock().unwrap() = Some(actual);
+                },
+            );
+            LinkManager::new().accept_oauth_request(
+                &mut env,
+                "https://oauth.example/request".to_owned(),
+                "code".to_owned(),
+                true,
+                false,
+                connect_data(proof),
+                promise,
+            );
+            assert_eq!(
+                answer.lock().unwrap().take(),
+                Some(message.to_owned()),
+                "the proof band answers the promise"
+            );
+        }
+        assert_eq!(env.sent.len(), 2, "the error band skips the send");
     }
 }

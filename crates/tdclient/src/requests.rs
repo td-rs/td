@@ -4753,6 +4753,7 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 match_code,
                 request.allow_write_access,
                 request.allow_phone_number_access,
+                request.ton_connect_connect_data,
                 promise,
             );
         }
