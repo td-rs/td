@@ -10795,10 +10795,14 @@ impl Td {
     /// community-family entries to CommunityManager before the
     /// channel/user remainder reaches ChatManager (#143). Every
     /// Td-reachable intake site that mirrors a C++ `td_->chat_manager_
-    /// ->on_get_chats`/`on_get_chat` call funnels through here; the
-    /// field-split env intakes (Story/StarGift/Theme/Poll/Business)
-    /// still hand `ChatManager::on_get_chats` its defensive-drop
-    /// remainder until their envs can re-enter `Td`.
+    /// ->on_get_chats`/`on_get_chat` call funnels through here, with
+    /// two remainders: the field-split env intakes (Story/StarGift/
+    /// Theme/Poll/Business/TopDialog/DialogParticipant) still hand
+    /// `ChatManager::on_get_chats` its defensive-drop remainder until
+    /// their envs can re-enter `Td`, and a manager method driven under
+    /// the take-dance must pre-route the community family itself — the
+    /// hop would apply into the placeholder manager the dance leaves
+    /// in `Td` (see `on_get_joined_communities`).
     fn intake_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &str) {
         let mut chats = chats;
         if chats.is_empty() {
