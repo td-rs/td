@@ -52,6 +52,7 @@ use tdutils::buffer::BufferSlice;
 use tdutils::random;
 use tdutils::status::{Result, Status};
 
+#[cfg(not(target_family = "wasm"))]
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -671,6 +672,7 @@ async fn session_driver(
             if callback.closed || wakeup_at == 0.0 {
                 // NativeFd.cpp:276 + PollableFd.h:127 — the fd teardown
                 // pair, on the real fd before the drop.
+                #[cfg(not(target_family = "wasm"))]
                 {
                     let raw_fd = session.connection.raw_connection().stream().as_raw_fd();
                     tdutils::vlog!(
@@ -707,7 +709,9 @@ async fn session_driver(
                 // writes inline, before this park) — the C++ adds W only
                 // while a write batch is outstanding, which this port
                 // never parks on.
+                #[cfg(not(target_family = "wasm"))]
                 let raw_fd = session.connection.raw_connection().stream().as_raw_fd();
+                #[cfg(not(target_family = "wasm"))]
                 tdutils::vlog!(
                     tdutils::logging::verbosity::FD,
                     "fd",
@@ -715,6 +719,7 @@ async fn session_driver(
                     133,
                     "[fd:{raw_fd}] add flags from poll [R]"
                 );
+                #[cfg(not(target_family = "wasm"))]
                 let observer = std::ptr::from_ref(&session.connection) as usize;
                 tokio::select! {
                     command = rx.recv() => {
@@ -725,6 +730,7 @@ async fn session_driver(
                     }
                     _ = session.connection.raw_connection().stream().readable() => {
                         // PollableFd.h:168 — the poller's wake.
+                        #[cfg(not(target_family = "wasm"))]
                         tdutils::vlog!(
                             tdutils::logging::verbosity::FD,
                             "fd",
@@ -766,28 +772,32 @@ async fn session_driver(
                                 // extraction. The observer is the
                                 // connection's own address (the C++ prints
                                 // its observer object's).
+                                #[cfg_attr(target_family = "wasm", allow(unused_mut))]
                                 let mut connection = connection;
                                 // NativeFd.cpp:118 — the fd construction
                                 // log; PollableFd.h:73 the pollable
                                 // extraction. The observer is the
                                 // connection's own address (the C++ prints
                                 // its observer object's).
-                                let raw_fd = connection.raw_connection().stream().as_raw_fd();
-                                let observer = std::ptr::from_ref(&connection) as usize;
-                                tdutils::vlog!(
-                                    tdutils::logging::verbosity::FD,
-                                    "fd",
-                                    at "NativeFd.cpp",
-                                    118,
-                                    "[fd:{raw_fd}] create"
-                                );
-                                tdutils::vlog!(
-                                    tdutils::logging::verbosity::FD,
-                                    "fd",
-                                    at "PollableFd.h",
-                                    73,
-                                    "[fd:{raw_fd}] extract pollable fd [observer:0x{observer:x}]"
-                                );
+                                #[cfg(not(target_family = "wasm"))]
+                                {
+                                    let raw_fd = connection.raw_connection().stream().as_raw_fd();
+                                    let observer = std::ptr::from_ref(&connection) as usize;
+                                    tdutils::vlog!(
+                                        tdutils::logging::verbosity::FD,
+                                        "fd",
+                                        at "NativeFd.cpp",
+                                        118,
+                                        "[fd:{raw_fd}] create"
+                                    );
+                                    tdutils::vlog!(
+                                        tdutils::logging::verbosity::FD,
+                                        "fd",
+                                        at "PollableFd.h",
+                                        73,
+                                        "[fd:{raw_fd}] extract pollable fd [observer:0x{observer:x}]"
+                                    );
+                                }
                                 live = Some(Live {
                                     connection,
                                     pending: HashMap::new(),
@@ -830,6 +840,7 @@ async fn session_driver(
                         };
                         // The shutdown teardown pair (PollableFd.h:127 +
                         // NativeFd.cpp:276), like the drop path.
+                        #[cfg(not(target_family = "wasm"))]
                         {
                             let raw_fd = session.connection.raw_connection().stream().as_raw_fd();
                             tdutils::vlog!(
