@@ -10231,8 +10231,10 @@ impl ChatManager {
     }
 
     /// `on_get_chat` (ChatManager.cpp:5704-5733) — the constructor
-    /// dispatcher. Communities are consumed and dropped by the
-    /// CommunityManager stub.
+    /// dispatcher. Communities route at the shared chats intake
+    /// (`Td::intake_chats`, #143); entries reaching this arm directly
+    /// (in-test drivers, the not-yet-funneled direct intakes) are
+    /// consumed and dropped.
     pub(crate) fn on_get_chat(
         &mut self,
         user_manager: &mut UserManager,
@@ -10252,8 +10254,9 @@ impl ChatManager {
             telegram_api::Chat::channelForbidden(c) => {
                 self.on_get_channel_forbidden(user_manager, env, c, source)
             }
-            // td_->community_manager_->on_get_community — consume and drop;
-            // the community slice owns them.
+            // td_->community_manager_->on_get_community — the C++ hop
+            // lives at the shared chats intake (`Td::intake_chats`);
+            // entries still arriving here drop.
             chat @ (telegram_api::Chat::community(_)
             | telegram_api::Chat::communityForbidden(_)) => {
                 let _ = chat;
@@ -10263,7 +10266,9 @@ impl ChatManager {
 
     /// `on_get_chats` (ChatManager.cpp:5735-5757) — communities before
     /// channels before plain chats, because the basic-group intake
-    /// consults the migrated-to channel.
+    /// consults the migrated-to channel. Through real wiring the
+    /// community family arrives pre-routed at `Td::intake_chats`
+    /// (#143), so the community pass here is the defensive remainder.
     #[allow(dead_code)] // production caller: UpdatesManager (M.7) / M.5.47
     pub(crate) fn on_get_chats(
         &mut self,

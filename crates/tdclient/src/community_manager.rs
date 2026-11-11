@@ -191,11 +191,12 @@ pub trait CommunityManagerEnv {
     /// `ChatManager::on_get_chats` (CommunityManager.cpp:1867 is the
     /// first community-family caller) — the shared wire-chats intake:
     /// the community dialogs must exist before an answer resolves. The
-    /// community-family entries route through the manager's own
-    /// `on_get_community`/`on_get_community_forbidden` intakes (the
-    /// port's `ChatManager::on_get_chat` consume-drops them — the C++
-    /// ChatManager.cpp:5767-5773 hop lives with the community slice),
-    /// so callers hand this seam the non-community remainder.
+    /// seam routes through the shared intake (`Td::intake_chats`),
+    /// which applies the community-first hop (#143); a manager method
+    /// driven under the take-dance (the dispatcher holds the community
+    /// manager out of `Td`) still pre-routes the community family
+    /// itself — see `on_get_joined_communities` — and hands this seam
+    /// the non-community remainder only.
     fn on_get_chats(&mut self, _chats: Vec<telegram_api::Chat>, _source: &str) {}
 
     /// `DialogManager::force_create_dialog` — the documented no-op stub;
@@ -1775,11 +1776,14 @@ impl CommunityManager {
                     community_ids.push(CommunityId::new(community.id));
                     // The community-first intake pass (cpp:1867's
                     // `on_get_chats` ordering, ChatManager.cpp:5780-5796):
-                    // the port's `ChatManager::on_get_chat` consume-drops
-                    // the community family ("the community slice owns
-                    // them"), so the C++ ChatManager.cpp:5767-5773 hop
-                    // lives here — each community lands in the cache
-                    // BEFORE the `have_community` filter reads it.
+                    // the shared hop lives at `Td::intake_chats` (#143),
+                    // but this method runs under the take-dance — the
+                    // dispatcher holds the community manager out of
+                    // `Td`, so routing through the seam would apply into
+                    // the placeholder and the put-back would clobber it —
+                    // so each community lands in the cache through the
+                    // local routing BEFORE the `have_community` filter
+                    // reads it.
                     self.on_get_community(env, &community, "on_get_joined_communities");
                 }
                 ref chat @ telegram_api::Chat::communityForbidden(ref forbidden) => {

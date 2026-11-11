@@ -2483,16 +2483,7 @@ impl crate::messages_manager::ChannelDifferenceContext for Td {
     }
 
     fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &str) {
-        let options = self.option_manager.as_mut();
-        if let Some(options) = options {
-            let mut env = UserEnv {
-                global: &mut self.global,
-                options,
-                auth_is_bot: self.auth_manager.is_bot(),
-            };
-            self.chat_manager
-                .on_get_chats(&mut self.user_manager, &mut env, chats, source);
-        }
+        self.intake_chats(chats, source);
     }
 
     fn on_get_dialog_error(
@@ -10795,10 +10786,36 @@ impl Td {
     }
 
     /// `td_->chat_manager_->on_get_chats` — the same shape over the chat
-    /// manager (the basic-group intake needs the user manager too).
+    /// manager (the basic-group intake needs the user manager too). The
+    /// community-first hop (ChatManager.cpp:5767-5773, the `on_get_chat`
+    /// community arms; :5780-5796, the `on_get_chats` ordering) lives
+    /// here: the port's ChatManager cannot reach the community manager
+    /// (the C++ `td_->community_manager_` pointer), so the shared intake
+    /// routes the community-family entries to CommunityManager before
+    /// the channel/user remainder reaches ChatManager (#143).
     fn intake_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &str) {
         if chats.is_empty() {
             return;
+        }
+        let mut chats = chats;
+        // The community-first pass (ChatManager.cpp:5780-5787): apply
+        // info about communities before the corresponding channels.
+        {
+            let mut community_manager = std::mem::take(&mut self.community_manager);
+            let mut env = CommunityEnv { td: &mut *self };
+            chats.retain(|chat| match chat {
+                telegram_api::Chat::community(community) => {
+                    community_manager.on_get_community(&mut env, community, source);
+                    false
+                }
+                telegram_api::Chat::communityForbidden(forbidden) => {
+                    community_manager
+                        .on_get_community_forbidden(CommunityId::new(forbidden.id), source);
+                    false
+                }
+                _ => true,
+            });
+            self.community_manager = community_manager;
         }
         let mut chat_manager = std::mem::take(&mut self.chat_manager);
         let mut user_manager = std::mem::take(&mut self.user_manager);
@@ -21944,12 +21961,7 @@ impl Td {
                                 answer.users,
                                 "GetMessageReactionsListQuery",
                             );
-                            self.chat_manager.on_get_chats(
-                                &mut self.user_manager,
-                                &mut env,
-                                answer.chats,
-                                "GetMessageReactionsListQuery",
-                            );
+                            self.intake_chats(answer.chats, "GetMessageReactionsListQuery");
                         }
 
                         // the reaction walk (cpp:261-295): the count clamp,
@@ -42839,11 +42851,13 @@ impl CommunityManagerEnv for CommunityEnv<'_> {
         }
     }
 
-    /// `ChatManager::on_get_chats` (cpp:1867) — the non-community
-    /// remainder of the answer reaches the shared chat intake
-    /// (`Td::intake_chats`, the `GetCommunitiesQuery` arm's seam); the
-    /// community-family entries already routed through the manager's
-    /// own intake (the `ChatManager::on_get_chat` consume-drop).
+    /// `ChatManager::on_get_chats` (cpp:1867) — the shared chat intake
+    /// (`Td::intake_chats`), which applies the community-first hop
+    /// (#143). A manager method driven under the take-dance must
+    /// pre-route the community family itself (the hop would apply into
+    /// the placeholder manager the dance leaves in `Td`, and the
+    /// put-back clobbers it — see `on_get_joined_communities`) and hand
+    /// this seam the non-community remainder only.
     fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &str) {
         self.td.intake_chats(chats, source);
     }
@@ -61932,6 +61946,61 @@ mod tests {
     }
 
     #[test]
+    fn intake_chats_routes_communities_first() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(intake_chats_routes_communities_first_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn intake_chats_routes_communities_first_impl() {
+        use crate::chat_manager::ChannelId;
+        use crate::community_id::CommunityId;
+
+        let (mut td, _rec) = netted_td("netfix-cm-intake-hop");
+        // A community-bearing chats vector rides the shared intake
+        // (#143): the community-family entries route to
+        // CommunityManager first — the community-first hop of
+        // ChatManager.cpp:5767-5796, whatever their position in the
+        // vector — and the channel/user remainder reaches ChatManager.
+        td.intake_chats(
+            vec![
+                telegram_api::Chat::channel(wire_channel(3, "the linked channel")),
+                telegram_api::Chat::community(telegram_api::community {
+                    flags: 1,
+                    creator: true,
+                    left: false,
+                    min: false,
+                    flags2: 0,
+                    collapsed_in_dialogs: true,
+                    id: 7,
+                    access_hash: 11,
+                    title: "My community".to_owned(),
+                    photo: None,
+                    date: 10,
+                    admin_rights: None,
+                    default_banned_rights: None,
+                }),
+            ],
+            "test",
+        );
+        with_community_manager(&mut td, |manager, _| {
+            assert!(
+                manager
+                    .get_community_object(CommunityId::new(7))
+                    .expect("the community-family entry reaches the community cache")
+                    .are_chats_collapsed
+            );
+        });
+        assert!(
+            td.chat_manager.have_channel(ChannelId::new(3)),
+            "the channel remainder reaches ChatManager"
+        );
+    }
+
+    #[test]
     fn community_collapse_toggle_rides_the_dispatcher() {
         std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
@@ -61983,17 +62052,17 @@ mod tests {
         // The answer is an Updates: it re-enters `on_get_updates` with
         // the popped promise (CommunityManager.cpp:531-536), carrying
         // the community chat whose `collapsed_in_dialogs` bit is the
-        // toggled state (the C++ flip happens through
-        // ChatManager::on_get_chats → CommunityManager::on_get_community).
-        // In the port the chats intake accepts the wire community
-        // (community-first ordering) but `ChatManager::on_get_chat`'s
-        // M.5.20 community stub consumes and drops it — the flag walk is
-        // proven at the manager seam by
-        // `collapse_flip_quiet_expansion_fans_out` instead. The promise
-        // still settles ok — updates processing cannot fail it
+        // toggled state — the C++ flip happens through
+        // ChatManager::on_get_chats → CommunityManager::on_get_community
+        // (the port's shared-intake hop, `Td::intake_chats`; #143). The
+        // promise still settles ok — updates processing cannot fail it
         // (UpdatesManager.cpp:1188-1194).
         let wire = telegram_api::community {
-            flags: 1,
+            // creator (flags.0) + the access-hash presence bit (flags.13):
+            // the answer round-trips through store/parse, so the hash
+            // needs its TL presence bit or the intake's non-min gate
+            // drops the community (C++ CommunityManager.cpp:728-810)
+            flags: 1 | (1 << 13),
             creator: true,
             left: false,
             min: false,
@@ -62022,12 +62091,12 @@ mod tests {
             recorded.lock().unwrap().as_ref(),
             Some(tdutils::status::Result::Ok(()))
         ));
-        // the recorded stub divergence: the wire community is dropped
-        // upstream of the manager, so the cached flag stays un-flipped
-        // here (flip this assert when the chats→community hop is wired)
+        // the wired hop: the Updates answer's community chat re-enters
+        // through the shared chats intake, flipping the cached flag
+        // end-to-end (the ChatManager.cpp:5780-5796 walk)
         with_community_manager(&mut td, |manager, _| {
             assert!(
-                !manager
+                manager
                     .get_community_object(CommunityId::new(7))
                     .expect("the seeded community")
                     .are_chats_collapsed
