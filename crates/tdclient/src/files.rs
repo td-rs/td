@@ -15464,14 +15464,14 @@ mod tests {
         assert_eq!(err.message(), "File size has changed");
 
         // empty file
-        let empty_path = dir.join("m12_check_empty_file");
+        let empty_path = dir.join(format!("m12_check_empty_file-{}", std::process::id()));
         std::fs::write(&empty_path, b"").unwrap();
         let err = check_full_local_location(&context, mk(&empty_path.to_string_lossy(), 0), false)
             .unwrap_err();
         assert_eq!(err.message(), "File must be non-empty");
 
         // thumbnail limit (200 KB - 1), bypassed for "map*" names
-        let big = dir.join("m12_check_big_thumb");
+        let big = dir.join(format!("m12_check_big_thumb-{}", std::process::id()));
         std::fs::write(&big, vec![0u8; 200 * 1024]).unwrap();
         let thumb = |path: &str| FullLocalLocationInfo {
             location: FullLocalFileLocation::new(FileType::Thumbnail, path.to_owned(), 0),
@@ -15483,12 +15483,12 @@ mod tests {
             err.message()
                 .starts_with("File of size 204800 bytes is too big for a thumbnail")
         );
-        let map_thumb = dir.join("map_m12_check_big_thumb");
+        let map_thumb = dir.join(format!("map_m12_check_big_thumb-{}", std::process::id()));
         std::fs::write(&map_thumb, vec![0u8; 200 * 1024]).unwrap();
         check_full_local_location(&context, thumb(&map_thumb.to_string_lossy()), false).unwrap();
 
         // the video-note option override through the context
-        let video_note = dir.join("m12_check_video_note");
+        let video_note = dir.join(format!("m12_check_video_note-{}", std::process::id()));
         std::fs::write(&video_note, vec![0u8; 100]).unwrap();
         struct NoteContext;
         impl FileManagerContext for NoteContext {

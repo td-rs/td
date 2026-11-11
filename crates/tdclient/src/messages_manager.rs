@@ -43244,7 +43244,7 @@ mod tests {
         use std::sync::Arc as StdArc;
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-        let base = std::env::temp_dir().join("m10_6_delete_run");
+        let base = std::env::temp_dir().join(format!("m10_6_delete_run-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         let dir = base.canonicalize().unwrap().to_string_lossy().into_owned();
@@ -46174,7 +46174,7 @@ mod tests {
         use std::sync::Arc as StdArc;
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-        let base = std::env::temp_dir().join("m10_8_send_run");
+        let base = std::env::temp_dir().join(format!("m10_8_send_run-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         let dir = base.canonicalize().unwrap().to_string_lossy().into_owned();
@@ -46349,7 +46349,8 @@ mod tests {
         use std::sync::Arc as StdArc;
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-        let base = std::env::temp_dir().join("m10_8_send_erase_run");
+        let base =
+            std::env::temp_dir().join(format!("m10_8_send_erase_run-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         let dir = base.canonicalize().unwrap().to_string_lossy().into_owned();
@@ -48153,7 +48154,8 @@ mod tests {
 
     #[test]
     fn mglue_add_message_file_to_downloads_walk_and_register() {
-        let root = std::env::temp_dir().join("td_rs_add_message_file");
+        let root =
+            std::env::temp_dir().join(format!("td_rs_add_message_file-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let root_str = root.to_string_lossy().into_owned();
