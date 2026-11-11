@@ -4,7 +4,7 @@
 //! [`tcp::connect`] (the client half of `SocketFd::open`).
 //!
 //! S47 — the DNS layer: [`dns::GetHostByName`] (`td::GetHostByNameActor`) and
-//! [`dns::idn_to_ascii`].
+//! [`idn_to_ascii`] (the pure host-normalization half, in [`idn`]).
 //!
 //! S46 — the UDP layer: [`udp::BufferedUdp`] (`td/net/Udp.h`).
 //!
@@ -33,6 +33,7 @@ mod transparent;
 pub mod dns;
 pub mod http;
 pub mod http_query;
+pub mod idn;
 pub mod net_query;
 #[cfg(not(target_family = "wasm"))]
 pub mod proxy;
@@ -56,7 +57,8 @@ pub mod wget;
 pub mod wget;
 
 #[cfg(not(target_family = "wasm"))]
-pub use dns::{GetHostByName, NativeResolver, Options, Resolver, idn_to_ascii};
+pub use dns::{GetHostByName, NativeResolver, Options, Resolver};
+pub use idn::idn_to_ascii;
 #[cfg(not(target_family = "wasm"))]
 pub use proxy::{http_proxy_connect, socks5_connect};
 #[cfg(not(target_family = "wasm"))]

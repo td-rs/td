@@ -41,8 +41,10 @@ In progress:
   288 `[blocked: net]` markers in `crates/` as of 2026-11-09. Affected
   requests are accepted but stay unanswered. Tracked in
   [docs/REMAINING_WORK.md](docs/REMAINING_WORK.md) and the issue tracker.
-- `wasm32-unknown-unknown` does not build; `wasm32-unknown-emscripten` is
-  the supported wasm target.
+- `wasm32-unknown-unknown` is not a target (no OS for the tddb/sqlcipher C
+  stack); `wasm32-unknown-emscripten` is the supported wasm target — Main
+  CI's advisory `wasm` job checks it (`cargo check --lib` with the pinned
+  emsdk).
 
 ### Platform support
 
