@@ -3021,8 +3021,9 @@ mod tests {
     }
 
     fn temp_path(name: &str) -> String {
+        // pid-salted: sibling worktree test runs must not share fixtures (#144)
         std::env::temp_dir()
-            .join(name)
+            .join(format!("{name}-{}", std::process::id()))
             .to_string_lossy()
             .into_owned()
     }
