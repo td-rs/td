@@ -302,12 +302,11 @@ jobs:
 
   fuzz-smoke:
     # Bounded fuzz smoke of the parsing-heavy components (S78): each target
-    # runs 60 s with coverage instrumentation via cargo-fuzz on nightly.
-    # The S78 release gate is a one-week clean run per target; this job only
-    # catches regressions quickly. Targets live in fuzz/fuzz_targets (the
-    # crate is excluded from the workspace and builds standalone).
+    # in fuzz/fuzz_targets runs 60 s with coverage instrumentation via
+    # cargo-fuzz on nightly. The S78 release gate is a one-week clean run per
+    # target; this job only catches regressions quickly.
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
@@ -316,8 +315,15 @@ jobs:
           tool: cargo-fuzz
       - name: Fuzz smoke (60 s per target)
         # cargo-fuzz resolves fuzz/Cargo.toml relative to the cwd, so it
-        # must run from the repo root, not from inside fuzz/.
+        # must run from the repo root, not from inside fuzz/. RUSTUP_TOOLCHAIN
+        # pins the nightly this job installed past the rust-toolchain.toml
+        # 1.95 pin (cargo-fuzz's -Zsanitizer flags are nightly-only). The
+        # explicit --target is load-bearing: the taiki-e prebuilt cargo-fuzz
+        # is musl-linked and defaults its fuzz target to musl, where ASan
+        # rejects the static libc — glibc is the supported libFuzzer combo.
+        env:
+          RUSTUP_TOOLCHAIN: nightly
         run: |
-          for target in td_api_json json_value binlog_event mtproto_packet tl_scheme_text transport_frame app_config simple_config message_input; do
-            cargo fuzz run "$target" -- -max_total_time=60
+          for target in $(ls fuzz/fuzz_targets | sed 's/\.rs$//'); do
+            cargo fuzz run "$target" --target x86_64-unknown-linux-gnu -- -max_total_time=60
           done
