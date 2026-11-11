@@ -15452,7 +15452,7 @@ mod tests {
 
         // real file: the zero size is filled from the stat
         let dir = std::env::temp_dir();
-        let path = dir.join("m12_check_local_file");
+        let path = dir.join(format!("m12_check_local_file-{}", std::process::id()));
         std::fs::write(&path, b"12345").unwrap();
         let location_path = path.to_string_lossy().into_owned();
         let info = check_full_local_location(&context, mk(&location_path, 0), false).unwrap();
@@ -26396,7 +26396,8 @@ mod files_glue_tests {
         let result = slot.lock().take().expect("settled");
         assert_eq!(result.error().message(), "File not found");
 
-        let root = std::env::temp_dir().join("td_rs_read_file_part_bands");
+        let root =
+            std::env::temp_dir().join(format!("td_rs_read_file_part_bands-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let (file_id, _) =
@@ -26414,7 +26415,8 @@ mod files_glue_tests {
 
     #[test]
     fn read_file_part_reads_the_downloaded_prefix() {
-        let root = std::env::temp_dir().join("td_rs_read_file_part");
+        let root =
+            std::env::temp_dir().join(format!("td_rs_read_file_part-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let root_str = root.to_string_lossy().into_owned();
@@ -26460,7 +26462,7 @@ mod files_glue_tests {
 
     #[test]
     fn delete_file_unlinks_cached_files_and_answers_ok() {
-        let root = std::env::temp_dir().join("td_rs_delete_file");
+        let root = std::env::temp_dir().join(format!("td_rs_delete_file-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let root_str = root.to_string_lossy().into_owned();
@@ -26494,7 +26496,8 @@ mod files_glue_tests {
 
     #[test]
     fn get_suggested_file_name_avoids_collisions() {
-        let root = std::env::temp_dir().join("td_rs_suggested_name");
+        let root =
+            std::env::temp_dir().join(format!("td_rs_suggested_name-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let root_str = root.to_string_lossy().into_owned();

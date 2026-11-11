@@ -42,7 +42,7 @@ fn ssl_ctx_missing_cert_file() {
 
 #[test]
 fn ssl_ctx_garbage_cert_file() {
-    let path = std::env::temp_dir().join("tdnet-tls-garbage.pem");
+    let path = std::env::temp_dir().join(format!("tdnet-tls-garbage-{}.pem", std::process::id()));
     std::fs::write(&path, b"not a certificate").unwrap();
     let error = error_text(SslCtx::create(path.to_str().unwrap(), VerifyPeer::On));
     assert_eq!(error, "Failed to set custom certificate file");

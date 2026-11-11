@@ -43058,7 +43058,7 @@ mod tests {
         use std::sync::Arc as StdArc;
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-        let base = std::env::temp_dir().join("m10_6_corpus_run");
+        let base = std::env::temp_dir().join(format!("m10_6_corpus_run-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         let dir = base.canonicalize().unwrap().to_string_lossy().into_owned();

@@ -2452,8 +2452,9 @@ mod tests {
     use tddb::td_db::init_message_db;
 
     fn open_db(name: &str) -> (String, SqliteDb) {
+        // pid-salted: sibling worktree test runs must not share fixtures (#144)
         let path = std::env::temp_dir()
-            .join(name)
+            .join(format!("{name}-{}", std::process::id()))
             .to_string_lossy()
             .into_owned();
         let _ = destroy(&path);
@@ -3322,7 +3323,7 @@ mod tests {
         use std::sync::Arc as StdArc;
 
         let path = std::env::temp_dir()
-            .join("m6_msgdb_sync_safe")
+            .join(format!("m6_msgdb_sync_safe-{}", std::process::id()))
             .to_string_lossy()
             .into_owned();
         let _ = tddb::sqlite_db::destroy(&path);
@@ -3370,7 +3371,7 @@ mod tests {
         const WRITES: usize = 120; // > 2 * MAX_PENDING_QUERY_COUNT
 
         let path = std::env::temp_dir()
-            .join("m6_msgdb_async")
+            .join(format!("m6_msgdb_async-{}", std::process::id()))
             .to_string_lossy()
             .into_owned();
         let _ = tddb::sqlite_db::destroy(&path);

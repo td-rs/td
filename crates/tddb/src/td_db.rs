@@ -1244,8 +1244,9 @@ mod tests {
     /// fresh-database pmc resets) into the binlog pmc, so the tests hand it
     /// a real (throwaway) binlog-backed pmc.
     fn test_binlog_pmc(name: &str) -> BinlogKeyValue {
+        // pid-salted: sibling worktree test runs must not share fixtures (#144)
         let path = std::env::temp_dir()
-            .join(name)
+            .join(format!("{name}-{}", std::process::id()))
             .to_string_lossy()
             .into_owned();
         let _ = BinlogKeyValue::destroy(&path);
@@ -1371,7 +1372,7 @@ mod tests {
             ("m6_tddb_fresh_key", b"1234echobot$".to_vec()),
             ("m6_tddb_fresh_key_empty", Vec::new()),
         ] {
-            let dir = std::env::temp_dir().join(name);
+            let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             let parameters = Parameters {
@@ -1412,17 +1413,18 @@ mod tests {
     /// pinned rows per folder into the pmc, newest order first.
     #[test]
     fn dialog_db_ladder_and_pinned_migration() {
-        fn open_sqlite(name: &str) -> SqliteDb {
+        fn open_sqlite(name: &str) -> (String, SqliteDb) {
             let path = std::env::temp_dir()
-                .join(name)
+                .join(format!("{name}-{}", std::process::id()))
                 .to_string_lossy()
                 .into_owned();
             let _ = crate::sqlite_db::destroy(&path);
-            SqliteDb::open_with_key(&path, true, &DbKey::empty(), None).unwrap()
+            let db = SqliteDb::open_with_key(&path, true, &DbKey::empty(), None).unwrap();
+            (path, db)
         }
 
         // 1. fresh database: was_created, both tables exist
-        let db = open_sqlite("m6_dialogdb_fresh");
+        let (fresh_path, db) = open_sqlite("m6_dialogdb_fresh");
         let mut pmc = test_binlog_pmc("m6_dialogdb_fresh_pmc");
         let mut was_created = false;
         let mut version = 0;
@@ -1436,16 +1438,11 @@ mod tests {
         init_dialog_db(&db, &mut version, &mut pmc, &mut was_created).ensure();
         assert!(!was_created);
         drop(db);
-        let _ = crate::sqlite_db::destroy(
-            std::env::temp_dir()
-                .join("m6_dialogdb_fresh")
-                .to_str()
-                .unwrap(),
-        );
+        let _ = crate::sqlite_db::destroy(&fresh_path);
 
         // 2. an old (version 11) database migrates its pinned dialogs into
         // the pmc, ordered by dialog_order DESC per folder
-        let db = open_sqlite("m6_dialogdb_old");
+        let (old_path, db) = open_sqlite("m6_dialogdb_old");
         db.exec(
             "CREATE TABLE dialogs (dialog_id INT8 PRIMARY KEY, dialog_order INT8, data BLOB, folder_id INT4)",
         )
@@ -1479,11 +1476,6 @@ mod tests {
         assert_eq!(pmc.get("pinned_dialog_ids1"), "-1003");
         assert_eq!(pmc.get("last_server_dialog_date"), "");
         drop(db);
-        let _ = crate::sqlite_db::destroy(
-            std::env::temp_dir()
-                .join("m6_dialogdb_old")
-                .to_str()
-                .unwrap(),
-        );
+        let _ = crate::sqlite_db::destroy(&old_path);
     }
 }
