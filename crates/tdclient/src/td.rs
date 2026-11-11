@@ -10785,19 +10785,25 @@ impl Td {
         self.user_manager = user_manager;
     }
 
-    /// `td_->chat_manager_->on_get_chats` — the same shape over the chat
-    /// manager (the basic-group intake needs the user manager too). The
-    /// community-first hop (ChatManager.cpp:5767-5773, the `on_get_chat`
-    /// community arms; :5780-5796, the `on_get_chats` ordering) lives
-    /// here: the port's ChatManager cannot reach the community manager
-    /// (the C++ `td_->community_manager_` pointer), so the shared intake
-    /// routes the community-family entries to CommunityManager before
-    /// the channel/user remainder reaches ChatManager (#143).
+    /// `td_->chat_manager_->on_get_chats` — the take/env/restore shape
+    /// over the chat manager (the basic-group intake needs the user
+    /// manager too). The community-first hop (ChatManager.cpp:5767-
+    /// 5773, the `on_get_chat` community arms; :5780-5796, the
+    /// `on_get_chats` ordering) lives here: the port's ChatManager
+    /// cannot reach the community manager (the C++ `td_->
+    /// community_manager_` pointer), so the shared intake routes the
+    /// community-family entries to CommunityManager before the
+    /// channel/user remainder reaches ChatManager (#143). Every
+    /// Td-reachable intake site that mirrors a C++ `td_->chat_manager_
+    /// ->on_get_chats`/`on_get_chat` call funnels through here; the
+    /// field-split env intakes (Story/StarGift/Theme/Poll/Business)
+    /// still hand `ChatManager::on_get_chats` its defensive-drop
+    /// remainder until their envs can re-enter `Td`.
     fn intake_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &str) {
+        let mut chats = chats;
         if chats.is_empty() {
             return;
         }
-        let mut chats = chats;
         // The community-first pass (ChatManager.cpp:5780-5787): apply
         // info about communities before the corresponding channels.
         {
@@ -12359,14 +12365,25 @@ impl Td {
                             users,
                         } = answer;
                         user_manager.on_get_users(&mut env, users, "GetFullUserQuery");
-                        let mut chat_manager = std::mem::take(&mut self.chat_manager);
-                        chat_manager.on_get_chats(
-                            &mut user_manager,
-                            &mut env,
-                            chats,
-                            "GetFullUserQuery",
-                        );
-                        self.chat_manager = chat_manager;
+                        // the shared chats intake owns the community-first
+                        // hop (#143): the C++ order is users → chats →
+                        // full (UserManager.cpp:1485-1487), so the manager
+                        // rides the swap back into `Td` for the hop (the
+                        // outer binding stays live — the placeholder
+                        // rides the local; the env borrow ends at its
+                        // last use) and the env rebuilds for the full
+                        // apply
+                        std::mem::swap(&mut self.user_manager, &mut user_manager);
+                        self.intake_chats(chats, "GetFullUserQuery");
+                        std::mem::swap(&mut self.user_manager, &mut user_manager);
+                        let mut env = crate::user_manager::UserEnv {
+                            global: &mut self.global,
+                            options: self
+                                .option_manager
+                                .as_mut()
+                                .expect("the full-user answer runs on the initialized td"),
+                            auth_is_bot: self.auth_manager.is_bot(),
+                        };
                         // the parse always fills the record; the default
                         // arm only keeps the type flat
                         user_manager.on_get_user_full(&mut env, full_user.unwrap_or_default());
@@ -33822,19 +33839,9 @@ impl Td {
         source: &str,
         promise: Promise<crate::td_api::Object>,
     ) {
-        let mut user_manager = std::mem::take(&mut self.user_manager);
-        if let Some(options) = self.option_manager.as_mut() {
-            let mut env = crate::user_manager::UserEnv {
-                global: &mut self.global,
-                options,
-                auth_is_bot: self.auth_manager.is_bot(),
-            };
-            user_manager.on_get_users(&mut env, users, source);
-            let mut chat_manager = std::mem::take(&mut self.chat_manager);
-            chat_manager.on_get_chats(&mut user_manager, &mut env, chats, source);
-            self.chat_manager = chat_manager;
-        }
-        self.user_manager = user_manager;
+        self.intake_users(users, source);
+        // the shared chats intake applies the community-first hop (#143)
+        self.intake_chats(chats, source);
         crate::dialog_manager::on_get_blocked_dialogs(
             self,
             offset,
@@ -44275,9 +44282,7 @@ impl StatisticsManagerEnv for StatisticsEnv<'_> {
     }
 
     fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &'static str) {
-        self.td.with_chat_intake(|chat_manager, user_manager, env| {
-            chat_manager.on_get_chats(user_manager, env, chats, source);
-        });
+        self.td.intake_chats(chats, source);
     }
 
     fn get_user_id_object(&mut self, user_id: i64, source: &'static str) -> i64 {
@@ -44943,17 +44948,7 @@ impl PremiumEnv for PremiumTdEnv<'_> {
     }
 
     fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &str) {
-        let options = self.td.option_manager.as_mut();
-        if let Some(options) = options {
-            let mut env = UserEnv {
-                global: &mut self.td.global,
-                options,
-                auth_is_bot: self.td.auth_manager.is_bot(),
-            };
-            self.td
-                .chat_manager
-                .on_get_chats(&mut self.td.user_manager, &mut env, chats, source);
-        }
+        self.td.intake_chats(chats, source);
     }
 
     fn have_channel_force(
@@ -46502,17 +46497,7 @@ impl crate::privacy_manager::PrivacyManagerEnv for PrivacyEnv<'_> {
     }
 
     fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &str) {
-        let td = &mut *self.td;
-        let mut env = UserEnv {
-            global: &mut td.global,
-            options: td
-                .option_manager
-                .as_mut()
-                .expect("privacy calls run with the initialized option manager"),
-            auth_is_bot: td.auth_manager.is_bot(),
-        };
-        td.chat_manager
-            .on_get_chats(&mut td.user_manager, &mut env, chats, source);
+        self.td.intake_chats(chats, source);
     }
 
     fn have_accessible_user(&self, user_id: crate::user_manager::UserId) -> bool {
@@ -53757,17 +53742,7 @@ impl crate::sponsored_message_manager::SponsoredMessageManagerEnv for TdSponsore
     }
 
     fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &'static str) {
-        let options = self.td.option_manager.as_mut();
-        if let Some(options) = options {
-            let mut env = UserEnv {
-                global: &mut self.td.global,
-                options,
-                auth_is_bot: self.td.auth_manager.is_bot(),
-            };
-            self.td
-                .chat_manager
-                .on_get_chats(&mut self.td.user_manager, &mut env, chats, source);
-        }
+        self.td.intake_chats(chats, source);
     }
 
     fn check_dialog_access(
@@ -54076,17 +54051,7 @@ impl crate::promo_data_manager::PromoDataManagerEnv for TdSponsoredEnv<'_> {
     }
 
     fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &'static str) {
-        let options = self.td.option_manager.as_mut();
-        if let Some(options) = options {
-            let mut env = UserEnv {
-                global: &mut self.td.global,
-                options,
-                auth_is_bot: self.td.auth_manager.is_bot(),
-            };
-            self.td
-                .chat_manager
-                .on_get_chats(&mut self.td.user_manager, &mut env, chats, source);
-        }
+        self.td.intake_chats(chats, source);
     }
 
     fn set_sponsored_dialog(
@@ -71069,14 +71034,40 @@ mod tests {
         }
 
         // 2. the happy-path answer (cpp:1469-1476): the users pre-apply,
-        //    the full record caches, the promise flushes.
+        //    the full record caches, the promise flushes. The chats
+        //    vector carries the community family + a channel: the arm
+        //    funnels through the shared chats intake, so the community
+        //    rides the community-first hop to the community cache and
+        //    the channel remainder reaches ChatManager (#143; the
+        //    users → chats → full order of UserManager.cpp:1485-1487)
         let mut answer = Vec::new();
         telegram_api::users_UserFull {
             full_user: Some(telegram_api::UserFull {
                 id: 5,
                 ..telegram_api::UserFull::default()
             }),
-            chats: Vec::new(),
+            chats: vec![
+                telegram_api::Chat::community(telegram_api::community {
+                    // creator (flags.0) + the access-hash presence bit
+                    // (flags.13): the answer round-trips through
+                    // store/parse, so the hash needs its TL presence bit
+                    // or the intake's non-min gate drops the community
+                    flags: 1 | (1 << 13),
+                    creator: true,
+                    left: false,
+                    min: false,
+                    flags2: 0,
+                    collapsed_in_dialogs: true,
+                    id: 7,
+                    access_hash: 11,
+                    title: "My community".to_owned(),
+                    photo: None,
+                    date: 10,
+                    admin_rights: None,
+                    default_banned_rights: None,
+                }),
+                telegram_api::Chat::channel(wire_channel(3, "the personal chat")),
+            ],
             users: vec![wire_user(5, "Alice")],
         }
         .store_boxed(&mut answer);
@@ -71090,6 +71081,19 @@ mod tests {
             td.user_manager
                 .get_user_full(crate::user_manager::UserId::new(5))
                 .is_some()
+        );
+        with_community_manager(&mut td, |manager, _| {
+            assert!(
+                manager
+                    .get_community_object(crate::community_id::CommunityId::new(7))
+                    .expect("the answer's community chat reaches the community cache")
+                    .are_chats_collapsed
+            );
+        });
+        assert!(
+            td.chat_manager
+                .have_channel(crate::chat_manager::ChannelId::new(3)),
+            "the channel remainder reaches ChatManager"
         );
 
         // 3. the error band forwards to the promise (cpp:1478-1481)

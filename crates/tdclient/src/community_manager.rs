@@ -678,11 +678,9 @@ impl CommunityManager {
                 env.remove_community_from_dialog_filters(community_id);
             }
         }
-        if !is_min {
-            if community_record.status != status {
-                community_record.status = status;
-                community_record.is_changed = true;
-            }
+        if !is_min && community_record.status != status {
+            community_record.status = status;
+            community_record.is_changed = true;
         }
         // CommunityManager.cpp:1276 — the title line runs for min
         // communities too
@@ -2490,11 +2488,16 @@ mod tests {
             .expect("the forbidden intake keeps the record");
         assert!(matches!(
             community.status,
-            Some(td_api::CommunityMemberStatus::communityMemberStatusBanned(_))
+            Some(td_api::CommunityMemberStatus::communityMemberStatusBanned(
+                _
+            ))
         ));
         assert_eq!(community.name, "Banned community");
         assert_eq!(community.date, 0);
-        assert!(!community.have_access, "a banned community is not accessible");
+        assert!(
+            !community.have_access,
+            "a banned community is not accessible"
+        );
         assert!(
             matches!(
                 manager.get_input_community(&env, CommunityId::new(7)),
@@ -2527,7 +2530,9 @@ mod tests {
             .expect("the converted record survives");
         assert!(matches!(
             converted.status,
-            Some(td_api::CommunityMemberStatus::communityMemberStatusBanned(_))
+            Some(td_api::CommunityMemberStatus::communityMemberStatusBanned(
+                _
+            ))
         ));
         assert_eq!(converted.date, 0);
     }
@@ -2603,7 +2608,11 @@ mod tests {
         let mut rehash = wire_community(7, "My community");
         rehash.access_hash = 6;
         manager.on_get_community(&mut env, &rehash, "test");
-        assert_eq!(env.updates.len(), 1, "the hash relearn is not client-visible");
+        assert_eq!(
+            env.updates.len(),
+            1,
+            "the hash relearn is not client-visible"
+        );
         assert!(
             matches!(
                 manager.get_input_community(&env, CommunityId::new(7)),
