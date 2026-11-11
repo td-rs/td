@@ -32,8 +32,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::time::Duration;
 
-#[cfg(not(target_family = "wasm"))]
+// emscripten keeps cfg(unix), so the explicit wasm gate matters: the
+// WsStream shim has no descriptor and the vlog call sites are off-wasm.
+#[cfg(all(unix, not(target_family = "wasm")))]
 use std::os::fd::AsRawFd as _;
+#[cfg(windows)]
+use std::os::windows::io::AsRawSocket as _;
 use tdactor::{ActorId, SchedulerPtr};
 use tdmtproto::auth_data::AuthData;
 use tdmtproto::auth_key::AuthKey;
@@ -60,6 +64,23 @@ use crate::auth_data_shared::AuthDataShared;
 use crate::auth_data_shared::{NetEvent, NetEventQueue};
 use crate::config_manager::StoredDcOption;
 use crate::td::{Td, TdMessage};
+
+/// The stream's raw descriptor for the fd-trace vlogs — the fd on Unix,
+/// the SOCKET handle on Windows (the C++ `NativeFd::fd` IS the socket
+/// handle there). Off-wasm only: the WsStream shim has no descriptor.
+#[cfg(not(target_family = "wasm"))]
+macro_rules! raw_fd {
+    ($stream:expr) => {{
+        #[cfg(unix)]
+        {
+            $stream.as_raw_fd()
+        }
+        #[cfg(windows)]
+        {
+            $stream.as_raw_socket()
+        }
+    }};
+}
 
 // ---------------------------------------------------------------------------
 // PublicRsaKeySharedMain
@@ -674,7 +695,7 @@ async fn session_driver(
                 // pair, on the real fd before the drop.
                 #[cfg(not(target_family = "wasm"))]
                 {
-                    let raw_fd = session.connection.raw_connection().stream().as_raw_fd();
+                    let raw_fd = raw_fd!(session.connection.raw_connection().stream());
                     tdutils::vlog!(
                         tdutils::logging::verbosity::FD,
                         "fd",
@@ -710,7 +731,7 @@ async fn session_driver(
                 // while a write batch is outstanding, which this port
                 // never parks on.
                 #[cfg(not(target_family = "wasm"))]
-                let raw_fd = session.connection.raw_connection().stream().as_raw_fd();
+                let raw_fd = raw_fd!(session.connection.raw_connection().stream());
                 #[cfg(not(target_family = "wasm"))]
                 tdutils::vlog!(
                     tdutils::logging::verbosity::FD,
@@ -781,7 +802,7 @@ async fn session_driver(
                                 // its observer object's).
                                 #[cfg(not(target_family = "wasm"))]
                                 {
-                                    let raw_fd = connection.raw_connection().stream().as_raw_fd();
+                                    let raw_fd = raw_fd!(connection.raw_connection().stream());
                                     let observer = std::ptr::from_ref(&connection) as usize;
                                     tdutils::vlog!(
                                         tdutils::logging::verbosity::FD,
@@ -842,7 +863,7 @@ async fn session_driver(
                         // NativeFd.cpp:276), like the drop path.
                         #[cfg(not(target_family = "wasm"))]
                         {
-                            let raw_fd = session.connection.raw_connection().stream().as_raw_fd();
+                            let raw_fd = raw_fd!(session.connection.raw_connection().stream());
                             tdutils::vlog!(
                                 tdutils::logging::verbosity::FD,
                                 "fd",
