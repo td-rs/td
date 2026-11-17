@@ -29,6 +29,25 @@ cargo test --workspace --locked
   Bumping it is a deliberate, visible change; CI pins it separately via
   `RUSTUP_TOOLCHAIN` and also tests current stable.
 
+## Shared master checkout discipline
+
+The master checkout is shared by concurrent live sessions: any dirty state in
+it is someone's in-flight work. `git stash` is not concurrency-safe there —
+entries carry no owner identity, push/pop/drop interleave across sessions, and
+a dropped entry leaves no reflog trace (only fsck-recoverable). See the
+2026-11-11 stash-collision incident in #148.
+
+- **Never stash, hard-reset, restore, or clean foreign dirty state on the
+  shared master checkout.** Leave its tree exactly as found. Never pop or
+  drop a stash entry you did not push.
+- **Write only from your own worktree** (one writer per checkout). If you
+  must stash inside a solely-owned worktree, owner-tag the message:
+  `git stash push -m "OWNER=<issue>: ..."`.
+- **Run gates in a worktree, never by clearing master's tree.**
+  `scripts/gate.sh [REV] [--only fmt,clippy,doc,test]` verifies any committed
+  REV in a detached gate worktree (fixed sibling path, warm shared target
+  dir, serialized per machine) and never touches the caller's working tree.
+
 ## Layout and boundaries
 
 - `crates/*` mirror upstream td module names: `tdutils`, `tdactor`, `tdnet`,
