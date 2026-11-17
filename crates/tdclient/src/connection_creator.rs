@@ -848,7 +848,7 @@ impl Proxy {
         // lower-case form rides in before the punycode pass like the C++
         // `idn_to_ascii(utf8_to_lower(host))`.
         let lowered = host.to_lowercase();
-        let result = tdnet::dns::idn_to_ascii(&lowered).map_err(|_| INVALID_HOST.to_string())?;
+        let result = tdnet::idn_to_ascii(&lowered).map_err(|_| INVALID_HOST.to_string())?;
         let result = result.to_lowercase();
         if result.len() > 253 {
             return Err(INVALID_HOST.to_string());
