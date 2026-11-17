@@ -10802,9 +10802,9 @@ impl Td {
     /// their envs can re-enter `Td`, and a manager method driven under
     /// the take-dance must pre-route the community family itself — the
     /// hop would apply into the placeholder manager the dance leaves
-    /// in `Td` (see `on_get_joined_communities`).
-    fn intake_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &str) {
-        let mut chats = chats;
+    /// in `Td` (see `on_get_joined_communities` /
+    /// `on_get_community_peer_link_requests`).
+    fn intake_chats(&mut self, mut chats: Vec<telegram_api::Chat>, source: &str) {
         if chats.is_empty() {
             return;
         }
@@ -63259,6 +63259,128 @@ mod tests {
             matches!(responses_of(&callback, 4).first(), Some(Object::ok(_))),
             "the reload answer settles the request"
         );
+    }
+
+    #[test]
+    fn community_peer_link_requests_answer_feeds_the_community_cache() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(community_peer_link_requests_answer_feeds_the_community_cache_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn community_peer_link_requests_answer_feeds_the_community_cache_impl() {
+        use crate::community_id::CommunityId;
+
+        let (mut td, rec, callback) = netted_td_with_callback("netfix-cm-plr-hop");
+        // seed a creator community (flags.13 carries the access hash
+        // through the wire round-trip)
+        with_community_manager(&mut td, |manager, env| {
+            manager.on_get_community(
+                env,
+                &telegram_api::community {
+                    flags: 1 | (1 << 13),
+                    creator: true,
+                    left: false,
+                    min: false,
+                    flags2: 0,
+                    collapsed_in_dialogs: false,
+                    id: 7,
+                    access_hash: 11,
+                    title: "My community".to_owned(),
+                    photo: None,
+                    date: 10,
+                    admin_rights: None,
+                    default_banned_rights: None,
+                },
+                "test",
+            );
+        });
+        td.request(
+            1,
+            Function::getCommunityAddChatRequests(td_api::getCommunityAddChatRequests {
+                community_id: 7,
+                offset: String::new(),
+                limit: 10,
+            }),
+        );
+        let sent = take_sent_query(&rec, telegram_api::communities_getPeerLinkRequests::ID);
+        net_complete(sent, {
+            let mut out = Vec::new();
+            telegram_api::communities_PeerLinkRequests {
+                flags: 1,
+                total_count: 1,
+                requests: vec![telegram_api::CommunityPeerRequest {
+                    flags: 0,
+                    visible: false,
+                    peer: Some(telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                        channel_id: 3,
+                    })),
+                    requested_by: 42,
+                    date: 77,
+                }],
+                next_offset: String::new(),
+                chats: vec![
+                    telegram_api::Chat::channel(telegram_api::channel {
+                        flags: (1 << 13) | (1 << 17),
+                        flags2: 0,
+                        creator: true,
+                        broadcast: true,
+                        id: 3,
+                        access_hash: 40,
+                        title: "requested".to_owned(),
+                        ..telegram_api::channel::default()
+                    }),
+                    // the community rides the answer's chats vector with a
+                    // changed title — the C++ walk (CommunityManager.cpp:
+                    // 411-434 -> ChatManager.cpp:5780-5796) routes it
+                    // through the community-first hop, so the rename lands
+                    // in the real community cache
+                    telegram_api::Chat::community(telegram_api::community {
+                        flags: 1 | (1 << 13),
+                        creator: true,
+                        left: false,
+                        min: false,
+                        flags2: 0,
+                        collapsed_in_dialogs: false,
+                        id: 7,
+                        access_hash: 11,
+                        title: "Renamed by the page answer".to_owned(),
+                        photo: None,
+                        date: 10,
+                        admin_rights: None,
+                        default_banned_rights: None,
+                    }),
+                ],
+                users: Vec::new(),
+            }
+            .store_boxed(&mut out);
+            out
+        });
+        td.dispatch_completed_community_net();
+        td.flush_deferred_results();
+        assert!(
+            matches!(
+                responses_of(&callback, 1).first(),
+                Some(Object::communityAddChatRequests(_))
+            ),
+            "the page answer settles"
+        );
+        // the wired hop under the take-dance: the method must pre-route the
+        // community family itself — the dispatcher holds the community
+        // manager out of `Td`, so the shared hop would apply into the
+        // placeholder and the put-back would clobber the rename
+        with_community_manager(&mut td, |manager, _| {
+            assert_eq!(
+                manager
+                    .get_community_object(CommunityId::new(7))
+                    .expect("the answer's community chat reaches the community cache")
+                    .name,
+                "Renamed by the page answer"
+            );
+        });
     }
 
     fn community_joined_communities_ride_the_dispatcher_impl() {

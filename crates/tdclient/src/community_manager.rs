@@ -195,8 +195,9 @@ pub trait CommunityManagerEnv {
     /// which applies the community-first hop (#143); a manager method
     /// driven under the take-dance (the dispatcher holds the community
     /// manager out of `Td`) still pre-routes the community family
-    /// itself — see `on_get_joined_communities` — and hands this seam
-    /// the non-community remainder only.
+    /// itself — see `on_get_joined_communities` /
+    /// `on_get_community_peer_link_requests` — and hands this seam the
+    /// non-community remainder only.
     fn on_get_chats(&mut self, _chats: Vec<telegram_api::Chat>, _source: &str) {}
 
     /// `DialogManager::force_create_dialog` — the documented no-op stub;
@@ -1170,10 +1171,31 @@ impl CommunityManager {
             std::mem::take(&mut ptr.users),
             "GetCommunityPeerLinkRequestsQuery",
         );
-        env.on_get_chats(
-            std::mem::take(&mut ptr.chats),
-            "GetCommunityPeerLinkRequestsQuery",
-        );
+        // The community-first intake pass (ChatManager.cpp:5780-5787 over
+        // this query's cpp:411-434): the shared hop lives at
+        // `Td::intake_chats` (#143), but this method runs under the
+        // take-dance — the dispatcher holds the community manager out of
+        // `Td`, so routing through the seam would apply into the
+        // placeholder and the put-back would clobber it — so the
+        // community family lands in the cache through the local routing
+        // before the remainder reaches ChatManager.
+        let mut other_chats = Vec::new();
+        for chat in std::mem::take(&mut ptr.chats) {
+            match chat {
+                telegram_api::Chat::community(community) => {
+                    self.on_get_community(env, &community, "GetCommunityPeerLinkRequestsQuery");
+                }
+                telegram_api::Chat::communityForbidden(forbidden) => {
+                    self.on_get_community_forbidden(
+                        env,
+                        &forbidden,
+                        "GetCommunityPeerLinkRequestsQuery",
+                    );
+                }
+                chat => other_chats.push(chat),
+            }
+        }
+        env.on_get_chats(other_chats, "GetCommunityPeerLinkRequestsQuery");
 
         let mut total_count = ptr.total_count;
         if total_count < ptr.requests.len() as i32 {

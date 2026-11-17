@@ -10269,7 +10269,6 @@ impl ChatManager {
     /// consults the migrated-to channel. Through real wiring the
     /// community family arrives pre-routed at `Td::intake_chats`
     /// (#143), so the community pass here is the defensive remainder.
-    #[allow(dead_code)] // production caller: UpdatesManager (M.7) / M.5.47
     pub(crate) fn on_get_chats(
         &mut self,
         user_manager: &mut UserManager,
