@@ -160,14 +160,19 @@ pub mod tl {
                 advance = 4; // td's `data += sizeof(int32)`
                 payload_at = self.pos + 1;
             } else if first == 254 {
-                self.need(3)?;
+                // Bounds first: the header reads buf[pos+1..=pos+3], so 4
+                // bytes must remain (libFuzzer found the old need(3)
+                // off-by-one — a 0xfe header at the 3-byte tail panicked).
+                self.need(4)?;
                 len = self.buf[self.pos + 1] as usize
                     | (self.buf[self.pos + 2] as usize) << 8
                     | (self.buf[self.pos + 3] as usize) << 16;
                 advance = 4;
                 payload_at = self.pos + 4;
             } else {
-                self.need(7)?;
+                // Same shape: buf[pos+1..=pos+7] needs 8 bytes remaining
+                // (the old need(7) panicked on a 0xff header at the tail).
+                self.need(8)?;
                 let len64 = self.buf[self.pos + 1] as u64
                     | (self.buf[self.pos + 2] as u64) << 8
                     | (self.buf[self.pos + 3] as u64) << 16

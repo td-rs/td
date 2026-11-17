@@ -2,7 +2,8 @@
 # plus the checks too slow or environment-heavy for every PR:
 #   - platform matrix (Linux x64/arm64, macOS arm64 + Intel cross-check, Windows x64)
 #   - current-stable compatibility (default elsewhere is the pinned 1.95)
-#   - wasm32 advisory check (the dependency choices exist to keep wasm buildable; S82 makes it a target)
+#   - wasm advisory check on the supported target, wasm32-unknown-emscripten
+#     (S82; emsdk + the emcc C toolchain env)
 #   - bounded stress soak of the release test suite
 #   - conformance verification against the C++ td oracle (pinned to the schemes commit, S03)
 #
@@ -85,20 +86,37 @@ jobs:
           cargo check --workspace --locked --target x86_64-apple-darwin
 
   wasm:
-    # Advisory only for now (continue-on-error): wasm ships in S82, but the
-    # dependency plan (RustCrypto instead of OpenSSL) exists precisely to keep
-    # it buildable — catch unix-only accidental dependencies early. Flip this
-    # to a gating job when S82 lands.
+    # Advisory (continue-on-error): `cargo check --lib` on the supported
+    # wasm target — wasm32-unknown-emscripten (S82, packaging/wasm). This
+    # is the lane that catches unix-only accidental dependencies early:
+    # wasm32-unknown-unknown is NOT a target (no OS for the tddb/sqlcipher
+    # C stack). The S82 recipe's CC/CXX/AR/RANLIB env is REQUIRED — cc-rs
+    # silently falls back to the host gcc otherwise (packaging/wasm
+    # findings), and the vendored libsqlite3-sys fork carries the emcc
+    # fini_array fix. --lib only: the dev bins (dc_probe etc.) are
+    # native-only tools. Still advisory until it has proven itself green;
+    # flip to gating when it has.
     continue-on-error: true
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.95"
-          targets: wasm32-unknown-unknown
-      - run: cargo check --workspace --locked --target wasm32-unknown-unknown
+          targets: wasm32-unknown-emscripten
+      - name: Install emsdk (pinned to the version the S82 work verified)
+        run: |
+          git clone --depth 1 --branch 6.0.9 https://github.com/emscripten-core/emsdk.git /tmp/emsdk
+          /tmp/emsdk/emsdk install 6.0.9
+          /tmp/emsdk/emsdk activate 6.0.9
+          echo /tmp/emsdk/upstream/emscripten >> "$GITHUB_PATH"
+      - run: cargo check --workspace --lib --locked --target wasm32-unknown-emscripten
+        env:
+          CC: emcc
+          CXX: em++
+          AR: emar
+          RANLIB: emranlib
 
   stress:
     # Bounded soak: keep re-running the release test suite for 10 minutes to
@@ -284,12 +302,11 @@ jobs:
 
   fuzz-smoke:
     # Bounded fuzz smoke of the parsing-heavy components (S78): each target
-    # runs 60 s with coverage instrumentation via cargo-fuzz on nightly.
-    # The S78 release gate is a one-week clean run per target; this job only
-    # catches regressions quickly. Targets live in fuzz/fuzz_targets (the
-    # crate is excluded from the workspace and builds standalone).
+    # in fuzz/fuzz_targets runs 60 s with coverage instrumentation via
+    # cargo-fuzz on nightly. The S78 release gate is a one-week clean run per
+    # target; this job only catches regressions quickly.
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
@@ -298,8 +315,15 @@ jobs:
           tool: cargo-fuzz
       - name: Fuzz smoke (60 s per target)
         # cargo-fuzz resolves fuzz/Cargo.toml relative to the cwd, so it
-        # must run from the repo root, not from inside fuzz/.
+        # must run from the repo root, not from inside fuzz/. RUSTUP_TOOLCHAIN
+        # pins the nightly this job installed past the rust-toolchain.toml
+        # 1.95 pin (cargo-fuzz's -Zsanitizer flags are nightly-only). The
+        # explicit --target is load-bearing: the taiki-e prebuilt cargo-fuzz
+        # is musl-linked and defaults its fuzz target to musl, where ASan
+        # rejects the static libc — glibc is the supported libFuzzer combo.
+        env:
+          RUSTUP_TOOLCHAIN: nightly
         run: |
-          for target in td_api_json json_value binlog_event mtproto_packet tl_scheme_text transport_frame app_config simple_config message_input; do
-            cargo fuzz run "$target" -- -max_total_time=60
+          for target in $(ls fuzz/fuzz_targets | sed 's/\.rs$//'); do
+            cargo fuzz run "$target" --target x86_64-unknown-linux-gnu -- -max_total_time=60
           done

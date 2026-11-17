@@ -86,9 +86,12 @@ a dropped entry leaves no reflog trace (only fsck-recoverable). See the
 
 - Vendored OpenSSL and SQLCipher compile from source: a C compiler, `perl`,
   and `pkg-config` are required; no system copies needed.
-- `wasm32-unknown-unknown` does not build clean (getrandom `js` feature gap);
-  its CI job is advisory. The emscripten target
-  (`wasm32-unknown-emscripten`) is configured in `.cargo/config.toml`.
+- `wasm32-unknown-unknown` is not a target (no OS for the tddb/sqlcipher C
+  stack); the supported wasm target is `wasm32-unknown-emscripten`
+  (configured in `.cargo/config.toml`, shipped via `packaging/wasm`). Main
+  CI's advisory `wasm` job checks it with the pinned emsdk and the
+  `CC=emcc CXX=em++ AR=emar RANLIB=emranlib` env — cc-rs silently uses the
+  host gcc otherwise.
 
 ## Distributed development and build strategy
 

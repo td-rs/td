@@ -42,26 +42,40 @@ use tokio::net::TcpStream;
 
 use base64::Engine as _;
 use tddb::binlog_key_value::BinlogKeyValue;
-use tdmtproto::auth_data::{AuthData, ServerSalt, parse_server_salt, store_server_salt};
+#[cfg(not(target_family = "wasm"))]
+use tdmtproto::auth_data::AuthData;
+use tdmtproto::auth_data::{ServerSalt, parse_server_salt, store_server_salt};
 use tdmtproto::auth_key::AuthKey;
+#[cfg(not(target_family = "wasm"))]
 use tdmtproto::dh_callback::DhCallback;
-use tdmtproto::handshake::{AuthKeyHandshake, AuthKeyHandshakeContext};
+#[cfg(not(target_family = "wasm"))]
+use tdmtproto::handshake::AuthKeyHandshake;
+#[cfg(not(target_family = "wasm"))]
+use tdmtproto::handshake::AuthKeyHandshakeContext;
 #[cfg(not(target_family = "wasm"))]
 use tdmtproto::handshake_actor::run_handshake;
+#[cfg(not(target_family = "wasm"))]
 use tdmtproto::message_id::MessageId;
 use tdmtproto::proxy_secret::ProxySecret;
 #[cfg(not(target_family = "wasm"))]
 use tdmtproto::raw_connection::RawConnection;
+#[cfg(not(target_family = "wasm"))]
 use tdmtproto::rsa::{PublicRsaKeyInterface, RsaKey};
-use tdmtproto::session_connection::{SessionConnection, SessionConnectionCallback, SessionMode};
+#[cfg(not(target_family = "wasm"))]
+use tdmtproto::session_connection::SessionConnectionCallback;
+#[cfg(not(target_family = "wasm"))]
+use tdmtproto::session_connection::{SessionConnection, SessionMode};
 use tdmtproto::telegram_api;
+#[cfg(not(target_family = "wasm"))]
 use tdmtproto::transport_type::{TransportType, TransportTypeEnum};
 use tdnet::http_query::HttpQuery;
 use tdnet::wget::{VerifyPeer, WgetParams, wget};
+#[cfg(not(target_family = "wasm"))]
 use tdutils::buffer::BufferSlice;
 use tdutils::http_date::parse_http_date;
 use tdutils::http_url::url_encode;
 use tdutils::json::{JsonValue, JsonValueType, json_decode};
+#[cfg(not(target_family = "wasm"))]
 use tdutils::random;
 use tdutils::rsa::Rsa;
 use tdutils::status::Status;
@@ -1448,11 +1462,13 @@ pub fn load_recovery_salts(pmc: &BinlogKeyValue, raw_dc_id: i32) -> Vec<ServerSa
 /// `PublicRsaKeySharedMain::create(is_test)`
 /// (net/PublicRsaKeySharedMain.cpp:22-58) — one pinned key per flavor; the
 /// fingerprint is the parsed key's own (`add_pem`).
+#[cfg(not(target_family = "wasm"))]
 struct RecoveryRsa {
     rsa: Rsa,
     fingerprint: i64,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl PublicRsaKeyInterface for RecoveryRsa {
     fn get_rsa_key(&self, fingerprints: &[i64]) -> tdutils::status::Result<RsaKey> {
         if fingerprints.contains(&self.fingerprint) {
@@ -1472,8 +1488,10 @@ impl PublicRsaKeyInterface for RecoveryRsa {
 
 /// The `PrimeCallback` of the Track-G probes (the C++
 /// `DhCallback`): accept the built-in prime, check others on the fly.
+#[cfg(not(target_family = "wasm"))]
 struct RecoveryPrimeCallback;
 
+#[cfg(not(target_family = "wasm"))]
 impl DhCallback for RecoveryPrimeCallback {
     fn is_good_prime(&self, _prime_str: &[u8]) -> i32 {
         -1 // run the full primality checks
@@ -1484,10 +1502,12 @@ impl DhCallback for RecoveryPrimeCallback {
 
 /// The `td::mtproto::AuthKeyHandshakeContext` of the recovery handshake:
 /// the built-in prime checks and the pinned `PublicRsaKeySharedMain` key.
+#[cfg(not(target_family = "wasm"))]
 struct RecoveryContext {
     rsa: RecoveryRsa,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl AuthKeyHandshakeContext for RecoveryContext {
     fn get_dh_callback(&self) -> &dyn DhCallback {
         static CALLBACK: RecoveryPrimeCallback = RecoveryPrimeCallback;
@@ -1501,6 +1521,7 @@ impl AuthKeyHandshakeContext for RecoveryContext {
 
 /// The `PublicRsaKeySharedMain` keys, `create(is_test)`
 /// (net/PublicRsaKeySharedMain.cpp:26-52).
+#[cfg(not(target_family = "wasm"))]
 fn recovery_rsa(is_test: bool) -> RecoveryRsa {
     // The test key (net/PublicRsaKeySharedMain.cpp:26-37).
     const TEST_KEY: &str = "-----BEGIN RSA PUBLIC KEY-----\n\
@@ -1699,6 +1720,7 @@ pub fn gen_recovery_header(options: &RecoveryHeaderOptions) -> Result<Vec<u8>, S
 
 /// The `GetConfigActor::on_result` parse — `fetch_result<help_getConfig>`
 /// (ConfigManager.cpp:432-434).
+#[cfg(not(target_family = "wasm"))]
 fn parse_full_config(packet: &[u8]) -> Result<telegram_api::Config, Status> {
     telegram_api::Config::parse(packet)
         .map_err(|error| Status::error_message(&format!("Failed to parse help.config: {error}")))
@@ -1716,6 +1738,7 @@ pub fn request_raw_connection_allowed(tries: usize) -> bool {
 /// one query, like the C++ `SessionCallback::on_result` handing the query
 /// to the dispatcher; the salt updates are persisted by the executor (the
 /// no-PFS `Session::on_server_salt_updated` branch, Session.cpp:612-618).
+#[cfg(not(target_family = "wasm"))]
 struct FullConfigCallback {
     request_id: MessageId,
     answer: Option<Result<Vec<u8>, Status>>,
@@ -1725,6 +1748,7 @@ struct FullConfigCallback {
     salts_updated: bool,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl SessionConnectionCallback for FullConfigCallback {
     fn on_connected(&mut self) {}
     fn on_closed(&mut self, _status: Status) {
