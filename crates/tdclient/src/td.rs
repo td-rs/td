@@ -8048,7 +8048,7 @@ impl Td {
         // block) — the autologin-token slice (M.3.9.1); the link surface
         // is Wave 2.
         self.link_manager = Some(LinkManager::new());
-        // The net-drain 32 dispatch surface (§0's shared-env shape: the
+        // The link net dispatch surface (§0's shared-env shape: the
         // handle rides the manager, the answers drain through
         // `Td::on_link_net_answer`).
         {
@@ -11814,8 +11814,8 @@ impl Td {
     }
 
     /// Drain the callback-parked LinkManager answers — the C++
-    /// ResultHandler `on_result`/`on_error` halves of the net-drain 32
-    /// families (LinkManager.cpp:1508-1780).
+    /// ResultHandler `on_result`/`on_error` halves of the link net
+    /// families (LinkManager.cpp:1508-2106).
     fn dispatch_completed_link_net(&mut self) {
         let completed = std::mem::take(&mut *self.link_net_completed.lock());
         for (kind, query) in completed {
@@ -29251,7 +29251,7 @@ impl Td {
     }
 
     /// Route one LinkManager net answer by kind — the ResultHandler
-    /// halves of the net-drain 32 families (LinkManager.cpp:1508-1780):
+    /// halves of the link net families (LinkManager.cpp:1508-2106):
     /// the wire answers parse here, run the users/chats intakes and the
     /// recentMeUrl ladder, and settle the parked family promises (the
     /// parse failures settle through the same error tails, the
@@ -29645,6 +29645,143 @@ impl Td {
                     match_code_first: request.match_codes_first,
                     match_codes: request.match_codes,
                 });
+            }
+            // `CheckUrlAuthMatchCodeQuery` (cpp:1995-2020) — the Bool
+            // answer: the true arm settles Unit, the false arm the
+            // MATCH_CODE_INVALID 400 (the C++ `!result_ptr.ok()` band
+            // reenters on_error, cpp:2011-2013).
+            crate::link_manager::LinkNetKind::CheckUrlAuthMatchCode => {
+                let promise = self
+                    .link_manager
+                    .as_mut()
+                    .and_then(|m| pop_head(&mut m.pending.check_url_auth_match_code));
+                if query.is_error() {
+                    if let Some(mut promise) = promise {
+                        promise.set_error(query.error().clone());
+                    }
+                    return;
+                }
+                let ok = match parse_wire_bool_value(query.ok()) {
+                    Some(ok) => ok,
+                    None => {
+                        if let Some(mut promise) = promise {
+                            promise.set_error(parse_error("messages_checkUrlAuthMatchCode"));
+                        }
+                        return;
+                    }
+                };
+                if !ok {
+                    if let Some(mut promise) = promise {
+                        promise.set_error(Status::error(400, "MATCH_CODE_INVALID"));
+                    }
+                    return;
+                }
+                if let Some(mut promise) = promise {
+                    promise.set_value(());
+                }
+            }
+            // `AcceptUrlAuthQuery` (cpp:2023-2080) — the three-way
+            // urlAuthResult ladder over the parked url/dialog_id/
+            // promise triple: the request form is the unexpected 500
+            // (the C++ `return on_error(...)` reentry through the
+            // same error tail the wire errors run, cpp:2049-2052),
+            // the accepted form the wire url, the default form the
+            // parked url; the error tail keeps the dialog-keyed
+            // intake and settles with the error (no default-open
+            // fallback — the C++ tail differs from
+            // `RequestUrlAuthQuery`'s, cpp:2074-2080).
+            crate::link_manager::LinkNetKind::AcceptUrlAuth => {
+                // `AcceptUrlAuthQuery::on_error` (cpp:2074-2080) — the
+                // dialog-keyed intake + the log, then the error
+                // passthrough.
+                fn accept_url_auth_error(
+                    td: &Td,
+                    dialog_id: Option<crate::dialog_id::DialogId>,
+                    status: Status,
+                    promise: &mut tdutils::promise::Promise<String>,
+                ) {
+                    let handled = dialog_id.is_some_and(|dialog_id| {
+                        crate::dialog_manager::on_get_dialog_error(
+                            &td.global,
+                            dialog_id,
+                            &status,
+                            "AcceptUrlAuthQuery",
+                        )
+                    });
+                    if !handled {
+                        tdutils::log_info!(
+                            "Receive error for AcceptUrlAuthQuery: {}",
+                            status.message()
+                        );
+                    }
+                    promise.set_error(status);
+                }
+                let Some((url, dialog_id, mut promise)) = self
+                    .link_manager
+                    .as_mut()
+                    .and_then(|m| pop_head(&mut m.pending.accept_url_auth))
+                else {
+                    return;
+                };
+                if query.is_error() {
+                    return accept_url_auth_error(
+                        self,
+                        dialog_id,
+                        query.error().clone(),
+                        &mut promise,
+                    );
+                }
+                let result = match telegram_api::UrlAuthResult::parse(query.ok()) {
+                    Ok(result) => result,
+                    Err(_) => {
+                        return accept_url_auth_error(
+                            self,
+                            dialog_id,
+                            parse_error("messages_acceptUrlAuth"),
+                            &mut promise,
+                        );
+                    }
+                };
+                match result {
+                    telegram_api::UrlAuthResult::urlAuthResultRequest(_) => {
+                        // the unexpected-request band reenters the
+                        // C++ `on_error` tail (cpp:2060-2061)
+                        tdutils::log_error!("Receive unexpected urlAuthResultRequest");
+                        accept_url_auth_error(
+                            self,
+                            dialog_id,
+                            Status::error(500, "Receive unexpected urlAuthResultRequest"),
+                            &mut promise,
+                        );
+                    }
+                    telegram_api::UrlAuthResult::urlAuthResultAccepted(accepted) => {
+                        promise.set_value(accepted.url);
+                    }
+                    telegram_api::UrlAuthResult::urlAuthResultDefault(_) => {
+                        promise.set_value(url);
+                    }
+                }
+            }
+            // `DeclineUrlAuthQuery` (cpp:2083-2106) — the ok settle:
+            // both the answer and the error tail resolve Unit (the
+            // C++ on_error is `set_value(Unit())`, cpp:2103-2106; a
+            // malformed body answers the same way — the C++ fetch
+            // failure routes through on_error).
+            crate::link_manager::LinkNetKind::DeclineUrlAuth => {
+                let promise = self
+                    .link_manager
+                    .as_mut()
+                    .and_then(|m| pop_head(&mut m.pending.decline_url_auth));
+                let Some(mut promise) = promise else {
+                    return;
+                };
+                if query.is_error() {
+                    tdutils::log_info!(
+                        "Receive error for DeclineUrlAuthQuery: {}",
+                        query.error().message()
+                    );
+                }
+                promise.set_value(());
             }
         }
     }
@@ -96130,6 +96267,409 @@ kQIDAQAB\n\
                     && pending.deep_link_info.is_empty()
                     && pending.url_auth.is_empty()
                     && pending.url_oauth.is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn url_auth_answer_trio_rides_the_dispatcher() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(url_auth_answer_trio_rides_the_dispatcher_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The settled-`Result<String>` recorder — the AcceptUrlAuthQuery
+    /// peer-form drive (the manager-level promise sink).
+    #[derive(Default)]
+    struct RecString {
+        settled: Arc<parking_lot::Mutex<Vec<Result<String, Status>>>>,
+    }
+
+    impl tdutils::promise::PromiseInterface<String> for RecString {
+        fn set_value(&mut self, value: String) {
+            self.settled.lock().push(Ok(value));
+        }
+
+        fn set_error(&mut self, error: Status) {
+            self.settled.lock().push(Err(error));
+        }
+    }
+
+    fn url_auth_answer_trio_rides_the_dispatcher_impl() {
+        macro_rules! wire {
+            ($value:expr) => {{
+                let mut out = Vec::new();
+                $value.store_boxed(&mut out);
+                out
+            }};
+        }
+        let (mut td, rec, callback) = netted_td_with_callback("netdrain147-url-auth");
+        // boolTrue#997275b5 / boolFalse#bc799737 — the bootstrap Bool
+        // constructors the generator emits no structs for
+        let wire_bool = |ok: bool| {
+            if ok {
+                0x9972_75b5u32.to_le_bytes().to_vec()
+            } else {
+                0xbc79_9737u32.to_le_bytes().to_vec()
+            }
+        };
+
+        // 1. checkOauthRequestMatchCode — the url/match-code pair rides
+        //    the wire, the true Bool settles ok
+        td.request(
+            1,
+            Function::checkOauthRequestMatchCode(td_api::checkOauthRequestMatchCode {
+                url: "https://oauth.example/request".to_owned(),
+                match_code: "code".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_checkUrlAuthMatchCode::ID,
+        );
+        let body = telegram_api::messages_checkUrlAuthMatchCode::parse(sent.query())
+            .expect("the sent body");
+        assert_eq!(
+            (body.url.as_str(), body.match_code.as_str()),
+            ("https://oauth.example/request", "code")
+        );
+        net_complete(sent, wire_bool(true));
+        td.dispatch_completed_link_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 1).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 1b. the false Bool — the MATCH_CODE_INVALID 400 band
+        td.request(
+            11,
+            Function::checkOauthRequestMatchCode(td_api::checkOauthRequestMatchCode {
+                url: "https://oauth.example/request".to_owned(),
+                match_code: "bad".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_checkUrlAuthMatchCode::ID,
+        );
+        net_complete(sent, wire_bool(false));
+        td.dispatch_completed_link_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 11);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (400, "MATCH_CODE_INVALID")
+        );
+
+        // 1c. the wire-error band — the promise error passes through
+        td.request(
+            12,
+            Function::checkOauthRequestMatchCode(td_api::checkOauthRequestMatchCode {
+                url: "https://oauth.example/request".to_owned(),
+                match_code: String::new(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_checkUrlAuthMatchCode::ID,
+        );
+        net_fail(sent, 420, "FLOOD_WAIT_7");
+        td.dispatch_completed_link_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 12);
+        assert_eq!((error.code, error.message.as_str()), (420, "FLOOD_WAIT_7"));
+
+        // 2. getExternalLink — the bare-url AcceptUrlAuthQuery form: the
+        //    url mask alone (write_allowed rides its own bit 0), the
+        //    accepted arm answers the wire url as httpUrl
+        td.request(
+            2,
+            Function::getExternalLink(td_api::getExternalLink {
+                link: "https://oauth.example/request".to_owned(),
+                allow_write_access: true,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_acceptUrlAuth::ID,
+        );
+        let body =
+            telegram_api::messages_acceptUrlAuth::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.flags, 1 | (1 << 2)); // write_allowed | URL_MASK
+        assert!(body.peer.is_none());
+        assert_eq!(
+            (
+                body.msg_id,
+                body.button_id,
+                body.url.as_str(),
+                body.match_code.as_str()
+            ),
+            (0, 0, "https://oauth.example/request", "")
+        );
+        assert!(body.tonconnect_session.is_none());
+        net_complete(
+            sent,
+            wire!(telegram_api::urlAuthResultAccepted {
+                flags: 1,
+                url: "https://accepted.example/done".to_owned(),
+            }),
+        );
+        td.dispatch_completed_link_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 2).first(),
+            Some(Object::httpUrl(u)) if u.url == "https://accepted.example/done"
+        ));
+
+        // 2b. the default arm — the parked url answers as httpUrl
+        td.request(
+            13,
+            Function::getExternalLink(td_api::getExternalLink {
+                link: "https://oauth.example/other".to_owned(),
+                allow_write_access: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_acceptUrlAuth::ID,
+        );
+        let body =
+            telegram_api::messages_acceptUrlAuth::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.flags, 1 << 2, "no write-allowed bit when off");
+        net_complete(sent, wire!(telegram_api::urlAuthResultDefault));
+        td.dispatch_completed_link_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 13).first(),
+            Some(Object::httpUrl(u)) if u.url == "https://oauth.example/other"
+        ));
+
+        // 2c. the unexpected-request arm — the 500 reenters the C++
+        //     on_error tail
+        td.request(
+            14,
+            Function::getExternalLink(td_api::getExternalLink {
+                link: "https://oauth.example/loop".to_owned(),
+                allow_write_access: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_acceptUrlAuth::ID,
+        );
+        net_complete(
+            sent,
+            wire!(telegram_api::urlAuthResultRequest {
+                flags: 0,
+                request_write_access: false,
+                request_phone_number: false,
+                match_codes_first: false,
+                // 1.8.70 wire fields — no TON Connect in the fixtures.
+                request_wallet: false,
+                tc_session_id: 0,
+                tc_client_id: String::new(),
+                is_app: false,
+                bot: Some(telegram_api::User::user(telegram_api::user {
+                    flags: 1,
+                    bot: true,
+                    id: 901,
+                    access_hash: 556,
+                    first_name: "AuthBot".to_owned(),
+                    ..telegram_api::user::default()
+                })),
+                domain: "oauth.example".to_owned(),
+                browser: String::new(),
+                platform: String::new(),
+                ip: String::new(),
+                region: String::new(),
+                match_codes: vec![],
+                user_id_hint: 0,
+                verified_app_name: String::new(),
+            }),
+        );
+        td.dispatch_completed_link_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 14);
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (500, "Receive unexpected urlAuthResultRequest")
+        );
+
+        // 2d. the wire-error band — no dialog context, the plain
+        //     passthrough
+        td.request(
+            15,
+            Function::getExternalLink(td_api::getExternalLink {
+                link: "https://oauth.example/fail".to_owned(),
+                allow_write_access: false,
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_acceptUrlAuth::ID,
+        );
+        net_fail(sent, 420, "URL_EXPIRED");
+        td.dispatch_completed_link_net();
+        td.flush_deferred_results();
+        let error = error_of(&callback, 15);
+        assert_eq!((error.code, error.message.as_str()), (420, "URL_EXPIRED"));
+
+        // 3. acceptOauthRequest — the full flag form: write_allowed +
+        //    share_phone_number (the generator's auto bits) over the
+        //    url/match-code/tonconnect-session masks, the session body
+        //    parsed off the wire
+        td.request(
+            3,
+            Function::acceptOauthRequest(td_api::acceptOauthRequest {
+                url: "https://oauth.example/request".to_owned(),
+                match_code: "code".to_owned(),
+                allow_write_access: true,
+                allow_phone_number_access: true,
+                ton_connect_connect_data: Some(td_api::TonConnectConnectData {
+                    session_id: 42,
+                    challenge_answer: b"challenge-answer".to_vec(),
+                    body: b"connect-body".to_vec(),
+                    proof: Some(td_api::TonWalletOwnershipProof {
+                        public_key: vec![1u8; 32],
+                        timestamp: 7,
+                        signature: vec![2u8; 64],
+                    }),
+                }),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_acceptUrlAuth::ID,
+        );
+        let body =
+            telegram_api::messages_acceptUrlAuth::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.flags, 1 | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5));
+        assert_eq!(body.match_code.as_str(), "code");
+        assert!(matches!(
+            &body.tonconnect_session,
+            Some(telegram_api::InputTonConnectOauthSession {
+                session_id: 42,
+                challenge_answer,
+                body,
+                proof: Some(telegram_api::WalletOwnershipProof { timestamp: 7, signature }),
+            }) if challenge_answer == b"challenge-answer" && body == b"connect-body"
+                && signature.len() == 64
+        ));
+        net_complete(
+            sent,
+            wire!(telegram_api::urlAuthResultAccepted {
+                flags: 1,
+                url: "https://accepted.example/oauth".to_owned(),
+            }),
+        );
+        td.dispatch_completed_link_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 3).first(),
+            Some(Object::httpUrl(u)) if u.url == "https://accepted.example/oauth"
+        ));
+
+        // 4. declineOauthRequest — the url rides the wire, the ok settle
+        td.request(
+            4,
+            Function::declineOauthRequest(td_api::declineOauthRequest {
+                url: "https://oauth.example/request".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_declineUrlAuth::ID,
+        );
+        let body =
+            telegram_api::messages_declineUrlAuth::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.url.as_str(), "https://oauth.example/request");
+        net_complete(sent, wire_bool(false));
+        td.dispatch_completed_link_net();
+        td.flush_deferred_results();
+        assert!(matches!(
+            responses_of(&callback, 4).first(),
+            Some(Object::ok(_))
+        ));
+
+        // 4b. the wire-error band — the C++ on_error is set_value (the
+        //     ok settle, cpp:2102-2106)
+        td.request(
+            16,
+            Function::declineOauthRequest(td_api::declineOauthRequest {
+                url: "https://oauth.example/gone".to_owned(),
+            }),
+        );
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_declineUrlAuth::ID,
+        );
+        net_fail(sent, 500, "AUTH_KEY_UNREGISTERED");
+        td.dispatch_completed_link_net();
+        td.flush_deferred_results();
+        assert!(
+            matches!(responses_of(&callback, 16).first(), Some(Object::ok(_))),
+            "the decline error tail settles ok"
+        );
+
+        // 5. the accept peer form — the manager-level drive over the
+        //    mock env (the request arm parks at the M.10 button seam):
+        //    the peer/msg/button mask alone (the url stays off the
+        //    wire — C++ `input_url` is only set in the bare form), the
+        //    default arm settles the parked url
+        let accept_sink = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        {
+            let mut manager = td.link_manager.take().expect("the link manager");
+            let promise = tdutils::promise::Promise::from_interface(RecString {
+                settled: Arc::clone(&accept_sink),
+            });
+            manager.get_login_url(
+                &mut PeerFormLinkEnv,
+                crate::messages_manager::MessageFullId::new(
+                    crate::dialog_id::DialogId::from_user_id(UserId::new(900)),
+                    crate::messages_manager::MessageId::from_server_message_id(
+                        crate::messages_manager::ServerMessageId::new(123),
+                    ),
+                ),
+                7,
+                true,
+                promise,
+            );
+            td.link_manager = Some(manager);
+        }
+        let sent = take_sent(
+            std::mem::take(&mut *rec.sent.lock()),
+            telegram_api::messages_acceptUrlAuth::ID,
+        );
+        let body =
+            telegram_api::messages_acceptUrlAuth::parse(sent.query()).expect("the sent body");
+        assert_eq!(body.flags, 1 | (1 << 1)); // write_allowed | PEER_MASK
+        assert!(matches!(
+            body.peer.as_deref(),
+            Some(telegram_api::InputPeer::inputPeerUser(p)) if p.user_id == 900
+        ));
+        assert_eq!(
+            (body.msg_id, body.button_id, body.url.as_str()),
+            (123, 7, "")
+        );
+        net_complete(sent, wire!(telegram_api::urlAuthResultDefault));
+        td.dispatch_completed_link_net();
+        assert!(matches!(
+            accept_sink.lock().first(),
+            Some(Ok(url)) if url == "https://btn.example/auth"
+        ));
+
+        // the drain ran clean — nothing parked, no strays
+        assert!(td.link_net_completed.lock().is_empty(), "drained");
+        {
+            let pending = &td.link_manager.as_ref().expect("the link manager").pending;
+            assert!(
+                pending.check_url_auth_match_code.is_empty()
+                    && pending.accept_url_auth.is_empty()
+                    && pending.decline_url_auth.is_empty()
             );
         }
     }

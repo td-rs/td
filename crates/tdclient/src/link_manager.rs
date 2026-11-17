@@ -917,7 +917,8 @@ pub trait LinkEnv {
     }
 
     /// `DialogManager::get_input_peer(dialog_id, Read)` — the send-leg
-    /// peer resolution of `RequestUrlAuthQuery::send` (cpp:1660-1665).
+    /// peer resolution of `RequestUrlAuthQuery::send` and
+    /// `AcceptUrlAuthQuery::send` (cpp:1873-1874, 2040-2041).
     /// The narrow env views can't reach the dialog plane, so the default
     /// answers `None` (the C++ `CHECK(input_peer != nullptr)` is fatal;
     /// the port downgrades it to a non-fatal log-and-drop); the
@@ -929,53 +930,6 @@ pub trait LinkEnv {
         _dialog_id: crate::dialog_id::DialogId,
     ) -> Option<tdmtproto::telegram_api::InputPeer> {
         None
-    }
-
-    /// `CheckUrlAuthMatchCodeQuery` (cpp:1782-1808,
-    /// `messages.checkUrlAuthMatchCode`) — `[blocked: net]`.
-    fn send_check_url_auth_match_code_query(
-        &mut self,
-        _url: String,
-        _match_code: String,
-        _promise: tdutils::promise::Promise<()>,
-    ) {
-    }
-
-    /// `AcceptUrlAuthQuery` (cpp:1810-1867, `messages.acceptUrlAuth`) —
-    /// the acceptance query behind `getLoginUrl`, `getExternalLink` and
-    /// `acceptOauthRequest` (the peer/button context and — upstream
-    /// 2485f5889 — the TON Connect session ride along in the C++
-    /// `send`; the session rides the wire query only when set, flag
-    /// bit 1<<5; the offline tail drops the promise, so the port keeps
-    /// the full parameter shape but never answers). Wire-shape rider
-    /// for the future send leg: the C++ codegen auto-ORs the
-    /// conditional-field bits (`(ptr != nullptr) << bit`,
-    /// tl_writer_cpp.cpp:533) into the flags word, the Rust generator
-    /// does not — the send leg must hand-set the `1<<2` url, `1<<4`
-    /// match_code and `1<<5` session bits in `messages_acceptUrlAuth`
-    /// exactly like `get_oauth_link_info` hand-sets the requestUrlAuth
-    /// masks.
-    #[allow(clippy::too_many_arguments)] // the C++ handler has the same shape
-    fn send_accept_url_auth_query(
-        &mut self,
-        _url: String,
-        _message_full_id: MessageFullId,
-        _button_id: i32,
-        _allow_write_access: bool,
-        _allow_phone_number_access: bool,
-        _match_code: String,
-        _tonconnect_session: Option<tdmtproto::telegram_api::InputTonConnectOauthSession>,
-        _promise: tdutils::promise::Promise<String>,
-    ) {
-    }
-
-    /// `DeclineUrlAuthQuery` (cpp:1869+, `messages.declineUrlAuth`) —
-    /// `[blocked: net]`.
-    fn send_decline_url_auth_query(
-        &mut self,
-        _url: String,
-        _promise: tdutils::promise::Promise<()>,
-    ) {
     }
 
     /// `MessagesManager::get_login_button_url` (MessagesManager.cpp:6726-6762)
@@ -7012,7 +6966,8 @@ pub fn get_message_link_info(
 }
 
 /// The LinkManager in-flight query kinds — the C++ ResultHandler classes
-/// of the net-drain 32 families (LinkManager.cpp:1508-1780). The handler
+/// of the net-drain 32 families + the url-auth answer trio
+/// (LinkManager.cpp:1508-2106). The handler
 /// state the answers read (`url_`/`dialog_id_`/the promise) rides the
 /// [`PendingLinkQueries`] lots instead — the kinds stay `Copy`.
 #[derive(Clone, Copy)]
@@ -7028,11 +6983,20 @@ pub(crate) enum LinkNetKind {
     /// `RequestUrlOauthQuery` (cpp:1722) — the oauth form with the
     /// in-app origin.
     RequestUrlOauth,
+    /// `CheckUrlAuthMatchCodeQuery` (cpp:1995) —
+    /// `messages.checkUrlAuthMatchCode`.
+    CheckUrlAuthMatchCode,
+    /// `AcceptUrlAuthQuery` (cpp:2023) — `messages.acceptUrlAuth` in
+    /// the peer/button or the bare-url flag form.
+    AcceptUrlAuth,
+    /// `DeclineUrlAuthQuery` (cpp:2083) — `messages.declineUrlAuth`.
+    DeclineUrlAuth,
 }
 
 /// The parked query promises — the ResultHandler members the `Copy`
 /// [`LinkNetKind`]s can't carry (`RequestUrlAuthQuery`'s `url_`/
-/// `dialog_id_`, `RequestUrlOauthQuery`'s `url_`, and every `promise_`).
+/// `dialog_id_`, `AcceptUrlAuthQuery`'s `url_`/`dialog_id_`,
+/// `RequestUrlOauthQuery`'s `url_`, and every `promise_`).
 /// FIFO-paired per family (§5).
 #[derive(Default)]
 pub(crate) struct PendingLinkQueries {
@@ -7048,6 +7012,16 @@ pub(crate) struct PendingLinkQueries {
     )>,
     /// `RequestUrlOauthQuery`'s `url_`/`promise_`.
     pub(crate) url_oauth: Vec<(String, tdutils::promise::Promise<td_api::OauthLinkInfo>)>,
+    /// `CheckUrlAuthMatchCodeQuery::promise_`.
+    pub(crate) check_url_auth_match_code: Vec<tdutils::promise::Promise<()>>,
+    /// `AcceptUrlAuthQuery`'s `url_`/`dialog_id_`/`promise_`.
+    pub(crate) accept_url_auth: Vec<(
+        String,
+        Option<crate::dialog_id::DialogId>,
+        tdutils::promise::Promise<String>,
+    )>,
+    /// `DeclineUrlAuthQuery::promise_`.
+    pub(crate) decline_url_auth: Vec<tdutils::promise::Promise<()>>,
 }
 
 /// The autologin-token state (LinkManager.h:227-231).
@@ -7058,7 +7032,7 @@ pub(crate) struct LinkManager {
     autologin_update_time: f64,
     url_auth_domains: Vec<String>,
     whitelisted_domains: Vec<String>,
-    /// The parked query promises of the net-drain 32 families.
+    /// The parked query promises of the link net families.
     pub(crate) pending: PendingLinkQueries,
     /// The net dispatch surface — the `td_` back-pointer the C++ manager
     /// uses for its query sends, narrowed to the net plane (`None` in
@@ -7251,6 +7225,131 @@ impl LinkManager {
         );
     }
 
+    /// `CheckUrlAuthMatchCodeQuery::send` (cpp:2002-2004) — the
+    /// url/match-code pair rides the wire query; the promise parks in
+    /// the family lot for the answer leg (the MATCH_CODE_INVALID 400
+    /// band on the false Bool, the Unit settle on the true one,
+    /// cpp:2006-2020).
+    fn send_check_url_auth_match_code_query(
+        &mut self,
+        url: String,
+        match_code: String,
+        promise: tdutils::promise::Promise<()>,
+    ) {
+        self.pending.check_url_auth_match_code.push(promise);
+        self.send_link_net_query(
+            LinkNetKind::CheckUrlAuthMatchCode,
+            tdmtproto::telegram_api::Function::messages_checkUrlAuthMatchCode(
+                tdmtproto::telegram_api::messages_checkUrlAuthMatchCode { url, match_code },
+            ),
+            "messages.checkUrlAuthMatchCode",
+        );
+    }
+
+    /// `AcceptUrlAuthQuery::send` (cpp:2032-2049) — the acceptance
+    /// query behind `getLoginUrl`, `getLinkLoginUrl` and
+    /// `acceptOauthRequest`. The peer/button form when the message
+    /// dialog is valid (the read input peer resolves at the send leg
+    /// like `RequestUrlAuthQuery::send`; the C++ `CHECK(input_peer !=
+    /// nullptr)` is fatal and the port downgrades it to a non-fatal
+    /// log-and-drop; the url stays off the wire — C++ `input_url` is
+    /// only set in the bare-url form, cpp:2042-2044), and the conditional-field bits
+    /// the C++ codegen auto-ORs (tl_writer_cpp.cpp:533) are hand-set:
+    /// `1<<1` peer/msg/button, `1<<2` url, `1<<4` match_code, `1<<5`
+    /// the TON Connect session (#146's generator divergence note).
+    /// The `url_`/`dialog_id_`/promise trio parks in the family lot
+    /// for the answer legs (cpp:2051-2080).
+    #[allow(clippy::too_many_arguments)] // the C++ handler has the same shape
+    fn send_accept_url_auth_query(
+        &mut self,
+        env: &mut impl LinkEnv,
+        url: String,
+        message_full_id: MessageFullId,
+        button_id: i32,
+        allow_write_access: bool,
+        allow_phone_number_access: bool,
+        match_code: String,
+        tonconnect_session: Option<tdmtproto::telegram_api::InputTonConnectOauthSession>,
+        promise: tdutils::promise::Promise<String>,
+    ) {
+        // messages_acceptUrlAuth flag bits (telegram_api.tl:2750).
+        const PEER_MASK: i32 = 1 << 1;
+        const URL_MASK: i32 = 1 << 2;
+        const MATCH_CODE_MASK: i32 = 1 << 4;
+        const TONCONNECT_SESSION_MASK: i32 = 1 << 5;
+        let dialog_id = message_full_id.get_dialog_id();
+        let (mut flags, peer, msg_id, wire_button_id, error_dialog_id, wire_url) =
+            if dialog_id.is_valid() {
+                let Some(peer) = env.get_input_peer_read(dialog_id) else {
+                    // the C++ CHECK(input_peer != nullptr) is fatal; the
+                    // port downgrades it to log-and-drop — the query never
+                    // sends and the promise stays unanswered
+                    tdutils::log_error!("AcceptUrlAuthQuery — no input peer for {dialog_id:?}");
+                    return;
+                };
+                (
+                    PEER_MASK,
+                    Some(Box::new(peer)),
+                    message_full_id
+                        .get_message_id()
+                        .get_server_message_id()
+                        .get(),
+                    button_id,
+                    Some(dialog_id),
+                    String::new(),
+                )
+            } else {
+                // the bare-url form (cpp:1837-1840): the C++ auto-OR sets
+                // the url bit only for a non-empty url
+                let mut flags = 0;
+                if !url.is_empty() {
+                    flags |= URL_MASK;
+                }
+                (flags, None, 0, 0, None, url.clone())
+            };
+        if !match_code.is_empty() {
+            flags |= MATCH_CODE_MASK;
+        }
+        if tonconnect_session.is_some() {
+            flags |= TONCONNECT_SESSION_MASK;
+        }
+        self.pending
+            .accept_url_auth
+            .push((url, error_dialog_id, promise));
+        self.send_link_net_query(
+            LinkNetKind::AcceptUrlAuth,
+            tdmtproto::telegram_api::Function::messages_acceptUrlAuth(
+                tdmtproto::telegram_api::messages_acceptUrlAuth {
+                    flags,
+                    write_allowed: allow_write_access,
+                    share_phone_number: allow_phone_number_access,
+                    peer,
+                    msg_id,
+                    button_id: wire_button_id,
+                    url: wire_url,
+                    match_code,
+                    tonconnect_session,
+                },
+            ),
+            "messages.acceptUrlAuth",
+        );
+    }
+
+    /// `DeclineUrlAuthQuery::send` (cpp:2090-2092) — the url rides
+    /// the wire query; the promise parks in the family lot for the
+    /// answer leg (the ok settle on both the answer and the error
+    /// tail, cpp:2094-2106).
+    fn send_decline_url_auth_query(&mut self, url: String, promise: tdutils::promise::Promise<()>) {
+        self.pending.decline_url_auth.push(promise);
+        self.send_link_net_query(
+            LinkNetKind::DeclineUrlAuth,
+            tdmtproto::telegram_api::Function::messages_declineUrlAuth(
+                tdmtproto::telegram_api::messages_declineUrlAuth { url },
+            ),
+            "messages.declineUrlAuth",
+        );
+    }
+
     /// `LinkManager::get_external_link_info` (cpp:4041-4129): the local
     /// machine — the tonsite/`.ton` proxy rewrite, the whitelisted
     /// skip-confirmation mark, the autologin-token append and the
@@ -7402,9 +7501,9 @@ impl LinkManager {
         }
     }
 
-    /// `LinkManager::get_login_url` (cpp:4138-4143): the same
-    /// button-URL resolution, then the `AcceptUrlAuthQuery` tail
-    /// (cpp:1810) is `[blocked: net]`.
+    /// `LinkManager::get_login_url` (cpp:4662-4668): the same
+    /// button-URL resolution, then the `AcceptUrlAuthQuery::send` peer
+    /// form (cpp:2032-2049) rides the net plane.
     pub(crate) fn get_login_url(
         &mut self,
         env: &mut impl LinkEnv,
@@ -7414,28 +7513,28 @@ impl LinkManager {
         mut promise: tdutils::promise::Promise<String>,
     ) {
         match env.get_login_button_url(message_full_id, button_id) {
-            tdutils::status::Result::Ok(url) => {
-                env.send_accept_url_auth_query(
-                    url,
-                    message_full_id,
-                    button_id as i32,
-                    allow_write_access,
-                    false,
-                    String::new(),
-                    None,
-                    promise,
-                );
-            }
+            tdutils::status::Result::Ok(url) => self.send_accept_url_auth_query(
+                env,
+                url,
+                message_full_id,
+                button_id as i32,
+                allow_write_access,
+                false,
+                String::new(),
+                None,
+                promise,
+            ),
             tdutils::status::Result::Err(status) => promise.set_error(status),
         }
     }
 
-    /// `LinkManager::get_link_login_url` (cpp:4145-4148; upstream
+    /// `LinkManager::get_link_login_url` (cpp:4670-4676; upstream
     /// 025086e31 at LinkManager.cpp:4670-4674 adds the empty-URL 400
     /// band): the pure external form of the acceptance query —
-    /// `AcceptUrlAuthQuery` (cpp:1810) with no peer/button context,
-    /// `[blocked: net]`. The band is offline-observable (the promise
-    /// answers before any net half), so it lands ahead of the net plane.
+    /// `AcceptUrlAuthQuery::send` (cpp:2032-2049) with no peer/button
+    /// context rides the net plane (the bare-url flag form). The band
+    /// is offline-observable (the promise answers before any net
+    /// half, #146), so an empty url never reaches the send.
     pub(crate) fn get_link_login_url(
         &mut self,
         env: &mut impl LinkEnv,
@@ -7446,7 +7545,8 @@ impl LinkManager {
         if url.is_empty() {
             return promise.set_error(Status::error(400, "URL must be non-empty"));
         }
-        env.send_accept_url_auth_query(
+        self.send_accept_url_auth_query(
+            env,
             url,
             MessageFullId::default(),
             0,
@@ -7458,28 +7558,30 @@ impl LinkManager {
         );
     }
 
-    /// `LinkManager::check_oauth_request_match_code` (cpp:4150-4152): the
-    /// `CheckUrlAuthMatchCodeQuery` (`messages.checkUrlAuthMatchCode`) is
-    /// `[blocked: net]`.
+    /// `LinkManager::check_oauth_request_match_code` (cpp:4678-4680):
+    /// the `CheckUrlAuthMatchCodeQuery::send` half
+    /// (`messages.checkUrlAuthMatchCode`) parks the promise in the
+    /// family lot; the answer leg settles the Unit / the
+    /// MATCH_CODE_INVALID 400 (cpp:2006-2020).
     pub(crate) fn check_oauth_request_match_code(
         &mut self,
-        env: &mut impl LinkEnv,
         url: String,
         match_code: String,
         promise: tdutils::promise::Promise<()>,
     ) {
-        env.send_check_url_auth_match_code_query(url, match_code, promise);
+        self.send_check_url_auth_match_code_query(url, match_code, promise);
     }
 
-    /// `LinkManager::accept_oauth_request` (cpp:4154-4158, upstream
+    /// `LinkManager::accept_oauth_request` (cpp:4682-4699, upstream
     /// 2485f5889 at LinkManager.cpp:4682-4700; 025086e31 adds the
     /// empty-URL 400 band ahead of the proof validation): the oauth
-    /// acceptance rides `AcceptUrlAuthQuery` (cpp:1810) with the match
-    /// code and the phone-number flag, `[blocked: net]`. The band sits
-    /// before the TON Connect proof validation, so an empty url
-    /// outranks the proof error. The TON Connect payload validates
-    /// through `get_wallet_ownership_proof` (`TRY_RESULT_PROMISE`: the
-    /// 400 band answers the promise and skips the send) and rides the
+    /// acceptance rides `AcceptUrlAuthQuery::send` (cpp:2032-2049) —
+    /// the bare-url flag form with the match code and the
+    /// phone-number flag — over the net plane. The band sits before
+    /// the TON Connect proof validation, so an empty url outranks the
+    /// proof error. The TON Connect payload validates through
+    /// `get_wallet_ownership_proof` (`TRY_RESULT_PROMISE`: the 400
+    /// band answers the promise and skips the send) and rides the
     /// query as the wire session — only when the payload is set.
     #[allow(clippy::too_many_arguments)] // the C++ handler has the same shape
     pub(crate) fn accept_oauth_request(
@@ -7509,7 +7611,8 @@ impl LinkManager {
                 proof: Some(proof),
             });
         }
-        env.send_accept_url_auth_query(
+        self.send_accept_url_auth_query(
+            env,
             url,
             MessageFullId::default(),
             0,
@@ -7521,16 +7624,16 @@ impl LinkManager {
         );
     }
 
-    /// `LinkManager::decline_oauth_request` (cpp:4160-4162): the
-    /// `DeclineUrlAuthQuery` (`messages.declineUrlAuth`) is
-    /// `[blocked: net]`.
+    /// `LinkManager::decline_oauth_request` (cpp:4701-4703): the
+    /// `DeclineUrlAuthQuery::send` half (`messages.declineUrlAuth`)
+    /// parks the promise in the family lot; the answer leg settles
+    /// ok on both the answer and the error tail (cpp:2094-2106).
     pub(crate) fn decline_oauth_request(
         &mut self,
-        env: &mut impl LinkEnv,
         url: String,
         promise: tdutils::promise::Promise<()>,
     ) {
-        env.send_decline_url_auth_query(url, promise);
+        self.send_decline_url_auth_query(url, promise);
     }
 
     /// `LinkManager::get_oauth_link_info` (cpp:4164-4177): the local half
@@ -7776,18 +7879,36 @@ mod tests {
         assert_eq!(get_link_user_id("https://t.me/user?id=1"), UserId::new(0));
     }
 
-    /// The net-drain 32 net-inert posture (§0): with no dispatch surface
+    /// The link net-inert posture (§0): with no dispatch surface
     /// the promises park in their family lots and nothing dispatches —
     /// the offline behavior is byte-identical to the pre-drain parking
     /// (the requests stay unanswered).
     #[test]
     fn net_queries_park_inert() {
+        struct NoEnv;
+        impl LinkEnv for NoEnv {}
+        let mut env = NoEnv;
         let mut manager = LinkManager::new();
         assert!(manager.net.is_none(), "no dispatch surface");
         manager.get_recent_me_urls("ref".to_owned(), Default::default());
         assert_eq!(manager.pending.recent_me_urls.len(), 1);
         manager.get_deep_link_info("tg://join?invite=x", Default::default());
         assert_eq!(manager.pending.deep_link_info.len(), 1);
+        manager.check_oauth_request_match_code(
+            "https://oauth.example".to_owned(),
+            "code".to_owned(),
+            Default::default(),
+        );
+        assert_eq!(manager.pending.check_url_auth_match_code.len(), 1);
+        manager.get_link_login_url(
+            &mut env,
+            "https://oauth.example".to_owned(),
+            true,
+            Default::default(),
+        );
+        assert_eq!(manager.pending.accept_url_auth.len(), 1);
+        manager.decline_oauth_request("https://oauth.example".to_owned(), Default::default());
+        assert_eq!(manager.pending.decline_url_auth.len(), 1);
         assert!(manager.pending.url_auth.is_empty() && manager.pending.url_oauth.is_empty());
     }
 
@@ -7820,6 +7941,39 @@ mod tests {
             Default::default(),
         );
         assert!(manager.pending.url_auth.is_empty(), "the CHECK band");
+    }
+
+    /// The `AcceptUrlAuthQuery::send` peer band (cpp:2037-2042): the
+    /// same read-input-peer resolution as `RequestUrlAuthQuery::send`
+    /// — an unresolvable peer never parks the promise and never sends
+    /// (the fatal C++ `CHECK(input_peer != nullptr)` downgraded to
+    /// log-and-drop).
+    #[test]
+    fn accept_url_auth_drops_on_unresolvable_peer() {
+        use crate::messages_manager::{MessageId, ServerMessageId};
+        struct ResolvedButtonEnv;
+        impl LinkEnv for ResolvedButtonEnv {
+            fn get_login_button_url(
+                &mut self,
+                _message_full_id: MessageFullId,
+                _button_id: i64,
+            ) -> tdutils::status::Result<String> {
+                tdutils::status::Result::Ok("https://btn.example/auth".to_owned())
+            }
+            // get_input_peer_read keeps the default `None`
+        }
+        let mut manager = LinkManager::new();
+        manager.get_login_url(
+            &mut ResolvedButtonEnv,
+            MessageFullId::new(
+                crate::dialog_id::DialogId::from_user_id(UserId::new(900)),
+                MessageId::from_server_message_id(ServerMessageId::new(123)),
+            ),
+            7,
+            true,
+            Default::default(),
+        );
+        assert!(manager.pending.accept_url_auth.is_empty(), "the CHECK band");
     }
 
     /// The upstream `test/link.cpp` web-proxy vectors (e52edfd8b,
@@ -8232,34 +8386,18 @@ mod tests {
 
     /// The 2485f5889 TON Connect vectors (`accept_oauth_request`,
     /// LinkManager.cpp:4682-4700 at the 23383aef pin): the connect
-    /// payload validates through `get_wallet_ownership_proof` and
-    /// rides the `AcceptUrlAuthQuery` send as the wire session — only
-    /// when set — while the invalid proofs answer the promise with the
-    /// 400 band (`TRY_RESULT_PROMISE`) and skip the send entirely.
+    /// payload validates through `get_wallet_ownership_proof` before
+    /// any send — the invalid proofs answer the promise with the 400
+    /// band (`TRY_RESULT_PROMISE`) and never park — while the valid
+    /// payloads park in the family lot (the wire session threading
+    /// rides the netted round-trip in td.rs: the `1<<5` mask + the
+    /// parsed session body).
     #[test]
-    fn accept_oauth_request_threads_the_ton_connect_session() {
+    fn accept_oauth_request_validates_the_ton_connect_proof_first() {
         use std::sync::{Arc, Mutex};
 
-        #[derive(Default)]
-        struct RecordingEnv {
-            sent: Vec<Option<tdmtproto::telegram_api::InputTonConnectOauthSession>>,
-        }
-        impl LinkEnv for RecordingEnv {
-            #[allow(clippy::too_many_arguments)] // the C++ handler shape
-            fn send_accept_url_auth_query(
-                &mut self,
-                _url: String,
-                _message_full_id: MessageFullId,
-                _button_id: i32,
-                _allow_write_access: bool,
-                _allow_phone_number_access: bool,
-                _match_code: String,
-                tonconnect_session: Option<tdmtproto::telegram_api::InputTonConnectOauthSession>,
-                _promise: tdutils::promise::Promise<String>,
-            ) {
-                self.sent.push(tonconnect_session);
-            }
-        }
+        struct NoEnv;
+        impl LinkEnv for NoEnv {}
 
         let connect_data = |proof: Option<td_api::TonWalletOwnershipProof>| {
             Some(td_api::TonConnectConnectData {
@@ -8277,46 +8415,8 @@ mod tests {
             })
         };
 
-        // the null payload keeps the session off the wire query
-        let mut env = RecordingEnv::default();
-        LinkManager::new().accept_oauth_request(
-            &mut env,
-            "https://oauth.example/request".to_owned(),
-            "code".to_owned(),
-            true,
-            false,
-            None,
-            Default::default(),
-        );
-        assert_eq!(env.sent, vec![None], "the null payload sends no session");
-
-        // the valid payload becomes the wire session (the proof's
-        // public-key half validates but doesn't ride — only the wire
-        // walletOwnershipProof does)
-        LinkManager::new().accept_oauth_request(
-            &mut env,
-            "https://oauth.example/request".to_owned(),
-            "code".to_owned(),
-            true,
-            false,
-            connect_data(proof_of(32, 64)),
-            Default::default(),
-        );
-        assert_eq!(
-            env.sent[1],
-            Some(tdmtproto::telegram_api::InputTonConnectOauthSession {
-                session_id: 42,
-                challenge_answer: b"challenge-answer".to_vec(),
-                body: b"connect-body".to_vec(),
-                proof: Some(tdmtproto::telegram_api::WalletOwnershipProof {
-                    timestamp: 7,
-                    signature: vec![2u8; 64],
-                }),
-            }),
-            "the payload threads as the wire session"
-        );
-
-        // the invalid proofs answer the 400 band and never reach the send
+        // the invalid proofs answer the 400 band and never park
+        let mut manager = LinkManager::new();
         for (proof, message) in [
             (None, "Proof must be non-empty"),
             (proof_of(31, 64), "Invalid public key specified"),
@@ -8333,8 +8433,8 @@ mod tests {
                     *capture.lock().unwrap() = Some(actual);
                 },
             );
-            LinkManager::new().accept_oauth_request(
-                &mut env,
+            manager.accept_oauth_request(
+                &mut NoEnv,
                 "https://oauth.example/request".to_owned(),
                 "code".to_owned(),
                 true,
@@ -8348,37 +8448,49 @@ mod tests {
                 "the proof band answers the promise"
             );
         }
-        assert_eq!(env.sent.len(), 2, "the error band skips the send");
+        assert!(
+            manager.pending.accept_url_auth.is_empty(),
+            "the error band skips the send"
+        );
+
+        // the null and the valid payloads both park in the family lot
+        // (the send runs through the net-inert surface)
+        manager.accept_oauth_request(
+            &mut NoEnv,
+            "https://oauth.example/request".to_owned(),
+            "code".to_owned(),
+            true,
+            false,
+            None,
+            Default::default(),
+        );
+        manager.accept_oauth_request(
+            &mut NoEnv,
+            "https://oauth.example/request".to_owned(),
+            "code".to_owned(),
+            true,
+            false,
+            connect_data(proof_of(32, 64)),
+            Default::default(),
+        );
+        assert_eq!(
+            manager.pending.accept_url_auth.len(),
+            2,
+            "the valid payloads park in the family lot"
+        );
     }
 
     /// The 025086e31 empty-URL 400 band (`get_link_login_url`,
     /// LinkManager.cpp:4670-4674 at the 23383aef pin): the bare-url
     /// acceptance form answers the promise offline, ahead of the
-    /// `[blocked: net]` send tail — an empty url never reaches the send.
+    /// `AcceptUrlAuthQuery::send` leg — an empty url never parks in
+    /// the family lot.
     #[test]
     fn get_link_login_url_empty_url_answers_the_400_band() {
         use std::sync::{Arc, Mutex};
 
-        #[derive(Default)]
-        struct CountingEnv {
-            accept_sends: usize,
-        }
-        impl LinkEnv for CountingEnv {
-            #[allow(clippy::too_many_arguments)] // the C++ handler shape
-            fn send_accept_url_auth_query(
-                &mut self,
-                _url: String,
-                _message_full_id: MessageFullId,
-                _button_id: i32,
-                _allow_write_access: bool,
-                _allow_phone_number_access: bool,
-                _match_code: String,
-                _tonconnect_session: Option<tdmtproto::telegram_api::InputTonConnectOauthSession>,
-                _promise: tdutils::promise::Promise<String>,
-            ) {
-                self.accept_sends += 1;
-            }
-        }
+        struct NoEnv;
+        impl LinkEnv for NoEnv {}
 
         let answer = Arc::new(Mutex::new(None));
         let capture = Arc::clone(&answer);
@@ -8391,14 +8503,18 @@ mod tests {
                 *capture.lock().unwrap() = Some(actual);
             },
         );
-        let mut env = CountingEnv::default();
-        LinkManager::new().get_link_login_url(&mut env, String::new(), false, promise);
+        let mut manager = LinkManager::new();
+        let mut env = NoEnv;
+        manager.get_link_login_url(&mut env, String::new(), false, promise);
         assert_eq!(
             answer.lock().unwrap().take(),
             Some("URL must be non-empty".to_owned()),
             "the empty url answers the 400 band"
         );
-        assert_eq!(env.accept_sends, 0, "the band skips the send");
+        assert!(
+            manager.pending.accept_url_auth.is_empty(),
+            "the band skips the send"
+        );
     }
 
     /// The 025086e31 empty-URL 400 band (`accept_oauth_request`,
@@ -8411,26 +8527,8 @@ mod tests {
     fn accept_oauth_request_empty_url_band_outranks_the_proof_band() {
         use std::sync::{Arc, Mutex};
 
-        #[derive(Default)]
-        struct CountingEnv {
-            accept_sends: usize,
-        }
-        impl LinkEnv for CountingEnv {
-            #[allow(clippy::too_many_arguments)] // the C++ handler shape
-            fn send_accept_url_auth_query(
-                &mut self,
-                _url: String,
-                _message_full_id: MessageFullId,
-                _button_id: i32,
-                _allow_write_access: bool,
-                _allow_phone_number_access: bool,
-                _match_code: String,
-                _tonconnect_session: Option<tdmtproto::telegram_api::InputTonConnectOauthSession>,
-                _promise: tdutils::promise::Promise<String>,
-            ) {
-                self.accept_sends += 1;
-            }
-        }
+        struct NoEnv;
+        impl LinkEnv for NoEnv {}
 
         // empty url + the proof shape whose own band would answer
         // "Proof must be non-empty": the url band wins
@@ -8451,8 +8549,9 @@ mod tests {
                 *capture.lock().unwrap() = Some(actual);
             },
         );
-        let mut env = CountingEnv::default();
-        LinkManager::new().accept_oauth_request(
+        let mut manager = LinkManager::new();
+        let mut env = NoEnv;
+        manager.accept_oauth_request(
             &mut env,
             String::new(),
             "code".to_owned(),
@@ -8466,6 +8565,9 @@ mod tests {
             Some("URL must be non-empty".to_owned()),
             "the url band outranks the proof band"
         );
-        assert_eq!(env.accept_sends, 0, "the band skips the send");
+        assert!(
+            manager.pending.accept_url_auth.is_empty(),
+            "the band skips the send"
+        );
     }
 }

@@ -4530,15 +4530,15 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
 
         // --- the LinkManager arm set (M.23 + net-drain 32):
         // Requests.cpp:3592-3642 + 8948-8954 + 9258-9264. The local
-        // halves run in the collapsed manager; the net-drain 32
-        // families (GetRecentMeUrls/GetDeepLinkInfo/RequestUrlAuth/
-        // RequestUrlOauth) ride the LinkNetKind plane, the remaining
-        // tails (accept/decline/match-code) stay the [blocked: net]
-        // seams and park the promise offline ---
+        // halves run in the collapsed manager; the link net families
+        // (GetRecentMeUrls/GetDeepLinkInfo/RequestUrlAuth/
+        // RequestUrlOauth + the url-auth answer trio — accept/
+        // match-code/decline) ride the LinkNetKind plane ---
         // --- the dialog-scoped LinkManager arms (M.23): the
         // button-URL resolution rides the [blocked: M.10 integration]
-        // message plane and answers the C++ not-found band offline; the
-        // net query tails are the [blocked: net] env seams ---
+        // message plane and answers the C++ not-found band offline;
+        // the net query tails (the RequestUrlAuth peer form, the
+        // AcceptUrlAuth peer form) ride the LinkNetKind plane ---
         Function::getLoginUrlInfo(request) => {
             // Requests.cpp:8166-8172; the button-URL resolution (the
             // [blocked: M.10] seam) precedes the RequestUrlAuthQuery
@@ -4562,7 +4562,8 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
         }
         Function::getLoginUrl(request) => {
             // Requests.cpp:8174-8181; the HTTP-URL promise band answers
-            // the string as httpUrl, the AcceptUrlAuthQuery tail parks
+            // the string as httpUrl, the messages.acceptUrlAuth peer
+            // form rides the dispatch
             if !check_is_user(td, id) {
                 return;
             }
@@ -4663,7 +4664,8 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
         Function::getExternalLink(request) => {
             // Requests.cpp:3596-3601: the HTTP-URL promise band
             // (Requests.cpp:1957-1967) answers the string as httpUrl; the
-            // messages.acceptUrlAuth tail parks
+            // messages.acceptUrlAuth query rides the dispatch (the
+            // bare-url flag form)
             if !check_is_user(td, id) {
                 return;
             }
@@ -4706,7 +4708,8 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             link_manager.get_oauth_link_info(&mut env, link, in_app_origin, promise);
         }
         Function::checkOauthRequestMatchCode(request) => {
-            // Requests.cpp:3620-3626; messages.checkUrlAuthMatchCode parks
+            // Requests.cpp:3758-3764; the messages.checkUrlAuthMatchCode
+            // query rides the dispatch
             if !check_is_user(td, id) {
                 return;
             }
@@ -4720,15 +4723,12 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             let Some(link_manager) = td.link_manager.as_mut() else {
                 return td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
             };
-            let mut env = TdLinkEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-            };
-            link_manager.check_oauth_request_match_code(&mut env, url, match_code, promise);
+            link_manager.check_oauth_request_match_code(url, match_code, promise);
         }
         Function::acceptOauthRequest(request) => {
-            // Requests.cpp:3628-3636; messages.acceptUrlAuth parks, the
-            // HTTP-URL promise band answers the string as httpUrl
+            // Requests.cpp:3766-3774; the messages.acceptUrlAuth query
+            // rides the dispatch, the HTTP-URL promise band answers
+            // the string as httpUrl
             if !check_is_user(td, id) {
                 return;
             }
@@ -4758,7 +4758,8 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             );
         }
         Function::declineOauthRequest(request) => {
-            // Requests.cpp:3638-3642; messages.declineUrlAuth parks
+            // Requests.cpp:3776-3781; the messages.declineUrlAuth query
+            // rides the dispatch
             if !check_is_user(td, id) {
                 return;
             }
@@ -4769,11 +4770,7 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             let Some(link_manager) = td.link_manager.as_mut() else {
                 return td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
             };
-            let mut env = TdLinkEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-            };
-            link_manager.decline_oauth_request(&mut env, url, promise);
+            link_manager.decline_oauth_request(url, promise);
         }
 
         function => run_dialog_requests(td, id, function),
