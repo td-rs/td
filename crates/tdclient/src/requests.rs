@@ -4708,7 +4708,7 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             link_manager.get_oauth_link_info(&mut env, link, in_app_origin, promise);
         }
         Function::checkOauthRequestMatchCode(request) => {
-            // Requests.cpp:3620-3626; the messages.checkUrlAuthMatchCode
+            // Requests.cpp:3758-3764; the messages.checkUrlAuthMatchCode
             // query rides the dispatch
             if !check_is_user(td, id) {
                 return;
@@ -4726,7 +4726,7 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             link_manager.check_oauth_request_match_code(url, match_code, promise);
         }
         Function::acceptOauthRequest(request) => {
-            // Requests.cpp:3628-3636; the messages.acceptUrlAuth query
+            // Requests.cpp:3766-3774; the messages.acceptUrlAuth query
             // rides the dispatch, the HTTP-URL promise band answers
             // the string as httpUrl
             if !check_is_user(td, id) {
@@ -4758,7 +4758,7 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             );
         }
         Function::declineOauthRequest(request) => {
-            // Requests.cpp:3638-3642; the messages.declineUrlAuth query
+            // Requests.cpp:3776-3781; the messages.declineUrlAuth query
             // rides the dispatch
             if !check_is_user(td, id) {
                 return;

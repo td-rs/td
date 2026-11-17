@@ -7501,7 +7501,7 @@ impl LinkManager {
         }
     }
 
-    /// `LinkManager::get_login_url` (cpp:4138-4143): the same
+    /// `LinkManager::get_login_url` (cpp:4662-4668): the same
     /// button-URL resolution, then the `AcceptUrlAuthQuery::send` peer
     /// form (cpp:2032-2049) rides the net plane.
     pub(crate) fn get_login_url(
@@ -7528,7 +7528,7 @@ impl LinkManager {
         }
     }
 
-    /// `LinkManager::get_link_login_url` (cpp:4145-4148; upstream
+    /// `LinkManager::get_link_login_url` (cpp:4670-4676; upstream
     /// 025086e31 at LinkManager.cpp:4670-4674 adds the empty-URL 400
     /// band): the pure external form of the acceptance query —
     /// `AcceptUrlAuthQuery::send` (cpp:2032-2049) with no peer/button
@@ -7558,7 +7558,7 @@ impl LinkManager {
         );
     }
 
-    /// `LinkManager::check_oauth_request_match_code` (cpp:4150-4152):
+    /// `LinkManager::check_oauth_request_match_code` (cpp:4678-4680):
     /// the `CheckUrlAuthMatchCodeQuery::send` half
     /// (`messages.checkUrlAuthMatchCode`) parks the promise in the
     /// family lot; the answer leg settles the Unit / the
@@ -7572,7 +7572,7 @@ impl LinkManager {
         self.send_check_url_auth_match_code_query(url, match_code, promise);
     }
 
-    /// `LinkManager::accept_oauth_request` (cpp:4154-4158, upstream
+    /// `LinkManager::accept_oauth_request` (cpp:4682-4699, upstream
     /// 2485f5889 at LinkManager.cpp:4682-4700; 025086e31 adds the
     /// empty-URL 400 band ahead of the proof validation): the oauth
     /// acceptance rides `AcceptUrlAuthQuery::send` (cpp:2032-2049) —
@@ -7624,7 +7624,7 @@ impl LinkManager {
         );
     }
 
-    /// `LinkManager::decline_oauth_request` (cpp:4160-4162): the
+    /// `LinkManager::decline_oauth_request` (cpp:4701-4703): the
     /// `DeclineUrlAuthQuery::send` half (`messages.declineUrlAuth`)
     /// parks the promise in the family lot; the answer leg settles
     /// ok on both the answer and the error tail (cpp:2094-2106).
