@@ -20,6 +20,10 @@ fn on_log_message(verbosity_level: i32, message: &str) {
 fn main() {
     // ExitGuard/ThreadIdGuard: the C++ guards track memory usage (memprof —
     // not ported) and the scheduler thread ids; nothing to do here.
+    // `ignore_signal(HangUp/Pipe)` (cli.cpp:9646-9647) is POSIX-only: the C++
+    // Windows port maps both SignalTypes to no native signals (signals.cpp
+    // `get_native_signals` returns {}), so there is nothing to ignore here.
+    #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGHUP, libc::SIG_IGN);
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
