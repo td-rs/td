@@ -61050,6 +61050,21 @@ mod tests {
         (td, rec, callback)
     }
 
+    /// The #145 regression lock: force the one-second wall-clock tick the
+    /// flake window allows. A forced +1 s server-time-difference update
+    /// between the test's capture and the request-internal
+    /// `mute_for ↔ mute_until` conversion reproduces the loaded-machine
+    /// interleaving deterministically — the pre-#145 exact asserts fail
+    /// off-by-one here, the banded ones hold.
+    fn advance_server_clock_one_second(td: &mut Td) {
+        let diff = td.global.get_server_time_difference() + 1.0;
+        let options = td
+            .option_manager
+            .as_mut()
+            .expect("the option manager exists after init");
+        td.global.update_server_time_difference(diff, true, options);
+    }
+
     /// The env exactly as the production drains build it — expanded at the
     /// call site so the field borrows stay disjoint.
     macro_rules! mk_env {
@@ -62224,6 +62239,8 @@ mod tests {
         let (mut td, rec, callback) = netted_td_with_callback("netfix-cm-notify-settings");
         const BOOL_TRUE: i32 = 0x9972_75b5u32 as i32;
         let unix_time = td.get_unix_time();
+        // #145: the tick lands inside the capture→conversion window
+        advance_server_clock_one_second(&mut td);
 
         // seed a creator community + its full
         let wire_community = telegram_api::community {
@@ -62318,6 +62335,14 @@ mod tests {
             }),
         );
         td.flush_deferred_results();
+        // #145: the mute_for → mute_until conversion reads the clock
+        // inside the request above, somewhere between this test's
+        // capture and this line — a wall-clock second ticked inside that
+        // window shifts mute_until by one, so the asserts band the window
+        // instead of pinning the capture instant (the forced #145 tick
+        // above holds the window one second open here; on an unticked
+        // run the band collapses to a point).
+        let now = td.get_unix_time();
         let sent = take_sent_query(&rec, telegram_api::account_updateNotifySettings::ID);
         let body =
             telegram_api::account_updateNotifySettings::parse(sent.query()).expect("the sent body");
@@ -62326,7 +62351,13 @@ mod tests {
             Some(telegram_api::InputNotifyPeer::inputNotifyCommunity(_))
         ));
         let settings = body.settings.expect("the wire settings");
-        assert_eq!(settings.mute_until, unix_time + 100);
+        let lo = unix_time + 100;
+        let hi = now + 100;
+        assert!(
+            (lo..=hi).contains(&settings.mute_until),
+            "the wire mute_until {} outside the [{lo}, {hi}] clock window",
+            settings.mute_until
+        );
         net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
         td.dispatch_completed_community_net();
         td.flush_deferred_results();
@@ -62339,7 +62370,13 @@ mod tests {
                 .get_community_notification_settings(env, CommunityId::new(7))
                 .expect("the synchronized community settings");
             assert!(!settings.use_default_mute_until);
-            assert_eq!(settings.mute_until, unix_time + 100);
+            let lo = unix_time + 100;
+            let hi = now + 100;
+            assert!(
+                (lo..=hi).contains(&settings.mute_until),
+                "the local half carries the wire mute_until: {} not in [{lo}, {hi}]",
+                settings.mute_until
+            );
         });
 
         // 2. the error arm — the failed server write repairs via the Get
@@ -94715,6 +94752,8 @@ kQIDAQAB\n\
         const BOOL_TRUE: i32 = 0x9972_75b5u32 as i32;
         const BOOL_FALSE: i32 = 0xbc79_9737u32 as i32;
         let unix_time = td.get_unix_time();
+        // #145: the tick lands inside the capture→conversion window
+        advance_server_clock_one_second(&mut td);
 
         // 1. the deferred Get — the unsynchronized scope parks the request
         //    promise on the fetch query; the wire carries the scope's
@@ -94761,9 +94800,21 @@ kQIDAQAB\n\
         );
         td.dispatch_completed_notification_settings_net();
         td.flush_deferred_results();
+        // #145: the mute_until → mute_for conversion reads the clock at
+        // the intake above, after the wire mute_until was built on the
+        // captured instant — every wall-clock second elapsed since the
+        // capture shortens mute_for by one, so the assert bands the
+        // window (the forced #145 tick above holds it one second open
+        // here; on an unticked run the band collapses to a point).
+        let now = td.get_unix_time();
         match responses_of(&callback, 1).first() {
             Some(Object::scopeNotificationSettings(settings)) => {
-                assert_eq!(settings.mute_for, 120);
+                let lo = 120 - (now - unix_time);
+                assert!(
+                    (lo..=120).contains(&settings.mute_for),
+                    "mute_for {} outside the [{lo}, 120] clock window",
+                    settings.mute_for
+                );
                 assert!(!settings.show_preview);
             }
             other => panic!("the deferred scope settings answer: {other:?}"),
@@ -94810,7 +94861,16 @@ kQIDAQAB\n\
             Some(telegram_api::InputNotifyPeer::inputNotifyChats(_))
         ));
         let settings = body.settings.expect("the wire settings");
-        assert_eq!(settings.mute_until, unix_time + 50);
+        // #145: the same clock band as the community test — the
+        // mute_for → mute_until conversion ran inside the request above
+        let now = td.get_unix_time();
+        let lo = unix_time + 50;
+        let hi = now + 50;
+        assert!(
+            (lo..=hi).contains(&settings.mute_until),
+            "mute_until {} outside the [{lo}, {hi}] clock window",
+            settings.mute_until
+        );
         assert!(settings.show_previews);
         net_complete(sent, BOOL_TRUE.to_le_bytes().to_vec());
         let probe_a = td.global.td_db().binlog().next_event_id();
