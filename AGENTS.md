@@ -110,6 +110,14 @@ Permanent principles for every campaign. The worker pool is two machines:
   memory-heavy phase, so concurrent linkers per machine stay within it.
 - **Distribute verification**: package-level tests, Clippy, and Rustdoc run
   across both machines; integration merges serialize pool-wide.
+- **The per-machine sccache server is campaign infra — never kill it under
+  load** (#151). A bare `sccache --stop-server`/`--restart-server` while other
+  sessions compile SIGTERMs their in-flight compile children (`sccache:
+  Compile terminated by signal 15`; on the vendored C side, a make failure).
+  Control it only through `scripts/sccache.sh`: `stop`/`restart` are
+  pgrep-audited and refuse while compiles are attached; `start` pins
+  `SCCACHE_IDLE_TIMEOUT=0` so the shared server never idle-exits mid-compile.
+  A run whose only failure is such a compile kill is infra-red: retry it.
 - **The Definition of Done is unchanged**: distributed runs parallelize
   work, never weaken the gate — the full-workspace Verification commands
   above must pass authoritatively before work counts as complete.
