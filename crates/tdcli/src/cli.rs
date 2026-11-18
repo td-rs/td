@@ -15983,7 +15983,8 @@ fn pump(client: &'static CliClient) {
         if client.close_flag.load(Ordering::SeqCst) {
             break;
         }
-        // Blocking wait for data (the C++ idle tick on the pollable fd).
+        // Blocking wait for data — `poll` on POSIX (the C++ idle tick on the
+        // pollable fd); on Windows the wait is the `read_once` block itself.
         if !reader.poll_blocking() {
             break;
         }
@@ -16035,10 +16036,14 @@ fn pump(client: &'static CliClient) {
     client.condvar.notify_all();
 }
 
-/// A raw-fd(0) line reader with the C++ `BufferedStdin`-style semantics:
-/// `poll` for readability, `read` only when readable, lines terminated by
-/// `\n` (a trailing `\r` is stripped like `process_stdin`), partial lines
-/// held until newline or EOF.
+/// A raw-stdin line reader with the C++ `BufferedStdin`-style semantics:
+/// lines terminated by `\n` (a trailing `\r` is stripped like
+/// `process_stdin`), partial lines held until newline or EOF. The wait/read
+/// primitives follow the C++ `BufferedStdinImpl` platform split
+/// (StdStreams.cpp): POSIX polls the fd and reads only when readable; the
+/// C++ Windows port has a reader thread blocking in `ReadFile` that posts
+/// each chunk — here the pump thread itself blocks in the read (the read is
+/// the wait).
 struct StdinReader {
     buffer: Vec<u8>,
     start: usize,
@@ -16054,16 +16059,34 @@ impl StdinReader {
 
     /// `poll` with a blocking timeout; `false` on poll error (read would not
     /// help — treated like EOF by the caller).
+    #[cfg(unix)]
     fn poll_blocking(&self) -> bool {
         poll_fd(0, -1)
     }
 
+    /// Windows twin: there is no poll — the C++ read thread blocks in
+    /// `ReadFile`, so the blocking wait happens in `read_once` itself.
+    #[cfg(windows)]
+    fn poll_blocking(&self) -> bool {
+        true
+    }
+
     /// `poll` with a zero timeout — is input available right now?
+    #[cfg(unix)]
     fn poll_zero(&self) -> bool {
         poll_fd(0, 0)
     }
 
+    /// Windows twin: no cross-handle probe exists (console, pipe, and file
+    /// stdin each need a different peek); the loop re-enters the blocking
+    /// read instead, matching the C++ chunk-driven IOCP notifications.
+    #[cfg(windows)]
+    fn poll_zero(&self) -> bool {
+        false
+    }
+
     /// Read once; `Ok(true)` — some bytes, `Ok(false)` — EOF.
+    #[cfg(unix)]
     fn read_once(&mut self) -> std::io::Result<bool> {
         let mut tmp = [0u8; 4096];
         loop {
@@ -16081,6 +16104,22 @@ impl StdinReader {
             self.buffer.extend_from_slice(&tmp[..n as usize]);
             return Ok(true);
         }
+    }
+
+    /// The C++ Windows `BufferedStdinImpl` read: one blocking stdin chunk
+    /// (`ReadFile` under the std lock, which may serve an already-buffered
+    /// chunk — equivalent; chunk boundaries are arbitrary in the IOCP
+    /// design too). `Ok(0)` EOF takes the shared tty Ctrl-D path; whether
+    /// a console maps Ctrl-Z to EOF is unpinned (dev-tool nicety only).
+    #[cfg(windows)]
+    fn read_once(&mut self) -> std::io::Result<bool> {
+        let mut tmp = [0u8; 4096];
+        let n = std::io::stdin().lock().read(&mut tmp)?;
+        if n == 0 {
+            return Ok(false);
+        }
+        self.buffer.extend_from_slice(&tmp[..n]);
+        Ok(true)
     }
 
     /// The next `\n`-terminated line (trailing `\r` stripped).
@@ -16116,6 +16155,9 @@ impl StdinReader {
     }
 }
 
+/// POSIX `poll` on a fd — the `BufferedStdinImpl` POSIX wait primitive
+/// (Windows has no counterpart; see the `StdinReader` cfg twins above).
+#[cfg(unix)]
 fn poll_fd(fd: libc::c_int, timeout_ms: libc::c_int) -> bool {
     let mut pfd = libc::pollfd {
         fd,
