@@ -26353,6 +26353,23 @@ mod files_glue_tests {
         }
     }
 
+    /// Creates the pid-salted per-test temp root and returns its `canonical`
+    /// path. `real_path()` canonicalizes every registered location, so the
+    /// context's `files_dir()` must be symlink-resolved too: on macOS
+    /// `$TMPDIR` is `/var/...` over a `/private/var/...` store, and the C++
+    /// `begins_with(path, get_files_dir())` check in read_file_part and
+    /// delete_file answers "File is not inside the cache" / skips the unlink
+    /// when the two halves disagree.
+    fn temp_root(tag: &str) -> String {
+        let root = std::env::temp_dir().join(format!("td_rs_{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::canonicalize(&root)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
     /// Registers a `size`-byte local file under the temp root; returns the
     /// file id and the file bytes.
     fn register_cached_file(
@@ -26396,12 +26413,8 @@ mod files_glue_tests {
         let result = slot.lock().take().expect("settled");
         assert_eq!(result.error().message(), "File not found");
 
-        let root =
-            std::env::temp_dir().join(format!("td_rs_read_file_part_bands-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let (file_id, _) =
-            register_cached_file(&mut manager, &root.to_string_lossy(), "unused", b"x");
+        let root_str = temp_root("read_file_part_bands");
+        let (file_id, _) = register_cached_file(&mut manager, &root_str, "unused", b"x");
         for (offset, count, message) in [
             (-1, 1, "Parameter offset must be non-negative"),
             (0, -1, "Parameter count must be non-negative"),
@@ -26415,11 +26428,7 @@ mod files_glue_tests {
 
     #[test]
     fn read_file_part_reads_the_downloaded_prefix() {
-        let root =
-            std::env::temp_dir().join(format!("td_rs_read_file_part-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let root_str = root.to_string_lossy().into_owned();
+        let root_str = temp_root("read_file_part");
 
         let mut manager = FileManager::new();
         manager.set_context(Box::new(TempDirContext {
@@ -26457,15 +26466,12 @@ mod files_glue_tests {
         let result = slot.lock().take().expect("settled");
         assert_eq!(result.move_as_ok(), Vec::<u8>::new());
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root_str);
     }
 
     #[test]
     fn delete_file_unlinks_cached_files_and_answers_ok() {
-        let root = std::env::temp_dir().join(format!("td_rs_delete_file-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let root_str = root.to_string_lossy().into_owned();
+        let root_str = temp_root("delete_file");
 
         let mut manager = FileManager::new();
         manager.set_context(Box::new(TempDirContext {
@@ -26491,16 +26497,12 @@ mod files_glue_tests {
         manager.delete_file(FileId::new(41, 0), promise, "deleteFile", fllm);
         assert_eq!(slot.lock().take().expect("settled").move_as_ok(), ());
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root_str);
     }
 
     #[test]
     fn get_suggested_file_name_avoids_collisions() {
-        let root =
-            std::env::temp_dir().join(format!("td_rs_suggested_name-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let root_str = root.to_string_lossy().into_owned();
+        let root_str = temp_root("suggested_name");
 
         let mut manager = FileManager::new();
         manager.set_context(Box::new(TempDirContext {
@@ -26555,7 +26557,7 @@ mod files_glue_tests {
         assert_eq!(cleaned, "doc.bin");
 
         drop(context);
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root_str);
     }
 
     #[test]
