@@ -200,23 +200,35 @@ pub fn store_event_prefix(event_type: SecretChatEventType, out: &mut Vec<u8>) {
     event_type.store(out);
 }
 
-/// `CloseSecretChat` (SecretChatEvent.h) — the close record.
+/// `CloseSecretChat` (SecretChatEvent.h) — the close record: the flags
+/// block (delete_history + is_already_discarded, the fields 3d03904cf
+/// makes the actor write) then chat_id. The flags parse is gated on
+/// `version >= 3` (SecretChatEvent.h) — a legacy close record carries
+/// chat_id only.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CloseSecretChat {
+    pub delete_history: bool,
+    pub is_already_discarded: bool,
     pub chat_id: i32,
 }
 
 impl CloseSecretChat {
-    /// `store` (SecretChatEvent.h) — chat_id only.
+    /// `store` (SecretChatEvent.h) — flags block, then chat_id.
     pub fn store(&self, out: &mut Vec<u8>) {
+        store_parse::store_flags(out, [self.delete_history, self.is_already_discarded]);
         store_parse::store_i32(out, self.chat_id);
     }
 
-    /// `parse`.
+    /// `parse` — the flags block only from event version 3.
     pub fn parse(parser: &mut Parser) -> std::result::Result<CloseSecretChat, &'static str> {
-        Ok(CloseSecretChat {
-            chat_id: parser.i32_()?,
-        })
+        let mut result = CloseSecretChat::default();
+        if parser.version() >= 3 {
+            let [delete_history, is_already_discarded] = parser.parse_flags()?;
+            result.delete_history = delete_history;
+            result.is_already_discarded = is_already_discarded;
+        }
+        result.chat_id = parser.i32_()?;
+        Ok(result)
     }
 }
 
@@ -400,8 +412,60 @@ mod tests {
     }
 
     #[test]
+    fn close_secret_chat_record_carries_the_close_flags() {
+        // 3d03904cf (03220f6): the CloseSecretChat logevent carries
+        // delete_history + is_already_discarded. The C++ record bytes are a
+        // BEGIN_STORE_FLAGS block (one LE uint32, bit0 = delete_history,
+        // bit1 = is_already_discarded) before chat_id (SecretChatEvent.h) —
+        // pinned here against the reference encoding.
+        let value = CloseSecretChat {
+            delete_history: false,
+            is_already_discarded: false,
+            chat_id: 9,
+        };
+        let mut out = Vec::new();
+        value.store(&mut out);
+        assert_eq!(out, [0, 0, 0, 0, 9, 0, 0, 0]);
+        let mut parser = Parser::new(&out);
+        assert_eq!(CloseSecretChat::parse(&mut parser).unwrap(), value);
+    }
+
+    #[test]
+    fn close_secret_chat_event_bytes_and_legacy_v2_replay() {
+        // The full binlog payload the C++ StorerImpl writes for a close
+        // event: event version 4, type magic 3 (CloseSecretChat), flags
+        // block with both bits set, chat_id.
+        let value = CloseSecretChat {
+            delete_history: true,
+            is_already_discarded: true,
+            chat_id: 9,
+        };
+        let mut out = Vec::new();
+        store_event_prefix(SecretChatEventType::CloseSecretChat, &mut out);
+        value.store(&mut out);
+        assert_eq!(out, [4, 0, 0, 0, 3, 0, 0, 0, 3, 0, 0, 0, 9, 0, 0, 0]);
+
+        // A pre-3 event carries no flags block (the SecretChatEvent.h
+        // parse gates the flags on version >= 3) — legacy replay.
+        let legacy = [9, 0, 0, 0];
+        let mut parser = Parser::new_with_version(&legacy, 2);
+        assert_eq!(
+            CloseSecretChat::parse(&mut parser).unwrap(),
+            CloseSecretChat {
+                delete_history: false,
+                is_already_discarded: false,
+                chat_id: 9,
+            }
+        );
+    }
+
+    #[test]
     fn close_and_create_records_round_trip() {
-        let value = CloseSecretChat { chat_id: 9 };
+        let value = CloseSecretChat {
+            delete_history: true,
+            is_already_discarded: false,
+            chat_id: 9,
+        };
         let mut out = Vec::new();
         value.store(&mut out);
         let mut parser = Parser::new(&out);

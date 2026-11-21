@@ -12,6 +12,22 @@
 //! binlog/PFS/seq state machines) and the encrypted-message payload
 //! codec stay [blocked: tde2e] seams. `SecretChatDb` is the pmc-keyed
 //! per-chat store.
+//!
+//! Seam-landing requirements (#175 — the four 03220f6-range fixes the
+//! actor port must be born with, from the pinned reference):
+//! - eaa3f32fb: flush AcceptKey/CommitKey immediately after the pfs state
+//!   save — once `on_save_changes_start` resolves the finish promises,
+//!   `if pfs_state_change { loop(); }`.
+//! - 5010b6120: keep the old key until CommitKey is acknowledged — drop
+//!   `pfs_state.other_auth_key` only when the message's auth_key_id is the
+//!   new key's, `can_forget_other_key` holds, and
+//!   `his_in_seq_no >= pfs_state.last_out_seq_no`; on inbound CommitKey set
+//!   `pfs_state.last_out_seq_no = 0` (protocol-interop correctness).
+//! - 3d03904cf: `cancel_chat` writes `delete_history` +
+//!   `is_already_discarded` into the CloseSecretChat log event — the
+//!   record framing already carries them (`secret_chat::CloseSecretChat`).
+//! - d30872700: on a failed resend, `query->set_error_canceled()` before
+//!   the promise error fires.
 
 use crate::dh_cache::{DhCache, DhConfig};
 use crate::secret_chat::{SecretChatId, SecretChatState};
