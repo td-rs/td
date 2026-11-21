@@ -504,8 +504,11 @@ pub trait MessageQueryManagerEnv {
     /// the media-content leg of `edit_callback_query_message` — the
     /// `create_upload_message_content_query` +
     /// `edit_ephemeral_message_queries_` plane keyed by the callback
-    /// query id (M.12 upload + net); the promise lands unanswered
-    /// offline.
+    /// query id (M.12 upload + net); the message promise lands
+    /// unanswered offline. When the net plane lands,
+    /// `on_edit_callback_query_message` (MessageQueryManager.cpp:4233)
+    /// resolves it with the sent message via
+    /// `get_message_id_of_ephemeral_message_id` + `get_message_object`.
     #[allow(clippy::too_many_arguments)]
     fn start_edit_callback_query_message_upload(
         &mut self,
@@ -516,7 +519,7 @@ pub trait MessageQueryManagerEnv {
         _reply_markup: Option<crate::reply_markup::ReplyMarkup>,
         _content: crate::message_content::MessageContent,
         _invert_media: bool,
-        _promise: Promise<()>,
+        _promise: Promise<td_api::Message>,
     ) {
     }
     /// `DeleteParticipantReactionsQuery::send`
@@ -3460,10 +3463,12 @@ impl MessageQueryManager {
     }
 
     /// `edit_callback_query_message`
-    /// (MessageQueryManager.cpp:4208-4236) — the
+    /// (MessageQueryManager.cpp:4177-4208) — the
     /// `replyToCallbackQueryWithEphemeralMessage` flow: the content
     /// parses against the empty dialog, then the upload stages with the
-    /// callback-query key (anchor/noforwards carried in the query).
+    /// callback-query key (anchor/noforwards carried in the query). At
+    /// 03220f6 the promise carries the sent `message`
+    /// (c8828d50: `message_promise_`).
     #[allow(clippy::too_many_arguments)]
     pub fn edit_callback_query_message(
         &mut self,
@@ -3473,7 +3478,7 @@ impl MessageQueryManager {
         noforwards: bool,
         reply_markup: Option<td_api::ReplyMarkup>,
         input_message_content: Option<td_api::InputMessageContent>,
-        mut promise: Promise<()>,
+        mut promise: Promise<td_api::Message>,
     ) {
         let is_bot = env.auth_is_bot();
         assert!(is_bot);
