@@ -133,9 +133,19 @@ not parity claims.
     GLOSSARY.md and `docs/adr/0001` created (the sync vocabulary and the
     mid-version-pin policy). No version/layer/README drift (still
     1.8.70/233), no crate version bump, no tag.
-  - Deferred restated (standing owner decisions): soak 3600, bench flagged
-    rows, S75 corpus replay, fuzz week. The second-machine workspace gate
-    ran on the ThinkPad via SSH; recorded blockers in the PR body.
+  - Workspace verification green on both machines at `28a1d03`
+    (Desktop: the campaign worktree; ThinkPad: the gate worktree over SSH,
+    rustup 1.95.0): fmt, clippy `-D warnings`, rustdoc `-D warnings`,
+    `cargo test --workspace --locked`. The ThinkPad's rustup toolchains
+    had been broken by a garbage-collected Nix path (the linker wrappers
+    pointed into a dead store path, and the owning rustup was gone too);
+    repaired user-level with the official-distro rustup and the pinned
+    1.95/1.95.0 toolchains — no system changes.
+  - Deferred restated (standing owner decisions): soak 3600, bench
+    flagged rows, S75 corpus replay, fuzz week. The serialized
+    `scripts/gate.sh` run for the final SHA stayed queued behind other
+    sessions' gates on the shared machine; the two worktree runs above
+    are the verification of record, and CI re-runs on the PR.
 - **2026-11-09 upstream sync (TDLib 1.8.68 → 1.8.70)**, pin bump
   `c15d3f5a5de6e3ba5839822c451152e5e18bb700` →
   `23383aef218a3123f02b744bfa91bde21056a814` (tdlib 1.8.70, layer 233),
