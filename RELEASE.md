@@ -91,6 +91,51 @@ not parity claims.
   milestones (S76 walking skeleton → 0.1.0 tag with the first release
   artifacts; S81 bindings validation → 0.2.0; S84 first full-parity
   release → 1.0.0-candidate).
+- **2026-11-21 upstream sync (intra-1.8.70 catch-up)**, pin bump
+  `23383aef218a3123f02b744bfa91bde21056a814` →
+  `03220f6b3043c6fd7785fbf0901d63f19ad19974` (still tdlib 1.8.70, layer
+  233 — the first deliberate **mid-version pin**, recorded as ADR-0001;
+  spec td-rs/td#165; families #166–#173; tail #174; seam follow-up #175),
+  branch `upstream-03220f6`: the five-scheme sha256 pin moved first as one
+  deliberate base commit (only `td_api.tl` differs — comment updates plus
+  `replyToCallbackQueryWithEphemeralMessage`: `Ok` → `Message`; the
+  generated delta is the one wire-id line, absorbed at the compile surface
+  per the 1.8.70 precedent, with the Ok-shaped answer the recorded
+  divergence #166 closes at the type level):
+  - Triage of the 49 upstream commits (REMAINING doc
+    `docs/UPSTREAM_SYNC_03220F6_REMAINING_20261121.md`, git-excluded by
+    design; the PR body carries its digest): **5 ported** (the
+    Message-typed callback-query chain #166; the binlog local-reply drop
+    #168; the JSON non-UTF-8 replacement #170 — which also fixed a C-ABI
+    panic on non-UTF-8 requests; the sqlite rare-range bind and the
+    document fallback extension condition #172 — the bind was a faithfully
+    ported upstream bug), **4 absorbed** (scheme comments, the fail-path
+    simplification, the notification-scope relocation, the download
+    generation guard — the Rust pre-download check is synchronous so the
+    stale-completion hazard cannot occur), **39 site-less with reasons**
+    (blocked seams: the tde2e SecretChatActor plane, the M.10/M.10.9/M.12
+    planes, the welcome/link-preview builders, C++ test-only, build
+    system), **1 split** (`03220f6`: scheme half absorbed, logic half
+    site-less). Seam-landing requirements recorded in #175 and the family
+    rows.
+  - Oracle set green against the pristine `03220f6` C++ clone plus a fresh
+    Release `TD_BUILD` (`libtdjson.so.1.8.70`), Desktop 2026-11-21:
+    `scheme_parity` (local pin + upstream drift, 5/5 identical),
+    `cpp_dump` (S04), `tl_oracle` tokens/scheme/tlo (S06/S07/S08),
+    `tl_store_oracle` (S10, 10/10), `tl_json_oracle` (S12),
+    `tl_replay_oracle` (S15), `tdjson_oracle` (S68) — per-log results in
+    the PR body.
+  - Census unchanged: **1,072 dispatched / 0 interim / 27 sync of 1,099**
+    (no constructors or functions added; the one changed signature stayed
+    dispatched — absorbed, not interim).
+  - CI conformance pin moved `23383aef` → `03220f6` (`main.yml` ×2,
+    AGENTS.md, the scheme_parity constant, the vectors README).
+    GLOSSARY.md and `docs/adr/0001` created (the sync vocabulary and the
+    mid-version-pin policy). No version/layer/README drift (still
+    1.8.70/233), no crate version bump, no tag.
+  - Deferred restated (standing owner decisions): soak 3600, bench flagged
+    rows, S75 corpus replay, fuzz week. The second-machine workspace gate
+    ran on the ThinkPad via SSH; recorded blockers in the PR body.
 - **2026-11-09 upstream sync (TDLib 1.8.68 → 1.8.70)**, pin bump
   `c15d3f5a5de6e3ba5839822c451152e5e18bb700` →
   `23383aef218a3123f02b744bfa91bde21056a814` (tdlib 1.8.70, layer 233),
