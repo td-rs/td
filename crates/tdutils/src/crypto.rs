@@ -583,6 +583,17 @@ fn xor_keystream(src: &[u8], ks: &[u8], dst: &mut [u8]) {
     }
 }
 
+/// `dst[i] ^= ks[i]` — the in-place form of [`xor_keystream`] used by
+/// `encrypt(payload, payload)`; a separate helper because an aliasing
+/// `&[u8]`/`&mut [u8]` pair over one buffer is stacked-borrows UB.
+#[cfg(any(target_os = "emscripten", miri))]
+fn xor_keystream_in_place(dst: &mut [u8], ks: &[u8]) {
+    let n = dst.len().min(ks.len());
+    for i in 0..n {
+        dst[i] ^= ks[i];
+    }
+}
+
 /// `td::AesCtrState` — streaming AES-256-CTR with the 128-bit big-endian
 /// counter seeded by the IV. The keystream is byte-continuous across calls,
 /// like OpenSSL's EVP CTR `num` state.
@@ -819,14 +830,21 @@ mod ctr_rustcrypto {
 
         /// `encrypt(payload, payload)` — the in-place form C++ uses everywhere.
         pub fn encrypt_in_place(&mut self, data: &mut [u8]) {
-            // SAFETY: `advance` reads `src[i]` and writes the same `data[i]`;
-            // both borrows target one allocation and the loop indexes them in
-            // lockstep, so aliasing is sound — the raw-pointer round trip is only
-            // needed to satisfy the borrow checker.
-            let ptr = data.as_mut_ptr();
-            let len = data.len();
-            unsafe {
-                self.advance(std::slice::from_raw_parts(ptr, len), data);
+            // The keystream XOR runs straight over `data` — no src/dst split
+            // (an aliasing `&[u8]`/`&mut [u8]` pair over one buffer is
+            // stacked-borrows UB, which Miri rightly rejects).
+            let mut offset = 0;
+            while offset < data.len() {
+                if self.used == KEYSTREAM_SIZE {
+                    self.refill_keystream();
+                }
+                let n = (data.len() - offset).min(KEYSTREAM_SIZE - self.used);
+                super::xor_keystream_in_place(
+                    &mut data[offset..offset + n],
+                    &self.keystream[self.used..self.used + n],
+                );
+                self.used += n;
+                offset += n;
             }
         }
 
@@ -1812,6 +1830,9 @@ mod tests {
         let lengths = [
             0usize, 1, 31, 32, 33, 9999, 10000, 10001, 999_999, 1_000_001,
         ];
+        // The 1 MB rows are hours of interpreted AES; the kept rows already
+        // cross every block/refill boundary (the `answers` pair by index).
+        let lengths = if cfg!(miri) { &lengths[..6] } else { &lengths };
 
         for (i, length) in lengths.iter().enumerate() {
             let mut generator = DeterministicBytes::new(*length as u32);
@@ -1869,6 +1890,9 @@ mod tests {
             724_143_417,
         ];
         let lengths = [0usize, 16, 32, 256, 1024, 65536];
+        // The 65,536-byte row is ~99% of the interpreted AES cost; the kept
+        // rows cross every boundary (the `answers` pair by index).
+        let lengths = if cfg!(miri) { &lengths[..5] } else { &lengths };
 
         for (i, length) in lengths.iter().enumerate() {
             let mut generator = DeterministicBytes::new(*length as u32);
@@ -1928,6 +1952,9 @@ mod tests {
             2_626_031_206,
         ];
         let lengths = [0usize, 16, 32, 256, 1024, 65536];
+        // The 65,536-byte row is ~99% of the interpreted AES cost; the kept
+        // rows cross every boundary (the `answers` pair by index).
+        let lengths = if cfg!(miri) { &lengths[..5] } else { &lengths };
 
         for (i, length) in lengths.iter().enumerate() {
             let mut generator = DeterministicBytes::new(*length as u32);

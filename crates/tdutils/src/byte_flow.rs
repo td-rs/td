@@ -31,15 +31,42 @@ pub fn connect(from: &mut dyn ByteFlowInterface, to: &mut dyn ByteFlowInterface)
 }
 
 /// A null parent pointer. Only the data pointer is ever inspected
-/// (`is_null` checks); the vtable of a null parent is never dereferenced.
+/// (`is_null` checks); the vtable of a null parent is never dereferenced
+/// through — but it must still be a *real* vtable: a fat pointer with a
+/// null vtable is an invalid value, so the null borrows the vtable of the
+/// zero-sized [`NullParent`] shim below instead of transmuting two thin
+/// nulls (which Miri rightly rejects).
 fn null_flow_parent() -> *mut dyn ByteFlowInterface {
-    // SAFETY: transmute of a null thin-pointer pair; the metadata is never
-    // used for a null parent.
-    unsafe {
-        std::mem::transmute::<(*mut (), *mut ()), *mut dyn ByteFlowInterface>((
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        ))
+    let mut shim = NullParent;
+    (&mut shim as &mut dyn ByteFlowInterface as *mut dyn ByteFlowInterface).map_addr(|_| 0)
+}
+
+/// Vtable donor for [`null_flow_parent`] — never called (the null data
+/// pointer is only ever `is_null`-checked); every method is an explicit
+/// `unreachable!` so a stray call is loud, not silent.
+struct NullParent;
+
+impl ByteFlowInterface for NullParent {
+    fn close_input(&mut self, _status: Status) {
+        unreachable!("the null flow parent is never driven")
+    }
+    fn wakeup(&mut self) {
+        unreachable!("the null flow parent is never driven")
+    }
+    fn set_parent(&mut self, _parent: &mut dyn ByteFlowInterface) {
+        unreachable!("the null flow parent is never driven")
+    }
+    fn set_input(&mut self, _input: ChainBufferReader) {
+        unreachable!("the null flow parent is never driven")
+    }
+    fn get_need_size(&mut self) -> usize {
+        unreachable!("the null flow parent is never driven")
+    }
+    fn get_read_size(&mut self) -> usize {
+        unreachable!("the null flow parent is never driven")
+    }
+    fn get_write_size(&mut self) -> usize {
+        unreachable!("the null flow parent is never driven")
     }
 }
 
@@ -110,8 +137,11 @@ impl<'a> ByteFlowBaseCommon<'a> {
     }
 
     /// `td::ByteFlowBaseCommon::wakeup` — the shared loop; `loop_step` plays
-    /// the role of the C++ virtual `loop()`.
-    pub fn wakeup_with(&mut self, loop_step: &mut dyn FnMut() -> bool) {
+    /// the role of the C++ virtual `loop()`, and receives the common by
+    /// `&mut` for the duration of each call (the C++ virtual reads the same
+    /// object; lending the borrow keeps that shape without an aliasing
+    /// raw-pointer capture).
+    pub fn wakeup_with(&mut self, loop_step: &mut dyn FnMut(&mut ByteFlowBaseCommon<'_>) -> bool) {
         if self.stop_flag || self.input.is_none() {
             return;
         }
@@ -159,7 +189,7 @@ impl<'a> ByteFlowBaseCommon<'a> {
             }
             self.need_size = 0;
 
-            if !loop_step() && self.need_size <= self.get_read_size_impl() {
+            if !loop_step(self) && self.need_size <= self.get_read_size_impl() {
                 self.need_size = self.get_read_size_impl() + 1;
             }
         }
@@ -623,14 +653,12 @@ impl<'a> ByteFlowInterface for GzipByteFlow<'a> {
         let total = &mut self.total_output_size;
         let max_output_size = self.max_output_size;
         // The step closure and the wakeup loop borrow disjoint fields of
-        // `self`; the common part is re-derived from a raw pointer so the
-        // closure can capture it while `wakeup_with` mutably borrows it.
-        let common_ptr = &mut self.base.common as *mut ByteFlowBaseCommon<'a>;
-        // SAFETY: `common_ptr` is valid for the whole wakeup call, and the
-        // closure is only invoked from within it.
-        let mut step =
-            move || unsafe { Self::step(gzip, output, &mut *common_ptr, total, max_output_size) };
-        unsafe { &mut *common_ptr }.wakeup_with(&mut step);
+        // `self`; the common is lent to each step call by `wakeup_with`
+        // itself, so nothing aliases it here.
+        let mut step = move |common: &mut ByteFlowBaseCommon<'_>| {
+            Self::step(gzip, output, common, total, max_output_size)
+        };
+        self.base.common.wakeup_with(&mut step);
     }
 
     fn set_parent(&mut self, parent: &mut dyn ByteFlowInterface) {
@@ -811,31 +839,21 @@ impl<'a> ByteFlowInterface for AesCtrByteFlow<'a> {
     fn wakeup(&mut self) {
         let state = &mut self.state;
         let output = &mut self.base.output;
-        let common_ptr = &mut self.base.common as *mut ByteFlowBaseCommon<'a>;
-        let mut step = move || unsafe {
-            // SAFETY: `common_ptr` is valid for the whole wakeup call and
-            // the closure is only invoked from within it.
-            let common = &mut *common_ptr;
+        // The step closure and the wakeup loop borrow disjoint fields of
+        // `self`; the common is lent to each step call by `wakeup_with`
+        // itself, so nothing aliases it here.
+        let mut step = move |common: &mut ByteFlowBaseCommon<'_>| {
             let mut result = false;
-            let (ptr, len) = {
-                let input = common.input.as_mut().expect("aes-ctr flow input");
-                let ready = input.prepare_read();
-                (ready.as_ptr(), ready.len())
-            };
+            let input = common.input.as_mut().expect("aes-ctr flow input");
+            let window = input.prepare_read_mut();
+            let len = window.len();
             if len != 0 {
-                // SAFETY: the reader window is stable until `confirm_read`
-                // below, and no other reader may access it (the single-writer
-                // discipline) — C++'s in-place `state_.encrypt(ready, ready)`.
-                state.encrypt_in_place(std::slice::from_raw_parts_mut(ptr as *mut u8, len));
-                // SAFETY: the window above is still live (confirm_read below
-                // only advances the reader's position).
-                let window = std::slice::from_raw_parts(ptr, len);
-                output.append(window, 0);
-                common
-                    .input
-                    .as_mut()
-                    .expect("aes-ctr flow input")
-                    .confirm_read(len);
+                // The C++ in-place `state_.encrypt(ready, ready)` over the
+                // read window (its `as_mutable_slice()`).
+                state.encrypt_in_place(window);
+                let ready = input.prepare_read();
+                output.append(&ready[..len], 0);
+                input.confirm_read(len);
                 result = true;
             }
 
@@ -844,7 +862,7 @@ impl<'a> ByteFlowInterface for AesCtrByteFlow<'a> {
             }
             result
         };
-        unsafe { &mut *common_ptr }.wakeup_with(&mut step);
+        self.base.common.wakeup_with(&mut step);
     }
 
     fn set_parent(&mut self, parent: &mut dyn ByteFlowInterface) {

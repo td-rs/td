@@ -315,6 +315,10 @@ GwIDAQAB\n-----END PUBLIC KEY-----";
     /// generation is slow, so a single test exercises raw inversion and the
     /// PKCS#1 v1.5 roundtrip).
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "2048-bit keygen and private-exponent modexps are hours under the interpreter"
+    )]
     fn generated_keypair_raw_inversion_and_pkcs1_v1_5() {
         use rsa_crate::traits::PrivateKeyParts;
         let mut rng = rsa_crate::rand_core::OsRng;

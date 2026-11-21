@@ -68,9 +68,10 @@ impl<'a> ByteFlowInterface for TlsReaderByteFlow<'a> {
 
     fn wakeup(&mut self) {
         let output = &mut self.base.output;
-        let common_ptr = &mut self.base.common as *mut ByteFlowBaseCommon<'a>;
-        let mut step = move || unsafe { Self::step(&mut *common_ptr, output) };
-        unsafe { &mut *common_ptr }.wakeup_with(&mut step);
+        // The common is lent to each step call by `wakeup_with` itself, so
+        // nothing aliases it here.
+        let mut step = move |common: &mut ByteFlowBaseCommon<'_>| Self::step(common, output);
+        self.base.common.wakeup_with(&mut step);
     }
 
     fn set_parent(&mut self, parent: &mut dyn ByteFlowInterface) {

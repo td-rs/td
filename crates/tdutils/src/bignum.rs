@@ -569,7 +569,12 @@ mod tests {
             seed ^= seed << 17;
             seed
         };
-        for case in 0..24 {
+        // One agreement case costs ~a minute under Miri's interpreter (the
+        // fixed limb budget's word arithmetic is interpreted, not compiled);
+        // two keep the check alive there, native/emscripten run the full
+        // sweep.
+        let cases = if cfg!(miri) { 2 } else { 24 };
+        for case in 0..cases {
             let modulus = BigNum::from_binary(
                 &(0..64)
                     .map(|_| (next() & 0xff) as u8)

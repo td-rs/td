@@ -274,9 +274,47 @@ impl BufferSlice {
     }
 
     /// `BufferSlice(Slice slice)`.
+    ///
+    /// The source must not alias the window this allocates: on the
+    /// thread-local slab the fresh bytes append past the published `end`,
+    /// so the only possible alias is another slab view — [`copy()`]'s
+    /// same-slab path, which routes through [`from_bytes_raw`] instead of
+    /// this reference-pair copy.
     pub fn from_slice_bytes(slice: &[u8]) -> Self {
         let mut this = Self::with_size(slice.len());
         this.as_mutable_slice().copy_from_slice(slice);
+        this
+    }
+
+    /// The `std::memcpy` core of [`from_slice_bytes`] for sources that may
+    /// live inside the same thread-local slab as the fresh window. The
+    /// source arrives as a raw pointer on purpose: a protected `&[u8]`
+    /// argument pointing into the same allocation as the `&mut` destination
+    /// window is stacked-borrows UB however disjoint the byte ranges are,
+    /// and the C++ this ports is exactly a `memcpy` over that one slab.
+    ///
+    /// # Safety
+    ///
+    /// `src` must be valid for `len` reads, and the `[begin, end)` window
+    /// of the fresh slice must be disjoint from those bytes.
+    unsafe fn from_bytes_raw(src: *const u8, len: usize) -> Self {
+        let this = Self::with_size(len);
+        let Some(raw) = this.buffer.raw() else {
+            debug_assert_eq!(len, 0, "a null slice allocates no window");
+            return this;
+        };
+        // The destination is addressed through the UnsafeCell itself:
+        // `addr_of_mut!` projects onto the byte without pushing a borrow
+        // tag, so the source view's tag on this same allocation survives
+        // (an `&mut` window would invalidate it and take the raw `src`
+        // pointer down with it).
+        let cell = raw.data.get();
+        // SAFETY: the projection reads the Box's data pointer without
+        // pushing a borrow tag (the whole point — see above).
+        let dst = unsafe { std::ptr::addr_of_mut!((*cell)[this.begin]) };
+        // SAFETY: caller guarantees validity/disjointness (the fresh window
+        // sits past the slab's published `end`).
+        unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
         this
     }
 
@@ -289,7 +327,14 @@ impl BufferSlice {
                 end: self.end,
             };
         }
-        Self::from_slice_bytes(self.as_slice())
+        // Same-slab copy: convert the source view to a raw pointer first —
+        // `from_slice_bytes`'s `&[u8]`/`&mut` pair can alias this very
+        // allocation (the view and the fresh window share the slab), which
+        // is stacked-borrows UB even though the byte ranges are disjoint.
+        let (src, len) = (self.as_slice().as_ptr(), self.size());
+        // SAFETY: `src` is valid for `len` reads (the live view above), and
+        // the fresh window appends past the slab's `end` — disjoint bytes.
+        unsafe { Self::from_bytes_raw(src, len) }
     }
 
     pub fn as_slice(&self) -> &[u8] {
@@ -821,6 +866,17 @@ impl ChainBufferIterator {
         }
     }
 
+    /// `td::ChainBufferIterator::prepare_read()` plus the C++
+    /// `Slice::as_mutable_slice()` — the same window, minted through the
+    /// mutable (UnsafeCell) path instead of the read view, for the
+    /// single-writer in-place operations (the AES flow's
+    /// `encrypt(ready, ready)`; deriving a `&mut` from the `&[u8]` view
+    /// would be stacked-borrows UB).
+    pub fn prepare_read_mut(&mut self) -> &mut [u8] {
+        let len = self.prepare_read().len();
+        &mut self.reader.as_mutable_slice()[..len]
+    }
+
     /// `td::ChainBufferIterator::read_as_buffer_slice(limit)`: reads only from
     /// the head slice.
     pub fn read_as_buffer_slice(&mut self, limit: usize) -> BufferSlice {
@@ -964,6 +1020,16 @@ impl ChainBufferReader {
         let size = self.size();
         let res = self.begin.prepare_read();
         &res[..res.len().min(size)]
+    }
+
+    /// [`prepare_read`](Self::prepare_read)'s window as `&mut` — the C++
+    /// `Slice::as_mutable_slice()` escape hatch for single-writer in-place
+    /// steps (see [`ChainBufferIterator::prepare_read_mut`]).
+    pub fn prepare_read_mut(&mut self) -> &mut [u8] {
+        let size = self.size();
+        let res = self.begin.prepare_read_mut();
+        let len = res.len().min(size);
+        &mut res[..len]
     }
 
     pub fn confirm_read(&mut self, size: usize) {

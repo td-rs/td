@@ -293,9 +293,13 @@ mod tests {
     /// per-producer ordering and exactly-once delivery.
     #[test]
     fn mpmc_queue_multi_thread() {
-        const PRODUCERS: usize = 10;
-        const CONSUMERS: usize = 10;
-        const ITEMS: usize = 100_000;
+        // Scaled down under Miri: a million interpreted queue ops through
+        // condvars would run for hours; the interleaving coverage the test
+        // exists for survives the smaller fan-out (the throughput row is a
+        // native benchmark, not an interpreter target).
+        const PRODUCERS: usize = if cfg!(miri) { 4 } else { 10 };
+        const CONSUMERS: usize = if cfg!(miri) { 4 } else { 10 };
+        const ITEMS: usize = if cfg!(miri) { 500 } else { 100_000 };
 
         #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
         struct Data {
