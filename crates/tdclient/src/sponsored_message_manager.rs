@@ -796,13 +796,12 @@ impl SponsoredMessageManager {
                 let messages = self.dialog_sponsored_messages.get_mut(&dialog_id).unwrap();
                 for (message_info, message) in parsed {
                     let local_id = message.local_id;
-                    debug_assert!(
-                        messages
-                            .message_infos
-                            .insert(local_id, message_info)
-                            .is_none(),
-                        "the C++ CHECKs the insert"
-                    );
+                    // the emplace is real; the CHECK only asserts (#155)
+                    let is_inserted = messages
+                        .message_infos
+                        .insert(local_id, message_info)
+                        .is_none();
+                    debug_assert!(is_inserted, "the C++ CHECKs the insert");
                     messages.messages.push(message);
                 }
                 if sponsored_messages.start_delay != 0 || sponsored_messages.between_delay != 0 {
@@ -1061,12 +1060,12 @@ impl SponsoredMessageManager {
                         is_viewed: false,
                         is_clicked: false,
                     };
-                    debug_assert!(
-                        self.dialog_infos
-                            .insert(dialog_local_id, dialog_info)
-                            .is_none(),
-                        "the C++ CHECKs the insert"
-                    );
+                    // the emplace is real; the CHECK only asserts (#155)
+                    let is_inserted = self
+                        .dialog_infos
+                        .insert(dialog_local_id, dialog_info)
+                        .is_none();
+                    debug_assert!(is_inserted, "the C++ CHECKs the insert");
 
                     let dialogs = self.search_sponsored_dialogs.get_mut(query).unwrap();
                     dialogs.dialogs.push(SponsoredDialog {
@@ -1278,12 +1277,12 @@ impl SponsoredMessageManager {
                         continue;
                     };
                     let ad_local_id = message.local_id;
-                    debug_assert!(
-                        self.video_ad_infos
-                            .insert(ad_local_id, video_ad_info)
-                            .is_none(),
-                        "the C++ CHECKs the insert"
-                    );
+                    // the emplace is real; the CHECK only asserts (#155)
+                    let is_inserted = self
+                        .video_ad_infos
+                        .insert(ad_local_id, video_ad_info)
+                        .is_none();
+                    debug_assert!(is_inserted, "the C++ CHECKs the insert");
                     let ads = self.video_sponsored_ads.get_mut(&message_full_id).unwrap();
                     ads.messages.push(message);
                 }

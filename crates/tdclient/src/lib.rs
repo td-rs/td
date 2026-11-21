@@ -7,6 +7,13 @@
 //! ([`synchronous_requests`]); the full ClientManager port is S70, the
 //! Options manager S69.
 
+// C++ CHECK translations must keep the side effect out of `debug_assert!`:
+// the macro compiles away in release builds (the stress soak runs the suite
+// with --release), so an insert hidden inside it never happens and release
+// registration silently goes missing (#155). CI clippy's -D warnings makes
+// this warn an error.
+#![warn(clippy::debug_assert_with_mut_call)]
+
 pub mod account_manager;
 pub mod active_story_state;
 pub mod age_verification_parameters;
