@@ -42,6 +42,11 @@ allow = [
   # webpki-roots: the pinned CA bundle is data under the permissive
   # Community Data License Agreement, not code.
   "CDLA-Permissive-2.0",
+  # libfuzzer-sys bundles LLVM's libFuzzer (NCSA/UIUC, the same permissive
+  # family as the BSD entries). Surfaced by the #163 standalone-lock deny
+  # coverage: fuzz targets are test tooling, never linked into shipped
+  # artifacts.
+  "NCSA",
 ]
 
 # Our own tdtl crate is a faithful port of td's tl-parser.c, which is
