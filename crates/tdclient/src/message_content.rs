@@ -12287,7 +12287,11 @@ pub fn create_input_message_content(
         file_name = suggested_file_name;
         mime_type = suggested_mime_type;
         if !tdutils::utf8::check_utf8(file_name.as_bytes()) {
-            if extension.is_empty() {
+            // 3d91ccf7b: the extension rides the fallback name only when
+            // it is non-empty and itself UTF-8 (the branch is unreachable
+            // through the String invariant today — shape parity with the
+            // pin for when file names carry bytes)
+            if !extension.is_empty() && tdutils::utf8::check_utf8(extension.as_bytes()) {
                 file_name = format!("file.{extension}");
             } else {
                 file_name = "file".to_string();

@@ -52,7 +52,7 @@ pub unsafe extern "C" fn td_json_client_create() -> *mut c_void {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn td_json_client_send(client: *mut c_void, request: *const c_char) {
     let client = unsafe { &*(client as *const ClientJson) };
-    let request = unsafe { cstr(request) };
+    let request = unsafe { request_bytes(request) };
     client.send(request);
 }
 
@@ -86,7 +86,7 @@ pub unsafe extern "C" fn td_json_client_execute(
     _client: *mut c_void,
     request: *const c_char,
 ) -> *const c_char {
-    store_string(client_json::execute(unsafe { cstr(request) }))
+    store_string(client_json::execute(unsafe { request_bytes(request) }))
 }
 
 /// Destroys the TDLib client instance (the C++ `delete`: the close +
@@ -181,7 +181,7 @@ pub extern "C" fn td_create_client_id() -> c_int {
 /// `request` must be a valid NUL-terminated string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn td_send(client_id: c_int, request: *const c_char) {
-    client_json::send(client_id, unsafe { cstr(request) });
+    client_json::send(client_id, unsafe { request_bytes(request) });
 }
 
 /// Receives incoming updates and request responses. Must not be called
@@ -200,7 +200,7 @@ pub extern "C" fn td_receive(timeout: f64) -> *const c_char {
 /// `request` must be a valid NUL-terminated string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn td_execute(request: *const c_char) -> *const c_char {
-    store_string(client_json::execute(unsafe { cstr(request) }))
+    store_string(client_json::execute(unsafe { request_bytes(request) }))
 }
 
 /// The host callback registered by `td_set_log_message_callback`.
@@ -238,7 +238,18 @@ pub extern "C" fn td_set_log_message_callback(
     }
 }
 
-/// The NUL-terminated request string behind a `*const c_char`.
+/// The NUL-terminated request bytes behind a `*const c_char` — raw bytes,
+/// like the C++ `Slice`: a request that isn't UTF-8 must reach the JSON
+/// boundary, which answers c67dd7f2a's replacement error instead of
+/// panicking on the conversion.
+///
+/// # Safety
+/// `request` must be a valid NUL-terminated string.
+unsafe fn request_bytes<'a>(request: *const c_char) -> &'a [u8] {
+    unsafe { std::ffi::CStr::from_ptr(request) }.to_bytes()
+}
+
+/// The NUL-terminated response string behind a `*const c_char`.
 ///
 /// # Safety
 /// `request` must be a valid NUL-terminated string.
@@ -325,6 +336,22 @@ mod tests {
             );
             td_json_client_destroy(client);
         }
+    }
+
+    #[test]
+    fn execute_replaces_non_utf8_requests_without_panicking() {
+        // c67dd7f2a: the C ABI takes raw bytes; a non-UTF-8 request must
+        // answer the replacement error, not abort the process
+        let mut bytes = b"{\"@type\":".to_vec();
+        bytes.push(b'"');
+        bytes.push(0xff);
+        bytes.extend_from_slice(b"\"}");
+        let request = std::ffi::CString::new(bytes).unwrap();
+        let response = unsafe { td_execute(request.as_ptr()) };
+        assert_eq!(
+            unsafe { cstr(response) },
+            r#"{"@type":"error","code":400,"message":"Strings must be encoded in UTF-8"}"#
+        );
     }
 
     #[test]

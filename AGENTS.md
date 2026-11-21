@@ -74,7 +74,7 @@ a dropped entry leaves no reflog trace (only fsck-recoverable). See the
 ## Conformance / oracles
 
 - Differential gates: `conformance/*/verify.sh <path-to-td-checkout>`, pinned
-  to upstream commit `23383aef218a3123f02b744bfa91bde21056a814` (see
+  to upstream commit `03220f6b3043c6fd7785fbf0901d63f19ad19974` (see
   `.github/workflows/main.yml`). They need a C++ td build (cmake, gperf,
   php) — slow, so they run in Main CI, not PR CI.
 - Live-session recording requires the `TD_BOT_TOKEN` / `TD_BOT_USERNAME` /

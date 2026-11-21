@@ -165,7 +165,7 @@ jobs:
         with:
           repository: tdlib/td
           # Full SHA required: actions/checkout cannot fetch abbreviated SHAs.
-          ref: 23383aef218a3123f02b744bfa91bde21056a814
+          ref: 03220f6b3043c6fd7785fbf0901d63f19ad19974
           path: td-cpp
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -271,7 +271,7 @@ jobs:
         if: steps.creds.outputs.ok == 'true'
         with:
           repository: tdlib/td
-          ref: 23383aef218a3123f02b744bfa91bde21056a814
+          ref: 03220f6b3043c6fd7785fbf0901d63f19ad19974
           path: td-cpp
       - uses: dtolnay/rust-toolchain@stable
         if: steps.creds.outputs.ok == 'true'

@@ -5931,13 +5931,13 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
 
         // replyToCallbackQueryWithEphemeralMessage (Requests.cpp:4424-4431):
         // CHECK_IS_BOT, then MessageQueryManager::edit_callback_query_message
-        // runs the real ephemeral-reply flow (the old unconditional 500
-        // "Unsupported" band is gone upstream).
+        // runs the real ephemeral-reply flow; at 03220f6 the contract
+        // returns the sent message (CREATE_REQUEST_PROMISE — c8828d50).
         Function::replyToCallbackQueryWithEphemeralMessage(request) => {
             if !check_is_bot(td, id) {
                 return;
             }
-            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let promise = td.deferred_promise::<td_api::Message, _>(id, Object::message);
             let (mut env, mq_manager) = crate::td::message_query_env_split(td);
             mq_manager.edit_callback_query_message(
                 &mut env,

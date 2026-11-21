@@ -2,6 +2,14 @@
 //! boundary of the C ABI. Request parsing matches the C++ exactly — parse
 //! errors become a `testReturnError` request carrying the 400 error, so
 //! they flow through the normal response path (`get_return_error_function`).
+//! At 03220f6 (c67dd7f2a) a request carrying bytes outside UTF-8 answers
+//! the replacement error `Strings must be encoded in UTF-8`: the C++ JSON
+//! parser is a byte parser whose error messages can embed the raw bytes,
+//! and the Rust string model cannot represent those flows — the boundary
+//! applies the replacement up front (the recorded divergence: a non-UTF-8
+//! request that is also syntactically broken answers the replacement
+//! instead of the C++ ASCII syntax-error text, and byte-valued string
+//! fields of an otherwise-known request error instead of proceeding).
 
 use std::collections::HashMap;
 use std::ffi::c_char;
@@ -27,7 +35,16 @@ fn return_error_function(error_message: String) -> Function {
 /// `ClientJson.cpp:to_request`: decode the request, extract `@extra`
 /// (re-encoded verbatim into the response), then `from_json` the rest.
 /// Returns `(function, extra)`.
-pub fn to_request(request: &str) -> (Function, String) {
+pub fn to_request(request: impl AsRef<[u8]>) -> (Function, String) {
+    let request = request.as_ref();
+    // c67dd7f2a — `get_return_error_function`'s replacement, applied at
+    // the earliest point the Rust string model can hold the input.
+    let Ok(request) = std::str::from_utf8(request) else {
+        return (
+            return_error_function("Strings must be encoded in UTF-8".to_string()),
+            String::new(),
+        );
+    };
     let mut json_value = match json_decode(request) {
         Result::Ok(value) => value,
         Result::Err(status) => {
@@ -152,7 +169,7 @@ impl ClientJson {
     }
 
     /// `ClientJson::send`.
-    pub fn send(&self, request: &str) {
+    pub fn send(&self, request: impl AsRef<[u8]>) {
         let (function, extra) = to_request(request);
         let extra_id = self.extra_id.fetch_add(1, Ordering::Relaxed);
         if !extra.is_empty() {
@@ -172,7 +189,7 @@ impl ClientJson {
     }
 
     /// `ClientJson::execute`.
-    pub fn execute(&self, request: &str) -> String {
+    pub fn execute(&self, request: impl AsRef<[u8]>) -> String {
         let (function, extra) = to_request(request);
         let object = Client::execute(Request { id: 0, function });
         from_response(&object, &extra, 0)
@@ -204,7 +221,7 @@ pub fn create_client_id() -> i32 {
 }
 
 /// `json_send`.
-pub fn send(client_id: i32, request: &str) {
+pub fn send(client_id: i32, request: impl AsRef<[u8]>) {
     let (function, extra) = to_request(request);
     let request_id = EXTRA_ID.fetch_add(1, Ordering::Relaxed);
     if !extra.is_empty() {
@@ -228,7 +245,7 @@ pub fn receive(timeout: f64) -> Option<String> {
 }
 
 /// `json_execute`.
-pub fn execute(request: &str) -> String {
+pub fn execute(request: impl AsRef<[u8]>) -> String {
     let (function, extra) = to_request(request);
     from_response(&ClientManager::execute(function), &extra, 0)
 }
@@ -241,6 +258,24 @@ pub fn get_manager() -> &'static ClientManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn to_request_replaces_non_utf8_errors_like_cpp() {
+        // c67dd7f2a: the request carries bytes outside UTF-8 (in `@type`),
+        // so every error message that would embed them is replaced
+        let mut request = b"{\"@type\":".to_vec();
+        request.push(b'"');
+        request.push(0xff);
+        request.extend_from_slice(b"\"}");
+        let (function, extra) = to_request(request);
+        let Function::testReturnError(request) = function else {
+            panic!("expected testReturnError");
+        };
+        let error = request.error.expect("error");
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Strings must be encoded in UTF-8");
+        assert!(extra.is_empty());
+    }
 
     #[test]
     fn to_request_extracts_extra_and_parses() {

@@ -380816,7 +380816,7 @@ pub struct replyToCallbackQueryWithEphemeralMessage {
 }
 
 impl replyToCallbackQueryWithEphemeralMessage {
-    pub const ID: i32 = -77034825;
+    pub const ID: i32 = 1672608572;
 
     pub fn store_boxed(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&Self::ID.to_le_bytes());
