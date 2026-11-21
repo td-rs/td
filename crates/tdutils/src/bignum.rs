@@ -55,8 +55,9 @@ montgomery_modpow_fn!(montgomery_modpow_64, 64);
 /// C++ `BigNum::mod_exp` makes, which OpenSSL internally routes to
 /// `BN_mod_exp_mont_consttime` for odd moduli (the exponent is secret; the
 /// vartime-ladder concern is the reason the consttime form matters). Native
-/// only — emscripten links no OpenSSL and keeps the Montgomery path above.
-#[cfg(not(target_os = "emscripten"))]
+/// only — emscripten links no OpenSSL and Miri cannot execute the FFI; both
+/// keep the Montgomery path above.
+#[cfg(all(not(target_os = "emscripten"), not(miri)))]
 mod bn_openssl {
     use num_bigint::{BigInt, BigUint, Sign};
 
@@ -410,7 +411,7 @@ impl BigNum {
         // the C++ calls, Montgomery consttime inside OpenSSL for odd
         // moduli — the S96 §1.4 fix for the 3.1× handshake gap. Falls back
         // to the Rust paths below on failure or on emscripten.
-        #[cfg(not(target_os = "emscripten"))]
+        #[cfg(all(not(target_os = "emscripten"), not(miri)))]
         if let Some(value) = bn_openssl::mod_exp(&a.value, &p.value, &m.value) {
             return Self { value };
         }
@@ -558,14 +559,6 @@ mod tests {
     #[test]
     fn dh_mod_exp_vectors() {
         let mut context = BigNumContext::new();
-        let p = BigNum::from_hex(P_HEX).unwrap();
-        let g = {
-            let mut g = BigNum::new();
-            g.set_value(2);
-            g
-        };
-        let a = BigNum::from_hex(&"a1b2c3d4".repeat(16)).unwrap();
-        let b = BigNum::from_hex(&"e5f6a7b8".repeat(16)).unwrap();
 
         // The Montgomery fast path must agree with num-bigint's modpow
         // byte-exactly on random inputs before the DH-shaped cases below.
@@ -595,21 +588,28 @@ mod tests {
             );
         }
 
-        let a_public = BigNum::mod_exp(&g, &a, &p, &mut context);
-        let b_public = BigNum::mod_exp(&g, &b, &p, &mut context);
-        let shared_a = BigNum::mod_exp(&b_public, &a, &p, &mut context);
-        let shared_b = BigNum::mod_exp(&a_public, &b, &p, &mut context);
-        assert_eq!(shared_a.to_decimal(), shared_b.to_decimal());
+        // The 2,048-bit DH exchanges below cost minutes per modexp under
+        // Miri's interpreter. The random cases above already pin the
+        // Montgomery path byte-exactly against num-bigint (the surface
+        // Miri guards), so the full vectors stay native/emscripten-only.
+        #[cfg(not(miri))]
+        {
+            let p = BigNum::from_hex(P_HEX).unwrap();
+            let g = {
+                let mut g = BigNum::new();
+                g.set_value(2);
+                g
+            };
+            let a = BigNum::from_hex(&"a1b2c3d4".repeat(16)).unwrap();
+            let b = BigNum::from_hex(&"e5f6a7b8".repeat(16)).unwrap();
 
-        // Reference values computed independently with Python's pow().
-        assert_eq!(
-            hex(&a_public.to_binary(-1)),
-            "f85d34a0f19959ea2006919e700606a20d428d53f693b2e0f3d545613b568bee7cb1e3765c5962b67c9f87c54084a4c13acb0a96db49a9feca50d936b4ee4566c09f9e3ced7ace31842c36a61826c2da5476885685224c433477d7fafde12c042fa6c7e2a381b3f6409a2b8bc7cad4f39eabd53bd71ffbd5d4d90c57a9847054c205519742bf815dda8c9bb7505b0ce85e4741c208ed6815b26f56326c85568b89c3ef3299e3bc14607d764d0e68b8864a5fdb181e1d4275cf054be482322e296d9990108605ce5f06f19f4db7a5644d417457c05f009253dcfaa2695a41e31254aed8b849cc787e2370e842058061cf9f2469365d5d42068ef7816af3eee9f1"
-        );
-        assert_eq!(
-            hex(&shared_a.to_binary(-1)),
-            "e0d7080bbee8d52035d0f2d42ff3c89fd6ed8350217a22747ef52a7ca13ddb1b9565ddaf11bdb894f53dfadd15632605a4aa74282cde2ae20d89e50cd1197dff646a6944a3437740d04d8d26d8342810890ea39f24440e33b1e9728687d89e2cec943468e2132f56e7a3c6120310c2511cd80b1c0d2b295cd8d59d31ff3edd6f250d0b38943a4741879c132c6308bedf56e85d78d3f55fd09e6c2141a613483ecc7d3d1cac438fc3a08d815a6d79bdc577d4509f34e971e522197db8982788849fb84d119ca28694ef36ce500d4c7314191b939660b98eb80604cb23e55f471b6cfd3df6f824751ccec3449cef81c3ef44539caf1686f384d7a6524b37d1ec1b"
-        );
+            let a_public = BigNum::mod_exp(&g, &a, &p, &mut context);
+            let b_public = BigNum::mod_exp(&g, &b, &p, &mut context);
+            let shared_a = BigNum::mod_exp(&b_public, &a, &p, &mut context);
+            let shared_b = BigNum::mod_exp(&a_public, &b, &p, &mut context);
+            assert_eq!(shared_a.to_decimal(), shared_b.to_decimal());
+            // Reference values computed independently with Python's pow().            assert_eq!(                hex(&a_public.to_binary(-1)),                "f85d34a0f19959ea2006919e700606a20d428d53f693b2e0f3d545613b568bee7cb1e3765c5962b67c9f87c54084a4c13acb0a96db49a9feca50d936b4ee4566c09f9e3ced7ace31842c36a61826c2da5476885685224c433477d7fafde12c042fa6c7e2a381b3f6409a2b8bc7cad4f39eabd53bd71ffbd5d4d90c57a9847054c205519742bf815dda8c9bb7505b0ce85e4741c208ed6815b26f56326c85568b89c3ef3299e3bc14607d764d0e68b8864a5fdb181e1d4275cf054be482322e296d9990108605ce5f06f19f4db7a5644d417457c05f009253dcfaa2695a41e31254aed8b849cc787e2370e842058061cf9f2469365d5d42068ef7816af3eee9f1"            );            assert_eq!(                hex(&shared_a.to_binary(-1)),                "e0d7080bbee8d52035d0f2d42ff3c89fd6ed8350217a22747ef52a7ca13ddb1b9565ddaf11bdb894f53dfadd15632605a4aa74282cde2ae20d89e50cd1197dff646a6944a3437740d04d8d26d8342810890ea39f24440e33b1e9728687d89e2cec943468e2132f56e7a3c6120310c2511cd80b1c0d2b295cd8d59d31ff3edd6f250d0b38943a4741879c132c6308bedf56e85d78d3f55fd09e6c2141a613483ecc7d3d1cac438fc3a08d815a6d79bdc577d4509f34e971e522197db8982788849fb84d119ca28694ef36ce500d4c7314191b939660b98eb80604cb23e55f471b6cfd3df6f824751ccec3449cef81c3ef44539caf1686f384d7a6524b37d1ec1b"            );
+        }
     }
 
     #[test]
@@ -685,8 +685,14 @@ mod tests {
     #[test]
     fn primality() {
         let mut context = BigNumContext::new();
-        let p = BigNum::from_hex(P_HEX).unwrap();
-        assert!(p.is_prime(&mut context), "RFC 3526 group 14 prime");
+        // The 2,048-bit prime's Miller–Rabin rounds cost minutes each under
+        // Miri's interpreter; the small cases below still cover the
+        // num-prime path it shares.
+        #[cfg(not(miri))]
+        {
+            let p = BigNum::from_hex(P_HEX).unwrap();
+            assert!(p.is_prime(&mut context), "RFC 3526 group 14 prime");
+        }
 
         let composite = {
             let mut v = BigNum::new();

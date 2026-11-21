@@ -7,6 +7,11 @@
 //! protocol and tdlib's file formats mandate them (secret-chat fingerprints,
 //! legacy MTProto paths), and a drop-in replacement must reproduce the same
 //! digests — they are never a choice of security strength here.
+//!
+//! The native fast paths below shell out to the vendored OpenSSL; Miri
+//! cannot execute that FFI, so under `cfg(miri)` every one of them compiles
+//! the RustCrypto arm instead (the same code emscripten builds — the wasm
+//! target links no OpenSSL).
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256, Sha512};
@@ -45,12 +50,12 @@ pub fn sha256_bytes(data: &[u8]) -> Vec<u8> {
 /// RustCrypto `sha2` crate measured ~1.1× under the C++ row (its SHA-512
 /// compress is slower than OpenSSL's asm); SHA-256/SHA-1 stay on `sha2`/`sha1`
 /// — those rows run ahead of C++. Emscripten keeps the RustCrypto form.
-#[cfg(not(target_os = "emscripten"))]
+#[cfg(all(not(target_os = "emscripten"), not(miri)))]
 pub fn sha512(data: &[u8]) -> [u8; 64] {
     openssl_digest::sha512(data)
 }
 
-#[cfg(target_os = "emscripten")]
+#[cfg(any(target_os = "emscripten", miri))]
 pub fn sha512(data: &[u8]) -> [u8; 64] {
     let mut hasher = Sha512::new();
     hasher.update(data);
@@ -90,12 +95,12 @@ pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
 /// once, and per call `EVP_MAC_init` + `EVP_MAC_update` + `EVP_MAC_final`.
 /// The `hmac` crate measured ~1.16× under the C++ row; HMAC-SHA256 stays
 /// on `hmac` — that row runs ahead of C++. Emscripten keeps RustCrypto.
-#[cfg(not(target_os = "emscripten"))]
+#[cfg(all(not(target_os = "emscripten"), not(miri)))]
 pub fn hmac_sha512(key: &[u8], message: &[u8]) -> [u8; 64] {
     openssl_digest::hmac_sha512(key, message)
 }
 
-#[cfg(target_os = "emscripten")]
+#[cfg(any(target_os = "emscripten", miri))]
 pub fn hmac_sha512(key: &[u8], message: &[u8]) -> [u8; 64] {
     let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(message);
@@ -112,7 +117,7 @@ pub fn hmac_sha512(key: &[u8], message: &[u8]) -> [u8; 64] {
 /// Guarantee change, documented here like the S96 random bridge: these two
 /// functions leave the pure-Rust RustCrypto stack for the vendored OpenSSL
 /// — the digests are identical, the backend is the C++ one.
-#[cfg(not(target_os = "emscripten"))]
+#[cfg(all(not(target_os = "emscripten"), not(miri)))]
 mod openssl_digest {
     use std::cell::RefCell;
 
@@ -403,7 +408,7 @@ fn xor_block(a: &[u8; AES_BLOCK_SIZE], b: &[u8; AES_BLOCK_SIZE]) -> [u8; AES_BLO
 /// loop is latency-bound and OpenSSL's asm (the XOR folded into the round
 /// pipeline, no per-block call) is the reference; the RustCrypto per-block
 /// form topped out ~30% under it on the S97 machine.
-#[cfg(not(target_os = "emscripten"))]
+#[cfg(all(not(target_os = "emscripten"), not(miri)))]
 mod cbc_native {
     use super::AES_BLOCK_SIZE;
 
@@ -561,7 +566,7 @@ impl Default for AesState {
 /// `dst[i] = src[i] ^ ks[i]` in 8-byte words — the word loop auto-vectorizes,
 /// where the byte-wise form dominated the profile after the bulk refill
 /// landed (the S79 CTR gate).
-#[cfg(target_os = "emscripten")]
+#[cfg(any(target_os = "emscripten", miri))]
 fn xor_keystream(src: &[u8], ks: &[u8], dst: &mut [u8]) {
     let n = src.len().min(ks.len());
     assert!(dst.len() >= n);
@@ -588,12 +593,12 @@ fn xor_keystream(src: &[u8], ks: &[u8], dst: &mut [u8]) {
 /// §1.1 bridge: the RustCrypto path topped out at ~2.4 GB/s vs OpenSSL's
 /// ~11 GB/s on the S96-final machine, a stable 4.7× row). emscripten keeps
 /// the RustCrypto implementation below — the wasm build links no OpenSSL.
-#[cfg(not(target_os = "emscripten"))]
+#[cfg(all(not(target_os = "emscripten"), not(miri)))]
 pub use crate::crypto::ctr_native::AesCtrState;
 
 /// The OpenSSL EVP-backed CTR state (native). Kept as a private module so
 /// the public type and its docs live at the use site above.
-#[cfg(not(target_os = "emscripten"))]
+#[cfg(all(not(target_os = "emscripten"), not(miri)))]
 mod ctr_native {
     /// `AES_BLOCK_SIZE` of the parent module — CTR's IV/counter width.
     const AES_BLOCK_SIZE: usize = 16;
@@ -719,8 +724,8 @@ mod ctr_native {
     unsafe impl Send for AesCtrState {}
 }
 
-/// The RustCrypto CTR state — emscripten only (see [`AesCtrState`]).
-#[cfg(target_os = "emscripten")]
+/// The RustCrypto CTR state — emscripten and Miri (see [`AesCtrState`]).
+#[cfg(any(target_os = "emscripten", miri))]
 mod ctr_rustcrypto {
     use super::AES_BLOCK_SIZE;
     use aes::cipher::{BlockEncrypt, KeyInit};
@@ -838,7 +843,7 @@ mod ctr_rustcrypto {
     }
 }
 
-#[cfg(target_os = "emscripten")]
+#[cfg(any(target_os = "emscripten", miri))]
 pub use crate::crypto::ctr_rustcrypto::AesCtrState;
 
 /// `td::AesIgeState` — the IGE mode of `crypto.cpp`, byte-exact port of
@@ -859,8 +864,8 @@ pub use crate::crypto::ctr_rustcrypto::AesCtrState;
 /// the C++ ECB-EVP loop.
 pub struct AesIgeState {
     /// The CBC-encrypt EVP context of the native encrypt path; created by
-    /// `init`, freed by `Drop`. Null on emscripten (field not compiled).
-    #[cfg(not(target_os = "emscripten"))]
+    /// `init`, freed by `Drop`. Not compiled on emscripten or under Miri.
+    #[cfg(all(not(target_os = "emscripten"), not(miri)))]
     evp: *mut openssl_sys::EVP_CIPHER_CTX,
     /// The RustCrypto cipher of the decrypt path (and of both emscripten
     /// paths). `None` until `init` needs it — the native *encrypt* path
@@ -876,7 +881,7 @@ pub struct AesIgeState {
 impl AesIgeState {
     pub fn new() -> Self {
         Self {
-            #[cfg(not(target_os = "emscripten"))]
+            #[cfg(all(not(target_os = "emscripten"), not(miri)))]
             evp: std::ptr::null_mut(),
             cipher: None,
             decrypt: true,
@@ -895,7 +900,7 @@ impl AesIgeState {
         // RustCrypto and never touches `evp`; creating and keying a CBC
         // context per one-shot decrypt state was pure waste, the dominant
         // cost of the 64-byte rows after the S98 pass).
-        #[cfg(not(target_os = "emscripten"))]
+        #[cfg(all(not(target_os = "emscripten"), not(miri)))]
         if encrypt {
             // SAFETY: the context is created here (or reused from a
             // previous `init` — re-`init` re-keys it), used on this thread
@@ -922,9 +927,9 @@ impl AesIgeState {
         }
         // Only the RustCrypto paths below need the expanded key: the
         // native encrypt path runs through the EVP context above.
-        #[cfg(not(target_os = "emscripten"))]
+        #[cfg(all(not(target_os = "emscripten"), not(miri)))]
         let need_cipher = !encrypt;
-        #[cfg(target_os = "emscripten")]
+        #[cfg(any(target_os = "emscripten", miri))]
         let need_cipher = true;
         self.cipher = if need_cipher {
             Some(Aes256::new_from_slice(key).expect("32-byte key checked above"))
@@ -958,7 +963,7 @@ impl AesIgeState {
             return;
         }
 
-        #[cfg(not(target_os = "emscripten"))]
+        #[cfg(all(not(target_os = "emscripten"), not(miri)))]
         {
             // The C++ `BLOCK_COUNT = 31`: stack working set, one bulk CBC
             // call per chunk.
@@ -1038,7 +1043,7 @@ impl AesIgeState {
             }
         }
 
-        #[cfg(target_os = "emscripten")]
+        #[cfg(any(target_os = "emscripten", miri))]
         {
             let cipher = self
                 .cipher
@@ -1116,7 +1121,7 @@ impl Drop for AesIgeState {
     fn drop(&mut self) {
         // SAFETY: the context was created by `init` (if ever) and is freed
         // exactly once, here. emscripten has no field at all.
-        #[cfg(not(target_os = "emscripten"))]
+        #[cfg(all(not(target_os = "emscripten"), not(miri)))]
         unsafe {
             if !self.evp.is_null() {
                 openssl_sys::EVP_CIPHER_CTX_free(self.evp);
@@ -1186,12 +1191,12 @@ pub fn aes_cbc_encrypt(aes_key: &[u8], aes_iv: &mut [u8], from: &[u8], to: &mut 
         return;
     }
 
-    #[cfg(not(target_os = "emscripten"))]
+    #[cfg(all(not(target_os = "emscripten"), not(miri)))]
     {
         cbc_native::cbc_encrypt_oneshot(aes_key, aes_iv, from, to);
     }
 
-    #[cfg(target_os = "emscripten")]
+    #[cfg(any(target_os = "emscripten", miri))]
     {
         let cipher = Aes256::new_from_slice(aes_key).expect("32-byte key checked above");
         let n_blocks = from.len() / AES_BLOCK_SIZE;
@@ -1239,7 +1244,7 @@ pub fn aes_cbc_decrypt(aes_key: &[u8], aes_iv: &mut [u8], from: &[u8], to: &mut 
         return;
     }
 
-    #[cfg(not(target_os = "emscripten"))]
+    #[cfg(all(not(target_os = "emscripten"), not(miri)))]
     {
         // The C++ order: decrypt under the *incoming* iv first
         // (`evp.init_iv`), then set the out iv to the last input block.
@@ -1247,7 +1252,7 @@ pub fn aes_cbc_decrypt(aes_key: &[u8], aes_iv: &mut [u8], from: &[u8], to: &mut 
         aes_iv.copy_from_slice(&from[from.len() - AES_BLOCK_SIZE..]);
     }
 
-    #[cfg(target_os = "emscripten")]
+    #[cfg(any(target_os = "emscripten", miri))]
     {
         let cipher = Aes256::new_from_slice(aes_key).expect("32-byte key checked above");
         let n_blocks = from.len() / AES_BLOCK_SIZE;

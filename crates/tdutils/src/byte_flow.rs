@@ -906,6 +906,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Gzip flow runs libz FFI - not executable under Miri")]
     fn flow_encode_matches_one_shot() {
         let str = rand_string(b'a' as i32, b'z' as i32, 1_000_000);
         let parts = rand_split(&str);
@@ -930,6 +931,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Gzip flow runs libz FFI - not executable under Miri")]
     fn flow_error_on_truncated_stream() {
         let str = rand_string(b'a' as i32, b'z' as i32, 1_000_000);
         let mut zip = gzencode(&str, 0.9).as_slice().to_vec();
@@ -954,6 +956,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Gzip flow runs libz FFI - not executable under Miri")]
     fn encode_decode_flow_roundtrip() {
         let str = rand_string(b'a' as i32, b'z' as i32, 1_000_000);
         let parts = rand_split(&str);

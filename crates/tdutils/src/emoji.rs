@@ -377,6 +377,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "packed table decodes through libz FFI - not executable under Miri"
+    )]
     fn table_matches_the_cpp_snapshot() {
         let table = emoji_table();
         assert_eq!(table.len(), EMOJI_COUNT);
@@ -398,6 +402,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "packed table decodes through libz FFI - not executable under Miri"
+    )]
     fn is_emoji_matches_the_cpp_shape() {
         // Table elements.
         assert!(is_emoji("⌚"));
@@ -422,6 +430,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "packed table decodes through libz FFI - not executable under Miri"
+    )]
     fn fitzpatrick_helpers_match_the_cpp_shape() {
         // 🫸🏿 = U+1F3B8 U+1F3FF ends on the type-6 modifier.
         assert_eq!(get_fitzpatrick_modifier("🫸\u{1F3FF}"), 6);
@@ -434,6 +446,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "packed table decodes through libz FFI - not executable under Miri"
+    )]
     fn modifier_removal_matches_the_cpp_shape() {
         // The selector is removed only when remove_selectors is set.
         assert_eq!(remove_emoji_modifiers("👍\u{FE0F}", true), "👍");
@@ -458,6 +474,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "packed table decodes through libz FFI - not executable under Miri"
+    )]
     fn find_emojis_matches_the_cpp_contract() {
         // No emoji — the empty and plain-text bands.
         assert!(find_emojis("").is_empty());

@@ -34,9 +34,15 @@ env:
 jobs:
   asan:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # The public-repo standard runner is 4 vCPU / 16 GB RAM / 14 GB disk.
+    # A from-scratch full-workspace debug ASan build with debuginfo starves
+    # it (runner shutdown signals mid-compile) and links too slowly to fit
+    # 45 minutes; debuginfo=0 keeps reports symbolized at function level
+    # via the ELF symtab — line numbers are recoverable by reproducing
+    # locally with full debuginfo.
+    timeout-minutes: 60
     env:
-      RUSTFLAGS: -Zsanitizer=address -Cdebug-assertions -Coverflow-checks
+      RUSTFLAGS: -Zsanitizer=address -Cdebug-assertions -Coverflow-checks -Cdebuginfo=0
       # detect_leaks=1: LeakSanitizer ships inside ASan on Linux.
       ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1:abort_on_error=1
     steps:
@@ -53,7 +59,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
-      RUSTFLAGS: -Zsanitizer=thread
+      # debuginfo=0 for the same 16 GB / 14 GB hosted-runner budget as the
+      # asan job: with full debuginfo the instrumented build-std compile
+      # starves the runner and the step dies to a shutdown signal (exit
+      # 143) a few minutes in.
+      RUSTFLAGS: -Zsanitizer=thread -Cdebuginfo=0
       TSAN_OPTIONS: halt_on_error=1
     steps:
       - uses: actions/checkout@v5
@@ -79,5 +89,8 @@ jobs:
         with:
           toolchain: nightly-2026-09-01
           components: miri
-      # tdutils only for now — widen as crates land.
+      # tdutils only for now — widen as crates land. The vendored-OpenSSL
+      # and libz FFI cannot run under the interpreter: tdutils routes Miri
+      # onto its pure-Rust fallback arms (same cfg as emscripten), and the
+      # zlib byte-identity tests ignore under Miri (gzip.rs says why).
       - run: cargo miri test -p tdutils --locked

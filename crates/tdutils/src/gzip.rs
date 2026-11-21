@@ -396,6 +396,13 @@ mod tests {
     use crate::crypto::sha256;
     use crate::random::{Xorshift128plus, rand_string};
 
+    // Every test here drives the libz-sys FFI, and unlike the OpenSSL
+    // bridges there is no honest fallback to route Miri onto: the module
+    // exists to be byte-identical with the vendored stock zlib. The zlib
+    // surface stays covered by the asan/tsan jobs and the conformance
+    // corpus, so these ignore under Miri (see .github/workflows/
+    // sanitizers.yml).
+
     fn hex(bytes: &[u8]) -> String {
         const DIGITS: &[u8; 16] = b"0123456789abcdef";
         let mut out = String::with_capacity(bytes.len() * 2);
@@ -413,6 +420,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "libz FFI - not executable under Miri")]
     fn gzencode_gzdecode_roundtrips() {
         let mut rng = Xorshift128plus::from_seed(1);
         let mut random = vec![0u8; 1000];
@@ -426,6 +434,7 @@ mod tests {
     /// the gzip-format encodings of "abacaba" decode through the
     /// auto-detecting reader.
     #[test]
+    #[cfg_attr(miri, ignore = "libz FFI - not executable under Miri")]
     fn gzdecode_zlib_format() {
         fn hex_decode(hex: &str) -> Vec<u8> {
             (0..hex.len())
@@ -450,6 +459,7 @@ mod tests {
     /// the three string families, each within the C++ ratio budget
     /// `max(2, 100 / len)` (integer division).
     #[test]
+    #[cfg_attr(miri, ignore = "libz FFI - not executable under Miri")]
     fn gzencode_size_sweep() {
         for exponent in 0..=7u32 {
             let len = 10usize.pow(exponent);
@@ -467,6 +477,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "libz FFI - not executable under Miri")]
     fn gzencode_compresses_and_uses_zlib_format() {
         let s = vec![b'a'; 100_000];
         let encoded = gzencode(&s, 2.0);
@@ -479,6 +490,7 @@ mod tests {
     /// Golden blob produced by system `gzip` (stock zlib), not by tdlib;
     /// a zlib-only decoder would reject it.
     #[test]
+    #[cfg_attr(miri, ignore = "libz FFI - not executable under Miri")]
     fn gzip_format_stream_autodetect() {
         let blob: &[u8] = &[
             0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x4b, 0xcf, 0xcf, 0x49,
@@ -497,6 +509,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "libz FFI - not executable under Miri")]
     fn golden_vectors_from_the_conformance_corpus() {
         // The C++ test data blobs and their zlib decodings, pinned in S04.
         let path = concat!(
@@ -527,6 +540,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "libz FFI - not executable under Miri")]
     fn malformed_input_gives_empty() {
         assert!(gzdecode(b"not a zlib stream at all").empty());
         assert!(gzdecode(b"").empty());
@@ -537,6 +551,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "libz FFI - not executable under Miri")]
     fn streaming_gzip_state_machine() {
         let mut gzip = Gzip::new();
         gzip.init_decode().ensure();

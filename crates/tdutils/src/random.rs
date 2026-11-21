@@ -8,7 +8,8 @@
 //! userspace). **Guarantee change:** secure bytes now come from OpenSSL's
 //! fork-safe userspace DRBG (reseeded by OpenSSL from the OS entropy pool
 //! on demand), identical to tdlib, instead of directly from the kernel.
-//! emscripten keeps `getrandom` (no OpenSSL there). The fast API uses a
+//! emscripten keeps `getrandom` (no OpenSSL there), and so does Miri
+//! (which cannot execute the FFI). The fast API uses a
 //! thread-local [`Xorshift128plus`] seeded from the secure RNG (replacing
 //! the nondeterministically seeded `std::mt19937` — the sequence was never
 //! reproducible, and the distribution contract is unchanged). The seeded
@@ -49,14 +50,14 @@ thread_local! {
 /// One DRBG fill of the thread-local buffer — `RAND_bytes` on native
 /// (the vendored OpenSSL DRBG, exactly the C++), `getrandom` on emscripten.
 fn fill_secure(dest: &mut [u8]) {
-    #[cfg(not(target_os = "emscripten"))]
+    #[cfg(all(not(target_os = "emscripten"), not(miri)))]
     {
         // SAFETY: `dest` is a live writable buffer of exactly `dest.len()`
         // bytes; RAND_bytes writes all of it or returns an error (asserted).
         let ok = unsafe { openssl_sys::RAND_bytes(dest.as_mut_ptr(), dest.len() as i32) };
         assert_eq!(ok, 1, "RAND_bytes failed: DRBG unavailable");
     }
-    #[cfg(target_os = "emscripten")]
+    #[cfg(any(target_os = "emscripten", miri))]
     {
         getrandom::fill(dest).expect("getrandom failed: OS CSPRNG unavailable");
     }
@@ -132,13 +133,13 @@ pub fn add_seed(bytes: &[u8], entropy: f64) {
     // draws straight from the OS pool, which cannot be reseeded from
     // userspace); the generation bump applies everywhere, so the buffered
     // bytes are dropped either way.
-    #[cfg(not(target_os = "emscripten"))]
+    #[cfg(all(not(target_os = "emscripten"), not(miri)))]
     // SAFETY: `bytes` is a live readable buffer of exactly `bytes.len()`
     // bytes; RAND_add only reads it.
     unsafe {
         openssl_sys::RAND_add(bytes.as_ptr().cast(), bytes.len() as i32, entropy);
     }
-    #[cfg(target_os = "emscripten")]
+    #[cfg(any(target_os = "emscripten", miri))]
     let _ = (bytes, entropy);
     RANDOM_SEED_GENERATION.fetch_add(1, Ordering::Release);
 }
