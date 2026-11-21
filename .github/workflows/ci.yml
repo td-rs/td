@@ -87,9 +87,29 @@ jobs:
           toolchain: "1.95"
       - run: cargo build --locked --manifest-path conformance/Cargo.toml
 
-  deny:
+  # The standalone lockfiles get no --locked enforcement anywhere else:
+  # the conformance build uses it, but fuzz-smoke's cargo-fuzz resolves
+  # without --locked and bench has no build at all — so a manifest change
+  # that skips their lockfiles went unnoticed (exactly how they drifted
+  # before #163). Resolve each standalone graph with --locked so stale
+  # locks fail fast (resolution only, no compile).
+  standalone-locks:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95"
+      - run: |
+          for m in conformance fuzz bench; do
+            cargo metadata --locked --manifest-path "$m/Cargo.toml" --format-version 1 > /dev/null
+            echo "$m: lockfile ok"
+          done
+
+  deny:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: EmbarkStudios/cargo-deny-action@v2
@@ -97,3 +117,24 @@ jobs:
           # The action prepends its default `check` subcommand; passing it here
           # makes cargo-deny parse `check` as a WHICH check-name and fail.
           arguments: --workspace --all-features
+      # The standalone crates keep their own lockfiles outside the workspace
+      # graph (AGENTS.md) — audit each against the same deny.toml so an
+      # advisory cannot hide in a lock no gate reads (#163). These steps
+      # keep the action's default `arguments: --all-features` (only the
+      # workspace step above needs `--workspace` on top). cargo-deny
+      # resolves via cargo metadata, so this gates the committed pins'
+      # advisory posture; pure lock staleness trips the standalone-locks
+      # --locked resolve instead.
+      # Known noise: the shared RUSTSEC-2026-0386 ignore logs an
+      # advisory-not-detected warning on the fuzz graph — warn-only, tokio
+      # is transitive-only there and unsound advisories are matched for
+      # direct dependencies of workspace roots.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: conformance/Cargo.toml
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: fuzz/Cargo.toml
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: bench/Cargo.toml

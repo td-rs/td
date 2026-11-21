@@ -62,3 +62,9 @@ path = "src/bin/soak.rs"
 # Keep the default opt-level 3, like the C++ Release build.
 lto = "thin"
 codegen-units = 1
+
+# Mirror of the workspace root [patch.crates-io] wiring (same rationale —
+# see the root [patch] comment and vendor/README.md): the deny gate now
+# covers these locks (#163) and flags the registry libsqlite3-sys copy.
+[patch.crates-io]
+libsqlite3-sys = { path = "../vendor/libsqlite3-sys" }

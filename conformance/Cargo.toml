@@ -9,6 +9,12 @@ license = "MIT"
 publish = false
 description = "Golden vectors and differential harness for the td Rust rewrite"
 
+# Mirror of the workspace root [patch.crates-io] wiring (same rationale —
+# see the root [patch] comment and vendor/README.md): the deny gate now
+# covers these locks (#163) and flags the registry libsqlite3-sys copy.
+[patch.crates-io]
+libsqlite3-sys = { path = "../vendor/libsqlite3-sys" }
+
 [dependencies]
 base64 = "0.22"
 rsa = "0.9"
