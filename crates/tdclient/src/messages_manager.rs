@@ -38148,6 +38148,7 @@ mod tests {
     /// local id space died with the crash): it drops to the implicit
     /// topic reply, while a live server reply stays untouched.
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn restore_reply_drops_stale_local_binlog_replies() {
         let ctx = SendTestContext::default();
         let mut manager = MessagesManager::new();
@@ -38157,15 +38158,17 @@ mod tests {
         // the stale local reply: plain user dialog, non-ephemeral message
         let mut m = Message::default();
         m.message_id = MessageId::new(MessageId::min().get() + 16);
-        m.input_reply_to = MessageInputReplyTo::regular(MessageId::new(i64::from(MessageId::TYPE_LOCAL)));
+        m.input_reply_to =
+            MessageInputReplyTo::regular(MessageId::new(i64::from(MessageId::TYPE_LOCAL)));
         restore_message_reply_to_message_id(&manager, &ctx, dialog_id, &mut m);
         assert!(get_message_input_reply_to(&m).is_empty());
 
         // the live server reply: the early return keeps it
         let mut m = Message::default();
         m.message_id = MessageId::new(MessageId::min().get() + 16);
-        m.input_reply_to =
-            MessageInputReplyTo::regular(MessageId::from_server_message_id(ServerMessageId::new(7)));
+        m.input_reply_to = MessageInputReplyTo::regular(MessageId::from_server_message_id(
+            ServerMessageId::new(7),
+        ));
         restore_message_reply_to_message_id(&manager, &ctx, dialog_id, &mut m);
         assert!(!get_message_input_reply_to(&m).is_empty());
     }
