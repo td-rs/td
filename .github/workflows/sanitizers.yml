@@ -34,12 +34,17 @@ env:
 jobs:
   asan:
     runs-on: ubuntu-24.04
-    # The public-repo standard runner is 4 vCPU / 16 GB RAM / 14 GB disk.
-    # A from-scratch full-workspace debug ASan build with debuginfo starves
-    # it (runner shutdown signals mid-compile) and links too slowly to fit
-    # 45 minutes; debuginfo=0 keeps reports symbolized at function level
-    # via the ELF symtab — line numbers are recoverable by reproducing
-    # locally with full debuginfo.
+    # The public-repo standard runner is 4 vCPU / 16 GB RAM / ~20 GB disk.
+    # The tdclient rustc alone peaks at ~13 GB under sanitizer
+    # instrumentation (measured locally on a 32 GB host): with default -j4
+    # siblings and test-binary linkers joining it, the 16 GB VM hard-freezes
+    # and the platform reclaims it (the historical "shutdown signal", exit
+    # 143). -j2 keeps the concurrent set to the big crate plus at most one
+    # job, and the swap file absorbs the remaining spike — the build
+    # survives a slow window, not an OOM freeze. debuginfo=0 keeps reports
+    # symbolized at function level via the ELF symtab (line numbers
+    # reproduce locally with full debuginfo) and the artifacts small
+    # enough to leave room for the swap.
     timeout-minutes: 60
     env:
       RUSTFLAGS: -Zsanitizer=address -Cdebug-assertions -Coverflow-checks -Cdebuginfo=0
@@ -50,19 +55,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: nightly-2026-09-01
+      - name: Swap headroom for the tdclient compile spike
+        run: |
+          sudo fallocate -l 8G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
       # --lib/--bins/--tests: sanitizer runtimes cannot be linked into
       # rustdoc-built doctest binaries (rust-lang/cargo#9025) — including
       # doctests fails the link step with undefined __asan_* symbols.
-      - run: cargo test --workspace --locked --target x86_64-unknown-linux-gnu --lib --bins --tests
+      - run: cargo test --workspace --locked -j 2 --target x86_64-unknown-linux-gnu --lib --bins --tests
 
   tsan:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
-      # debuginfo=0 for the same 16 GB / 14 GB hosted-runner budget as the
-      # asan job: with full debuginfo the instrumented build-std compile
-      # starves the runner and the step dies to a shutdown signal (exit
-      # 143) a few minutes in.
+      # debuginfo=0 and the swap/-j2 steps: same 16 GB hosted-runner budget
+      # as the asan job (the tdclient TSan rustc peaks at ~13 GB; see the
+      # comment there).
       RUSTFLAGS: -Zsanitizer=thread -Cdebuginfo=0
       TSAN_OPTIONS: halt_on_error=1
     steps:
@@ -71,14 +81,23 @@ jobs:
         with:
           toolchain: nightly-2026-09-01
           components: rust-src
+      - name: Swap headroom for the tdclient compile spike
+        run: |
+          sudo fallocate -l 8G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
       # Mostly green today (little concurrency code yet); becomes the real
       # gate for the tdactor port (S07+). No doctests: same cargo#9025 link
       # limitation as the asan job.
-      - run: cargo test -Zbuild-std=std --workspace --locked --target x86_64-unknown-linux-gnu --lib --bins --tests
+      - run: cargo test -Zbuild-std=std --workspace --locked -j 2 --target x86_64-unknown-linux-gnu --lib --bins --tests
 
   miri:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    # The interpreted suite (FFI routed to the Rust arms, 2048-bit and
+    # megabyte rows budgeted off in the tests) runs ~60-90 minutes on the
+    # 4-core runner; 120 leaves margin.
+    timeout-minutes: 120
     env:
       # The harness tests write temp files (regression tester); grant the
       # real host filesystem instead of Miri's isolated one.
