@@ -3335,7 +3335,11 @@ impl<S: UpdatesSink> UpdatesManager<S> {
         source: &str,
     ) {
         debug_assert!(self.get_pts() != -1);
-        debug_assert!(env.is_authorized());
+        // a pure env read hoisted for lint parity with the insert sites: the
+        // env trait's &mut convention makes is_authorized() a mut call, which
+        // must stay out of debug_assert! (#155)
+        let is_authorized = env.is_authorized();
+        debug_assert!(is_authorized);
         debug_assert!(!self.running_get_difference);
 
         self.running_get_difference = true;

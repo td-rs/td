@@ -463,12 +463,13 @@ impl AudiosManager {
                 .is_none(),
             "CHECK(get_input_media(file_id, nullptr, nullptr) == nullptr)"
         );
-        debug_assert!(
-            self.being_uploaded_audio_files
-                .insert(file_upload_id, promise)
-                .is_none(),
-            "CHECK(is_inserted)"
-        );
+        // the emplace is real; the CHECK only asserts (a debug_assert! insert
+        // would skip the registration in release builds, #155)
+        let is_inserted = self
+            .being_uploaded_audio_files
+            .insert(file_upload_id, promise)
+            .is_none();
+        debug_assert!(is_inserted, "CHECK(is_inserted)");
         tdutils::log_info!("Ask to upload audio {file_upload_id:?}");
         files.upload(file_upload_id, upload_callback.clone(), 2, 0, fllm);
         tdutils::status::Result::Ok(AudioUploadOutcome::Started {
@@ -490,12 +491,12 @@ impl AudiosManager {
         promise: Promise<()>,
     ) -> FileUploadId {
         let file_upload_id = FileUploadId::new(file_id, files.get_internal_upload_id());
-        debug_assert!(
-            self.being_uploaded_audio_files
-                .insert(file_upload_id, promise)
-                .is_none(),
-            "CHECK(is_inserted)"
-        );
+        // the emplace is real; the CHECK only asserts (#155)
+        let is_inserted = self
+            .being_uploaded_audio_files
+            .insert(file_upload_id, promise)
+            .is_none();
+        debug_assert!(is_inserted, "CHECK(is_inserted)");
         tdutils::log_info!("Ask to reupload audio {file_upload_id:?}");
         files.resume_upload(
             file_upload_id,
