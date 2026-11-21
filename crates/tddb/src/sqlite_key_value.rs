@@ -272,7 +272,10 @@ impl SqliteKeyValue {
                     .get_by_prefix_rare_stmt
                     .as_mut()
                     .expect("not initialized");
-                stmt.bind_blob(1, till).ensure();
+                // fe61d641d: the rare (unbounded-till) statement is keyed
+                // from `from` — the C++ bound `till` (empty in this arm)
+                // and returned the whole table
+                stmt.bind_blob(1, from).ensure();
                 stmt
             }
             ByPrefix => {
@@ -411,6 +414,16 @@ mod tests {
             true
         });
         assert_eq!(range.len(), 2);
+
+        // the unbounded-till range (the rare statement) starts at `from` —
+        // fe61d641d: the C++ bound the empty `till` and scanned the whole
+        // table
+        let mut rare = Vec::new();
+        kv.get_by_range(b"pb", b"", |k, _v| {
+            rare.push(k.to_vec());
+            true
+        });
+        assert_eq!(rare, vec![b"pb1".to_vec()]);
 
         // early stop via callback
         let mut count = 0;
