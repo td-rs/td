@@ -1826,7 +1826,8 @@ sentGiftUpgraded gift:upgradedGift = SentGift;
 //@date Point in time (Unix timestamp) when the gift was sent
 //@gift The gift
 //@collection_ids Identifiers of collections to which the gift is added; only for the receiver of the gift
-//@sell_star_count Number of Telegram Stars that can be claimed by the receiver instead of the regular gift; 0 if the gift can't be sold by the current user
+//@sell_star_count Number of Telegram Stars that can be claimed by the receiver instead of the regular gift within getOption("gift_sell_period") seconds from its sending;
+//-0 if the gift can't be sold by the receiver
 //@prepaid_upgrade_star_count Number of Telegram Stars that were paid by the sender for the ability to upgrade the gift
 //@is_upgrade_separate True, if the upgrade was bought after the gift was sent. In this case, prepaid upgrade cost must not be added to the gift cost
 //@transfer_star_count Number of Telegram Stars that must be paid to transfer the upgraded gift; only for the receiver of the gift
@@ -6182,7 +6183,8 @@ messageTonConnectRequest session_id:int64 state:TonConnectRequestState dapp_name
 //@received_gift_id Unique identifier of the received gift for the current user; only for the receiver of the gift
 //@text Message added to the gift
 //@unique_gift_number Unique number of the gift among gifts upgraded from the same gift after upgrade; 0 if yet unassigned
-//@sell_star_count Number of Telegram Stars that can be claimed by the receiver instead of the regular gift; 0 if the gift can't be sold by the receiver
+//@sell_star_count Number of Telegram Stars that can be claimed by the receiver instead of the regular gift within getOption("gift_sell_period") seconds from its sending;
+//-0 if the gift can't be sold by the receiver
 //@prepaid_upgrade_star_count Number of Telegram Stars that were paid by the sender for the ability to upgrade the gift
 //@is_upgrade_separate True, if the upgrade was bought after the gift was sent. In this case, prepaid upgrade cost must not be added to the gift cost
 //@is_from_auction True, if the message is a notification about a gift won on an auction
@@ -13579,7 +13581,7 @@ editEphemeralMessage chat_id:int53 receiver_user_id:int53 ephemeral_message_id:i
 //@show_caption_above_media Pass true to show the caption above the media; otherwise, the caption will be shown below the media. May be true only for animation, photo, and video messages
 editEphemeralMessageCaption chat_id:int53 receiver_user_id:int53 ephemeral_message_id:int32 reply_markup:ReplyMarkup caption:formattedText show_caption_above_media:Bool = Ok;
 
-//@description Replies to a callback query with an ephemeral message; for bots only
+//@description Replies to a callback query with an ephemeral message; for bots only. Returns the sent message
 //@callback_query_id Identifier of the callback query
 //@replace_callback_query_message Pass true if the ephemeral message must replace the message from which the callback query originated
 //@protect_content Pass true if the content of the message must be protected from forwarding and saving
@@ -13587,7 +13589,7 @@ editEphemeralMessageCaption chat_id:int53 receiver_user_id:int53 ephemeral_messa
 //@input_message_content New content of the message. Must be one of the following types: inputMessageText, inputMessageAnimation,
 //-inputMessageAudio, inputMessageDocument, inputMessagePhoto, inputMessageRichMessage, inputMessageSticker, inputMessageVideo, inputMessageVideoNote, inputMessageVoiceNote,
 //-inputMessageLocation, inputMessageVenue, inputMessageContact
-replyToCallbackQueryWithEphemeralMessage callback_query_id:int64 replace_callback_query_message:Bool protect_content:Bool reply_markup:ReplyMarkup input_message_content:InputMessageContent = Ok;
+replyToCallbackQueryWithEphemeralMessage callback_query_id:int64 replace_callback_query_message:Bool protect_content:Bool reply_markup:ReplyMarkup input_message_content:InputMessageContent = Message;
 
 //@description Edits the time when a scheduled message will be sent. Scheduling state of all messages in the same album or forwarded together with the message will be also changed
 //@chat_id The chat the message belongs to
@@ -14983,7 +14985,7 @@ canPostStory chat_id:int53 = CanPostStoryResult;
 //@content Content of the story
 //@areas Clickable rectangle areas to be shown on the story media; pass null if none
 //@caption Story caption; pass null to use an empty caption; 0-getOption("story_caption_length_max") characters; can have entities only if getOption("can_use_text_entities_in_story_caption")
-//@music Music to be attached to the story; pass null if none. The music can be up to 60 seconds long
+//@music Music to be attached to the story; pass null if none. The music can be up to 60 seconds long. The bot getOption("audio_search_bot_username") can be used to find the music files
 //@privacy_settings The privacy settings for the story; ignored for stories posted on behalf of supergroup and channel chats
 //@album_ids Identifiers of story albums to which the story will be added upon posting. An album can have up to getOption("story_album_size_max") stories
 //@active_period Period after which the story is moved to archive, in seconds; must be one of 6 * 3600, 12 * 3600, 86400, or 2 * 86400 for Telegram Premium users, and 86400 otherwise
@@ -16706,12 +16708,14 @@ placeGiftAuctionBid gift_id:int64 star_count:int53 user_id:int53 text:formattedT
 //@star_count The number of Telegram Stars to put in the bid
 increaseGiftAuctionBid gift_id:int64 star_count:int53 = Ok;
 
-//@description Sells a gift for Telegram Stars; requires owner privileges for gifts owned by a chat
+//@description Sells a gift for Telegram Stars. Use receivedGift.sell_star_count or messageGift.sell_star_count to check whether the gift is soldable.
+//-A gift can be sold if it is soldable and not more than getOption("gift_sell_period") seconds passed since gift sending
 //@business_connection_id Unique identifier of business connection on behalf of which to send the request; for bots only
 //@received_gift_id Identifier of the gift
 sellGift business_connection_id:string received_gift_id:string = Ok;
 
-//@description Deletes a gift without receiving Telegram Stars for it. Use receivedGift.can_be_deleted or messageGift.can_be_deleted to check whether the gift can be deleted
+//@description Deletes a gift without receiving Telegram Stars for it. Use receivedGift.can_be_deleted or messageGift.can_be_deleted to check whether the gift can be deleted.
+//-The gift may be deleted even it can still be sold using sellGift
 //@business_connection_id Unique identifier of business connection on behalf of which to send the request; for bots only
 //@received_gift_id Identifier of the gift
 deleteGift business_connection_id:string received_gift_id:string = Ok;
