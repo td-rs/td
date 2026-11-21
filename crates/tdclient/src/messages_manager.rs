@@ -26046,18 +26046,22 @@ pub fn restore_message_reply_to_message_id(
     let replied_message_full_id =
         get_message_input_reply_to(m).get_reply_message_full_id(dialog_id);
     let replied_message_id = replied_message_full_id.get_message_id();
-    if replied_message_id == MessageId::default() || !replied_message_id.is_yet_unsent() {
+    if replied_message_id == MessageId::default() {
         return;
     }
-    assert!(replied_message_full_id.get_dialog_id() == dialog_id);
-    let log_check_reply_full_id = m
-        .replied_message_info
-        .get_reply_message_full_id(dialog_id, true);
-    assert!(
-        log_check_reply_full_id == replied_message_full_id,
-        "restore_message_reply_to_message_id reply mismatch: {replied_message_full_id:?} vs {log_check_reply_full_id:?}"
-    );
-    let message_id = {
+    // 67574afad: a local reply restored from binlog is stale (the local
+    // id space died with the crash) — it drops to the implicit topic
+    // reply; secret-chat and ephemeral replies keep the C++ carve-outs
+    // and a live reply id stays untouched.
+    let message_id = if replied_message_id.is_yet_unsent() {
+        assert!(replied_message_full_id.get_dialog_id() == dialog_id);
+        let log_check_reply_full_id = m
+            .replied_message_info
+            .get_reply_message_full_id(dialog_id, true);
+        assert!(
+            log_check_reply_full_id == replied_message_full_id,
+            "restore_message_reply_to_message_id reply mismatch: {replied_message_full_id:?} vs {log_check_reply_full_id:?}"
+        );
         let d = manager.get_dialog(dialog_id).unwrap();
         get_message_id_by_random_id(
             ctx,
@@ -26065,6 +26069,14 @@ pub fn restore_message_reply_to_message_id(
             m.reply_to_random_id,
             "restore_message_reply_to_message_id",
         )
+    } else if replied_message_id.is_local()
+        && dialog_id.get_type() != DialogType::SecretChat
+        && !is_ephemeral_message(m)
+    {
+        log_error!("Drop reply to {:?} from binlog", replied_message_full_id);
+        MessageId::default()
+    } else {
+        return;
     };
     if (message_id.is_valid() || message_id.is_valid_scheduled())
         && !message_id.is_local()
@@ -38131,6 +38143,32 @@ mod tests {
     use crate::keyboard_button::{KeyboardButton, KeyboardButtonType};
     use crate::keyboard_button_style::{KeyboardButtonStyle, KeyboardButtonStyleType};
     use crate::requested_dialog_type::{RequestedDialogType, RequestedDialogTypeType};
+
+    /// 67574afad — a binlog-restored reply to a LOCAL id is stale (the
+    /// local id space died with the crash): it drops to the implicit
+    /// topic reply, while a live server reply stays untouched.
+    #[test]
+    fn restore_reply_drops_stale_local_binlog_replies() {
+        let ctx = SendTestContext::default();
+        let mut manager = MessagesManager::new();
+        let dialog_id = DialogId::from_user_id(UserId::new(10));
+        manager.add_dialog_for_new_message(dialog_id);
+
+        // the stale local reply: plain user dialog, non-ephemeral message
+        let mut m = Message::default();
+        m.message_id = MessageId::new(MessageId::min().get() + 16);
+        m.input_reply_to = MessageInputReplyTo::regular(MessageId::new(i64::from(MessageId::TYPE_LOCAL)));
+        restore_message_reply_to_message_id(&manager, &ctx, dialog_id, &mut m);
+        assert!(get_message_input_reply_to(&m).is_empty());
+
+        // the live server reply: the early return keeps it
+        let mut m = Message::default();
+        m.message_id = MessageId::new(MessageId::min().get() + 16);
+        m.input_reply_to =
+            MessageInputReplyTo::regular(MessageId::from_server_message_id(ServerMessageId::new(7)));
+        restore_message_reply_to_message_id(&manager, &ctx, dialog_id, &mut m);
+        assert!(!get_message_input_reply_to(&m).is_empty());
+    }
 
     /// the local emoji of the dialog-store reaction world
     fn local_emoji(reaction: &str) -> ReactionType {
