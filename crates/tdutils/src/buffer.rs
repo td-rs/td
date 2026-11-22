@@ -277,9 +277,9 @@ impl BufferSlice {
     ///
     /// The source must not alias the window this allocates: on the
     /// thread-local slab the fresh bytes append past the published `end`,
-    /// so the only possible alias is another slab view — [`copy()`]'s
-    /// same-slab path, which routes through [`from_bytes_raw`] instead of
-    /// this reference-pair copy.
+    /// so the only possible alias is another slab view — `copy()`'s
+    /// same-slab path, which routes through the private `from_bytes_raw`
+    /// raw-memcpy core instead of this reference-pair copy.
     pub fn from_slice_bytes(slice: &[u8]) -> Self {
         let mut this = Self::with_size(slice.len());
         this.as_mutable_slice().copy_from_slice(slice);

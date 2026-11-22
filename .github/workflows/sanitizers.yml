@@ -57,10 +57,16 @@ jobs:
           toolchain: nightly-2026-09-01
       - name: Swap headroom for the tdclient compile spike
         run: |
+          # The 24.04 image ships an active /swapfile (fallocate on it fails
+          # with "Text file busy"); replace it with a bigger one.
+          swapon --show || true
+          sudo swapoff /swapfile 2>/dev/null || true
+          sudo rm -f /swapfile
           sudo fallocate -l 8G /swapfile
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile
           sudo swapon /swapfile
+          swapon --show
       # --lib/--bins/--tests: sanitizer runtimes cannot be linked into
       # rustdoc-built doctest binaries (rust-lang/cargo#9025) — including
       # doctests fails the link step with undefined __asan_* symbols.
@@ -83,10 +89,16 @@ jobs:
           components: rust-src
       - name: Swap headroom for the tdclient compile spike
         run: |
+          # The 24.04 image ships an active /swapfile (fallocate on it fails
+          # with "Text file busy"); replace it with a bigger one.
+          swapon --show || true
+          sudo swapoff /swapfile 2>/dev/null || true
+          sudo rm -f /swapfile
           sudo fallocate -l 8G /swapfile
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile
           sudo swapon /swapfile
+          swapon --show
       # Mostly green today (little concurrency code yet); becomes the real
       # gate for the tdactor port (S07+). No doctests: same cargo#9025 link
       # limitation as the asan job.
